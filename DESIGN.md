@@ -1,7 +1,7 @@
 # Android Traffic Control (ATC) — MVP Design Specification
 
 - **Status:** MVP Design Specification
-- **Target Platforms:** macOS, Linux, Windows
+- **Target Platforms:** macOS, Linux (Windows supported via `adb` and SDK `emulator` fallback; `android emulator` subcommands are macOS/Linux only per official Android CLI support)
 - **Runtime Stack:** Node.js (>= 20 LTS, zero external runtime dependencies, ESM `.mjs`)
 - **Integration Targets:** Official `android` CLI (`android emulator`, `android run`, `android layout`, `android screen`), `adb`, Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code, and Stdio MCP.
 

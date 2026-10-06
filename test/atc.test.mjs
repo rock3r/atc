@@ -1142,6 +1142,79 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(physDev.profile.playStore, true);
     assert.equal(matchesProfile(physDev, { kind: "physical", apiSpec: "35", play: true }), true);
     assert.equal(matchesProfile(physDev, { kind: "physical", apiSpec: "36" }), false);
+
+    // Pipelines feeding commands into shell interpreters or xargs are inspected by guard
+    const pipeShGuard = evaluateCommandGuard("echo 'adb shell pm clear com.example' | sh", {
+      sessionId: "sess-unleased",
+      activeLeases: [],
+    });
+    assert.equal(pipeShGuard.allowed, false);
+
+    const pipeBashLifecycle = evaluateCommandGuard(
+      "printf '%s\\n' 'emulator -avd Pixel_8_API_35' | bash",
+      {
+        sessionId: "sess-create",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      }
+    );
+    assert.equal(pipeBashLifecycle.allowed, false);
+    assert.match(pipeBashLifecycle.reason, /Direct emulator launch is disabled/);
+
+    // cmdGuard with --session and ATC_ANCHOR_PID retains anchorPid in rewritten command
+    const piGuard = cmdGuard(
+      dir,
+      "atc claim --type phone",
+      { session: "pi-1234" },
+      { env: { ATC_ANCHOR_PID: "4242" } }
+    );
+    assert.equal(piGuard.allowed, true);
+    assert.match(piGuard.rewrittenCommand, /ATC_SESSION_ID=pi-1234 ATC_ANCHOR_PID=4242/);
+
+    // Windows emulator lifecycle uses `emulator -avd` and `adb -s <serial> emu kill`
+    const winDir = makeTempStateDir();
+    try {
+      const winCalls = [];
+      const winClaim = cmdClaim(
+        winDir,
+        { session: "win-sess", api: "35", headless: true, cold: true },
+        {
+          platform: "win32",
+          avdHome,
+          inventory: offlineInventory,
+          runner: (cmd, args) => {
+            winCalls.push([cmd, ...args].join(" "));
+            if (cmd === "emulator") {
+              return { status: 0, stdout: "emulator-5554\n", stderr: "" };
+            }
+            if (cmd === "adb" && args.includes("getprop")) {
+              return { status: 0, stdout: "1\n", stderr: "" };
+            }
+            return { status: 0, stdout: "OK", stderr: "" };
+          },
+        }
+      );
+      assert.equal(winClaim.exitCode, 0);
+      assert.ok(winCalls.includes("emulator -avd Pixel_8_API_35 -no-window -no-snapshot-load"));
+
+      const winFreeCalls = [];
+      const winFree = cmdFree(
+        winDir,
+        winClaim.lease.leaseId,
+        { session: "win-sess", stop: true },
+        {
+          platform: "win32",
+          avdHome,
+          runner: (cmd, args) => {
+            winFreeCalls.push([cmd, ...args].join(" "));
+            return { status: 0, stdout: "OK", stderr: "" };
+          },
+        }
+      );
+      assert.equal(winFree.exitCode, 0);
+      assert.deepEqual(winFreeCalls, ["adb -s emulator-5554 emu kill"]);
+    } finally {
+      fs.rmSync(winDir, { recursive: true, force: true });
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

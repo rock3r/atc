@@ -25,6 +25,7 @@ export function resolveExecutable(command, env = process.env) {
   const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
   pathDirs.push(
     path.join(localAppData, "Android", "Sdk", "platform-tools"),
+    path.join(localAppData, "Android", "Sdk", "emulator"),
     path.join(os.homedir(), ".local", "bin"),
   );
 
@@ -92,6 +93,27 @@ export function buildSpawnConfig(command, args = [], options = {}) {
 }
 
 export function runCommandSync(command, args = [], options = {}) {
+  if (options.detached) {
+    const cfg = buildSpawnConfig(command, args, {
+      ...options,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    try {
+      const child = spawn(cfg.command, cfg.args, cfg.options);
+      if (typeof child.unref === "function") child.unref();
+      return { status: 0, signal: null, stdout: "", stderr: "", error: null };
+    } catch (err) {
+      return {
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: err?.message || "Failed to spawn detached process",
+        error: err,
+      };
+    }
+  }
   const cfg = buildSpawnConfig(command, args, {
     encoding: "utf8",
     timeout: options.timeoutMs ?? 15_000,

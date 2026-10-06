@@ -44,7 +44,13 @@ export default function atcExtension(pi: any) {
       const stdout = execFileSync(
         "atc",
         ["guard", "--session", sessionId, "--format=json", "--", command],
-        { encoding: "utf8" }
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            ATC_ANCHOR_PID: process.env.ATC_ANCHOR_PID || String(process.pid),
+          },
+        }
       );
       return handleDecision(stdout);
     } catch (err: any) {
@@ -66,7 +72,13 @@ export default function atcExtension(pi: any) {
 
   const releaseSessionLeases = async () => {
     try {
-      execFileSync("atc", ["free", "--session", sessionId], { stdio: "ignore" });
+      execFileSync("atc", ["free", "--session", sessionId], {
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          ATC_ANCHOR_PID: process.env.ATC_ANCHOR_PID || String(process.pid),
+        },
+      });
     } catch {
       // ignore if no active lease
     }

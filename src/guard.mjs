@@ -12,7 +12,22 @@ const TRANSPARENT_WRAPPERS = new Set([
   "time",
   "npx",
 ]);
-const SHELL_WRAPPERS = new Set(["sh", "bash", "zsh", "dash", "ksh", "pwsh", "powershell", "cmd"]);
+const SHELL_WRAPPERS = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "csh",
+  "tcsh",
+  "pwsh",
+  "powershell",
+  "cmd",
+  "eval",
+  "source",
+  ".",
+]);
 const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "echo",
   "printf",
@@ -81,10 +96,39 @@ export function splitShellSegments(command) {
   const normalized = command
     .replace(/(?:\$|<|>)\(([^)]+)\)/g, " ; $1 ; ")
     .replace(/`([^`]+)`/g, " ; $1 ; ");
-  return normalized
-    .split(/(?:&&|\|\||[;|\n&])+/)
+  const clauses = normalized
+    .split(/(?:&&|\|\||[;\n&])+/)
     .map((s) => s.trim())
     .filter(Boolean);
+  const segments = [];
+  for (const clause of clauses) {
+    const stages = clause
+      .split("|")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const upstreamArgs = [];
+    for (let i = 0; i < stages.length; i++) {
+      const stage = stages[i];
+      const parsedStage = parseSegment(stage);
+      if (i > 0 && upstreamArgs.length > 0) {
+        if (SHELL_WRAPPERS.has(parsedStage.baseCmd)) {
+          segments.push(`${stage} ${upstreamArgs.map((a) => JSON.stringify(a)).join(" ")}`);
+        } else if (parsedStage.baseCmd === "xargs" || parsedStage.baseCmd === "parallel") {
+          segments.push(`${stage} ${upstreamArgs.join(" ")}`);
+        } else {
+          segments.push(stage);
+        }
+      } else {
+        segments.push(stage);
+      }
+      for (const arg of parsedStage.args) {
+        if (!/^-[A-Za-z0-9]+$/.test(arg) || FAST_PATH_REGEX.test(arg)) {
+          upstreamArgs.push(arg);
+        }
+      }
+    }
+  }
+  return segments;
 }
 
 export function tokenizeSegment(segment) {
@@ -195,8 +239,15 @@ export function extractTargetSerial(parsed) {
   return null;
 }
 
-export function classifySegment(segment, inheritedVars = {}) {
+export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   const parsed = parseSegment(segment, inheritedVars);
+  if (depth > 8) {
+    return {
+      kind: "device_action",
+      targetSerial: extractTargetSerial(parsed),
+      parsed,
+    };
+  }
   const { baseCmd, args } = parsed;
   const effectiveSegment = parsed.raw || segment;
 
@@ -308,16 +359,21 @@ export function classifySegment(segment, inheritedVars = {}) {
     return { kind: "ignore", parsed };
   }
 
-  // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`)
+  // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`, `eval adb shell ...`)
   if (SHELL_WRAPPERS.has(baseCmd) && FAST_PATH_REGEX.test(effectiveSegment)) {
-    const innerStrings = args.filter((a) => FAST_PATH_REGEX.test(a));
+    const nonFlagArgs = args.filter((a) => !a.startsWith("-") && a !== "<<<" && a !== "<<");
+    const innerStrings = [...args.filter((a) => FAST_PATH_REGEX.test(a))];
+    if (nonFlagArgs.length > 1) {
+      innerStrings.push(nonFlagArgs.join(" "));
+    }
     if (innerStrings.length > 0) {
       let chosen = { kind: "ignore", parsed };
       const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
       for (const inner of innerStrings) {
         const innerVars = { ...parsed.envVars };
         for (const subSeg of splitShellSegments(inner)) {
-          const subClass = classifySegment(subSeg, innerVars);
+          if (subSeg.trim() === effectiveSegment.trim()) continue;
+          const subClass = classifySegment(subSeg, innerVars, depth + 1);
           Object.assign(innerVars, subClass.parsed?.envVars || {});
           if ((rank[subClass.kind] || 0) > (rank[chosen.kind] || 0)) {
             chosen = subClass;
@@ -369,7 +425,7 @@ export function classifySegment(segment, inheritedVars = {}) {
         const nestedSegment = cleanedArgs
           .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        return classifySegment(nestedSegment, parsed.envVars);
+        return classifySegment(nestedSegment, parsed.envVars, depth + 1);
       }
     }
     return {

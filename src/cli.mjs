@@ -670,7 +670,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     }
 
     if (txOutcome.status === "needs_boot_or_prep") {
-      return executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome });
+      return executeBootOrPrepOutsideLock(stateDir, txOutcome, req, {
+        runner,
+        avdHome,
+        platform: options.platform,
+      });
     }
 
     // Two-Stage Poll Loop (§5.3 Step 6)
@@ -701,7 +705,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
   }
 }
 
-function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome }) {
+function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome, platform }) {
   const { lease, selection, victimLeaseId, ttlMs, bootTimeoutMs, knownAvdNames } = txOutcome;
   const candidate = selection.candidate;
   const hbTimer = startWorkerDeadlineHeartbeat(
@@ -713,14 +717,19 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
   let resolvedSerial = candidate.serial;
   let bootedNewEmulator = false;
 
+  const isWin = (platform || process.platform) === "win32";
+
   try {
     // 1. Evict victim if replacingAvd is set
     if (selection.victim) {
-      const stopRes = runner(
-        "android",
-        ["emulator", "stop", selection.victim.serial || selection.victim.avd],
-        { strictInternal: true },
-      );
+      const stopRes =
+        isWin && selection.victim.serial
+          ? runner("adb", ["-s", selection.victim.serial, "emu", "kill"], { strictInternal: true })
+          : runner(
+              "android",
+              ["emulator", "stop", selection.victim.serial || selection.victim.avd],
+              { strictInternal: true },
+            );
       if (stopRes.status !== 0) {
         throw new Error(
           `Failed to stop idle victim emulator ${selection.victim.avd}: ${stopRes.stderr || stopRes.stdout}`,
@@ -850,11 +859,14 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       }
     } else {
       if (candidate.online && (req.wipeData || req.coldBoot)) {
-        const rebootStopRes = runner(
-          "android",
-          ["emulator", "stop", candidate.serial || candidate.avd],
-          { strictInternal: true },
-        );
+        const rebootStopRes =
+          isWin && candidate.serial
+            ? runner("adb", ["-s", candidate.serial, "emu", "kill"], { strictInternal: true })
+            : runner(
+                "android",
+                ["emulator", "stop", candidate.serial || candidate.avd],
+                { strictInternal: true },
+              );
         if (rebootStopRes.status !== 0) {
           throw new Error(
             `Failed to stop emulator ${candidate.avd} before reboot: ${rebootStopRes.stderr || rebootStopRes.stdout}`,
@@ -864,14 +876,26 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       if (req.wipeData) {
         wipeAvdUserData(candidate.avd, avdHome);
       }
-      const startArgs = ["emulator", "start", candidate.avd];
-      if (req.headless) startArgs.push("--headless");
-      if (req.coldBoot || req.wipeData) startArgs.push("--cold");
+      let bootRes;
+      if (isWin) {
+        const winArgs = ["-avd", candidate.avd];
+        if (req.headless) winArgs.push("-no-window");
+        if (req.coldBoot || req.wipeData) winArgs.push("-no-snapshot-load");
+        bootRes = runner("emulator", winArgs, {
+          strictInternal: true,
+          detached: true,
+          timeoutMs: bootTimeoutMs,
+        });
+      } else {
+        const startArgs = ["emulator", "start", candidate.avd];
+        if (req.headless) startArgs.push("--headless");
+        if (req.coldBoot || req.wipeData) startArgs.push("--cold");
 
-      const bootRes = runner("android", startArgs, {
-        strictInternal: true,
-        timeoutMs: bootTimeoutMs,
-      });
+        bootRes = runner("android", startArgs, {
+          strictInternal: true,
+          timeoutMs: bootTimeoutMs,
+        });
+      }
       if (bootRes.status !== 0) {
         throw new Error(
           `Failed to boot emulator ${candidate.avd}: ${bootRes.stderr || bootRes.stdout}`,
@@ -881,17 +905,23 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
       resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
-      if (!resolvedSerial) {
+      const pollDeadline = Date.now() + Math.min(bootTimeoutMs, 60_000);
+      while (!resolvedSerial) {
         const refreshed = discoverFleet({ runner, avdHome });
         const booted = (refreshed.running || []).find(
           (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
         );
         resolvedSerial = booted?.serial || null;
+        if (resolvedSerial || !isWin || Date.now() >= pollDeadline) break;
+        sleepSync(500);
       }
       if (!resolvedSerial) {
         throw new Error(
           `Booted emulator ${candidate.avd} did not report an adb serial and could not be discovered.`,
         );
+      }
+      if (isWin) {
+        waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
       }
 
       if (req.snapshotLoad) {
@@ -946,9 +976,13 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     hbTimer.stop();
     if (bootedNewEmulator) {
       try {
-        runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
-          strictInternal: true,
-        });
+        if (isWin && resolvedSerial) {
+          runner("adb", ["-s", resolvedSerial, "emu", "kill"], { strictInternal: true });
+        } else {
+          runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
+            strictInternal: true,
+          });
+        }
       } catch {
         // Best-effort cleanup of newly booted emulator
       }
@@ -1150,10 +1184,17 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
       }
       if (!itemFailed && doStop) {
-        const stopRes = runner("android", ["emulator", "stop", lease.serial || lease.avd], {
-          strictInternal: true,
-          timeoutMs: stopTimeoutMs,
-        });
+        const isWin = (options.platform || process.platform) === "win32";
+        const stopRes =
+          isWin && lease.serial
+            ? runner("adb", ["-s", lease.serial, "emu", "kill"], {
+                strictInternal: true,
+                timeoutMs: stopTimeoutMs,
+              })
+            : runner("android", ["emulator", "stop", lease.serial || lease.avd], {
+                strictInternal: true,
+                timeoutMs: stopTimeoutMs,
+              });
         if (stopRes.status !== 0) {
           itemFailed = true;
           actionErrors.push(
