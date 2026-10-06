@@ -198,6 +198,18 @@ export function parseAndroidEmulatorListOutput(stdout) {
   return avds;
 }
 
+export function readFreeDiskMb(avdHome = resolveAvdHome()) {
+  let freeDiskMb = 16384;
+  try {
+    const targetDir = fs.existsSync(avdHome) ? avdHome : os.homedir();
+    const stat = fs.statfsSync(targetDir);
+    freeDiskMb = Math.round((Number(stat.bavail) * Number(stat.bsize)) / (1024 * 1024));
+  } catch {
+    // Fallback
+  }
+  return freeDiskMb;
+}
+
 export function readHostResources(avdHome = resolveAvdHome()) {
   const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
   let availableRamMb = Math.round(os.freemem() / (1024 * 1024));
@@ -236,19 +248,10 @@ export function readHostResources(avdHome = resolveAvdHome()) {
     }
   }
 
-  let freeDiskMb = 16384;
-  try {
-    const targetDir = fs.existsSync(avdHome) ? avdHome : os.homedir();
-    const stat = fs.statfsSync(targetDir);
-    freeDiskMb = Math.round((Number(stat.bavail) * Number(stat.bsize)) / (1024 * 1024));
-  } catch {
-    // Fallback
-  }
-
   return {
     totalRamMb,
     availableRamMb,
-    freeDiskMb,
+    freeDiskMb: readFreeDiskMb(avdHome),
     cpuCores: os.availableParallelism(),
   };
 }

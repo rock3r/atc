@@ -40,7 +40,15 @@ import {
 } from "../src/guard.mjs";
 import { handlePreToolUseHook, handleStopHook } from "../src/hook.mjs";
 import { buildChildInvocation } from "../src/spawn.mjs";
-import { cmdClaim, cmdFree, cmdRenew, cmdExec, cmdStatus, cmdConfig } from "../src/cli.mjs";
+import {
+  cmdClaim,
+  cmdFree,
+  cmdRenew,
+  cmdSnapshot,
+  cmdExec,
+  cmdStatus,
+  cmdConfig,
+} from "../src/cli.mjs";
 
 function makeTempStateDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "atc-test-"));
@@ -435,3 +443,89 @@ test("cli: claim, status, renew, exec, and free end-to-end with mock fleet", asy
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("cli: error propagation for resetApp, boot serial discovery, free actions, and snapshot load", () => {
+  const dir = makeTempStateDir();
+  try {
+    const warmDevice = {
+      deviceKey: "avd:Pixel_8_API_35",
+      avd: "Pixel_8_API_35",
+      serial: "emulator-5554",
+      kind: "emulator",
+      online: true,
+      ramSizeMb: 2048,
+      requiredRamMb: 3072,
+      dataDiskMb: 6656,
+      snapshots: ["atc-clean-base"],
+      profile: {
+        deviceType: "phone",
+        deviceName: "pixel_8",
+        apiLevel: "android-35",
+        services: "google_apis",
+        playStore: false,
+        abi: "arm64-v8a",
+      },
+    };
+    const mockInventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      running: [warmDevice],
+      offline: [],
+      creatable: [],
+    };
+
+    // 1. Failing --reset-app fails the claim and cleans up the lease
+    const failedReset = cmdClaim(
+      dir,
+      { session: "sess-1", api: "35", resetApp: "com.example.missing" },
+      {
+        inventory: mockInventory,
+        runner: () => ({ status: 1, stdout: "", stderr: "Failed" }),
+      }
+    );
+    assert.equal(failedReset.exitCode, 1);
+    assert.match(failedReset.error, /Failed to reset app/);
+    assert.deepEqual(readState(dir).leases, {});
+
+    // 2. Claim succeeds when runner succeeds, and snapshot load only records loadedSnapshot on success
+    const claimOk = cmdClaim(
+      dir,
+      { session: "sess-1", api: "35" },
+      { inventory: mockInventory }
+    );
+    assert.equal(claimOk.exitCode, 0);
+
+    const snapFail = cmdSnapshot(
+      dir,
+      "load",
+      "clean-snap",
+      { session: "sess-1" },
+      { runner: () => ({ status: 1, stdout: "", stderr: "KO: snapshot does not exist" }) }
+    );
+    assert.equal(snapFail.exitCode, 1);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].loadedSnapshot, null);
+
+    const snapOk = cmdSnapshot(
+      dir,
+      "load",
+      "clean-snap",
+      { session: "sess-1" },
+      { runner: () => ({ status: 0, stdout: "OK", stderr: "" }) }
+    );
+    assert.equal(snapOk.exitCode, 0);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-snap");
+
+    // 3. Failing post-release action on cmdFree propagates exitCode 1
+    const freeFail = cmdFree(
+      dir,
+      claimOk.lease.leaseId,
+      { session: "sess-1", stop: true },
+      { runner: () => ({ status: 1, stdout: "", stderr: "stop failed" }) }
+    );
+    assert.equal(freeFail.exitCode, 1);
+    assert.match(freeFail.error, /Failed to stop emulator/);
+    assert.deepEqual(freeFail.freed, []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+

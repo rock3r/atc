@@ -3,6 +3,7 @@ import {
   checkResourceAdmission,
   deterministicCreatedAvdId,
   discoverFleet,
+  readFreeDiskMb,
   readHostResources,
   readLocalAvdMetadata,
   resolveAvdHome,
@@ -585,9 +586,16 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
   try {
     // 1. Evict victim if replacingAvd is set
     if (selection.victim) {
-      runner("android", ["emulator", "stop", selection.victim.serial || selection.victim.avd], {
-        strictInternal: true,
-      });
+      const stopRes = runner(
+        "android",
+        ["emulator", "stop", selection.victim.serial || selection.victim.avd],
+        { strictInternal: true },
+      );
+      if (stopRes.status !== 0) {
+        throw new Error(
+          `Failed to stop idle victim emulator ${selection.victim.avd}: ${stopRes.stderr || stopRes.stdout}`,
+        );
+      }
       withStateTransaction(stateDir, (state) => {
         const vLease = state.leases[selection.victim.deviceKey];
         if (vLease && vLease.leaseId === victimLeaseId) {
@@ -627,15 +635,29 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
         }
       }
       if (req.resetApp) {
-        runner("adb", ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp], {
-          strictInternal: true,
-        });
+        const resetRes = runner(
+          "adb",
+          ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp],
+          { strictInternal: true },
+        );
+        if (resetRes.status !== 0) {
+          throw new Error(
+            `Failed to reset app "${req.resetApp}" on ${resolvedSerial}: ${resetRes.stderr || resetRes.stdout}`,
+          );
+        }
       }
     } else {
       if (candidate.online && (req.wipeData || req.coldBoot)) {
-        runner("android", ["emulator", "stop", candidate.serial || candidate.avd], {
-          strictInternal: true,
-        });
+        const rebootStopRes = runner(
+          "android",
+          ["emulator", "stop", candidate.serial || candidate.avd],
+          { strictInternal: true },
+        );
+        if (rebootStopRes.status !== 0) {
+          throw new Error(
+            `Failed to stop emulator ${candidate.avd} before reboot: ${rebootStopRes.stderr || rebootStopRes.stdout}`,
+          );
+        }
       }
       const startArgs = ["emulator", "start", candidate.avd];
       if (req.headless) startArgs.push("--headless");
@@ -654,12 +676,31 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
       }
 
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
-      resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial || "emulator-5554";
+      resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
+      if (!resolvedSerial) {
+        const refreshed = discoverFleet({ runner });
+        const booted = (refreshed.running || []).find(
+          (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
+        );
+        resolvedSerial = booted?.serial || null;
+      }
+      if (!resolvedSerial) {
+        throw new Error(
+          `Booted emulator ${candidate.avd} did not report an adb serial and could not be discovered.`,
+        );
+      }
 
       if (req.resetApp) {
-        runner("adb", ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp], {
-          strictInternal: true,
-        });
+        const resetRes = runner(
+          "adb",
+          ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp],
+          { strictInternal: true },
+        );
+        if (resetRes.status !== 0) {
+          throw new Error(
+            `Failed to reset app "${req.resetApp}" on ${resolvedSerial}: ${resetRes.stderr || resetRes.stdout}`,
+          );
+        }
       }
     }
 
@@ -706,11 +747,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome();
 
-  // Pre-lock disk check if snapshot save is requested on free
-  let hostSnapshot = null;
-  if (flags.snapshotSave && !flags.force) {
-    hostSnapshot = options.host || readHostResources(avdHome);
-  }
+  // Pre-lock disk check (pure statfs, never spawns subprocesses under atc.lock)
+  const freeDiskMb =
+    options.host?.freeDiskMb ?? (!flags.force ? readFreeDiskMb(avdHome) : 16384);
 
   let outcome;
   try {
@@ -769,9 +808,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         const doStop = Boolean(flags.stop) && lease.kind === "emulator";
 
         if (saveSnap && !flags.force && lease.kind === "emulator") {
-          const host = hostSnapshot || readHostResources(avdHome);
           const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
-          if (host.freeDiskMb < meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)) {
+          if (freeDiskMb < meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)) {
             throw new ResourceError(
               5,
               `Insufficient disk space to save snapshot "${saveSnap}" on ${lease.avd}: needs ${meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)}MB free.`,
@@ -817,6 +855,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   }
 
   const allFreed = [...(outcome.freedImmediate || [])];
+  const actionErrors = [];
   for (const item of outcome.stoppingQueue || []) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
     const hb = startWorkerDeadlineHeartbeat(
@@ -825,21 +864,44 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       lease.leaseId,
       stopTimeoutMs,
     );
+    let itemFailed = false;
     try {
       if (saveSnap && lease.serial) {
-        runner("adb", ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap], {
-          strictInternal: true,
-        });
+        const saveRes = runner(
+          "adb",
+          ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap],
+          { strictInternal: true },
+        );
+        if (saveRes.status !== 0) {
+          itemFailed = true;
+          actionErrors.push(
+            `Failed to save snapshot "${saveSnap}" on ${lease.serial}: ${saveRes.stderr || saveRes.stdout}`,
+          );
+        }
       }
-      if (loadSnap && !doStop && lease.serial) {
-        runner("adb", ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap], {
-          strictInternal: true,
-        });
+      if (!itemFailed && loadSnap && !doStop && lease.serial) {
+        const loadRes = runner(
+          "adb",
+          ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap],
+          { strictInternal: true },
+        );
+        if (loadRes.status !== 0) {
+          itemFailed = true;
+          actionErrors.push(
+            `Failed to load snapshot "${loadSnap}" on ${lease.serial}: ${loadRes.stderr || loadRes.stdout}`,
+          );
+        }
       }
-      if (doStop) {
-        runner("android", ["emulator", "stop", lease.serial || lease.avd], {
+      if (!itemFailed && doStop) {
+        const stopRes = runner("android", ["emulator", "stop", lease.serial || lease.avd], {
           strictInternal: true,
         });
+        if (stopRes.status !== 0) {
+          itemFailed = true;
+          actionErrors.push(
+            `Failed to stop emulator ${lease.avd || lease.serial}: ${stopRes.stderr || stopRes.stdout}`,
+          );
+        }
       }
     } finally {
       clearInterval(hb);
@@ -851,8 +913,18 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
         return { mutated: false };
       });
-      allFreed.push(lease.leaseId);
+      if (!itemFailed) {
+        allFreed.push(lease.leaseId);
+      }
     }
+  }
+
+  if (actionErrors.length > 0) {
+    return {
+      exitCode: 1,
+      error: actionErrors.join("; "),
+      freed: allFreed,
+    };
   }
 
   return { exitCode: 0, freed: allFreed };
@@ -976,10 +1048,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
-    if (action === "load") {
-      lease.loadedSnapshot = name;
-    }
-    return { mutated: true, value: { exitCode: 0, lease } };
+    return { mutated: true, value: { exitCode: 0, lease: { ...lease } } };
   });
 
   if (leaseCheck.exitCode !== 0) {
@@ -997,7 +1066,20 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       error: `adb snapshot ${action} "${name}" failed: ${res.stderr || res.stdout}`,
     };
   }
-  return { exitCode: 0, lease: leaseCheck.lease, snapshot: name, action };
+
+  let finalLease = leaseCheck.lease;
+  if (action === "load") {
+    finalLease = withStateTransaction(stateDir, (state) => {
+      const cur = state.leases[leaseCheck.lease.deviceKey];
+      if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
+        cur.loadedSnapshot = name;
+        return { mutated: true, value: { ...cur } };
+      }
+      return { mutated: false, value: leaseCheck.lease };
+    });
+  }
+
+  return { exitCode: 0, lease: finalLease, snapshot: name, action };
 }
 
 export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
@@ -1319,7 +1401,20 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "guard": {
-      const cmdStr = parsed.positionals.join(" ");
+      const cmdTokens =
+        parsed.restAfterDash.length > 0 ? parsed.restAfterDash : parsed.positionals;
+      let cmdStr = cmdTokens.join(" ");
+      if (!cmdStr) {
+        const rawStdin = readStdinSync();
+        if (rawStdin && rawStdin.trim()) {
+          try {
+            const payload = JSON.parse(rawStdin);
+            cmdStr = payload.command ?? payload.CommandLine ?? "";
+          } catch {
+            cmdStr = rawStdin.trim();
+          }
+        }
+      }
       const res = cmdGuard(stateDir, cmdStr, parsed.flags, { env });
       if (parsed.flags.format === "json" || parsed.flags.json) {
         process.stdout.write(JSON.stringify(res) + "\n");
