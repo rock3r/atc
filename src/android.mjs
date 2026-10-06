@@ -150,6 +150,34 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   };
 }
 
+export function wipeAvdUserData(avdId, avdHome = resolveAvdHome(), cfg = DEFAULT_CONFIG) {
+  const meta = readLocalAvdMetadata(avdId, avdHome, cfg);
+  const avdPath = meta.avdPath;
+  if (!avdPath || !fs.existsSync(avdPath)) {
+    return;
+  }
+  const filesToRemove = [
+    "userdata-qemu.img",
+    "userdata-qemu.img.qcow2",
+    "cache.img",
+    "cache.img.qcow2",
+    "encryptionkey.img",
+    "encryptionkey.img.qcow2",
+  ];
+  for (const name of filesToRemove) {
+    try {
+      fs.rmSync(path.join(avdPath, name), { force: true });
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+  try {
+    fs.rmSync(path.join(avdPath, "snapshots", "default_boot"), { recursive: true, force: true });
+  } catch {
+    // Best-effort cleanup
+  }
+}
+
 export function parseAdbDevicesOutput(stdout) {
   const results = [];
   const lines = String(stdout).split(/\r?\n/);
@@ -183,7 +211,7 @@ export function parseAndroidEmulatorListOutput(stdout) {
       continue;
     }
     if (cols.length >= 2) {
-      const avd = cols[0];
+      const avd = cols[0].split(/\s+/)[0];
       const online = line.toLowerCase().includes("online");
       const serialMatch = line.match(/\b(emulator-\d+)\b/);
       const apiMatch = line.match(/\b(?:android-)?(\d{2})\b/i);

@@ -23,4 +23,4 @@ Always coordinate Android emulator and physical device access through `atc` so c
    ```bash
    npx atc free --role builder-1
    ```
-4. **Never start, boot, kill, or wipe an emulator directly** (`emulator -avd ...`, `adb emu kill`, `android emulator start`). Let `atc claim` and `atc free --shutdown` manage device lifecycle and clean snapshots (`atc-clean-base`).
+4. **Never start, boot, kill, or wipe an emulator directly** (`emulator -avd ...`, `adb emu kill`, `android emulator start`). Let `atc claim` and `atc free --stop` manage device lifecycle and clean snapshots (`atc-clean-base`).

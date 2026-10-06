@@ -9,6 +9,7 @@ import {
   readHostResources,
   readLocalAvdMetadata,
   resolveAvdHome,
+  wipeAvdUserData,
 } from "./android.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
@@ -63,6 +64,7 @@ export function parseCliArgs(argv) {
         "--headless",
         "--force",
         "--stop",
+        "--shutdown",
         "--json",
         "--help",
         "-h",
@@ -110,31 +112,8 @@ function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
-  const stateModuleUrl = new URL("./state.mjs", import.meta.url).href;
-  const workerCode = `
-    import { workerData } from "node:worker_threads";
-    import { withStateTransaction } from ${JSON.stringify(stateModuleUrl)};
-    const { stateDir, deviceKey, leaseId, timeoutMs, workerPid } = workerData;
-    setInterval(() => {
-      try {
-        withStateTransaction(stateDir, (state, { now }) => {
-          const lease = state.leases[deviceKey];
-          if (
-            lease &&
-            lease.leaseId === leaseId &&
-            lease.workerPid === workerPid &&
-            (lease.state === "starting" || lease.state === "stopping")
-          ) {
-            lease.deadlineMs = now + timeoutMs;
-            return { mutated: true };
-          }
-          return { mutated: false };
-        });
-      } catch {}
-    }, 15000);
-  `;
-  const worker = new Worker(workerCode, {
-    eval: true,
+  const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
+  const worker = new Worker(workerUrl, {
     workerData: {
       stateDir,
       deviceKey,
@@ -291,13 +270,26 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   ].some((d) => d.kind === "emulator" && matchesProfile(d, req));
 
   if (req.createIfMissing && !anyExistingMatch && usedSlots < effectiveMax) {
-    const creatablePool = (inventory.creatable || []).filter((c) =>
-      matchesProfile({ kind: "emulator", profile: c.profile || c }, req),
-    );
+    const creatablePool = (inventory.creatable || []).filter((c) => {
+      const profileName = c.deviceName || c.profile?.deviceName;
+      if (
+        req.avd &&
+        c.avd !== req.avd &&
+        profileName !== req.avd &&
+        String(profileName || "").toLowerCase() !== String(req.avd).toLowerCase()
+      ) {
+        return false;
+      }
+      return matchesProfile(
+        { kind: "emulator", avd: req.avd || c.avd || profileName, profile: c.profile || c },
+        req,
+      );
+    });
     if (creatablePool.length > 0) {
       const matchedCreatable = creatablePool[0];
       const baseProfile = matchedCreatable.profile || matchedCreatable;
-      const avdId = req.avd || deterministicCreatedAvdId(req);
+      const profileName = matchedCreatable.deviceName || baseProfile.deviceName || "pixel_9";
+      const avdId = req.avd || matchedCreatable.avd || profileName || deterministicCreatedAvdId(req);
       const deviceKey = `avd:${avdId}`;
       if (!state.leases[deviceKey] && !isReservedForEarlierTicket({ online: false }, true)) {
         const syntheticCandidate = {
@@ -310,7 +302,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
           dataDiskMb: 6656,
           profile: {
             deviceType: baseProfile.deviceType || req.deviceType || "phone",
-            deviceName: matchedCreatable.deviceName || baseProfile.deviceName || "pixel_9",
+            deviceName: profileName,
             apiLevel:
               baseProfile.apiLevel ||
               (req.apiSpec
@@ -394,8 +386,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       };
     }
   }
+  const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
   const initialCfg = readState(stateDir).config || DEFAULT_CONFIG;
-  let inventory = options.inventory || discoverFleet({ runner, cfg: initialCfg });
+  let inventory = options.inventory || discoverFleet({ runner, avdHome, cfg: initialCfg });
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
 
@@ -540,6 +533,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           state.leases[dev.deviceKey] = startingLease;
           state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
 
+          const knownAvdNames = new Set(
+            [...(inventory.running || []), ...(inventory.offline || [])]
+              .filter((d) => d.kind === "emulator" && d.avd)
+              .map((d) => d.avd),
+          );
+
           return {
             mutated: true,
             value: {
@@ -549,6 +548,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               victimLeaseId,
               ttlMs,
               bootTimeoutMs,
+              knownAvdNames,
             },
           };
         }
@@ -638,7 +638,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     }
 
     if (txOutcome.status === "needs_boot_or_prep") {
-      return executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner });
+      return executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome });
     }
 
     // Two-Stage Poll Loop (§5.3 Step 6)
@@ -662,15 +662,15 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       }
       if (tick % 5 === 0 || stageA.activeCount === 0) {
         const curCfg = readState(stateDir).config || DEFAULT_CONFIG;
-        inventory = options.inventory || discoverFleet({ runner, cfg: curCfg });
+        inventory = options.inventory || discoverFleet({ runner, avdHome, cfg: curCfg });
         break;
       }
     }
   }
 }
 
-function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
-  const { lease, selection, victimLeaseId, ttlMs, bootTimeoutMs } = txOutcome;
+function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome }) {
+  const { lease, selection, victimLeaseId, ttlMs, bootTimeoutMs, knownAvdNames } = txOutcome;
   const candidate = selection.candidate;
   const hbTimer = startWorkerDeadlineHeartbeat(
     stateDir,
@@ -708,13 +708,68 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
     if (selection.createAvd) {
       const createRes = runner(
         "android",
-        ["emulator", "create", candidate.profile.deviceName, "--name", candidate.avd],
+        ["emulator", "create", candidate.profile.deviceName],
         { strictInternal: true },
       );
       if (createRes.status !== 0) {
         throw new Error(
-          `Failed to create AVD ${candidate.avd}: ${createRes.stderr || createRes.stdout}`,
+          `Failed to create AVD for profile ${candidate.profile.deviceName}: ${createRes.stderr || createRes.stdout}`,
         );
+      }
+
+      const postCreateFleet = discoverFleet({ runner, avdHome });
+      const allPostAvds = [
+        ...(postCreateFleet.offline || []),
+        ...(postCreateFleet.running || []),
+      ].filter((d) => d.kind === "emulator" && d.avd);
+      const reqWithoutAvd = { ...req, avd: null };
+      const newlyCreated =
+        allPostAvds.find((d) => !knownAvdNames?.has(d.avd) && matchesProfile(d, reqWithoutAvd)) ||
+        allPostAvds.find((d) => !knownAvdNames?.has(d.avd));
+
+      let createdAvdName = newlyCreated?.avd || null;
+      if (!createdAvdName && createRes.stdout) {
+        const m =
+          createRes.stdout.match(/Created AVD\s+['"]?([A-Za-z0-9._-]+)['"]?/i) ||
+          createRes.stdout.trim().match(/^([A-Za-z0-9._-]+)$/);
+        if (m) {
+          createdAvdName = m[1];
+        }
+      }
+      createdAvdName = createdAvdName || candidate.avd;
+
+      if (req.avd && createdAvdName !== req.avd) {
+        throw new Error(
+          `Created AVD "${createdAvdName}" does not match requested --avd "${req.avd}".`,
+        );
+      }
+
+      if (createdAvdName !== candidate.avd || newlyCreated) {
+        const oldKey = lease.deviceKey;
+        const newKey = `avd:${createdAvdName}`;
+        withStateTransaction(stateDir, (state) => {
+          const current = state.leases[oldKey];
+          if (current && current.leaseId === lease.leaseId) {
+            if (oldKey !== newKey) {
+              delete state.leases[oldKey];
+            }
+            current.deviceKey = newKey;
+            current.avd = createdAvdName;
+            if (newlyCreated?.profile) {
+              current.profile = newlyCreated.profile;
+            }
+            state.leases[newKey] = current;
+            return { mutated: true };
+          }
+          return { mutated: false };
+        });
+        candidate.avd = createdAvdName;
+        candidate.deviceKey = newKey;
+        if (newlyCreated?.profile) {
+          candidate.profile = newlyCreated.profile;
+        }
+        lease.avd = createdAvdName;
+        lease.deviceKey = newKey;
       }
     }
 
@@ -724,10 +779,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
         const snapRes = runner(
           "adb",
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
-          { strictInternal: true },
+          { strictInternal: true, timeoutMs: bootTimeoutMs },
         );
         if (snapRes.status !== 0) {
-          throw new Error(`Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}`);
+          throw new Error(
+            `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
+          );
         }
       }
       if (req.resetApp) {
@@ -755,11 +812,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
           );
         }
       }
+      if (req.wipeData) {
+        wipeAvdUserData(candidate.avd, avdHome);
+      }
       const startArgs = ["emulator", "start", candidate.avd];
       if (req.headless) startArgs.push("--headless");
-      if (req.coldBoot) startArgs.push("--cold");
-      if (req.wipeData) startArgs.push("--wipe-data");
-      if (req.snapshotLoad) startArgs.push(`--snapshot=${req.snapshotLoad}`);
+      if (req.coldBoot || req.wipeData) startArgs.push("--cold");
 
       const bootRes = runner("android", startArgs, {
         strictInternal: true,
@@ -775,7 +833,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
       resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
       if (!resolvedSerial) {
-        const refreshed = discoverFleet({ runner });
+        const refreshed = discoverFleet({ runner, avdHome });
         const booted = (refreshed.running || []).find(
           (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
         );
@@ -785,6 +843,19 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
         throw new Error(
           `Booted emulator ${candidate.avd} did not report an adb serial and could not be discovered.`,
         );
+      }
+
+      if (req.snapshotLoad) {
+        const snapRes = runner(
+          "adb",
+          ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
+          { strictInternal: true, timeoutMs: bootTimeoutMs },
+        );
+        if (snapRes.status !== 0) {
+          throw new Error(
+            `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
+          );
+        }
       }
 
       if (req.resetApp) {
@@ -911,7 +982,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       for (const lease of matches) {
         const saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree || null;
         const loadSnap = flags.snapshotLoad || null;
-        const doStop = Boolean(flags.stop) && lease.kind === "emulator";
+        const doStop = Boolean(flags.stop || flags.shutdown) && lease.kind === "emulator";
 
         if (saveSnap && !flags.force && lease.kind === "emulator") {
           const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);

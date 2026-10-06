@@ -731,3 +731,140 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
   }
 });
 
+test("cli: offline wipeData/snapshotLoad and createIfMissing use supported android CLI flags", () => {
+  const dir = makeTempStateDir();
+  const avdHome = makeTempStateDir();
+  try {
+    const avdDir = path.join(avdHome, "Pixel_8_API_35.avd");
+    fs.mkdirSync(path.join(avdDir, "snapshots", "default_boot"), { recursive: true });
+    fs.writeFileSync(path.join(avdDir, "userdata-qemu.img.qcow2"), "dirty", "utf8");
+
+    const offlineInventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      running: [],
+      offline: [
+        {
+          deviceKey: "avd:Pixel_8_API_35",
+          avd: "Pixel_8_API_35",
+          serial: null,
+          kind: "emulator",
+          online: false,
+          ramSizeMb: 2048,
+          requiredRamMb: 3072,
+          dataDiskMb: 6656,
+          profile: {
+            deviceType: "phone",
+            deviceName: "pixel_8",
+            apiLevel: "android-35",
+            services: "google_apis",
+            playStore: false,
+            abi: "arm64-v8a",
+          },
+        },
+      ],
+      creatable: [
+        {
+          kind: "emulator",
+          deviceName: "medium_phone",
+          profile: {
+            deviceType: "phone",
+            deviceName: "medium_phone",
+            apiLevel: "android-36",
+            services: "play",
+            playStore: true,
+            abi: "arm64-v8a",
+          },
+        },
+      ],
+    };
+
+    const bootCalls = [];
+    const bootRes = cmdClaim(
+      dir,
+      {
+        session: "sess-boot",
+        api: "35",
+        wipeData: true,
+        snapshotLoad: "clean-base",
+        headless: true,
+      },
+      {
+        avdHome,
+        inventory: offlineInventory,
+        runner: (cmd, args) => {
+          bootCalls.push([cmd, ...args].join(" "));
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+            return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
+          }
+          return { status: 0, stdout: "OK", stderr: "" };
+        },
+      }
+    );
+    assert.equal(bootRes.exitCode, 0);
+    assert.equal(fs.existsSync(path.join(avdDir, "userdata-qemu.img.qcow2")), false);
+    assert.equal(fs.existsSync(path.join(avdDir, "snapshots", "default_boot")), false);
+    assert.deepEqual(bootCalls, [
+      "android emulator start Pixel_8_API_35 --headless --cold",
+      "adb -s emulator-5554 emu avd snapshot load clean-base",
+    ]);
+
+    // Free with --shutdown synonym
+    const freeCalls = [];
+    const freeRes = cmdFree(
+      dir,
+      bootRes.lease.leaseId,
+      { session: "sess-boot", shutdown: true },
+      {
+        avdHome,
+        runner: (cmd, args) => {
+          freeCalls.push([cmd, ...args].join(" "));
+          return { status: 0, stdout: "OK", stderr: "" };
+        },
+      }
+    );
+    assert.equal(freeRes.exitCode, 0);
+    assert.deepEqual(freeCalls, ["android emulator stop emulator-5554"]);
+
+    // Auto-create missing AVD invokes `android emulator create <profile>` without `--name` and migrates lease key
+    const createCalls = [];
+    const createRes = cmdClaim(
+      dir,
+      {
+        session: "sess-create",
+        api: "36",
+        type: "phone",
+        createIfMissing: true,
+      },
+      {
+        avdHome,
+        inventory: offlineInventory,
+        runner: (cmd, args) => {
+          createCalls.push([cmd, ...args].join(" "));
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "create") {
+            return { status: 0, stdout: "Created AVD Medium_Phone_API_36\n", stderr: "" };
+          }
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+            return {
+              status: 0,
+              stdout: "AVD                 Status    Serial          API\nMedium_Phone_API_36 offline   -               android-36\n",
+              stderr: "",
+            };
+          }
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+            return { status: 0, stdout: "Started emulator-5556\n", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      }
+    );
+    assert.equal(createRes.exitCode, 0);
+    assert.equal(createRes.lease.avd, "Medium_Phone_API_36");
+    assert.equal(createRes.lease.deviceKey, "avd:Medium_Phone_API_36");
+    assert.ok(createCalls.includes("android emulator create medium_phone"));
+    assert.ok(createCalls.includes("android emulator start Medium_Phone_API_36"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(avdHome, { recursive: true, force: true });
+  }
+});
+

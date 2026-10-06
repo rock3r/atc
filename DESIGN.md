@@ -351,19 +351,20 @@ To maximize throughput on already-spun-up emulators while guaranteeing that jobs
        1. `state.leases[V.deviceKey] = { state: "stopping", serial: V.serial, workerPid: process.pid, deadlineMs: now + stopTimeoutMs, ... }`
        2. `state.leases[C.deviceKey] = { state: "starting", replacingAvd: V.avd, workerPid: process.pid, deadlineMs: now + bootTimeoutMs, ... }`
      - Remove caller's queue ticket, commit, and release lock. Proceed to Step 5.
-   - **Priority 4 — Auto-Create Missing AVD (`--create-if-missing`):** If no existing AVD on disk or in `state.leases` matches `req` and `--create-if-missing` is passed, verify a `readyToCreate` profile exists in §5.2(3) and passes **Rule D2 (Creation Disk Check)** and **Rule R1 (RAM Check)**. Pre-compute a deterministic AVD name `avdId = "atc_" + deviceProfileSlug + "_" + apiLevel + "_" + services + "_" + abi` (e.g. `atc_pixel_9_android-36_play_arm64-v8a`) before leaving `atc.lock`, check that `state.leases["avd:" + avdId]` does not already exist (preventing duplicate concurrent creation of the same profile), write `state.leases["avd:" + avdId] = { state: "starting", avd: avdId, workerPid: process.pid, claimedAtMs: now, deadlineMs: now + bootTimeoutMs, ... }`, commit, and release `atc.lock`. Outside `atc.lock`, create the AVD with that exact name (`android emulator create <profile> --name <avdId>` / `avdmanager create avd -n <avdId>`) and proceed to Step 5.
+   - **Priority 4 — Auto-Create Missing AVD (`--create-if-missing`):** If no existing AVD on disk or in `state.leases` matches `req` and `--create-if-missing` is passed, verify a `readyToCreate` profile exists in §5.2(3) and passes **Rule D2 (Creation Disk Check)** and **Rule R1 (RAM Check)**. Reserve `state.leases["avd:" + avdId] = { state: "starting", avd: avdId, workerPid: process.pid, claimedAtMs: now, deadlineMs: now + bootTimeoutMs, ... }`, commit, and release `atc.lock`. Outside `atc.lock`, create the AVD via `android emulator create <profile>`, discover the newly created AVD name, migrate the `"starting"` lease key if needed, and proceed to Step 5.
    - **Hard Resource Failure vs Queue Wait:** If an offline candidate `C` exists and no other emulators are running (`usedSlots === 0`), yet `C` still fails **Rule R1 (RAM)** or **Rule D1/D2 (Disk)** (and `--force` is not set), waiting in the queue cannot free emulator RAM/disk: release `atc.lock` and fail immediately with exit code `5` (`ERESOURCE_EXCEEDED`) and an actionable diagnostic message.
 
 #### Step 5: Evict, Boot & Snapshot/Wipe Preparation Phase (Outside Lock)
 All external commands run strictly outside `atc.lock` while the device is protected by `state: "starting"`:
 1. **Evict Victim (if `replacingAvd` set):** Run `android emulator stop <V.serial>`, then acquire `atc.lock` and delete `state.leases[V.deviceKey]` (verifying `leaseId`).
 2. **Warm State Preparation (if device was already online and `--wipe-data` / `--cold` are false):**
-   - If `--snapshot-load <name>` is requested: run `adb -s <serial> emu avd snapshot load <name>` and wait for `sys.boot_completed == 1`.
+   - If `--snapshot-load <name>` is requested: run `adb -s <serial> emu avd snapshot load <name>`.
    - If `--reset-app <pkg>` is requested: run `adb -s <serial> shell pm clear <pkg>`.
 3. **Cold / Snapshot / Wipe Boot (if device was offline, or needed restart for `--wipe-data` / `--cold`):**
    - If device was online and needed `--wipe-data` or `--cold`, run `android emulator stop <serial>` first.
-   - If `--wipe-data` or a non-default `--snapshot-load <name>` is specified, spawn `<sdk>/emulator/emulator @<C.avd> [-wipe-data] [-snapshot <name>] [-no-window]` (or `android emulator start <C.avd> [--headless] [--cold]` for standard/cold boots) bounded by `bootTimeoutSec`.
-   - Poll inventory (§5.2) every `1,000ms` until `C.avd` reports an online `emulator-<port>` serial AND `adb -s <serial> shell getprop sys.boot_completed` outputs `"1"`, up to `deadlineMs`.
+   - If `--wipe-data` is specified, delete user-data/cache images and default quickboot snapshot in the AVD directory before starting with `--cold`.
+   - Run `android emulator start <C.avd> [--headless] [--cold]` bounded by `bootTimeoutSec` and resolve the resulting `emulator-<port>` serial.
+   - If `--snapshot-load <name>` is requested, run `adb -s <serial> emu avd snapshot load <name>` after boot.
    - If `--reset-app <pkg>` is also requested, run `adb -s <serial> shell pm clear <pkg>`.
 4. **Activate Lease:** Acquire `atc.lock`, verify `state.leases[C.deviceKey]` still matches our `leaseId`, transition `state` to `"active"` with `serial`, `loadedSnapshot`, `saveSnapshotOnFree`, and `expiresAtMs = now + ttlMs`, commit, and return.
 5. **Rollback on Failure / Timeout / Signal:** Best-effort stop any newly booted emulator, acquire `atc.lock`, delete `state.leases[C.deviceKey]` (and `state.leases[V.deviceKey]` if still `"stopping"`), and exit with code `1`.
