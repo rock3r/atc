@@ -3,12 +3,13 @@ import {
   checkResourceAdmission,
   deterministicCreatedAvdId,
   discoverFleet,
+  parseAdbDevicesOutput,
   readFreeDiskMb,
   readHostResources,
   readLocalAvdMetadata,
   resolveAvdHome,
 } from "./android.mjs";
-import { evaluateCommandGuard } from "./guard.mjs";
+import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
 import { randomNonce, resolveStateDir, sleepSync } from "./lock.mjs";
 import { startMcpServer } from "./mcp.mjs";
@@ -20,6 +21,7 @@ import {
   computeUsedEmulatorSlots,
   isTicketStarvationProtected,
   matchesProfile,
+  readState,
   reconcileOfflineLeases,
   resolveSessionIdentity,
   withStateTransaction,
@@ -205,6 +207,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
     if (isReservedForEarlierTicket(dev, true)) continue;
     try {
       checkResourceAdmission(dev, inventory.host, state, inventory, {
+        replacingAvd: dev.online ? dev : null,
         wipeOrCreate: Boolean(req.wipeData),
         force: Boolean(req.force),
         now,
@@ -328,12 +331,14 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     reason: flags.reason || null,
   };
 
-  const waitSec = flags.wait !== undefined ? Number(flags.wait) : DEFAULT_CONFIG.defaultWaitSec;
-  if (!Number.isFinite(waitSec) || waitSec < 0) {
-    return {
-      exitCode: 1,
-      error: `Invalid --wait duration "${flags.wait}". Expected a non-negative number of seconds.`,
-    };
+  if (flags.wait !== undefined) {
+    const parsedWait = Number(flags.wait);
+    if (!Number.isFinite(parsedWait) || parsedWait < 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --wait duration "${flags.wait}". Expected a non-negative number of seconds.`,
+      };
+    }
   }
   if (flags.reorderWindow !== undefined) {
     const rw = Number(flags.reorderWindow);
@@ -344,7 +349,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       };
     }
   }
-  let inventory = options.inventory || discoverFleet({ runner });
+  const initialCfg = readState(stateDir).config || DEFAULT_CONFIG;
+  let inventory = options.inventory || discoverFleet({ runner, cfg: initialCfg });
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
 
@@ -352,6 +358,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     let txOutcome;
     try {
       txOutcome = withStateTransaction(stateDir, (state, { now }) => {
+        const waitSec =
+          flags.wait !== undefined
+            ? Number(flags.wait)
+            : (state.config?.defaultWaitSec ?? DEFAULT_CONFIG.defaultWaitSec);
         const identity = resolveSessionIdentity({
           flags,
           env: options.env || process.env,
@@ -427,6 +437,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
           let victimLeaseId = null;
 
+          const overheadMb = state.config?.qemuOverheadRamMb ?? 1024;
+          const computeRequiredRam = (d) =>
+            typeof d.ramSizeMb === "number" && d.ramSizeMb > 0
+              ? d.ramSizeMb + overheadMb
+              : d.requiredRamMb || 2048 + overheadMb;
+
           if (selection.victim) {
             victimLeaseId = `lease_${randomNonce().slice(0, 12)}`;
             state.leases[selection.victim.deviceKey] = {
@@ -441,7 +457,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               state: "stopping",
               workerPid: process.pid,
               replacingAvd: null,
-              requiredRamMb: selection.victim.requiredRamMb || 3072,
+              requiredRamMb: computeRequiredRam(selection.victim),
               claimedAtMs: now,
               deadlineMs: now + stopTimeoutMs,
             };
@@ -459,7 +475,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             state: "starting",
             workerPid: process.pid,
             replacingAvd: selection.victim ? selection.victim.avd : null,
-            requiredRamMb: dev.requiredRamMb || 3072,
+            requiredRamMb: computeRequiredRam(dev),
             loadedSnapshot: req.snapshotLoad || null,
             saveSnapshotOnFree: req.snapshotSaveOnFree || null,
             claimedAtMs: now,
@@ -581,7 +597,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         break;
       }
       if (tick % 5 === 0 || stageA.activeCount === 0) {
-        inventory = options.inventory || discoverFleet({ runner });
+        const curCfg = readState(stateDir).config || DEFAULT_CONFIG;
+        inventory = options.inventory || discoverFleet({ runner, cfg: curCfg });
         break;
       }
     }
@@ -1183,7 +1200,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
 export function cmdStatus(stateDir, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
-  const inventory = options.inventory || discoverFleet({ runner });
+  const cfg = readState(stateDir).config || DEFAULT_CONFIG;
+  const inventory = options.inventory || discoverFleet({ runner, cfg });
   const req = {
     kind: flags.kind || "any",
     deviceType: flags.type || null,
@@ -1282,6 +1300,25 @@ export function cmdGc(stateDir) {
 }
 
 export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
+  const inventory = options.inventory || null;
+  let probedRunningCount = inventory ? (inventory.running || []).length : 0;
+
+  if (!inventory && options.runningCount === undefined) {
+    const hasUnscopedDeviceAction = splitShellSegments(commandStr).some((seg) => {
+      const c = classifySegment(seg);
+      return c.kind === "device_action" && !c.targetSerial;
+    });
+    if (hasUnscopedDeviceAction) {
+      const runner = options.runner || runCommandSync;
+      const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
+      if (adbRes.status === 0 && adbRes.stdout) {
+        probedRunningCount = parseAdbDevicesOutput(adbRes.stdout).length;
+      }
+    }
+  } else if (options.runningCount !== undefined) {
+    probedRunningCount = options.runningCount;
+  }
+
   const evalRes = withStateTransaction(stateDir, (state) => {
     const identity = resolveSessionIdentity({
       flags,
@@ -1294,8 +1331,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       (l) => l.state === "active" && l.sessionId === identity.sessionId,
     );
     const totalLeasedCount = Object.keys(state.leases).length;
-    const runningCount =
-      options.runningCount ?? Math.max(totalLeasedCount, activeLeases.length);
+    const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
     const guard = evaluateCommandGuard(commandStr, {
       sessionId: identity.sessionId,
       anchorPid: identity.anchorPid,

@@ -265,7 +265,11 @@ export function checkResourceAdmission(
 ) {
   if (force) return { ok: true };
   const cfg = state.config || DEFAULT_CONFIG;
-  const neededRamMb = candidate.requiredRamMb || (candidate.ramSizeMb || 2048) + (cfg.qemuOverheadRamMb ?? 1024);
+  const overheadMb = cfg.qemuOverheadRamMb ?? 1024;
+  const neededRamMb =
+    typeof candidate.ramSizeMb === "number" && candidate.ramSizeMb > 0
+      ? candidate.ramSizeMb + overheadMb
+      : candidate.requiredRamMb || 2048 + overheadMb;
   const neededDiskMb = wipeOrCreate ? candidate.dataDiskMb || 6656 : candidate.ramSizeMb || 2048;
 
   const onlineAvds = new Set(
@@ -281,11 +285,15 @@ export function checkResourceAdmission(
       typeof lease.activatedAtMs === "number" &&
       now - lease.activatedAtMs < 30_000;
     if (isStarting || isRecentlyActivated) {
-      unaccountedRamMb += lease.requiredRamMb || 3072;
+      unaccountedRamMb += lease.requiredRamMb || 2048 + overheadMb;
     }
   }
 
-  const replacingCreditMb = replacingAvd ? replacingAvd.requiredRamMb || 3072 : 0;
+  const replacingCreditMb = replacingAvd
+    ? typeof replacingAvd.ramSizeMb === "number" && replacingAvd.ramSizeMb > 0
+      ? replacingAvd.ramSizeMb + overheadMb
+      : replacingAvd.requiredRamMb || 2048 + overheadMb
+    : 0;
   const projectedAvailableRamMb =
     (host.availableRamMb ?? 4096) + replacingCreditMb - unaccountedRamMb;
 

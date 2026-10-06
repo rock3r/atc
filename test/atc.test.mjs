@@ -48,6 +48,7 @@ import {
   cmdExec,
   cmdStatus,
   cmdConfig,
+  cmdGuard,
 } from "../src/cli.mjs";
 
 function makeTempStateDir() {
@@ -615,6 +616,33 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     );
     assert.equal(badWait.exitCode, 1);
     assert.match(badWait.error, /Invalid --wait duration/);
+
+    // 5. Configured defaultWaitSec = 0 is honored when --wait is omitted
+    cmdConfig(dir, "set", "defaultWaitSec", "0");
+    const busyNoWait = cmdClaim(
+      dir,
+      { session: "sess-2", api: "36" },
+      { inventory: mockInventory }
+    );
+    assert.equal(busyNoWait.exitCode, 2);
+
+    // 6. Standalone cmdGuard probes live devices via adb devices and blocks unscoped commands when >1 device is online
+    cmdClaim(dir, { session: "sess-1", api: "35" }, { inventory: mockInventory });
+    const guardMulti = cmdGuard(
+      dir,
+      "adb shell wm size",
+      { session: "sess-1" },
+      {
+        runner: () => ({
+          status: 0,
+          stdout:
+            "List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n",
+          stderr: "",
+        }),
+      }
+    );
+    assert.equal(guardMulti.exitCode, 2);
+    assert.equal(guardMulti.allowed, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
