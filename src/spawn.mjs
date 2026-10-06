@@ -135,19 +135,62 @@ export function runCommandSync(command, args = [], options = {}) {
       stdio: "ignore",
       windowsHide: true,
     });
-    try {
-      const child = spawn(cfg.command, cfg.args, cfg.options);
-      if (typeof child.unref === "function") child.unref();
-      return { status: 0, signal: null, stdout: "", stderr: "", error: null };
-    } catch (err) {
-      return {
-        status: 1,
-        signal: null,
-        stdout: "",
-        stderr: err?.message || "Failed to spawn detached process",
-        error: err,
-      };
-    }
+    const launcherScript = [
+      'const { spawn } = require("node:child_process");',
+      "const payload = JSON.parse(process.argv[1]);",
+      "try {",
+      "  const child = spawn(payload.command, payload.args, {",
+      "    cwd: payload.cwd,",
+      "    env: payload.env,",
+      "    detached: true,",
+      '    stdio: "ignore",',
+      "    windowsHide: true,",
+      "    shell: false,",
+      "    windowsVerbatimArguments: Boolean(payload.windowsVerbatimArguments),",
+      "  });",
+      '  child.once("error", (err) => {',
+      "    process.stderr.write(String(err && err.message ? err.message : err));",
+      "    process.exit(1);",
+      "  });",
+      '  child.once("spawn", () => {',
+      "    child.unref();",
+      "    process.exit(0);",
+      "  });",
+      "} catch (err) {",
+      "  process.stderr.write(String(err && err.message ? err.message : err));",
+      "  process.exit(1);",
+      "}",
+    ].join("\n");
+    const launchRes = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        launcherScript,
+        JSON.stringify({
+          command: cfg.command,
+          args: cfg.args,
+          cwd: cfg.options.cwd || process.cwd(),
+          env: cfg.options.env || process.env,
+          windowsVerbatimArguments: Boolean(cfg.options.windowsVerbatimArguments),
+        }),
+      ],
+      {
+        encoding: "utf8",
+        timeout: options.timeoutMs ?? 10_000,
+        windowsHide: true,
+      },
+    );
+    const ok = launchRes.status === 0 && !launchRes.error && !launchRes.signal;
+    return {
+      status: ok ? 0 : (launchRes.status ?? 1),
+      signal: launchRes.signal || null,
+      stdout: launchRes.stdout || "",
+      stderr:
+        launchRes.stderr ||
+        (launchRes.error ? launchRes.error.message : "") ||
+        (launchRes.signal ? `Terminated by signal ${launchRes.signal}` : ""),
+      error: launchRes.error || null,
+    };
   }
   const cfg = buildSpawnConfig(command, args, {
     encoding: "utf8",

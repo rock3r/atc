@@ -1306,10 +1306,19 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       }
     } finally {
       heartbeats.get(lease.leaseId)?.stop();
-      withStateTransaction(stateDir, (state) => {
+      withStateTransaction(stateDir, (state, { now }) => {
         const cur = state.leases[lease.deviceKey];
         if (cur && cur.leaseId === lease.leaseId) {
-          delete state.leases[lease.deviceKey];
+          if (itemFailed) {
+            cur.state = "active";
+            cur.workerPid = null;
+            cur.deadlineMs = null;
+            const ttlMs = (state.config?.defaultTtlSec || 600) * 1000;
+            cur.renewedAtMs = now;
+            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+          } else {
+            delete state.leases[lease.deviceKey];
+          }
           return { mutated: true };
         }
         return { mutated: false };

@@ -43,7 +43,7 @@ import {
   splitShellSegments,
 } from "../src/guard.mjs";
 import { handlePreToolUseHook, handleStopHook } from "../src/hook.mjs";
-import { buildChildInvocation, resolveExecutable } from "../src/spawn.mjs";
+import { buildChildInvocation, resolveExecutable, runCommandSync } from "../src/spawn.mjs";
 import {
   cmdClaim,
   cmdFree,
@@ -667,7 +667,7 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     assert.equal(snapOk.exitCode, 0);
     assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-snap");
 
-    // 3. Failing post-release action on cmdFree propagates exitCode 1
+    // 3. Failing post-release action on cmdFree propagates exitCode 1 and retains active lease
     const freeFail = cmdFree(
       dir,
       claimOk.lease.leaseId,
@@ -677,6 +677,7 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     assert.equal(freeFail.exitCode, 1);
     assert.match(freeFail.error, /Failed to stop emulator/);
     assert.deepEqual(freeFail.freed, []);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].state, "active");
 
     // 4. Non-finite --wait duration is rejected with exitCode 1
     const badWait = cmdClaim(
@@ -1575,6 +1576,13 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       const resolvedLocalRel = resolveExecutable("./gradlew", { PATH: "" }, winDir, "win32");
       assert.equal(resolvedLocalRel.isBatch, true);
       assert.equal(resolvedLocalRel.executable, path.join(winDir, "gradlew.bat"));
+
+      // Detached runCommandSync catches asynchronous spawn errors and returns non-zero status
+      const detachedMissing = runCommandSync("nonexistent_binary_for_atc_test_xyz", [], {
+        detached: true,
+      });
+      assert.notEqual(detachedMissing.status, 0);
+      assert.match(detachedMissing.stderr, /ENOENT/);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
