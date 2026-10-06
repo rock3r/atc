@@ -32,7 +32,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs",
-    "check": "node --check bin/atc.mjs && node --test test/*.test.mjs"
+    "test": "node --test test/atc.test.mjs",
+    "check": "node --check bin/atc.mjs && node --test test/atc.test.mjs"
   }
 }
