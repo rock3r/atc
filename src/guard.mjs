@@ -489,10 +489,26 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     };
   }
 
-  // Precedence 4: Gradle connectedAndroidTest tasks
+  // Precedence 4: Gradle connectedAndroidTest and install/uninstall tasks
   if (baseCmd === "gradlew" || baseCmd === "gradle") {
-    const hasConnectedTask = args.some((a) => /connected.*androidtest|connectedcheck/i.test(a));
-    if (hasConnectedTask) {
+    const hasDeviceTask = args.some((a) => {
+      if (!a || a.startsWith("-")) return false;
+      const taskName = a.split(":").pop() || "";
+      if (/^(connected.*androidtest|connectedcheck|devicecheck)$/i.test(taskName)) {
+        return true;
+      }
+      if (/^uninstall([A-Z0-9_].*)?$/i.test(taskName)) {
+        return true;
+      }
+      if (
+        /^install([A-Z0-9_].*)?$/i.test(taskName) &&
+        !/^install(Dist|BootDist|ShadowDist|Maven|ToMavenLocal)$/i.test(taskName)
+      ) {
+        return true;
+      }
+      return false;
+    });
+    if (hasDeviceTask) {
       return {
         kind: "device_action",
         targetSerial: extractTargetSerial(parsed),

@@ -437,12 +437,21 @@ export function computeEffectiveMaxEmulators(config = DEFAULT_CONFIG, host = {})
 
 export function computeUsedEmulatorSlots(state, inventory = {}) {
   const runningOrStopping = new Set();
-  for (const dev of inventory.running || []) {
-    if (dev.kind === "emulator" && dev.avd) {
-      runningOrStopping.add(dev.avd);
+  const serialToLeasedAvd = new Map();
+  for (const lease of Object.values(state.leases || {})) {
+    if (lease.kind === "emulator" && lease.serial && lease.avd) {
+      serialToLeasedAvd.set(lease.serial, lease.avd);
     }
   }
-  for (const lease of Object.values(state.leases)) {
+  for (const dev of inventory.running || []) {
+    if (dev.kind === "emulator") {
+      const key = dev.avd || serialToLeasedAvd.get(dev.serial) || (dev.serial ? `serial:${dev.serial}` : null);
+      if (key) {
+        runningOrStopping.add(key);
+      }
+    }
+  }
+  for (const lease of Object.values(state.leases || {})) {
     if (
       lease.kind === "emulator" &&
       (lease.state === "stopping" || lease.state === "active") &&
@@ -633,7 +642,7 @@ export function resolveSessionIdentity({
     const sid = validateSessionId(`term-${sanitized}`);
     return {
       sessionId: sid,
-      anchorPid: findHookAnchorForSession(sid),
+      anchorPid: findHookAnchorForSession(sid) || ppid,
       source: "terminal_env",
     };
   }

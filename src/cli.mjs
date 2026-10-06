@@ -292,11 +292,16 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   }
 
   // Priority 2: Tier 1 Boot Into Free Slot (or reboot running match for wipeData/coldBoot)
+  // If any running emulator could not be mapped to its AVD name, fail closed on offline AVD launches
+  // so ATC never attempts to cold-boot an AVD that is already running under an unmapped serial.
+  const hasUnmappedRunningEmulator = (inventory.running || []).some(
+    (d) => d.kind === "emulator" && !d.avd,
+  );
   const bootPool = [
     ...(req.wipeData || req.coldBoot
-      ? (inventory.running || []).filter((d) => d.kind === "emulator")
+      ? (inventory.running || []).filter((d) => d.kind === "emulator" && d.avd)
       : []),
-    ...(inventory.offline || []),
+    ...(hasUnmappedRunningEmulator ? [] : inventory.offline || []),
   ].filter((d) => !state.leases[d.deviceKey] && matchesProfile(d, req));
 
   let firstResourceErr = null;
@@ -329,6 +334,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
     const idleRunningEmulators = (inventory.running || []).filter(
       (d) =>
         d.kind === "emulator" &&
+        d.avd &&
         !state.leases[d.deviceKey] &&
         !isReservedForEarlierTicket(d, true),
     );

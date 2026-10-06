@@ -495,6 +495,7 @@ export function discoverFleet({
 
   // 3. Query adb devices for online emulators and physical USB/Wi-Fi devices
   const physicalDevices = [];
+  const unmappedEmulators = [];
   const adbRes = runner("adb", ["devices"], { timeoutMs: 8000 });
   const adbDevicesOk = adbRes.status === 0;
   if (adbDevicesOk && adbRes.stdout) {
@@ -507,18 +508,40 @@ export function discoverFleet({
           continue;
         }
         const nameRes = runner("adb", ["-s", dev.serial, "emu", "avd", "name"], { timeoutMs: 4000 });
-        if (nameRes.status === 0 && nameRes.stdout) {
-          const avdId = nameRes.stdout.split(/\r?\n/)[0].trim();
-          if (avdId && avdId !== "OK") {
-            const existing = knownAvds.get(avdId) || {
-              ...readLocalAvdMetadata(avdId, avdHome, cfg),
-              deviceKey: `avd:${avdId}`,
-              kind: "emulator",
-            };
-            existing.online = true;
-            existing.serial = dev.serial;
-            knownAvds.set(avdId, existing);
-          }
+        const avdId =
+          nameRes.status === 0 && nameRes.stdout
+            ? nameRes.stdout.split(/\r?\n/)[0].trim()
+            : "";
+        if (avdId && avdId !== "OK") {
+          const existing = knownAvds.get(avdId) || {
+            ...readLocalAvdMetadata(avdId, avdHome, cfg),
+            deviceKey: `avd:${avdId}`,
+            kind: "emulator",
+          };
+          existing.online = true;
+          existing.serial = dev.serial;
+          knownAvds.set(avdId, existing);
+        } else {
+          unmappedEmulators.push({
+            deviceKey: `serial:${dev.serial}`,
+            kind: "emulator",
+            avd: null,
+            serial: dev.serial,
+            online: true,
+            unknownAvd: true,
+            profile: {
+              deviceType: null,
+              deviceName: dev.serial,
+              apiLevel: null,
+              services: null,
+              playStore: null,
+              abi: null,
+            },
+            ramSizeMb: 2048,
+            requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
+            dataDiskMb: 0,
+            snapshots: [],
+          });
         }
       } else {
         const propRes = runner("adb", ["-s", dev.serial, "shell", "getprop"], { timeoutMs: 4000 });
@@ -572,7 +595,7 @@ export function discoverFleet({
       offline.push(avd);
     }
   }
-  running.push(...physicalDevices);
+  running.push(...unmappedEmulators, ...physicalDevices);
 
   return {
     host,

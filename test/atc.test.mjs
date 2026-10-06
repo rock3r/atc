@@ -1483,6 +1483,65 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.equal(emuSelection.priority, 1);
       assert.equal(emuSelection.candidate.avd, "Pixel_8_API_35");
+
+      // Gradle install/uninstall tasks are guarded as device actions while installDist is ignored
+      const gradleInstallGuard = evaluateCommandGuard("./gradlew :app:installDebug", {
+        sessionId: "sess-unleased",
+        activeLeases: [],
+      });
+      assert.equal(gradleInstallGuard.allowed, false);
+      const gradleUninstallGuard = evaluateCommandGuard("./gradlew uninstallAll", {
+        sessionId: "sess-unleased",
+        activeLeases: [],
+      });
+      assert.equal(gradleUninstallGuard.allowed, false);
+      const gradleInstallDistGuard = evaluateCommandGuard("./gradlew installDist", {
+        sessionId: "sess-unleased",
+        activeLeases: [],
+      });
+      assert.equal(gradleInstallDistGuard.allowed, true);
+
+      // Terminal session fallback anchors to parent PID
+      const termIdentity = resolveSessionIdentity({
+        flags: {},
+        env: { TMUX_PANE: "%3" },
+        state: { hookSessions: {} },
+        ppid: 4242,
+      });
+      assert.equal(termIdentity.sessionId, "term-_3");
+      assert.equal(termIdentity.anchorPid, 4242);
+
+      // Unmapped running emulator from failed `adb emu avd name` counts toward slots and blocks offline boot
+      const unmappedFleet = discoverFleet({
+        avdHome,
+        runner: (cmd, a) => {
+          if (cmd === "android" && a[0] === "emulator" && a[1] === "list") {
+            return { status: 1, stdout: "", stderr: "error" };
+          }
+          if (cmd === "adb" && a[0] === "devices") {
+            return {
+              status: 0,
+              stdout: "List of devices attached\nemulator-5554\tdevice\n",
+              stderr: "",
+            };
+          }
+          if (cmd === "adb" && a[2] === "emu") {
+            return { status: 1, stdout: "", stderr: "timeout" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(unmappedFleet.running.length, 1);
+      assert.equal(unmappedFleet.running[0].unknownAvd, true);
+      assert.equal(computeUsedEmulatorSlots({ leases: {} }, unmappedFleet), 1);
+      const blockedOffline = selectCandidateUnderLock(
+        createDefaultState(),
+        unmappedFleet,
+        { kind: "emulator", avd: "Pixel_8_API_35" },
+        null,
+        schedNow,
+      );
+      assert.equal(blockedOffline.priority, null);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
