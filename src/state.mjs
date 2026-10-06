@@ -126,10 +126,12 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       continue;
     }
     if (lease.state === "active") {
+      const lastRenewedMs =
+        typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;
       const expired =
         now >= lease.expiresAtMs ||
         now < lease.claimedAtMs ||
-        now > lease.claimedAtMs + maxTtlMs;
+        (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
       const deadAnchor =
         lease.anchorPid !== null &&
         lease.anchorPid !== undefined &&

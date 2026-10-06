@@ -133,6 +133,24 @@ test("state: GC expires dead leases and cleans stale queue tickets", () => {
   assert.equal(state.leases["avd:Pixel_8_API_35"], undefined);
   assert.equal(pruned.queue.length, 1);
   assert.equal(state.queue.length, 0);
+
+  // Renewed active lease older than maxTtlSec from original claim is NOT pruned while renewedAtMs is fresh
+  state.leases["avd:Pixel_9_API_36"] = {
+    leaseId: "lease-renewed",
+    deviceKey: "avd:Pixel_9_API_36",
+    serial: "emulator-5556",
+    avd: "Pixel_9_API_36",
+    kind: "emulator",
+    state: "active",
+    sessionId: "sess-live",
+    anchorPid: process.pid,
+    claimedAtMs: now - 7_200_000, // 2 hours ago (> maxTtlSec)
+    renewedAtMs: now - 60_000, // renewed 1 min ago
+    expiresAtMs: now + 540_000,
+  };
+  const pruned2 = runGarbageCollection(state, null, now);
+  assert.equal(pruned2.leases.length, 0);
+  assert.ok(state.leases["avd:Pixel_9_API_36"]);
 });
 
 test("state: reconcileOfflineLeases requires 5s dual-source confirmation", () => {
@@ -353,6 +371,21 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   });
   assert.equal(killServer.allowed, false);
   assert.match(killServer.reason, /adb kill-server/);
+
+  // Compound ATC commands export ATC_SESSION_ID across all segments
+  const compoundAtc = evaluateCommandGuard(
+    "atc claim --type phone && atc exec -- ./gradlew connectedCheck",
+    {
+      sessionId: "sess-compound",
+      anchorPid: 12345,
+      activeLeases: [],
+    }
+  );
+  assert.equal(compoundAtc.allowed, true);
+  assert.match(
+    compoundAtc.rewrittenCommand,
+    /^export ATC_SESSION_ID=sess-compound ATC_ANCHOR_PID=12345; /
+  );
 });
 
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {

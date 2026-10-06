@@ -1,3 +1,4 @@
+import { Worker } from "node:worker_threads";
 import {
   ResourceError,
   checkResourceAdmission,
@@ -109,29 +110,52 @@ function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
-  const timer = setInterval(() => {
-    try {
-      withStateTransaction(stateDir, (state, { now }) => {
-        const lease = state.leases[deviceKey];
-        if (
-          lease &&
-          lease.leaseId === leaseId &&
-          lease.workerPid === process.pid &&
-          (lease.state === "starting" || lease.state === "stopping")
-        ) {
-          lease.deadlineMs = now + timeoutMs;
-          return { mutated: true };
-        }
-        return { mutated: false };
-      });
-    } catch {
-      // Best-effort heartbeat
-    }
-  }, 15_000);
-  if (typeof timer.unref === "function") {
-    timer.unref();
+  const stateModuleUrl = new URL("./state.mjs", import.meta.url).href;
+  const workerCode = `
+    import { workerData } from "node:worker_threads";
+    import { withStateTransaction } from ${JSON.stringify(stateModuleUrl)};
+    const { stateDir, deviceKey, leaseId, timeoutMs, workerPid } = workerData;
+    setInterval(() => {
+      try {
+        withStateTransaction(stateDir, (state, { now }) => {
+          const lease = state.leases[deviceKey];
+          if (
+            lease &&
+            lease.leaseId === leaseId &&
+            lease.workerPid === workerPid &&
+            (lease.state === "starting" || lease.state === "stopping")
+          ) {
+            lease.deadlineMs = now + timeoutMs;
+            return { mutated: true };
+          }
+          return { mutated: false };
+        });
+      } catch {}
+    }, 15000);
+  `;
+  const worker = new Worker(workerCode, {
+    eval: true,
+    workerData: {
+      stateDir,
+      deviceKey,
+      leaseId,
+      timeoutMs,
+      workerPid: process.pid,
+    },
+  });
+  worker.on("error", () => {});
+  if (typeof worker.unref === "function") {
+    worker.unref();
   }
-  return timer;
+  return {
+    stop() {
+      try {
+        worker.terminate();
+      } catch {
+        // Ignore termination error
+      }
+    },
+  };
 }
 
 export function selectCandidateUnderLock(state, inventory, req, callerTicket, now = Date.now()) {
@@ -777,7 +801,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
       }
     }
 
-    clearInterval(hbTimer);
+    hbTimer.stop();
 
     // 4. Activate lease under atc.lock
     const activeLease = withStateTransaction(stateDir, (state, { now }) => {
@@ -798,7 +822,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
 
     return { exitCode: 0, lease: activeLease, idempotent: false };
   } catch (err) {
-    clearInterval(hbTimer);
+    hbTimer.stop();
     if (bootedNewEmulator) {
       try {
         runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
@@ -955,6 +979,22 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
     let itemFailed = false;
     try {
+      withStateTransaction(stateDir, (state, { now }) => {
+        let mutated = false;
+        for (const rem of stoppingItems) {
+          const cur = state.leases[rem.lease.deviceKey];
+          if (
+            cur &&
+            cur.leaseId === rem.lease.leaseId &&
+            cur.workerPid === process.pid &&
+            cur.state === "stopping"
+          ) {
+            cur.deadlineMs = now + rem.stopTimeoutMs;
+            mutated = true;
+          }
+        }
+        return { mutated };
+      });
       if (saveSnap && lease.serial) {
         const saveRes = runner(
           "adb",
@@ -994,7 +1034,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
       }
     } finally {
-      clearInterval(heartbeats.get(lease.leaseId));
+      heartbeats.get(lease.leaseId)?.stop();
       withStateTransaction(stateDir, (state) => {
         const cur = state.leases[lease.deviceKey];
         if (cur && cur.leaseId === lease.leaseId) {
@@ -1102,15 +1142,9 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     };
   }
 
-  if (action === "save" && !flags.force) {
-    const host = options.host || readHostResources(avdHome);
-    if (host.freeDiskMb < 4096) {
-      return {
-        exitCode: 5,
-        error: `Insufficient disk space (${host.freeDiskMb}MB free) to save snapshot "${name}". Pass --force to bypass.`,
-      };
-    }
-  }
+  const freeDiskMb =
+    options.host?.freeDiskMb ??
+    (action === "save" && !flags.force ? readFreeDiskMb(avdHome) : 16384);
 
   const leaseCheck = withStateTransaction(stateDir, (state, { now }) => {
     const identity = resolveSessionIdentity({
@@ -1144,6 +1178,19 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       };
     }
     const lease = owned[0];
+    if (action === "save" && !flags.force) {
+      const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
+      const minDisk = state.config.minFreeDiskMb ?? 2048;
+      if (freeDiskMb < meta.ramSizeMb + minDisk) {
+        return {
+          mutated: false,
+          value: {
+            exitCode: 5,
+            error: `Insufficient disk space (${freeDiskMb}MB free) to save snapshot "${name}" on ${lease.avd}: needs ${meta.ramSizeMb + minDisk}MB free. Pass --force to bypass.`,
+          },
+        };
+      }
+    }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
     lease.renewedAtMs = now;

@@ -198,7 +198,8 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
   return null;
 }
 
-export function startMcpServer(stateDir) {
+export function startMcpServer(stateDir, sessionOptions = {}) {
+  const mcpSessionId = sessionOptions.sessionId || `mcp-${process.pid}`;
   return new Promise((resolve) => {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -206,17 +207,42 @@ export function startMcpServer(stateDir) {
     });
     rl.on("line", (line) => {
       if (!line.trim()) return;
+      let msg;
       try {
-        const msg = JSON.parse(line);
-        const reply = handleMcpRequest(stateDir, msg);
+        msg = JSON.parse(line);
+      } catch {
+        // Ignore malformed JSON-RPC lines
+        return;
+      }
+      try {
+        const reply = handleMcpRequest(stateDir, msg, {
+          ...sessionOptions,
+          sessionId: mcpSessionId,
+        });
         if (reply) {
           process.stdout.write(JSON.stringify(reply) + "\n");
         }
-      } catch {
-        // Ignore malformed JSON-RPC lines
+      } catch (err) {
+        if (msg && msg.id !== undefined) {
+          process.stdout.write(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              error: {
+                code: -32603,
+                message: err?.message || "Internal MCP error",
+              },
+            }) + "\n",
+          );
+        }
       }
     });
     rl.on("close", () => {
+      try {
+        cmdFree(stateDir, null, { session: mcpSessionId }, sessionOptions);
+      } catch {
+        // Best-effort lease cleanup on MCP transport close
+      }
       resolve();
     });
   });

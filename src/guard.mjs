@@ -385,10 +385,17 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
 
   let rewrittenCommand = null;
   if (needsAtcRewrite && sessionId) {
-    const prefix = anchorPid
-      ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
-      : `ATC_SESSION_ID=${sessionId} `;
-    rewrittenCommand = prefix + command;
+    if (segments.length > 1) {
+      const exportVars = anchorPid
+        ? `export ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid}; `
+        : `export ATC_SESSION_ID=${sessionId}; `;
+      rewrittenCommand = exportVars + command;
+    } else {
+      const prefix = anchorPid
+        ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
+        : `ATC_SESSION_ID=${sessionId} `;
+      rewrittenCommand = prefix + command;
+    }
   }
 
   return {
