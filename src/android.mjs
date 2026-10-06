@@ -218,9 +218,57 @@ export function parseAndroidEmulatorListOutput(stdout) {
   return avds;
 }
 
-export function parseCreatableProfilesOutput(stdout) {
+export function resolveSdkRoot(env = process.env) {
+  if (env.ANDROID_HOME) return env.ANDROID_HOME;
+  if (env.ANDROID_SDK_ROOT) return env.ANDROID_SDK_ROOT;
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Android", "sdk");
+  }
+  if (process.platform === "win32") {
+    const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return path.join(localAppData, "Android", "Sdk");
+  }
+  return path.join(os.homedir(), "Android", "Sdk");
+}
+
+export function readInstalledSystemImages(sdkRoot = resolveSdkRoot()) {
+  const images = [];
+  if (!sdkRoot) return images;
+  const sysImagesDir = path.join(sdkRoot, "system-images");
+  if (!fs.existsSync(sysImagesDir)) return images;
+  try {
+    for (const apiDir of fs.readdirSync(sysImagesDir, { withFileTypes: true })) {
+      if (!apiDir.isDirectory()) continue;
+      const apiMatch = apiDir.name.match(/android-(\d+)/i);
+      const apiLevel = apiMatch ? `android-${apiMatch[1]}` : apiDir.name;
+      const apiPath = path.join(sysImagesDir, apiDir.name);
+      for (const tagDir of fs.readdirSync(apiPath, { withFileTypes: true })) {
+        if (!tagDir.isDirectory()) continue;
+        const tagId = tagDir.name;
+        const tagPath = path.join(apiPath, tagId);
+        for (const abiDir of fs.readdirSync(tagPath, { withFileTypes: true })) {
+          if (!abiDir.isDirectory()) continue;
+          const abi = abiDir.name.toLowerCase();
+          const sysDirRel = `system-images/${apiDir.name}/${tagId}/${abiDir.name}/`;
+          const { services, playStore } = inferServices(false, sysDirRel, tagId);
+          images.push({
+            apiLevel,
+            tagId,
+            services,
+            playStore,
+            abi,
+          });
+        }
+      }
+    }
+  } catch {
+    // Ignore unreadable system-images directory
+  }
+  return images;
+}
+
+export function parseCreatableProfilesOutput(stdout, installedImages = []) {
   const profiles = [];
-  const defaultAbi = process.arch === "arm64" ? "arm64-v8a" : "x86_64";
   const lines = String(stdout).split(/\r?\n/);
   for (const raw of lines) {
     const line = raw.trim();
@@ -242,15 +290,32 @@ export function parseCreatableProfilesOutput(stdout) {
     if (!deviceName || !/^[A-Za-z0-9._-]+$/.test(deviceName)) continue;
 
     const apiMatch = line.match(/\b(?:android-)?(\d{2})\b/i);
-    const apiLevel = apiMatch ? `android-${apiMatch[1]}` : "android-36";
+    const apiLevel = apiMatch ? `android-${apiMatch[1]}` : null;
     const abiMatch = line.match(/\b(arm64-v8a|x86_64|x86|armeabi-v7a)\b/i);
-    const abi = abiMatch ? abiMatch[1].toLowerCase() : defaultAbi;
-    const { services, playStore } = inferServices(
-      line.toLowerCase().includes("play"),
-      line,
-      line,
-    );
+    const abi = abiMatch ? abiMatch[1].toLowerCase() : null;
+    const hasServiceToken = /\b(playstore|play|google_apis|aosp|wear-signed)\b/i.test(line);
+    const { services, playStore } = hasServiceToken
+      ? inferServices(line.toLowerCase().includes("play"), line, line)
+      : { services: null, playStore: null };
     const deviceType = inferDeviceType(deviceName, line, line);
+
+    if (apiLevel === null && abi === null && services === null && installedImages.length > 0) {
+      for (const img of installedImages) {
+        profiles.push({
+          kind: "emulator",
+          deviceName,
+          profile: {
+            deviceType,
+            deviceName,
+            apiLevel: img.apiLevel,
+            services: img.services,
+            playStore: img.playStore,
+            abi: img.abi,
+          },
+        });
+      }
+      continue;
+    }
 
     profiles.push({
       kind: "emulator",
@@ -485,7 +550,8 @@ export function discoverFleet({
     timeoutMs: 8000,
   });
   if (profRes.status === 0 && profRes.stdout) {
-    creatable = parseCreatableProfilesOutput(profRes.stdout);
+    const installedImages = readInstalledSystemImages();
+    creatable = parseCreatableProfilesOutput(profRes.stdout, installedImages);
   }
 
   const running = [];

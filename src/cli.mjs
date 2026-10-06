@@ -271,7 +271,8 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
 
   if (req.createIfMissing && !anyExistingMatch && usedSlots < effectiveMax) {
     const creatablePool = (inventory.creatable || []).filter((c) => {
-      const profileName = c.deviceName || c.profile?.deviceName;
+      const p = c.profile || c;
+      const profileName = c.deviceName || p.deviceName;
       if (
         req.avd &&
         c.avd !== req.avd &&
@@ -280,9 +281,17 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
       ) {
         return false;
       }
+      const effectiveReq = {
+        ...req,
+        apiSpec: p.apiLevel ? req.apiSpec : null,
+        services: p.services ? req.services : null,
+        play: typeof p.playStore === "boolean" || p.services ? req.play : null,
+        abi: p.abi ? req.abi : null,
+        snapshotLoad: null,
+      };
       return matchesProfile(
-        { kind: "emulator", avd: req.avd || c.avd || profileName, profile: c.profile || c },
-        req,
+        { kind: "emulator", avd: req.avd || c.avd || profileName, profile: p },
+        effectiveReq,
       );
     });
     if (creatablePool.length > 0) {
@@ -738,6 +747,22 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       }
       createdAvdName = createdAvdName || candidate.avd;
 
+      if (
+        newlyCreated &&
+        newlyCreated.profile?.apiLevel &&
+        newlyCreated.profile.apiLevel !== "unknown" &&
+        !matchesProfile(newlyCreated, { ...reqWithoutAvd, snapshotLoad: null })
+      ) {
+        try {
+          runner("android", ["emulator", "remove", newlyCreated.avd], { strictInternal: true });
+        } catch {
+          // Best-effort cleanup of mismatched created AVD
+        }
+        throw new Error(
+          `Created AVD "${newlyCreated.avd}" (${newlyCreated.profile.apiLevel}) does not satisfy requested profile constraints.`,
+        );
+      }
+
       if (req.avd && createdAvdName !== req.avd) {
         throw new Error(
           `Created AVD "${createdAvdName}" does not match requested --avd "${req.avd}".`,
@@ -1151,7 +1176,17 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
         leasesList.find((l) => l.serial === target) ||
         leasesList.find((l) => l.avd === target);
     } else {
-      lease = leasesList.find((l) => l.sessionId === identity.sessionId) || null;
+      const owned = leasesList.filter((l) => l.sessionId === identity.sessionId);
+      if (owned.length > 1) {
+        return {
+          mutated: false,
+          value: {
+            exitCode: 1,
+            error: `Session "${identity.sessionId}" holds ${owned.length} active leases; specify a <lease-id|serial|avd> target to renew.`,
+          },
+        };
+      }
+      lease = owned[0] || null;
     }
 
     if (!lease) {
@@ -1561,8 +1596,14 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
     let mutated = false;
     if (guard.allowed && guard.renewLease && activeLeases.length > 0) {
       const ttlMs = (state.config?.defaultTtlSec ?? DEFAULT_CONFIG.defaultTtlSec ?? 600) * 1000;
+      const targeted =
+        Array.isArray(guard.targetSerials) && guard.targetSerials.length > 0
+          ? new Set(guard.targetSerials)
+          : guard.targetSerial
+            ? new Set([guard.targetSerial])
+            : null;
       for (const lease of activeLeases) {
-        if (!guard.targetSerial || lease.serial === guard.targetSerial) {
+        if (!targeted || targeted.has(lease.serial)) {
           lease.renewedAtMs = now;
           lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
           mutated = true;

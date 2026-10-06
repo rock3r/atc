@@ -960,6 +960,52 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     );
     assert.equal(guardRenew.exitCode, 0);
     assert.ok(readState(dir).leases["avd:Medium_Phone_API_36"].expiresAtMs > shortExpiry + 100_000);
+
+    // Names-only --list-profiles output does not fabricate API/services/ABI
+    const namesOnly = parseCreatableProfilesOutput("medium_phone\nmedium_tablet\n");
+    assert.equal(namesOnly.length, 2);
+    assert.equal(namesOnly[0].profile.deviceType, "phone");
+    assert.equal(namesOnly[0].profile.apiLevel, null);
+    assert.equal(namesOnly[0].profile.services, null);
+    assert.equal(namesOnly[0].profile.playStore, null);
+    assert.equal(namesOnly[0].profile.abi, null);
+
+    // Multi-lease session: targetless cmdRenew is rejected as ambiguous, and PreToolUse hook renews only targeted serial
+    withStateTransaction(dir, (state, { now }) => {
+      state.leases["avd:Pixel_8_API_35"] = {
+        leaseId: "lease-second",
+        deviceKey: "avd:Pixel_8_API_35",
+        avd: "Pixel_8_API_35",
+        serial: "emulator-5554",
+        kind: "emulator",
+        state: "active",
+        sessionId: "sess-create",
+        anchorPid: process.pid,
+        claimedAtMs: now,
+        renewedAtMs: now,
+        expiresAtMs: shortExpiry,
+      };
+      state.leases["avd:Medium_Phone_API_36"].expiresAtMs = shortExpiry;
+      return { mutated: true };
+    });
+
+    const ambigRenew = cmdRenew(dir, null, { session: "sess-create" });
+    assert.equal(ambigRenew.exitCode, 1);
+    assert.match(ambigRenew.error, /holds 2 active leases/);
+
+    const hookTargeted = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        session_id: "sess-create",
+        tool_name: "Bash",
+        tool_input: { command: "adb -s emulator-5554 shell wm size" },
+      }),
+      { ppid: process.pid, runningCount: 2 }
+    );
+    assert.equal(hookTargeted.exitCode, 0);
+    const afterHookState = readState(dir);
+    assert.ok(afterHookState.leases["avd:Pixel_8_API_35"].expiresAtMs > shortExpiry + 100_000);
+    assert.equal(afterHookState.leases["avd:Medium_Phone_API_36"].expiresAtMs, shortExpiry);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

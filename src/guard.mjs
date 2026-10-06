@@ -321,6 +321,9 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
 
   const segments = splitShellSegments(command);
   let needsAtcRewrite = false;
+  let hasDeviceAction = false;
+  let hasUnscopedDeviceAction = false;
+  const targetSerials = new Set();
 
   for (const seg of segments) {
     const c = classifySegment(seg);
@@ -347,6 +350,7 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
     }
 
     if (c.kind === "device_action") {
+      hasDeviceAction = true;
       if (!activeLeases || activeLeases.length === 0) {
         return {
           allowed: false,
@@ -371,6 +375,7 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
             rewrittenCommand: null,
           };
         }
+        targetSerials.add(targetSerial);
       } else if (activeLeases.length > 1 || runningCount > 1) {
         const primarySerial = activeLeases[0].serial;
         return {
@@ -381,6 +386,8 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
             `  Or specify: ANDROID_SERIAL=${primarySerial} ${seg}`,
           rewrittenCommand: null,
         };
+      } else {
+        hasUnscopedDeviceAction = true;
       }
     }
   }
@@ -400,10 +407,14 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
     }
   }
 
+  const serialList = hasUnscopedDeviceAction ? null : Array.from(targetSerials);
+
   return {
     allowed: true,
     fastPath: false,
     rewrittenCommand,
-    renewLease: activeLeases.length > 0,
+    renewLease: hasDeviceAction && activeLeases.length > 0,
+    targetSerial: serialList && serialList.length === 1 ? serialList[0] : null,
+    targetSerials: serialList,
   };
 }

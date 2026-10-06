@@ -121,10 +121,18 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     });
 
     if (guardRes.allowed && guardRes.renewLease) {
-      const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
+      const ttlMs = (state.config?.defaultTtlSec ?? 600) * 1000;
+      const targeted =
+        Array.isArray(guardRes.targetSerials) && guardRes.targetSerials.length > 0
+          ? new Set(guardRes.targetSerials)
+          : guardRes.targetSerial
+            ? new Set([guardRes.targetSerial])
+            : null;
       for (const lease of activeLeases) {
-        lease.renewedAtMs = now;
-        lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+        if (!targeted || targeted.has(lease.serial)) {
+          lease.renewedAtMs = now;
+          lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+        }
       }
     }
 
