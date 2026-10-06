@@ -150,7 +150,7 @@ function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
     );
     if (propRes.status === 0) {
       const out = String(propRes.stdout || "").trim();
-      if (out === "1" || out === "OK" || out === "") {
+      if (out === "1") {
         return true;
       }
     }
@@ -1140,6 +1140,13 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           actionErrors.push(
             `Failed to load snapshot "${loadSnap}" on ${lease.serial}: ${loadRes.stderr || loadRes.stdout}`,
           );
+        } else {
+          try {
+            waitForEmulatorReady(runner, lease.serial, stopTimeoutMs);
+          } catch (err) {
+            itemFailed = true;
+            actionErrors.push(err.message);
+          }
         }
       }
       if (!itemFailed && doStop) {

@@ -307,18 +307,47 @@ export function classifySegment(segment) {
     }
   }
 
-  // Unrecognized wrapper around an Android command: peel to nested tool or fail closed
-  if (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) && FAST_PATH_REGEX.test(segment)) {
-    const nestedIdx = args.findIndex((a) => {
+  // Unrecognized wrapper or executable action on a utility around an Android command: peel to nested tool or fail closed
+  const execFlagIdx =
+    baseCmd === "find"
+      ? args.findIndex((a) => a === "-exec" || a === "-execdir" || a === "-ok" || a === "-okdir")
+      : -1;
+  const isExecutablePassive =
+    execFlagIdx !== -1 ||
+    (baseCmd === "git" &&
+      (args.includes("-c") || (args[0] === "bisect" && args[1] === "run"))) ||
+    baseCmd === "awk" ||
+    baseCmd === "sed";
+
+  if (
+    (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) || isExecutablePassive) &&
+    FAST_PATH_REGEX.test(segment)
+  ) {
+    const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
+    const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {
       const b = path.basename(a, path.extname(a)).toLowerCase();
-      return ["atc", "emulator", "adb", "android", "gradlew", "gradle"].includes(b);
+      return (
+        ["atc", "emulator", "adb", "android", "gradlew", "gradle"].includes(b) ||
+        SHELL_WRAPPERS.has(b) ||
+        TRANSPARENT_WRAPPERS.has(b)
+      );
     });
-    if (nestedIdx !== -1) {
-      const nestedSegment = args
-        .slice(nestedIdx)
-        .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
-        .join(" ");
-      return classifySegment(nestedSegment);
+    const peelIdx =
+      execFlagIdx !== -1 && execFlagIdx + 1 < args.length
+        ? execFlagIdx + 1
+        : nestedRelIdx !== -1
+          ? startSearchIdx + nestedRelIdx
+          : -1;
+    if (peelIdx !== -1) {
+      const cleanedArgs = args
+        .slice(peelIdx)
+        .filter((a) => a !== ";" && a !== "\\;" && a !== "+");
+      if (cleanedArgs.length > 0) {
+        const nestedSegment = cleanedArgs
+          .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
+          .join(" ");
+        return classifySegment(nestedSegment);
+      }
     }
     return {
       kind: "device_action",

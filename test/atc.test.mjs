@@ -799,6 +799,9 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
             return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
           }
+          if (cmd === "adb" && args.includes("getprop")) {
+            return { status: 0, stdout: "1\n", stderr: "" };
+          }
           return { status: 0, stdout: "OK", stderr: "" };
         },
       }
@@ -1027,6 +1030,13 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     });
     assert.equal(explicitId.sessionId, "explicit-builder");
     assert.equal(explicitId.anchorPid, null);
+
+    // find -exec is inspected by guard rather than treated as passive
+    const findExecGuard = evaluateCommandGuard("find . -exec adb shell pm clear com.example \\;", {
+      sessionId: "sess-unleased",
+      activeLeases: [],
+    });
+    assert.equal(findExecGuard.allowed, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });
