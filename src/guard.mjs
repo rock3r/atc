@@ -298,18 +298,43 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   // Precedence 1: ATC commands (`atc ...`)
   if (baseCmd === "atc") {
-    const subcommand = args[0] || "";
+    let subIdx = 0;
+    while (subIdx < args.length) {
+      const a = args[subIdx];
+      if (
+        (a === "--session" ||
+          a === "--role" ||
+          a === "--serial" ||
+          a === "--lease" ||
+          a === "--state-dir") &&
+        subIdx + 1 < args.length
+      ) {
+        subIdx += 2;
+      } else if (a.startsWith("-") && a !== "--") {
+        subIdx += 1;
+      } else {
+        break;
+      }
+    }
+    const subcommand = args[subIdx] || "";
     let execTargetSerial = null;
     if (subcommand === "exec") {
-      const dashDashIdx = args.indexOf("--");
+      const dashDashIdx = args.indexOf("--", subIdx + 1);
       let wrappedTokens = [];
       if (dashDashIdx !== -1) {
         wrappedTokens = args.slice(dashDashIdx + 1);
       } else {
-        let i = 1;
+        let i = subIdx + 1;
         while (i < args.length) {
           const a = args[i];
-          if ((a === "--session" || a === "--role" || a === "--serial" || a === "--lease") && i + 1 < args.length) {
+          if (
+            (a === "--session" ||
+              a === "--role" ||
+              a === "--serial" ||
+              a === "--lease" ||
+              a === "--state-dir") &&
+            i + 1 < args.length
+          ) {
             i += 2;
           } else if (a.startsWith("--")) {
             i += 1;
@@ -341,7 +366,49 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   // Precedence 2: Direct lifecycle bypass (evaluated before generic android subcommands!)
-  if (baseCmd === "emulator" || (baseCmd === "android" && args[0] === "emulator")) {
+  const androidSubInfo = (() => {
+    if (baseCmd !== "android") return null;
+    const valueFlags = new Set([
+      "--sdk",
+      "--device",
+      "-s",
+      "--format",
+      "--output",
+      "--log-level",
+      "--config",
+    ]);
+    let subIdx = 0;
+    while (subIdx < args.length) {
+      const a = String(args[subIdx]);
+      if (a === "--") {
+        subIdx += 1;
+        break;
+      }
+      if (valueFlags.has(a) && subIdx + 1 < args.length) {
+        subIdx += 2;
+      } else if (a.startsWith("-")) {
+        subIdx += 1;
+      } else {
+        break;
+      }
+    }
+    const sub = String(args[subIdx] || "");
+    let actIdx = subIdx + 1;
+    while (actIdx < args.length) {
+      const a = String(args[actIdx]);
+      if (valueFlags.has(a) && actIdx + 1 < args.length) {
+        actIdx += 2;
+      } else if (a.startsWith("-")) {
+        actIdx += 1;
+      } else {
+        break;
+      }
+    }
+    const action = String(args[actIdx] || args[subIdx + 1] || "");
+    return { subIdx, sub, action };
+  })();
+
+  if (baseCmd === "emulator" || (baseCmd === "android" && androidSubInfo.sub === "emulator")) {
     if (baseCmd === "emulator") {
       if (args.includes("-list-avds") || args.includes("-version") || args.includes("-help")) {
         return { kind: "read_only", parsed };
@@ -353,7 +420,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         parsed,
       };
     }
-    const emuAction = args[1] || "";
+    const emuAction = androidSubInfo.action;
     if (["start", "stop", "remove", "create"].includes(emuAction)) {
       if (emuAction === "create" && args.includes("--list-profiles")) {
         return { kind: "read_only", parsed };
@@ -411,7 +478,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   // Precedence 3: Read-only Android commands (including top-level `android create` project creation)
   if (baseCmd === "android") {
-    const sub = args[0] || "";
+    const sub = androidSubInfo.sub;
     if (!sub || READ_ONLY_ANDROID_SUBCOMMANDS.has(sub)) {
       return { kind: "read_only", parsed };
     }

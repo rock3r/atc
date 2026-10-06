@@ -129,16 +129,59 @@ export function runCommandSync(command, args = [], options = {}) {
   };
 }
 
+const ANDROID_VALUE_GLOBAL_FLAGS = new Set([
+  "--sdk",
+  "--device",
+  "-s",
+  "--format",
+  "--output",
+  "--log-level",
+  "--config",
+]);
+
+function findAndroidSubcommand(args) {
+  let subIdx = 0;
+  while (subIdx < args.length) {
+    const a = String(args[subIdx]);
+    if (a === "--") {
+      subIdx += 1;
+      break;
+    }
+    if (ANDROID_VALUE_GLOBAL_FLAGS.has(a) && subIdx + 1 < args.length) {
+      subIdx += 2;
+    } else if (a.startsWith("-")) {
+      subIdx += 1;
+    } else {
+      break;
+    }
+  }
+  const sub = String(args[subIdx] || "");
+  let actIdx = subIdx + 1;
+  while (actIdx < args.length) {
+    const a = String(args[actIdx]);
+    if (ANDROID_VALUE_GLOBAL_FLAGS.has(a) && actIdx + 1 < args.length) {
+      actIdx += 2;
+    } else if (a.startsWith("-")) {
+      actIdx += 1;
+    } else {
+      break;
+    }
+  }
+  const action = String(args[actIdx] || args[subIdx + 1] || "");
+  return { subIdx, sub, actIdx, action };
+}
+
 export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
+  const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
   if (base === "emulator") {
     if (!args.includes("-list-avds") && !args.includes("-version") && !args.includes("-help")) {
       throw new Error(
         'Direct emulator launch is disabled under ATC. Use "atc claim --type <type> --api <api>" instead.',
       );
     }
-  } else if (base === "android" && args[0] === "emulator") {
-    const emuAction = args[1] || "";
+  } else if (base === "android" && androidParsed.sub === "emulator") {
+    const emuAction = androidParsed.action;
     if (
       ["start", "stop", "remove", "create"].includes(emuAction) &&
       !(emuAction === "create" && args.includes("--list-profiles"))
@@ -215,12 +258,16 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   let nextArgs = [...args];
   if (
     base === "android" &&
-    nextArgs.length > 0 &&
-    ["run", "install", "layout", "screen"].includes(nextArgs[0])
+    androidParsed &&
+    ["run", "install", "layout", "screen"].includes(androidParsed.sub)
   ) {
     const hasDeviceFlag = nextArgs.some((a) => a === "--device" || a.startsWith("--device="));
     if (!hasDeviceFlag && lease.serial) {
-      nextArgs = [nextArgs[0], `--device=${lease.serial}`, ...nextArgs.slice(1)];
+      nextArgs = [
+        ...nextArgs.slice(0, androidParsed.subIdx + 1),
+        `--device=${lease.serial}`,
+        ...nextArgs.slice(androidParsed.subIdx + 1),
+      ];
     }
   }
   return { cmd, args: nextArgs, env };
