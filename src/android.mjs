@@ -278,7 +278,7 @@ export function readInstalledSystemImages(sdkRoot = resolveSdkRoot()) {
   return images;
 }
 
-export function parseCreatableProfilesOutput(stdout, installedImages = []) {
+export function parseCreatableProfilesOutput(stdout) {
   const profiles = [];
   const lines = String(stdout).split(/\r?\n/);
   for (const raw of lines) {
@@ -309,24 +309,6 @@ export function parseCreatableProfilesOutput(stdout, installedImages = []) {
       ? inferServices(line.toLowerCase().includes("play"), line, line)
       : { services: null, playStore: null };
     const deviceType = inferDeviceType(deviceName, line, line);
-
-    if (apiLevel === null && abi === null && services === null && installedImages.length > 0) {
-      for (const img of installedImages) {
-        profiles.push({
-          kind: "emulator",
-          deviceName,
-          profile: {
-            deviceType,
-            deviceName,
-            apiLevel: img.apiLevel,
-            services: img.services,
-            playStore: img.playStore,
-            abi: img.abi,
-          },
-        });
-      }
-      continue;
-    }
 
     profiles.push({
       kind: "emulator",
@@ -571,8 +553,7 @@ export function discoverFleet({
     timeoutMs: 8000,
   });
   if (profRes.status === 0 && profRes.stdout) {
-    const installedImages = readInstalledSystemImages();
-    creatable = parseCreatableProfilesOutput(profRes.stdout, installedImages);
+    creatable = parseCreatableProfilesOutput(profRes.stdout);
   }
 
   const running = [];

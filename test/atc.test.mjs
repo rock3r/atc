@@ -735,7 +735,7 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
   }
 });
 
-test("cli: offline wipeData/snapshotLoad and createIfMissing use supported android CLI flags", () => {
+test("cli: offline wipeData/snapshotLoad and createIfMissing use supported android CLI flags", async () => {
   const dir = makeTempStateDir();
   const avdHome = makeTempStateDir();
   try {
@@ -1346,6 +1346,31 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.equal(cursorDeny.exitCode, 2);
       assert.equal(JSON.parse(cursorDeny.stdout).permission, "deny");
+
+      // Wrapped ANDROID_SERIAL overrides in cmdExec are rejected before spawning
+      withStateTransaction(winDir, (state, { now }) => {
+        state.leases["avd:Pixel_8_API_35"] = {
+          leaseId: "lease-exec-wrap",
+          deviceKey: "avd:Pixel_8_API_35",
+          avd: "Pixel_8_API_35",
+          serial: "emulator-5554",
+          kind: "emulator",
+          state: "active",
+          sessionId: "exec-wrap-sess",
+          anchorPid: null,
+          claimedAtMs: now,
+          renewedAtMs: now,
+          expiresAtMs: now + 60_000,
+        };
+        return { mutated: true };
+      });
+      const wrappedExecConflict = await cmdExec(
+        winDir,
+        ["env", "ANDROID_SERIAL=emulator-5556", "adb", "shell", "pm", "clear", "com.example"],
+        { session: "exec-wrap-sess" }
+      );
+      assert.equal(wrappedExecConflict.exitCode, 3);
+      assert.match(wrappedExecConflict.error, /Conflicting device selector "emulator-5556"/);
 
       // computeUsedEmulatorSlots counts active emulator leases during transient inventory gaps
       assert.equal(

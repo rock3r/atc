@@ -1536,6 +1536,19 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         },
       };
     }
+    if (
+      wrappedClass.targetSerial &&
+      lease.serial &&
+      wrappedClass.targetSerial !== lease.serial
+    ) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Conflicting device selector "${wrappedClass.targetSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+        },
+      };
+    }
     try {
       buildChildInvocation(cmd, args, lease, identity.sessionId, options.env);
     } catch (err) {
