@@ -30,6 +30,7 @@ import {
   ResourceError,
   parseAdbDevicesOutput,
   parseAndroidEmulatorListOutput,
+  parseCreatableProfilesOutput,
   checkResourceAdmission,
   deterministicCreatedAvdId,
 } from "../src/android.mjs";
@@ -270,6 +271,14 @@ test("android: parsers and resource admission with recently-activated RAM projec
     abi: "arm64-v8a",
   });
   assert.equal(id1, "atc_phone_android-35_google_apis_arm64-v8a");
+
+  const creatable = parseCreatableProfilesOutput(
+    "Profile        Type     API          Services   ABI\npixel_9        phone    android-36   play       arm64-v8a\npixel_tablet   tablet   android-35   google_apis arm64-v8a\n"
+  );
+  assert.equal(creatable.length, 2);
+  assert.equal(creatable[0].deviceName, "pixel_9");
+  assert.equal(creatable[0].profile.apiLevel, "android-36");
+  assert.equal(creatable[1].profile.deviceType, "tablet");
 });
 
 test("guard: fast-path, compound splitting, precedence rules, and serial validation", () => {
@@ -592,7 +601,12 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
       "load",
       "clean-snap",
       { session: "sess-1" },
-      { runner: () => ({ status: 0, stdout: "OK", stderr: "" }) }
+      {
+        runner: (_cmd, _args, opts) => {
+          assert.equal(opts.timeoutMs, 60_000);
+          return { status: 0, stdout: "OK", stderr: "" };
+        },
+      }
     );
     assert.equal(snapOk.exitCode, 0);
     assert.equal(readState(dir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-snap");

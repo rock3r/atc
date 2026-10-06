@@ -198,6 +198,56 @@ export function parseAndroidEmulatorListOutput(stdout) {
   return avds;
 }
 
+export function parseCreatableProfilesOutput(stdout) {
+  const profiles = [];
+  const defaultAbi = process.arch === "arm64" ? "arm64-v8a" : "x86_64";
+  const lines = String(stdout).split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (
+      !line ||
+      line.startsWith("Profile") ||
+      line.startsWith("Device") ||
+      line.startsWith("ID") ||
+      line.startsWith("---") ||
+      line.startsWith("No ")
+    ) {
+      continue;
+    }
+    const cols = line
+      .split(/\s{2,}|\s+/)
+      .map((c) => c.trim())
+      .filter(Boolean);
+    const deviceName = cols[0];
+    if (!deviceName || !/^[A-Za-z0-9._-]+$/.test(deviceName)) continue;
+
+    const apiMatch = line.match(/\b(?:android-)?(\d{2})\b/i);
+    const apiLevel = apiMatch ? `android-${apiMatch[1]}` : "android-36";
+    const abiMatch = line.match(/\b(arm64-v8a|x86_64|x86|armeabi-v7a)\b/i);
+    const abi = abiMatch ? abiMatch[1].toLowerCase() : defaultAbi;
+    const { services, playStore } = inferServices(
+      line.toLowerCase().includes("play"),
+      line,
+      line,
+    );
+    const deviceType = inferDeviceType(deviceName, line, line);
+
+    profiles.push({
+      kind: "emulator",
+      deviceName,
+      profile: {
+        deviceType,
+        deviceName,
+        apiLevel,
+        services,
+        playStore,
+        abi,
+      },
+    });
+  }
+  return profiles;
+}
+
 export function readFreeDiskMb(avdHome = resolveAvdHome()) {
   let freeDiskMb = 16384;
   try {
@@ -409,6 +459,15 @@ export function discoverFleet({
     }
   }
 
+  // 4. Query creatable profiles via android emulator create --list-profiles
+  let creatable = [];
+  const profRes = runner("android", ["emulator", "create", "--list-profiles"], {
+    timeoutMs: 8000,
+  });
+  if (profRes.status === 0 && profRes.stdout) {
+    creatable = parseCreatableProfilesOutput(profRes.stdout);
+  }
+
   const running = [];
   const offline = [];
   for (const avd of knownAvds.values()) {
@@ -424,7 +483,7 @@ export function discoverFleet({
     host,
     running,
     offline,
-    creatable: [],
+    creatable,
   };
 }
 

@@ -261,41 +261,56 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
 
   // Priority 4: Auto-create missing AVD (--create-if-missing)
   if (req.createIfMissing && bootPool.length === 0 && usedSlots < effectiveMax) {
-    const avdId = req.avd || deterministicCreatedAvdId(req);
-    const deviceKey = `avd:${avdId}`;
-    if (!state.leases[deviceKey] && !isReservedForEarlierTicket({ online: false }, true)) {
-      const syntheticCandidate = {
-        avd: avdId,
-        deviceKey,
-        kind: "emulator",
-        online: false,
-        ramSizeMb: 2048,
-        requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
-        dataDiskMb: 6656,
-        profile: {
-          deviceType: req.deviceType || "phone",
-          deviceName: req.deviceType || "pixel_9",
-          apiLevel: req.apiSpec ? `android-${String(req.apiSpec).replace(/\D/g, "") || "36"}` : "android-36",
-          services: req.services || (req.play === false ? "aosp" : "play"),
-          playStore: req.play !== false,
-          abi: req.abi || (process.arch === "arm64" ? "arm64-v8a" : "x86_64"),
-        },
-      };
-      try {
-        checkResourceAdmission(syntheticCandidate, inventory.host, state, inventory, {
-          wipeOrCreate: true,
-          force: Boolean(req.force),
-          now,
-        });
-        return {
-          priority: 4,
-          tier: 1,
-          candidate: syntheticCandidate,
-          createAvd: true,
+    const creatablePool = (inventory.creatable || []).filter((c) =>
+      matchesProfile({ kind: "emulator", profile: c.profile || c }, req),
+    );
+    if (creatablePool.length > 0) {
+      const matchedCreatable = creatablePool[0];
+      const baseProfile = matchedCreatable.profile || matchedCreatable;
+      const avdId = req.avd || deterministicCreatedAvdId(req);
+      const deviceKey = `avd:${avdId}`;
+      if (!state.leases[deviceKey] && !isReservedForEarlierTicket({ online: false }, true)) {
+        const syntheticCandidate = {
+          avd: avdId,
+          deviceKey,
+          kind: "emulator",
+          online: false,
+          ramSizeMb: 2048,
+          requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
+          dataDiskMb: 6656,
+          profile: {
+            deviceType: baseProfile.deviceType || req.deviceType || "phone",
+            deviceName: matchedCreatable.deviceName || baseProfile.deviceName || "pixel_9",
+            apiLevel:
+              baseProfile.apiLevel ||
+              (req.apiSpec
+                ? `android-${String(req.apiSpec).replace(/\D/g, "") || "36"}`
+                : "android-36"),
+            services:
+              baseProfile.services || req.services || (req.play === false ? "aosp" : "play"),
+            playStore:
+              typeof baseProfile.playStore === "boolean"
+                ? baseProfile.playStore
+                : req.play !== false,
+            abi: baseProfile.abi || req.abi || (process.arch === "arm64" ? "arm64-v8a" : "x86_64"),
+          },
         };
-      } catch (err) {
-        if (err instanceof ResourceError && !firstResourceErr) {
-          firstResourceErr = err;
+        try {
+          checkResourceAdmission(syntheticCandidate, inventory.host, state, inventory, {
+            wipeOrCreate: true,
+            force: Boolean(req.force),
+            now,
+          });
+          return {
+            priority: 4,
+            tier: 1,
+            candidate: syntheticCandidate,
+            createAvd: true,
+          };
+        } catch (err) {
+          if (err instanceof ResourceError && !firstResourceErr) {
+            firstResourceErr = err;
+          }
         }
       }
     }
@@ -1102,9 +1117,10 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     }
     const lease = owned[0];
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
+    const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
-    return { mutated: true, value: { exitCode: 0, lease: { ...lease } } };
+    return { mutated: true, value: { exitCode: 0, lease: { ...lease }, stopTimeoutMs } };
   });
 
   if (leaseCheck.exitCode !== 0) {
@@ -1114,7 +1130,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   const res = runner(
     "adb",
     ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", action, name],
-    { strictInternal: true },
+    { strictInternal: true, timeoutMs: leaseCheck.stopTimeoutMs },
   );
   if (res.status !== 0) {
     return {
