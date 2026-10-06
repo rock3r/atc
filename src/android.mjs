@@ -189,6 +189,17 @@ export function parseAdbDevicesOutput(stdout) {
   return results;
 }
 
+export function parseAdbGetpropOutput(stdout) {
+  const props = {};
+  for (const rawLine of String(stdout || "").split(/\r?\n/)) {
+    const m = rawLine.trim().match(/^\[([^\]]+)\]:\s*\[(.*)\]$/);
+    if (m) {
+      props[m[1].trim()] = m[2].trim();
+    }
+  }
+  return props;
+}
+
 export function parseAndroidEmulatorListOutput(stdout) {
   const avds = [];
   const lines = String(stdout).split(/\r?\n/);
@@ -521,6 +532,16 @@ export function discoverFleet({
           }
         }
       } else {
+        const propRes = runner("adb", ["-s", dev.serial, "shell", "getprop"], { timeoutMs: 4000 });
+        const props =
+          propRes.status === 0 && propRes.stdout ? parseAdbGetpropOutput(propRes.stdout) : {};
+        const sdk = props["ro.build.version.sdk"];
+        const cpuAbi =
+          props["ro.product.cpu.abi"] || props["ro.product.cpu.abilist"]?.split(",")[0];
+        const model = props["ro.product.model"] || "";
+        const characteristics = props["ro.build.characteristics"] || "";
+        const gmsVersion = props["ro.com.google.gmsversion"] || "";
+        const hasProps = Object.keys(props).length > 0;
         physicalDevices.push({
           deviceKey: `serial:${dev.serial}`,
           kind: "physical",
@@ -528,12 +549,12 @@ export function discoverFleet({
           serial: dev.serial,
           online: true,
           profile: {
-            deviceType: "phone",
-            deviceName: dev.serial,
-            apiLevel: "unknown",
-            services: "play",
-            playStore: true,
-            abi: "arm64-v8a",
+            deviceType: hasProps ? inferDeviceType(model, characteristics, characteristics) : null,
+            deviceName: model || dev.serial,
+            apiLevel: sdk && /^\d+$/.test(sdk) ? `android-${sdk}` : null,
+            services: gmsVersion ? "play" : hasProps ? "aosp" : null,
+            playStore: gmsVersion ? true : hasProps ? false : null,
+            abi: cpuAbi ? cpuAbi.toLowerCase() : null,
           },
           ramSizeMb: 0,
           requiredRamMb: 0,

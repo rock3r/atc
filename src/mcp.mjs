@@ -29,6 +29,7 @@ export const MCP_TOOLS = [
         waitSec: { type: "number" },
         reorderWindowSec: { type: "number" },
         reason: { type: "string" },
+        session: { type: "string", description: "Optional explicit session ID override" },
       },
     },
   },
@@ -43,6 +44,7 @@ export const MCP_TOOLS = [
         snapshotLoad: { type: "string" },
         stop: { type: "boolean" },
         force: { type: "boolean" },
+        session: { type: "string", description: "Optional explicit session ID override" },
       },
     },
   },
@@ -54,6 +56,7 @@ export const MCP_TOOLS = [
       properties: {
         target: { type: "string" },
         ttlSec: { type: "number" },
+        session: { type: "string", description: "Optional explicit session ID override" },
       },
     },
   },
@@ -68,6 +71,7 @@ export const MCP_TOOLS = [
         avd: { type: "string" },
         serial: { type: "string" },
         force: { type: "boolean" },
+        session: { type: "string", description: "Optional explicit session ID override" },
       },
       required: ["action"],
     },
@@ -90,11 +94,17 @@ export const MCP_TOOLS = [
 export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
   if (!msg || typeof msg !== "object") return null;
   const { id, method, params } = msg;
-  const mcpSessionId = sessionOptions.sessionId || `mcp-${process.pid}`;
+  const hostAgentPid = sessionOptions.ppid ?? process.ppid;
+  const baseEnv = sessionOptions.env || process.env;
   const mcpEnv = {
-    ...process.env,
-    ATC_SESSION_ID: mcpSessionId,
-    ATC_ANCHOR_PID: String(process.pid),
+    ...baseEnv,
+    ...(sessionOptions.sessionId ? { ATC_SESSION_ID: sessionOptions.sessionId } : {}),
+    ATC_ANCHOR_PID: baseEnv.ATC_ANCHOR_PID || String(hostAgentPid),
+  };
+  const callOptions = {
+    ...sessionOptions,
+    env: mcpEnv,
+    ppid: hostAgentPid,
   };
 
   if (method === "initialize") {
@@ -137,33 +147,21 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
           wait: args.waitSec ?? 0,
           reorderWindow: args.reorderWindowSec,
         },
-        { env: mcpEnv, ppid: process.pid, ...sessionOptions },
+        callOptions,
       );
     } else if (toolName === "atc_free") {
-      res = cmdFree(stateDir, args.target || null, args, {
-        env: mcpEnv,
-        ppid: process.pid,
-        ...sessionOptions,
-      });
+      res = cmdFree(stateDir, args.target || null, args, callOptions);
     } else if (toolName === "atc_renew") {
       res = cmdRenew(
         stateDir,
         args.target || null,
-        { ttl: args.ttlSec },
-        { env: mcpEnv, ppid: process.pid, ...sessionOptions },
+        { ...args, ttl: args.ttlSec },
+        callOptions,
       );
     } else if (toolName === "atc_snapshot") {
-      res = cmdSnapshot(stateDir, args.action, args.name || null, args, {
-        env: mcpEnv,
-        ppid: process.pid,
-        ...sessionOptions,
-      });
+      res = cmdSnapshot(stateDir, args.action, args.name || null, args, callOptions);
     } else if (toolName === "atc_status") {
-      res = cmdStatus(stateDir, args, {
-        env: mcpEnv,
-        ppid: process.pid,
-        ...sessionOptions,
-      });
+      res = cmdStatus(stateDir, args, callOptions);
     } else {
       return {
         jsonrpc: "2.0",
@@ -199,7 +197,7 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
 }
 
 export function startMcpServer(stateDir, sessionOptions = {}) {
-  const mcpSessionId = sessionOptions.sessionId || `mcp-${process.pid}`;
+  const hostAgentPid = sessionOptions.ppid ?? process.ppid;
   return new Promise((resolve) => {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -217,7 +215,7 @@ export function startMcpServer(stateDir, sessionOptions = {}) {
       try {
         const reply = handleMcpRequest(stateDir, msg, {
           ...sessionOptions,
-          sessionId: mcpSessionId,
+          ppid: hostAgentPid,
         });
         if (reply) {
           process.stdout.write(JSON.stringify(reply) + "\n");
@@ -239,7 +237,18 @@ export function startMcpServer(stateDir, sessionOptions = {}) {
     });
     rl.on("close", () => {
       try {
-        cmdFree(stateDir, null, { session: mcpSessionId }, sessionOptions);
+        const baseEnv = sessionOptions.env || process.env;
+        const mcpEnv = {
+          ...baseEnv,
+          ...(sessionOptions.sessionId ? { ATC_SESSION_ID: sessionOptions.sessionId } : {}),
+          ATC_ANCHOR_PID: baseEnv.ATC_ANCHOR_PID || String(hostAgentPid),
+        };
+        cmdFree(
+          stateDir,
+          null,
+          sessionOptions.sessionId ? { session: sessionOptions.sessionId } : {},
+          { ...sessionOptions, env: mcpEnv, ppid: hostAgentPid },
+        );
       } catch {
         // Best-effort lease cleanup on MCP transport close
       }

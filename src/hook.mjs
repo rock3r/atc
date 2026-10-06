@@ -99,45 +99,60 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     probedRunningCount = options.runningCount;
   }
 
-  const evalResult = withStateTransaction(stateDir, (state, { now }) => {
-    state.hookSessions[String(norm.anchorPid)] = {
-      sessionId: norm.sessionId,
-      agentPid: norm.anchorPid,
-      cwd,
-      updatedAtMs: now,
-    };
+  const evalResult = withStateTransaction(
+    stateDir,
+    (state, { now }) => {
+      state.hookSessions[String(norm.anchorPid)] = {
+        sessionId: norm.sessionId,
+        agentPid: norm.anchorPid,
+        cwd,
+        updatedAtMs: now,
+      };
 
-    const activeLeases = Object.values(state.leases).filter(
-      (l) => l.state === "active" && l.sessionId === norm.sessionId,
-    );
-    const totalLeasedCount = Object.keys(state.leases).length;
-    const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
-
-    const guardRes = evaluateCommandGuard(norm.command, {
-      sessionId: norm.sessionId,
-      anchorPid: norm.anchorPid,
-      activeLeases,
-      runningCount,
-    });
-
-    if (guardRes.allowed && guardRes.renewLease) {
-      const ttlMs = (state.config?.defaultTtlSec ?? 600) * 1000;
-      const targeted =
-        Array.isArray(guardRes.targetSerials) && guardRes.targetSerials.length > 0
-          ? new Set(guardRes.targetSerials)
-          : guardRes.targetSerial
-            ? new Set([guardRes.targetSerial])
-            : null;
-      for (const lease of activeLeases) {
-        if (!targeted || targeted.has(lease.serial)) {
-          lease.renewedAtMs = now;
-          lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+      const fallbackPpidSession = `ppid-${norm.anchorPid}`;
+      for (const l of Object.values(state.leases)) {
+        if (
+          l.state === "active" &&
+          (l.sessionId === fallbackPpidSession ||
+            (l.anchorPid === norm.anchorPid && String(l.sessionId).startsWith("ppid-")))
+        ) {
+          l.sessionId = norm.sessionId;
         }
       }
-    }
 
-    return { mutated: true, value: guardRes };
-  });
+      const activeLeases = Object.values(state.leases).filter(
+        (l) => l.state === "active" && l.sessionId === norm.sessionId,
+      );
+      const totalLeasedCount = Object.keys(state.leases).length;
+      const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
+
+      const guardRes = evaluateCommandGuard(norm.command, {
+        sessionId: norm.sessionId,
+        anchorPid: norm.anchorPid,
+        activeLeases,
+        runningCount,
+      });
+
+      if (guardRes.allowed && guardRes.renewLease) {
+        const ttlMs = (state.config?.defaultTtlSec ?? 600) * 1000;
+        const targeted =
+          Array.isArray(guardRes.targetSerials) && guardRes.targetSerials.length > 0
+            ? new Set(guardRes.targetSerials)
+            : guardRes.targetSerial
+              ? new Set([guardRes.targetSerial])
+              : null;
+        for (const lease of activeLeases) {
+          if (!targeted || targeted.has(lease.serial)) {
+            lease.renewedAtMs = now;
+            lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+          }
+        }
+      }
+
+      return { mutated: true, value: guardRes };
+    },
+    { ppid: norm.anchorPid },
+  );
 
   if (!evalResult.allowed) {
     const denyJson =
@@ -200,15 +215,35 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
     payload?.conversation_id ||
     null;
 
-  const targetSessionId = withStateTransaction(stateDir, (state) => {
-    let resolvedId = rawSession ? sanitizeSessionId(rawSession, ppid) : null;
-    if (!resolvedId && state.hookSessions[String(ppid)]) {
-      resolvedId = state.hookSessions[String(ppid)].sessionId;
-    }
-    const hadHookSession = Boolean(state.hookSessions[String(ppid)]);
-    delete state.hookSessions[String(ppid)];
-    return { mutated: hadHookSession, value: resolvedId };
-  });
+  const targetSessionId = withStateTransaction(
+    stateDir,
+    (state) => {
+      let resolvedId = rawSession ? sanitizeSessionId(rawSession, ppid) : null;
+      if (!resolvedId && state.hookSessions[String(ppid)]) {
+        resolvedId = state.hookSessions[String(ppid)].sessionId;
+      }
+      const fallbackPpidSession = `ppid-${ppid}`;
+      let mutated = Boolean(state.hookSessions[String(ppid)]);
+      delete state.hookSessions[String(ppid)];
+
+      for (const l of Object.values(state.leases)) {
+        if (
+          l.state === "active" &&
+          (l.sessionId === fallbackPpidSession ||
+            (l.anchorPid === ppid && String(l.sessionId).startsWith("ppid-")))
+        ) {
+          if (resolvedId) {
+            l.sessionId = resolvedId;
+            mutated = true;
+          } else {
+            resolvedId = l.sessionId;
+          }
+        }
+      }
+      return { mutated, value: resolvedId };
+    },
+    { ppid },
+  );
 
   if (!targetSessionId) {
     return { exitCode: 0, freed: [] };

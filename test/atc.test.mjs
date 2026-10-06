@@ -33,7 +33,9 @@ import {
   parseCreatableProfilesOutput,
   checkResourceAdmission,
   deterministicCreatedAvdId,
+  discoverFleet,
 } from "../src/android.mjs";
+import { handleMcpRequest } from "../src/mcp.mjs";
 import {
   classifySegment,
   evaluateCommandGuard,
@@ -1052,6 +1054,94 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     });
     assert.equal(ambientId.sessionId, "codex-123");
     assert.equal(ambientId.anchorPid, null);
+
+    // MCP claim shares session identity with subsequent PreToolUse and Stop hooks
+    const mcpDir = makeTempStateDir();
+    try {
+      const mcpReply = handleMcpRequest(
+        mcpDir,
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "atc_claim",
+            arguments: { avd: "Pixel_8_API_35" },
+          },
+        },
+        {
+          ppid: process.pid,
+          env: {},
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [
+              {
+                deviceKey: "avd:Pixel_8_API_35",
+                avd: "Pixel_8_API_35",
+                serial: "emulator-5554",
+                kind: "emulator",
+                online: true,
+                profile: { deviceType: "phone", apiLevel: "android-35" },
+              },
+            ],
+            offline: [],
+            creatable: [],
+          },
+        }
+      );
+      const mcpBody = JSON.parse(mcpReply.result.content[0].text);
+      assert.equal(mcpBody.exitCode, 0);
+
+      const hookAfterMcp = handlePreToolUseHook(
+        mcpDir,
+        JSON.stringify({
+          session_id: "host-session-after-mcp",
+          tool_name: "Bash",
+          tool_input: { command: "adb -s emulator-5554 shell wm size" },
+        }),
+        { ppid: process.pid, runningCount: 1 }
+      );
+      assert.equal(hookAfterMcp.exitCode, 0);
+      assert.equal(readState(mcpDir).leases["avd:Pixel_8_API_35"].sessionId, "host-session-after-mcp");
+    } finally {
+      fs.rmSync(mcpDir, { recursive: true, force: true });
+    }
+
+    // Physical device property discovery via adb shell getprop
+    const fleetWithPhysical = discoverFleet({
+      avdHome,
+      runner: (cmd, args) => {
+        if (cmd === "adb" && args[0] === "devices") {
+          return {
+            status: 0,
+            stdout: "List of devices attached\nR58M123456A\tdevice\n",
+            stderr: "",
+          };
+        }
+        if (cmd === "adb" && args[0] === "-s" && args[1] === "R58M123456A" && args[3] === "getprop") {
+          return {
+            status: 0,
+            stdout: [
+              "[ro.build.version.sdk]: [35]",
+              "[ro.product.cpu.abi]: [arm64-v8a]",
+              "[ro.product.model]: [Pixel 8]",
+              "[ro.build.characteristics]: [nosdcard]",
+              "[ro.com.google.gmsversion]: [14_202405]",
+            ].join("\n"),
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    const physDev = fleetWithPhysical.running.find((d) => d.serial === "R58M123456A");
+    assert.ok(physDev);
+    assert.equal(physDev.profile.apiLevel, "android-35");
+    assert.equal(physDev.profile.abi, "arm64-v8a");
+    assert.equal(physDev.profile.services, "play");
+    assert.equal(physDev.profile.playStore, true);
+    assert.equal(matchesProfile(physDev, { kind: "physical", apiSpec: "35", play: true }), true);
+    assert.equal(matchesProfile(physDev, { kind: "physical", apiSpec: "36" }), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

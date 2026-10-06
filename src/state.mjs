@@ -324,6 +324,7 @@ export function parseApiNumber(apiStr) {
 
 export function matchesApiSpec(deviceApiLevel, apiSpec) {
   if (!apiSpec) return true;
+  if (!deviceApiLevel || deviceApiLevel === "unknown") return false;
   const spec = String(apiSpec).trim();
   const devNum = parseApiNumber(deviceApiLevel);
   if (devNum === null) {
@@ -378,10 +379,15 @@ export function matchesProfile(device, req = {}) {
       return false;
     }
   }
-  if (req.play === true && device.profile?.services !== "play" && !device.profile?.playStore) {
+  if (req.play === true && device.profile?.services !== "play" && device.profile?.playStore !== true) {
     return false;
   }
-  if (req.play === false && (device.profile?.services === "play" || device.profile?.playStore === true)) {
+  if (
+    req.play === false &&
+    (device.profile?.services === "play" ||
+      device.profile?.playStore === true ||
+      (device.profile?.services == null && device.profile?.playStore == null))
+  ) {
     return false;
   }
   if (req.abi && (device.profile?.abi || "").toLowerCase() !== req.abi.toLowerCase()) {
