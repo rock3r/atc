@@ -1,0 +1,38 @@
+{
+  "name": "android-traffic-control",
+  "version": "0.1.0",
+  "description": "Daemonless Android emulator and physical device leases, bounded-window warm-affinity wait queue, snapshots, and multi-agent guardrails around the official android CLI.",
+  "license": "Apache-2.0",
+  "author": "Sebastiano Poggi <me@sebastiano.dev>",
+  "homepage": "https://specs.sebastiano.dev/atc/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rock3r/atc.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "atc": "./bin/atc.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "skills/",
+    "extensions/",
+    "hooks/",
+    ".codex-plugin/",
+    ".cursor/",
+    ".claude-plugin/",
+    "hooks.json",
+    "plugin.json",
+    "DESIGN.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check bin/atc.mjs && node --test test/*.test.mjs"
+  }
+}
