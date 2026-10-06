@@ -1,0 +1,1371 @@
+import {
+  ResourceError,
+  checkResourceAdmission,
+  deterministicCreatedAvdId,
+  discoverFleet,
+  readHostResources,
+  readLocalAvdMetadata,
+  resolveAvdHome,
+} from "./android.mjs";
+import { evaluateCommandGuard } from "./guard.mjs";
+import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
+import { randomNonce, resolveStateDir, sleepSync } from "./lock.mjs";
+import { startMcpServer } from "./mcp.mjs";
+import { runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
+import {
+  DEFAULT_CONFIG,
+  canJumpAhead,
+  computeEffectiveMaxEmulators,
+  computeUsedEmulatorSlots,
+  isTicketStarvationProtected,
+  matchesProfile,
+  reconcileOfflineLeases,
+  resolveSessionIdentity,
+  withStateTransaction,
+} from "./state.mjs";
+
+export function parseCliArgs(argv) {
+  const args = [...argv];
+  const dashDashIdx = args.indexOf("--");
+  let restAfterDash = [];
+  let mainArgs = args;
+  if (dashDashIdx !== -1) {
+    mainArgs = args.slice(0, dashDashIdx);
+    restAfterDash = args.slice(dashDashIdx + 1);
+  }
+
+  const positionals = [];
+  const flags = {};
+
+  for (let i = 0; i < mainArgs.length; i++) {
+    const tok = mainArgs[i];
+    if (!tok.startsWith("-")) {
+      positionals.push(tok);
+      continue;
+    }
+    if (tok === "--play") {
+      flags.play = true;
+      continue;
+    }
+    if (tok === "--no-play") {
+      flags.play = false;
+      continue;
+    }
+    if (
+      [
+        "--create-if-missing",
+        "--wipe-data",
+        "--cold",
+        "--headless",
+        "--force",
+        "--stop",
+        "--json",
+        "--help",
+        "-h",
+      ].includes(tok)
+    ) {
+      const camel = tok
+        .replace(/^-+/, "")
+        .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      flags[camel] = true;
+      continue;
+    }
+    const eqIdx = tok.indexOf("=");
+    if (eqIdx !== -1) {
+      const key = tok
+        .slice(0, eqIdx)
+        .replace(/^-+/, "")
+        .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      flags[key] = tok.slice(eqIdx + 1);
+      continue;
+    }
+    const key = tok
+      .replace(/^-+/, "")
+      .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    if (i + 1 < mainArgs.length && !mainArgs[i + 1].startsWith("-")) {
+      flags[key] = mainArgs[++i];
+    } else {
+      flags[key] = true;
+    }
+  }
+
+  return {
+    subcommand: positionals[0] || "help",
+    positionals: positionals.slice(1),
+    flags,
+    restAfterDash,
+  };
+}
+
+function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
+  const def = cfg.defaultTtlSec ?? 600;
+  const max = cfg.maxTtlSec ?? 3600;
+  const n = rawTtl !== undefined ? Number(rawTtl) : def;
+  if (!Number.isFinite(n)) return def;
+  return Math.max(10, Math.min(max, Math.round(n)));
+}
+
+function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
+  const timer = setInterval(() => {
+    try {
+      withStateTransaction(stateDir, (state, { now }) => {
+        const lease = state.leases[deviceKey];
+        if (
+          lease &&
+          lease.leaseId === leaseId &&
+          lease.workerPid === process.pid &&
+          (lease.state === "starting" || lease.state === "stopping")
+        ) {
+          lease.deadlineMs = now + timeoutMs;
+          return { mutated: true };
+        }
+        return { mutated: false };
+      });
+    } catch {
+      // Best-effort heartbeat
+    }
+  }, 15_000);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  return timer;
+}
+
+export function selectCandidateUnderLock(state, inventory, req, callerTicket, now = Date.now()) {
+  const cfg = state.config || DEFAULT_CONFIG;
+  const effectiveMax = computeEffectiveMaxEmulators(cfg, inventory.host);
+  const usedSlots = computeUsedEmulatorSlots(state, inventory);
+
+  const earlierTickets = [];
+  for (const t of state.queue) {
+    if (callerTicket && t.ticketId === callerTicket.ticketId) break;
+    if (callerTicket && t.sessionId === callerTicket.sessionId) break;
+    earlierTickets.push(t);
+  }
+
+  const pseudoCandidateTicket = callerTicket || {
+    enqueuedAtMs: now,
+    requestedKind: req.kind || "emulator",
+    requestedAvd: req.avd || null,
+    requestedSerial: req.serial || null,
+    requestedProfile: req,
+  };
+
+  function isReservedForEarlierTicket(device, isColdOrEvict = false) {
+    for (const earlier of earlierTickets) {
+      if (isTicketStarvationProtected(earlier, now, cfg)) {
+        return true;
+      }
+      if (isColdOrEvict) {
+        return true;
+      }
+      if (!canJumpAhead(pseudoCandidateTicket, earlier, device, now, cfg)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Priority 1: Tier 0 Warm Idle Match
+  if (!req.wipeData && !req.coldBoot) {
+    const warmCandidates = (inventory.running || []).filter(
+      (d) => !state.leases[d.deviceKey] && matchesProfile(d, req),
+    );
+    for (const dev of warmCandidates) {
+      if (!isReservedForEarlierTicket(dev, false)) {
+        return {
+          priority: 1,
+          tier: 0,
+          candidate: dev,
+          needsWarmPrep: Boolean(req.snapshotLoad || req.resetApp),
+        };
+      }
+    }
+  }
+
+  // Physical devices only match in Tier 0
+  if (req.kind === "physical") {
+    return { priority: null, usedSlots, effectiveMax };
+  }
+
+  // Priority 2: Tier 1 Boot Into Free Slot (or reboot running match for wipeData/coldBoot)
+  const bootPool = [
+    ...(req.wipeData || req.coldBoot
+      ? (inventory.running || []).filter((d) => d.kind === "emulator")
+      : []),
+    ...(inventory.offline || []),
+  ].filter((d) => !state.leases[d.deviceKey] && matchesProfile(d, req));
+
+  let firstResourceErr = null;
+
+  for (const dev of bootPool) {
+    const slotAvailable = dev.online || usedSlots < effectiveMax;
+    if (!slotAvailable) continue;
+    if (isReservedForEarlierTicket(dev, true)) continue;
+    try {
+      checkResourceAdmission(dev, inventory.host, state, inventory, {
+        wipeOrCreate: Boolean(req.wipeData),
+        force: Boolean(req.force),
+        now,
+      });
+      return {
+        priority: 2,
+        tier: 1,
+        candidate: dev,
+      };
+    } catch (err) {
+      if (err instanceof ResourceError && !firstResourceErr) {
+        firstResourceErr = err;
+      }
+    }
+  }
+
+  // Priority 3: Tier 2 Evict Idle Running Emulator
+  if (cfg.autoStopIdleOnContention !== false && bootPool.length > 0) {
+    const idleRunningEmulators = (inventory.running || []).filter(
+      (d) =>
+        d.kind === "emulator" &&
+        !state.leases[d.deviceKey] &&
+        !isReservedForEarlierTicket(d, true),
+    );
+
+    for (const victim of idleRunningEmulators) {
+      for (const dev of bootPool) {
+        if (dev.deviceKey === victim.deviceKey) continue;
+        if (isReservedForEarlierTicket(dev, true)) continue;
+        try {
+          checkResourceAdmission(dev, inventory.host, state, inventory, {
+            replacingAvd: victim,
+            wipeOrCreate: Boolean(req.wipeData),
+            force: Boolean(req.force),
+            now,
+          });
+          return {
+            priority: 3,
+            tier: 2,
+            candidate: dev,
+            victim,
+          };
+        } catch (err) {
+          if (err instanceof ResourceError && !firstResourceErr) {
+            firstResourceErr = err;
+          }
+        }
+      }
+    }
+  }
+
+  // Priority 4: Auto-create missing AVD (--create-if-missing)
+  if (req.createIfMissing && bootPool.length === 0 && usedSlots < effectiveMax) {
+    const avdId = req.avd || deterministicCreatedAvdId(req);
+    const deviceKey = `avd:${avdId}`;
+    if (!state.leases[deviceKey] && !isReservedForEarlierTicket({ online: false }, true)) {
+      const syntheticCandidate = {
+        avd: avdId,
+        deviceKey,
+        kind: "emulator",
+        online: false,
+        ramSizeMb: 2048,
+        requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
+        dataDiskMb: 6656,
+        profile: {
+          deviceType: req.deviceType || "phone",
+          deviceName: req.deviceType || "pixel_9",
+          apiLevel: req.apiSpec ? `android-${String(req.apiSpec).replace(/\D/g, "") || "36"}` : "android-36",
+          services: req.services || (req.play === false ? "aosp" : "play"),
+          playStore: req.play !== false,
+          abi: req.abi || (process.arch === "arm64" ? "arm64-v8a" : "x86_64"),
+        },
+      };
+      try {
+        checkResourceAdmission(syntheticCandidate, inventory.host, state, inventory, {
+          wipeOrCreate: true,
+          force: Boolean(req.force),
+          now,
+        });
+        return {
+          priority: 4,
+          tier: 1,
+          candidate: syntheticCandidate,
+          createAvd: true,
+        };
+      } catch (err) {
+        if (err instanceof ResourceError && !firstResourceErr) {
+          firstResourceErr = err;
+        }
+      }
+    }
+  }
+
+  // Hard Resource Failure vs Queue Wait: if usedSlots === 0 and resource check failed
+  if (firstResourceErr && usedSlots === 0) {
+    throw firstResourceErr;
+  }
+
+  return { priority: null, usedSlots, effectiveMax };
+}
+
+export function cmdClaim(stateDir, flags = {}, options = {}) {
+  const runner = options.runner || runCommandSync;
+  const req = {
+    kind: flags.kind || (flags.serial && !String(flags.serial).startsWith("emulator-") ? "any" : "emulator"),
+    avd: flags.avd || null,
+    serial: flags.serial || null,
+    deviceType: flags.type || null,
+    apiSpec: flags.api ? String(flags.api) : null,
+    services: flags.services || null,
+    play: typeof flags.play === "boolean" ? flags.play : null,
+    abi: flags.abi || null,
+    createIfMissing: Boolean(flags.createIfMissing),
+    snapshotLoad: flags.snapshotLoad || null,
+    snapshotSaveOnFree: flags.snapshotSaveOnFree || null,
+    wipeData: Boolean(flags.wipeData),
+    coldBoot: Boolean(flags.cold),
+    resetApp: flags.resetApp || null,
+    headless: Boolean(flags.headless),
+    force: Boolean(flags.force),
+    reason: flags.reason || null,
+  };
+
+  let inventory = options.inventory || discoverFleet({ runner });
+  const waitSec = flags.wait !== undefined ? Number(flags.wait) : DEFAULT_CONFIG.defaultWaitSec;
+  const startWaitMs = Date.now();
+  let retainedTicketTiming = null;
+
+  while (true) {
+    let txOutcome;
+    try {
+      txOutcome = withStateTransaction(stateDir, (state, { now }) => {
+        const identity = resolveSessionIdentity({
+          flags,
+          env: options.env || process.env,
+          state,
+          cwd: options.cwd || process.cwd(),
+          ppid: options.ppid ?? process.ppid,
+        });
+        const ttlSec = clampTtlSec(flags.ttl, state.config);
+        const ttlMs = ttlSec * 1000;
+
+        reconcileOfflineLeases(state, inventory, identity.sessionId, now);
+
+        // Step 3: Idempotent Re-Claim (Same Session)
+        for (const lease of Object.values(state.leases)) {
+          if (
+            lease.state === "active" &&
+            lease.sessionId === identity.sessionId &&
+            matchesProfile(lease, req) &&
+            !req.wipeData &&
+            !req.coldBoot &&
+            (!req.snapshotLoad || lease.loadedSnapshot === req.snapshotLoad)
+          ) {
+            lease.renewedAtMs = now;
+            lease.expiresAtMs = now + ttlMs;
+            return {
+              mutated: true,
+              value: { status: "claimed_immediate", lease, idempotent: true },
+            };
+          }
+        }
+
+        const existingTicket = state.queue.find((t) => t.sessionId === identity.sessionId) || null;
+        const selection = selectCandidateUnderLock(state, inventory, req, existingTicket, now);
+
+        if (selection.priority === 1 && !selection.needsWarmPrep) {
+          const dev = selection.candidate;
+          const leaseId = `lease_${randomNonce().slice(0, 12)}`;
+          const lease = {
+            leaseId,
+            deviceKey: dev.deviceKey,
+            kind: dev.kind,
+            avd: dev.avd || null,
+            serial: dev.serial,
+            profile: dev.profile,
+            sessionId: identity.sessionId,
+            anchorPid: identity.anchorPid,
+            state: "active",
+            workerPid: null,
+            replacingAvd: null,
+            requiredRamMb: dev.requiredRamMb || 0,
+            loadedSnapshot: req.snapshotLoad || null,
+            saveSnapshotOnFree: req.snapshotSaveOnFree || null,
+            claimedAtMs: now,
+            activatedAtMs: now,
+            renewedAtMs: now,
+            expiresAtMs: now + ttlMs,
+            deadlineMs: null,
+            firstSeenOfflineAtMs: null,
+            reason: req.reason,
+          };
+          state.leases[dev.deviceKey] = lease;
+          state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+          return {
+            mutated: true,
+            value: { status: "claimed_immediate", lease, idempotent: false },
+          };
+        }
+
+        if (selection.priority !== null) {
+          const dev = selection.candidate;
+          const leaseId = `lease_${randomNonce().slice(0, 12)}`;
+          const bootTimeoutMs = (state.config.bootTimeoutSec || 180) * 1000;
+          const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
+          let victimLeaseId = null;
+
+          if (selection.victim) {
+            victimLeaseId = `lease_${randomNonce().slice(0, 12)}`;
+            state.leases[selection.victim.deviceKey] = {
+              leaseId: victimLeaseId,
+              deviceKey: selection.victim.deviceKey,
+              kind: "emulator",
+              avd: selection.victim.avd,
+              serial: selection.victim.serial,
+              profile: selection.victim.profile,
+              sessionId: identity.sessionId,
+              anchorPid: identity.anchorPid,
+              state: "stopping",
+              workerPid: process.pid,
+              replacingAvd: null,
+              requiredRamMb: selection.victim.requiredRamMb || 3072,
+              claimedAtMs: now,
+              deadlineMs: now + stopTimeoutMs,
+            };
+          }
+
+          const startingLease = {
+            leaseId,
+            deviceKey: dev.deviceKey,
+            kind: dev.kind,
+            avd: dev.avd,
+            serial: dev.serial || null,
+            profile: dev.profile,
+            sessionId: identity.sessionId,
+            anchorPid: identity.anchorPid,
+            state: "starting",
+            workerPid: process.pid,
+            replacingAvd: selection.victim ? selection.victim.avd : null,
+            requiredRamMb: dev.requiredRamMb || 3072,
+            loadedSnapshot: req.snapshotLoad || null,
+            saveSnapshotOnFree: req.snapshotSaveOnFree || null,
+            claimedAtMs: now,
+            activatedAtMs: null,
+            renewedAtMs: now,
+            expiresAtMs: now + ttlMs,
+            deadlineMs: now + bootTimeoutMs,
+            firstSeenOfflineAtMs: null,
+            reason: req.reason,
+          };
+          state.leases[dev.deviceKey] = startingLease;
+          state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+
+          return {
+            mutated: true,
+            value: {
+              status: "needs_boot_or_prep",
+              lease: startingLease,
+              selection,
+              victimLeaseId,
+              ttlMs,
+              bootTimeoutMs,
+            },
+          };
+        }
+
+        // No candidate available right now
+        if (waitSec <= 0) {
+          return {
+            mutated: false,
+            value: { status: "busy" },
+          };
+        }
+
+        const reorderWindowMs =
+          (flags.reorderWindow !== undefined
+            ? Number(flags.reorderWindow)
+            : state.config.reorderWindowSec || 120) * 1000;
+        const waitExpiresAtMs = startWaitMs + waitSec * 1000;
+        if (now >= waitExpiresAtMs) {
+          state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+          return {
+            mutated: true,
+            value: { status: "busy" },
+          };
+        }
+
+        let ticket = existingTicket;
+        if (!ticket) {
+          const enqueuedAtMs = retainedTicketTiming ? retainedTicketTiming.enqueuedAtMs : now;
+          const starvationDeadlineMs = retainedTicketTiming
+            ? retainedTicketTiming.starvationDeadlineMs
+            : enqueuedAtMs + reorderWindowMs;
+          ticket = {
+            ticketId: `q_${randomNonce().slice(0, 12)}`,
+            sessionId: identity.sessionId,
+            waiterPid: process.pid,
+            requestedKind: req.kind,
+            requestedAvd: req.avd,
+            requestedSerial: req.serial,
+            requestedProfile: req,
+            enqueuedAtMs,
+            starvationDeadlineMs,
+            lastHeartbeatAtMs: now,
+            waitExpiresAtMs,
+            reason: req.reason,
+          };
+          retainedTicketTiming = { enqueuedAtMs, starvationDeadlineMs };
+          state.queue.push(ticket);
+        } else {
+          ticket.lastHeartbeatAtMs = now;
+          ticket.waiterPid = process.pid;
+        }
+
+        return {
+          mutated: true,
+          value: { status: "queued", ticket },
+        };
+      });
+    } catch (err) {
+      if (err instanceof ResourceError) {
+        return { exitCode: err.exitCode, error: err.message };
+      }
+      return { exitCode: 1, error: err.message };
+    }
+
+    if (txOutcome.status === "claimed_immediate") {
+      return { exitCode: 0, lease: txOutcome.lease, idempotent: txOutcome.idempotent };
+    }
+
+    if (txOutcome.status === "busy") {
+      return {
+        exitCode: 2,
+        error: "No matching Android device is currently available (wait timeout reached).",
+      };
+    }
+
+    if (txOutcome.status === "needs_boot_or_prep") {
+      return executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner });
+    }
+
+    // Two-Stage Poll Loop (§5.3 Step 6)
+    let tick = 0;
+    while (true) {
+      sleepSync(900 + Math.floor(Math.random() * 200));
+      tick++;
+      const stageA = withStateTransaction(stateDir, (state, { now }) => {
+        const ticket = state.queue.find((t) => t.ticketId === txOutcome.ticket.ticketId);
+        if (ticket) {
+          ticket.lastHeartbeatAtMs = now;
+        }
+        const activeCount = Object.values(state.leases).length;
+        return {
+          mutated: Boolean(ticket),
+          value: { activeCount, expired: now >= txOutcome.ticket.waitExpiresAtMs },
+        };
+      });
+      if (stageA.expired) {
+        break;
+      }
+      if (tick % 5 === 0 || stageA.activeCount === 0) {
+        inventory = options.inventory || discoverFleet({ runner });
+        break;
+      }
+    }
+  }
+}
+
+function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
+  const { lease, selection, victimLeaseId, ttlMs, bootTimeoutMs } = txOutcome;
+  const candidate = selection.candidate;
+  const hbTimer = startWorkerDeadlineHeartbeat(
+    stateDir,
+    lease.deviceKey,
+    lease.leaseId,
+    bootTimeoutMs,
+  );
+
+  try {
+    // 1. Evict victim if replacingAvd is set
+    if (selection.victim) {
+      runner("android", ["emulator", "stop", selection.victim.serial || selection.victim.avd], {
+        strictInternal: true,
+      });
+      withStateTransaction(stateDir, (state) => {
+        const vLease = state.leases[selection.victim.deviceKey];
+        if (vLease && vLease.leaseId === victimLeaseId) {
+          delete state.leases[selection.victim.deviceKey];
+          return { mutated: true };
+        }
+        return { mutated: false };
+      });
+    }
+
+    // 2. Auto-create missing AVD if Priority 4
+    if (selection.createAvd) {
+      const createRes = runner(
+        "android",
+        ["emulator", "create", candidate.profile.deviceName, "--name", candidate.avd],
+        { strictInternal: true },
+      );
+      if (createRes.status !== 0) {
+        throw new Error(
+          `Failed to create AVD ${candidate.avd}: ${createRes.stderr || createRes.stdout}`,
+        );
+      }
+    }
+
+    let resolvedSerial = candidate.serial;
+
+    // 3. Warm state preparation vs Cold/Wipe boot
+    if (selection.priority === 1 && selection.needsWarmPrep) {
+      if (req.snapshotLoad) {
+        const snapRes = runner(
+          "adb",
+          ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
+          { strictInternal: true },
+        );
+        if (snapRes.status !== 0) {
+          throw new Error(`Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}`);
+        }
+      }
+      if (req.resetApp) {
+        runner("adb", ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp], {
+          strictInternal: true,
+        });
+      }
+    } else {
+      if (candidate.online && (req.wipeData || req.coldBoot)) {
+        runner("android", ["emulator", "stop", candidate.serial || candidate.avd], {
+          strictInternal: true,
+        });
+      }
+      const startArgs = ["emulator", "start", candidate.avd];
+      if (req.headless) startArgs.push("--headless");
+      if (req.coldBoot) startArgs.push("--cold");
+      if (req.wipeData) startArgs.push("--wipe-data");
+      if (req.snapshotLoad) startArgs.push(`--snapshot=${req.snapshotLoad}`);
+
+      const bootRes = runner("android", startArgs, {
+        strictInternal: true,
+        timeoutMs: bootTimeoutMs,
+      });
+      if (bootRes.status !== 0) {
+        throw new Error(
+          `Failed to boot emulator ${candidate.avd}: ${bootRes.stderr || bootRes.stdout}`,
+        );
+      }
+
+      const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
+      resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial || "emulator-5554";
+
+      if (req.resetApp) {
+        runner("adb", ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp], {
+          strictInternal: true,
+        });
+      }
+    }
+
+    clearInterval(hbTimer);
+
+    // 4. Activate lease under atc.lock
+    const activeLease = withStateTransaction(stateDir, (state, { now }) => {
+      const current = state.leases[lease.deviceKey];
+      if (!current || current.leaseId !== lease.leaseId) {
+        throw new Error(`Lease reservation ${lease.leaseId} was lost during boot`);
+      }
+      current.state = "active";
+      current.workerPid = null;
+      current.replacingAvd = null;
+      current.serial = resolvedSerial;
+      current.activatedAtMs = now;
+      current.renewedAtMs = now;
+      current.expiresAtMs = now + ttlMs;
+      current.deadlineMs = null;
+      return { mutated: true, value: current };
+    });
+
+    return { exitCode: 0, lease: activeLease, idempotent: false };
+  } catch (err) {
+    clearInterval(hbTimer);
+    withStateTransaction(stateDir, (state) => {
+      const current = state.leases[lease.deviceKey];
+      if (current && current.leaseId === lease.leaseId) {
+        delete state.leases[lease.deviceKey];
+      }
+      if (selection.victim) {
+        const vCurrent = state.leases[selection.victim.deviceKey];
+        if (vCurrent && vCurrent.leaseId === victimLeaseId) {
+          delete state.leases[selection.victim.deviceKey];
+        }
+      }
+      return { mutated: true };
+    });
+    return { exitCode: 1, error: err.message };
+  }
+}
+
+export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
+  const runner = options.runner || runCommandSync;
+  const avdHome = options.avdHome || resolveAvdHome();
+
+  // Pre-lock disk check if snapshot save is requested on free
+  let hostSnapshot = null;
+  if (flags.snapshotSave && !flags.force) {
+    hostSnapshot = options.host || readHostResources(avdHome);
+  }
+
+  let outcome;
+  try {
+    outcome = withStateTransaction(stateDir, (state, { now }) => {
+      const identity = resolveSessionIdentity({
+        flags,
+        env: options.env || process.env,
+        state,
+        cwd: options.cwd || process.cwd(),
+        ppid: options.ppid ?? process.ppid,
+      });
+
+      const matches = [];
+      const leasesList = Object.values(state.leases);
+      if (target) {
+        const byId = leasesList.find((l) => l.leaseId === target);
+        const bySerial = !byId && leasesList.find((l) => l.serial === target);
+        const byAvd = !byId && !bySerial && leasesList.find((l) => l.avd === target);
+        const found = byId || bySerial || byAvd;
+        if (!found) {
+          return { mutated: false, value: { status: "not_found", freed: [] } };
+        }
+        const isOwner =
+          found.sessionId === identity.sessionId ||
+          found.leaseId === target ||
+          Boolean(flags.force);
+        if (!isOwner) {
+          return {
+            mutated: false,
+            value: {
+              status: "forbidden",
+              error: `Lease ${found.leaseId} (${found.deviceKey}) is owned by session "${found.sessionId}", not "${identity.sessionId}".`,
+            },
+          };
+        }
+        matches.push(found);
+      } else {
+        for (const l of leasesList) {
+          if (l.sessionId === identity.sessionId && l.state === "active") {
+            matches.push(l);
+          }
+        }
+      }
+
+      if (matches.length === 0) {
+        return { mutated: false, value: { status: "empty", freed: [] } };
+      }
+
+      const stoppingQueue = [];
+      const freedImmediate = [];
+      const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
+
+      for (const lease of matches) {
+        const saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree || null;
+        const loadSnap = flags.snapshotLoad || null;
+        const doStop = Boolean(flags.stop) && lease.kind === "emulator";
+
+        if (saveSnap && !flags.force && lease.kind === "emulator") {
+          const host = hostSnapshot || readHostResources(avdHome);
+          const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
+          if (host.freeDiskMb < meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)) {
+            throw new ResourceError(
+              5,
+              `Insufficient disk space to save snapshot "${saveSnap}" on ${lease.avd}: needs ${meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)}MB free.`,
+            );
+          }
+        }
+
+        if ((saveSnap || loadSnap || doStop) && lease.kind === "emulator") {
+          lease.state = "stopping";
+          lease.workerPid = process.pid;
+          lease.deadlineMs = now + stopTimeoutMs;
+          stoppingQueue.push({
+            lease: { ...lease },
+            saveSnap,
+            loadSnap,
+            doStop,
+            stopTimeoutMs,
+          });
+        } else {
+          freedImmediate.push(lease.leaseId);
+          delete state.leases[lease.deviceKey];
+        }
+      }
+
+      return {
+        mutated: true,
+        value: {
+          status: "ok",
+          freedImmediate,
+          stoppingQueue,
+        },
+      };
+    });
+  } catch (err) {
+    if (err instanceof ResourceError) {
+      return { exitCode: err.exitCode, error: err.message };
+    }
+    return { exitCode: 1, error: err.message };
+  }
+
+  if (outcome.status === "forbidden") {
+    return { exitCode: 3, error: outcome.error };
+  }
+
+  const allFreed = [...(outcome.freedImmediate || [])];
+  for (const item of outcome.stoppingQueue || []) {
+    const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
+    const hb = startWorkerDeadlineHeartbeat(
+      stateDir,
+      lease.deviceKey,
+      lease.leaseId,
+      stopTimeoutMs,
+    );
+    try {
+      if (saveSnap && lease.serial) {
+        runner("adb", ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap], {
+          strictInternal: true,
+        });
+      }
+      if (loadSnap && !doStop && lease.serial) {
+        runner("adb", ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap], {
+          strictInternal: true,
+        });
+      }
+      if (doStop) {
+        runner("android", ["emulator", "stop", lease.serial || lease.avd], {
+          strictInternal: true,
+        });
+      }
+    } finally {
+      clearInterval(hb);
+      withStateTransaction(stateDir, (state) => {
+        const cur = state.leases[lease.deviceKey];
+        if (cur && cur.leaseId === lease.leaseId) {
+          delete state.leases[lease.deviceKey];
+          return { mutated: true };
+        }
+        return { mutated: false };
+      });
+      allFreed.push(lease.leaseId);
+    }
+  }
+
+  return { exitCode: 0, freed: allFreed };
+}
+
+export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
+  return withStateTransaction(stateDir, (state, { now }) => {
+    const identity = resolveSessionIdentity({
+      flags,
+      env: options.env || process.env,
+      state,
+      cwd: options.cwd || process.cwd(),
+      ppid: options.ppid ?? process.ppid,
+    });
+    const ttlSec = clampTtlSec(flags.ttl, state.config);
+    const ttlMs = ttlSec * 1000;
+
+    const leasesList = Object.values(state.leases).filter((l) => l.state === "active");
+    let lease = null;
+    if (target) {
+      lease =
+        leasesList.find((l) => l.leaseId === target) ||
+        leasesList.find((l) => l.serial === target) ||
+        leasesList.find((l) => l.avd === target);
+    } else {
+      lease = leasesList.find((l) => l.sessionId === identity.sessionId) || null;
+    }
+
+    if (!lease) {
+      return {
+        mutated: false,
+        value: { exitCode: 3, error: "No matching active lease found to renew." },
+      };
+    }
+    if (lease.sessionId !== identity.sessionId && lease.leaseId !== target) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Lease ${lease.leaseId} is owned by "${lease.sessionId}", not "${identity.sessionId}".`,
+        },
+      };
+    }
+
+    lease.renewedAtMs = now;
+    lease.expiresAtMs = now + ttlMs;
+    return {
+      mutated: true,
+      value: { exitCode: 0, lease },
+    };
+  });
+}
+
+export function cmdSnapshot(stateDir, action, name = null, flags = {}, options = {}) {
+  const runner = options.runner || runCommandSync;
+  const avdHome = options.avdHome || resolveAvdHome();
+
+  if (action === "list") {
+    const targetAvd = flags.avd || null;
+    if (targetAvd) {
+      const meta = readLocalAvdMetadata(targetAvd, avdHome);
+      return { exitCode: 0, snapshots: meta.snapshots };
+    }
+    const fleet = options.inventory || discoverFleet({ avdHome, runner });
+    const byAvd = {};
+    for (const d of [...fleet.running, ...fleet.offline]) {
+      if (d.kind === "emulator" && d.avd) {
+        byAvd[d.avd] = d.snapshots || [];
+      }
+    }
+    return { exitCode: 0, snapshots: byAvd };
+  }
+
+  if (!["save", "load", "delete"].includes(action)) {
+    return {
+      exitCode: 1,
+      error: `Unknown snapshot action "${action}". Expected list, save, load, or delete.`,
+    };
+  }
+
+  if (!name || !/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    return {
+      exitCode: 1,
+      error: `Invalid snapshot name "${name}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+    };
+  }
+
+  if (action === "save" && !flags.force) {
+    const host = options.host || readHostResources(avdHome);
+    if (host.freeDiskMb < 4096) {
+      return {
+        exitCode: 5,
+        error: `Insufficient disk space (${host.freeDiskMb}MB free) to save snapshot "${name}". Pass --force to bypass.`,
+      };
+    }
+  }
+
+  const leaseCheck = withStateTransaction(stateDir, (state, { now }) => {
+    const identity = resolveSessionIdentity({
+      flags,
+      env: options.env || process.env,
+      state,
+      cwd: options.cwd || process.cwd(),
+      ppid: options.ppid ?? process.ppid,
+    });
+    const owned = Object.values(state.leases).filter(
+      (l) =>
+        l.state === "active" &&
+        l.kind === "emulator" &&
+        l.sessionId === identity.sessionId &&
+        (!flags.serial || l.serial === flags.serial) &&
+        (!flags.avd || l.avd === flags.avd),
+    );
+    if (owned.length === 0) {
+      return {
+        mutated: false,
+        value: { exitCode: 3, error: `Session "${identity.sessionId}" holds no active emulator lease.` },
+      };
+    }
+    const lease = owned[0];
+    const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
+    lease.renewedAtMs = now;
+    lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+    if (action === "load") {
+      lease.loadedSnapshot = name;
+    }
+    return { mutated: true, value: { exitCode: 0, lease } };
+  });
+
+  if (leaseCheck.exitCode !== 0) {
+    return leaseCheck;
+  }
+
+  const res = runner(
+    "adb",
+    ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", action, name],
+    { strictInternal: true },
+  );
+  if (res.status !== 0) {
+    return {
+      exitCode: 1,
+      error: `adb snapshot ${action} "${name}" failed: ${res.stderr || res.stdout}`,
+    };
+  }
+  return { exitCode: 0, lease: leaseCheck.lease, snapshot: name, action };
+}
+
+export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
+  if (!commandArgs || commandArgs.length === 0) {
+    return { exitCode: 1, error: "Usage: atc exec [--serial <serial>] -- <command> [args...]" };
+  }
+
+  const check = withStateTransaction(stateDir, (state, { now }) => {
+    const identity = resolveSessionIdentity({
+      flags,
+      env: options.env || process.env,
+      state,
+      cwd: options.cwd || process.cwd(),
+      ppid: options.ppid ?? process.ppid,
+    });
+    const owned = Object.values(state.leases).filter(
+      (l) =>
+        l.state === "active" &&
+        l.sessionId === identity.sessionId &&
+        (!flags.serial || l.serial === flags.serial),
+    );
+    if (owned.length === 0) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Session "${identity.sessionId}" holds no active device lease. Run "atc claim" first.`,
+        },
+      };
+    }
+    if (owned.length > 1 && !flags.serial) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Session "${identity.sessionId}" holds multiple active leases; pass --serial <serial>.`,
+        },
+      };
+    }
+    const lease = owned[0];
+    const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
+    lease.renewedAtMs = now;
+    lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+    return {
+      mutated: true,
+      value: {
+        exitCode: 0,
+        lease,
+        sessionId: identity.sessionId,
+        ttlMs,
+      },
+    };
+  });
+
+  if (check.exitCode !== 0) {
+    return check;
+  }
+
+  const [cmd, ...args] = commandArgs;
+  const heartbeatIntervalMs = Math.min(60_000, Math.max(1000, Math.floor(check.ttlMs / 3)));
+  const onHeartbeat = () => {
+    withStateTransaction(stateDir, (state, { now }) => {
+      const cur = state.leases[check.lease.deviceKey];
+      if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+        cur.renewedAtMs = now;
+        cur.expiresAtMs = now + check.ttlMs;
+        return { mutated: true };
+      }
+      return { mutated: false };
+    });
+  };
+
+  const exitCode = await spawnWithHeartbeat(
+    cmd,
+    args,
+    check.lease,
+    check.sessionId,
+    onHeartbeat,
+    {
+      ...options,
+      heartbeatIntervalMs,
+    },
+  );
+  return { exitCode };
+}
+
+export function cmdStatus(stateDir, flags = {}, options = {}) {
+  const runner = options.runner || runCommandSync;
+  const inventory = options.inventory || discoverFleet({ runner });
+  const req = {
+    kind: flags.kind || "any",
+    deviceType: flags.type || null,
+    apiSpec: flags.api ? String(flags.api) : null,
+    services: flags.services || null,
+    play: typeof flags.play === "boolean" ? flags.play : null,
+    abi: flags.abi || null,
+  };
+
+  return withStateTransaction(stateDir, (state) => {
+    const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
+    const usedSlots = computeUsedEmulatorSlots(state, inventory);
+    const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
+    const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
+
+    return {
+      mutated: true,
+      value: {
+        exitCode: 0,
+        hostCapacity: {
+          ...inventory.host,
+          usedSlots,
+          effectiveMaxEmulators,
+          minFreeRamMb: state.config.minFreeRamMb,
+          minFreeDiskMb: state.config.minFreeDiskMb,
+        },
+        fleet: {
+          running,
+          offline,
+          creatable: inventory.creatable || [],
+        },
+        leases: state.leases,
+        queue: state.queue,
+        config: state.config,
+      },
+    };
+  });
+}
+
+export function cmdConfig(stateDir, action, key = null, val = null) {
+  return withStateTransaction(stateDir, (state) => {
+    if (!action || action === "get") {
+      if (!key) {
+        return { mutated: false, value: { exitCode: 0, config: state.config } };
+      }
+      return { mutated: false, value: { exitCode: 0, key, value: state.config[key] } };
+    }
+    if (action === "set") {
+      if (!key || !(key in DEFAULT_CONFIG)) {
+        return {
+          mutated: false,
+          value: { exitCode: 1, error: `Unknown config key "${key}".` },
+        };
+      }
+      let parsedVal = val;
+      if (key === "maxRunningEmulators") {
+        if (val === "auto") {
+          parsedVal = "auto";
+        } else if (/^\d+$/.test(String(val)) && Number(val) >= 1) {
+          parsedVal = Number(val);
+        } else {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: 'maxRunningEmulators must be "auto" or an integer >= 1.',
+            },
+          };
+        }
+      } else if (typeof DEFAULT_CONFIG[key] === "number") {
+        const n = Number(val);
+        if (!Number.isFinite(n) || n < 0) {
+          return {
+            mutated: false,
+            value: { exitCode: 1, error: `Config key "${key}" requires a non-negative number.` },
+          };
+        }
+        parsedVal = Math.round(n);
+      } else if (typeof DEFAULT_CONFIG[key] === "boolean") {
+        parsedVal = String(val).toLowerCase() === "true" || String(val) === "1";
+      }
+      state.config[key] = parsedVal;
+      return { mutated: true, value: { exitCode: 0, key, value: parsedVal } };
+    }
+    return {
+      mutated: false,
+      value: { exitCode: 1, error: `Unknown config action "${action}". Use get or set.` },
+    };
+  });
+}
+
+export function cmdGc(stateDir) {
+  return withStateTransaction(stateDir, (_state, { pruned }) => {
+    return { mutated: true, value: { exitCode: 0, pruned } };
+  });
+}
+
+export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
+  const evalRes = withStateTransaction(stateDir, (state) => {
+    const identity = resolveSessionIdentity({
+      flags,
+      env: options.env || process.env,
+      state,
+      cwd: options.cwd || process.cwd(),
+      ppid: options.ppid ?? process.ppid,
+    });
+    const activeLeases = Object.values(state.leases).filter(
+      (l) => l.state === "active" && l.sessionId === identity.sessionId,
+    );
+    const guard = evaluateCommandGuard(commandStr, {
+      sessionId: identity.sessionId,
+      anchorPid: identity.anchorPid,
+      activeLeases,
+      runningCount: options.runningCount ?? activeLeases.length,
+    });
+    return { mutated: false, value: guard };
+  });
+
+  return {
+    exitCode: evalRes.allowed ? 0 : 2,
+    ...evalRes,
+  };
+}
+
+export async function runCli(argv = process.argv.slice(2), env = process.env) {
+  const parsed = parseCliArgs(argv);
+  const stateDir = resolveStateDir(env.ATC_STATE_DIR);
+
+  switch (parsed.subcommand) {
+    case "claim": {
+      const res = cmdClaim(stateDir, parsed.flags, { env });
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
+      if (parsed.flags.json) {
+        process.stdout.write(JSON.stringify(res.lease, null, 2) + "\n");
+      } else {
+        const l = res.lease;
+        process.stdout.write(
+          `✓ Claimed ${l.avd || l.serial} (${l.serial})\n` +
+            `  lease:   ${l.leaseId} · profile: ${l.profile?.deviceType || l.kind} / ${l.profile?.apiLevel || "physical"}\n` +
+            `  session: ${l.sessionId}\n`,
+        );
+      }
+      return 0;
+    }
+
+    case "free": {
+      const res = cmdFree(stateDir, parsed.positionals[0] || null, parsed.flags, { env });
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
+      if (parsed.flags.json) {
+        process.stdout.write(JSON.stringify({ freed: res.freed }, null, 2) + "\n");
+      } else {
+        process.stdout.write(
+          res.freed.length > 0
+            ? `✓ Freed lease(s): ${res.freed.join(", ")}\n`
+            : `✓ No active leases to free.\n`,
+        );
+      }
+      return 0;
+    }
+
+    case "renew": {
+      const res = cmdRenew(stateDir, parsed.positionals[0] || null, parsed.flags, { env });
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
+      process.stdout.write(`✓ Renewed ${res.lease.leaseId} (${res.lease.serial})\n`);
+      return 0;
+    }
+
+    case "snapshot": {
+      const [action, name] = parsed.positionals;
+      const res = cmdSnapshot(stateDir, action, name, parsed.flags, { env });
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
+      process.stdout.write(JSON.stringify(res.snapshots ?? res, null, 2) + "\n");
+      return 0;
+    }
+
+    case "exec": {
+      const cmdTokens =
+        parsed.restAfterDash.length > 0 ? parsed.restAfterDash : parsed.positionals;
+      const res = await cmdExec(stateDir, cmdTokens, parsed.flags, { env });
+      if (res.error) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+      }
+      return res.exitCode;
+    }
+
+    case "status": {
+      const res = cmdStatus(stateDir, parsed.flags, { env });
+      if (parsed.flags.json) {
+        process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+      } else {
+        const hc = res.hostCapacity;
+        process.stdout.write(
+          `Host Capacity: ${hc.availableRamMb} MB RAM avail · ${hc.freeDiskMb} MB disk free · slots: ${hc.usedSlots}/${hc.effectiveMaxEmulators} used\n`,
+        );
+        process.stdout.write(`  Running (${res.fleet.running.length}): ${res.fleet.running.map((d) => `${d.avd || d.serial} (${d.serial})`).join(", ") || "none"}\n`);
+        process.stdout.write(`  Offline (${res.fleet.offline.length}): ${res.fleet.offline.map((d) => d.avd).join(", ") || "none"}\n`);
+        process.stdout.write(`  Leases  (${Object.keys(res.leases).length}): ${Object.keys(res.leases).join(", ") || "none"}\n`);
+        process.stdout.write(`  Queue   (${res.queue.length}): ${res.queue.map((q) => q.ticketId).join(", ") || "none"}\n`);
+      }
+      return 0;
+    }
+
+    case "config": {
+      const [action, key, val] = parsed.positionals;
+      const res = cmdConfig(stateDir, action, key, val);
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
+      process.stdout.write(JSON.stringify(res.config ?? { [res.key]: res.value }, null, 2) + "\n");
+      return 0;
+    }
+
+    case "gc": {
+      const res = cmdGc(stateDir);
+      process.stdout.write(JSON.stringify(res.pruned, null, 2) + "\n");
+      return 0;
+    }
+
+    case "guard": {
+      const cmdStr = parsed.positionals.join(" ");
+      const res = cmdGuard(stateDir, cmdStr, parsed.flags, { env });
+      if (parsed.flags.format === "json" || parsed.flags.json) {
+        process.stdout.write(JSON.stringify(res) + "\n");
+      } else if (!res.allowed) {
+        process.stderr.write(`${res.reason}\n`);
+      } else if (res.rewrittenCommand) {
+        process.stdout.write(`${res.rewrittenCommand}\n`);
+      }
+      return res.exitCode;
+    }
+
+    case "hook": {
+      const hookType = parsed.positionals[0] || "pre-tool-use";
+      const rawStdin = readStdinSync();
+      if (hookType === "stop" || hookType === "session-end") {
+        const res = handleStopHook(stateDir, rawStdin);
+        return res.exitCode;
+      }
+      const res = handlePreToolUseHook(stateDir, rawStdin);
+      if (res.stderr) process.stderr.write(res.stderr);
+      if (res.stdout) process.stdout.write(res.stdout);
+      return res.exitCode;
+    }
+
+    case "mcp": {
+      await startMcpServer(stateDir);
+      return 0;
+    }
+
+    default: {
+      process.stdout.write(
+        `Android Traffic Control (atc)\n\n` +
+          `Usage:\n` +
+          `  atc claim [--type <type>] [--api <spec>] [--play|--no-play] [--snapshot-load <name>] [--ttl <sec>] [--wait <sec>]\n` +
+          `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
+          `  atc renew [<target>] [--ttl <sec>]\n` +
+          `  atc snapshot <list|save|load|delete> [<name>]\n` +
+          `  atc exec -- <command> [args...]\n` +
+          `  atc status [--type <type>] [--api <spec>] [--json]\n` +
+          `  atc config <get|set> [key] [val]\n` +
+          `  atc gc\n` +
+          `  atc guard [--format=json] <command>\n` +
+          `  atc hook <pre-tool-use|stop>\n` +
+          `  atc mcp\n`,
+      );
+      return 0;
+    }
+  }
+}

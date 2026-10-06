@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|run_command|shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "atc hook PreToolUse"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "atc hook Stop"
+          }
+        ]
+      }
+    ]
+  }
+}

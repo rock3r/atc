@@ -1,0 +1,13 @@
+{
+  "name": "atc-marketplace",
+  "owner": {
+    "name": "Sebastiano Poggi"
+  },
+  "plugins": [
+    {
+      "name": "atc",
+      "source": "./",
+      "description": "Android Traffic Control — multi-agent Android emulator and device coordinator"
+    }
+  ]
+}

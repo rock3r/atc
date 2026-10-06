@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "atc hook PreToolUse"
+      }
+    ],
+    "stop": [
+      {
+        "command": "atc hook Stop"
+      }
+    ]
+  }
+}
