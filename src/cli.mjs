@@ -928,7 +928,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
       resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
-      const pollDeadline = Date.now() + Math.min(bootTimeoutMs, 60_000);
+      const pollDeadline = Date.now() + bootTimeoutMs;
       while (!resolvedSerial) {
         const refreshed = discoverFleet({ runner, avdHome });
         const booted = (refreshed.running || []).find(
@@ -1000,8 +1000,18 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     victimHbTimer?.stop();
     if (bootedNewEmulator) {
       try {
-        if (isWin && resolvedSerial) {
-          runner("adb", ["-s", resolvedSerial, "emu", "kill"], { strictInternal: true });
+        if (isWin) {
+          let cleanupSerial = resolvedSerial;
+          if (!cleanupSerial) {
+            const refreshed = discoverFleet({ runner, avdHome });
+            const booted = (refreshed.running || []).find(
+              (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
+            );
+            cleanupSerial = booted?.serial || null;
+          }
+          if (cleanupSerial) {
+            runner("adb", ["-s", cleanupSerial, "emu", "kill"], { strictInternal: true });
+          }
         } else {
           runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
             strictInternal: true,
@@ -1514,6 +1524,18 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }
     const lease = owned[0];
     const [cmd, ...args] = commandArgs;
+    const wrappedClass = classifySegment(
+      [cmd, ...args].map((a) => (/\s/.test(String(a)) ? JSON.stringify(String(a)) : String(a))).join(" "),
+    );
+    if (wrappedClass.kind === "deny_lifecycle") {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: wrappedClass.reason,
+        },
+      };
+    }
     try {
       buildChildInvocation(cmd, args, lease, identity.sessionId, options.env);
     } catch (err) {

@@ -58,6 +58,8 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "jq",
   "true",
   "false",
+  "which",
+  "type",
 ]);
 
 const READ_ONLY_ANDROID_SUBCOMMANDS = new Set([
@@ -93,9 +95,19 @@ export function hasAndroidOrAtcTokens(command) {
 
 export function splitShellSegments(command) {
   if (!command || typeof command !== "string") return [];
-  const normalized = command
-    .replace(/(?:\$|<|>)\(([^)]+)\)/g, " ; $1 ; ")
-    .replace(/`([^`]+)`/g, " ; $1 ; ");
+  const innerSubstitutions = [];
+  const replaceSub = (_full, inner) => {
+    innerSubstitutions.push(inner);
+    const tokenMatch = String(inner).match(FAST_PATH_REGEX);
+    return tokenMatch ? tokenMatch[1] : "";
+  };
+  const inlineExpanded = command
+    .replace(/(?:\$|<|>)\(([^)]+)\)/g, replaceSub)
+    .replace(/`([^`]+)`/g, replaceSub);
+  const normalized =
+    innerSubstitutions.length > 0
+      ? `${inlineExpanded} ; ${innerSubstitutions.join(" ; ")}`
+      : inlineExpanded;
   const clauses = normalized
     .split(/(?:&&|\|\||[;\n&])+/)
     .map((s) => s.trim())
@@ -174,9 +186,16 @@ export function parseSegment(segment, inheritedVars = {}) {
       continue;
     }
     const base = path.basename(tok, path.extname(tok)).toLowerCase();
+    if (base === "command" && (tokens[idx + 1] === "-v" || tokens[idx + 1] === "-V")) {
+      break;
+    }
     if (TRANSPARENT_WRAPPERS.has(base)) {
       idx++;
-      if (base === "timeout" && idx < tokens.length && /^\d+[smhd]?$/.test(tokens[idx])) {
+      if (base === "command") {
+        while (idx < tokens.length && (tokens[idx] === "-p" || tokens[idx] === "--")) {
+          idx++;
+        }
+      } else if (base === "timeout" && idx < tokens.length && /^\d+[smhd]?$/.test(tokens[idx])) {
         idx++;
       } else if (base === "sudo") {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
@@ -251,7 +270,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   const { baseCmd, args } = parsed;
   const effectiveSegment = parsed.raw || segment;
 
-  if (!baseCmd) {
+  if (!baseCmd || (baseCmd === "command" && (args[0] === "-v" || args[0] === "-V"))) {
     return { kind: "ignore", parsed };
   }
 

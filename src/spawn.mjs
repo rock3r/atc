@@ -131,6 +131,48 @@ export function runCommandSync(command, args = [], options = {}) {
 
 export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
+  if (base === "emulator") {
+    if (!args.includes("-list-avds") && !args.includes("-version") && !args.includes("-help")) {
+      throw new Error(
+        'Direct emulator launch is disabled under ATC. Use "atc claim --type <type> --api <api>" instead.',
+      );
+    }
+  } else if (base === "android" && args[0] === "emulator") {
+    const emuAction = args[1] || "";
+    if (
+      ["start", "stop", "remove", "create"].includes(emuAction) &&
+      !(emuAction === "create" && args.includes("--list-profiles"))
+    ) {
+      throw new Error(
+        `Direct "android emulator ${emuAction}" is disabled under ATC. Use "atc claim" or "atc free --stop" instead.`,
+      );
+    }
+  } else if (base === "adb") {
+    let subIdx = 0;
+    while (subIdx < args.length) {
+      const a = String(args[subIdx]);
+      if (a === "-s" || a === "-t" || a === "-H" || a === "-P") {
+        subIdx += 2;
+      } else if (a.startsWith("-")) {
+        subIdx += 1;
+      } else {
+        break;
+      }
+    }
+    const adbSub = String(args[subIdx] || "");
+    const adbRest = args.slice(subIdx + 1).map(String);
+    if (adbSub === "kill-server") {
+      throw new Error(
+        'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
+      );
+    }
+    if (adbSub === "emu" && adbRest[0] === "kill") {
+      throw new Error(
+        'Direct "adb emu kill" is disabled under ATC. Use "atc free --stop" instead.',
+      );
+    }
+  }
+
   if (base === "adb" || base === "android") {
     for (let i = 0; i < args.length; i++) {
       const a = String(args[i]);

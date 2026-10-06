@@ -1300,6 +1300,28 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.deepEqual(nodeInv.args, ["tool.mjs", "-s", "smoke"]);
 
+      // Lifecycle commands inside buildChildInvocation are rejected
+      assert.throws(
+        () =>
+          buildChildInvocation(
+            "adb",
+            ["kill-server"],
+            { serial: "emulator-5554", leaseId: "lease-1" },
+            "sess-1"
+          ),
+        /adb kill-server/
+      );
+
+      // Executable command substitutions preserve outer arguments in guard
+      const cmdSubExecGuard = evaluateCommandGuard(
+        "$(command -v adb) shell pm clear com.example",
+        {
+          sessionId: "sess-unleased",
+          activeLeases: [],
+        }
+      );
+      assert.equal(cmdSubExecGuard.allowed, false);
+
       // computeUsedEmulatorSlots counts active emulator leases during transient inventory gaps
       assert.equal(
         computeUsedEmulatorSlots(
