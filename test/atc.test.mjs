@@ -34,6 +34,7 @@ import {
   checkResourceAdmission,
   deterministicCreatedAvdId,
   discoverFleet,
+  resolveAvdHome,
 } from "../src/android.mjs";
 import { handleMcpRequest } from "../src/mcp.mjs";
 import {
@@ -42,7 +43,7 @@ import {
   splitShellSegments,
 } from "../src/guard.mjs";
 import { handlePreToolUseHook, handleStopHook } from "../src/hook.mjs";
-import { buildChildInvocation } from "../src/spawn.mjs";
+import { buildChildInvocation, resolveExecutable } from "../src/spawn.mjs";
 import {
   cmdClaim,
   cmdFree,
@@ -1542,6 +1543,38 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         schedNow,
       );
       assert.equal(blockedOffline.priority, null);
+
+      // env -i ANDROID_SERIAL=... selector is parsed and rejected when conflicting
+      const envIgnoreGuard = evaluateCommandGuard(
+        "env -i ANDROID_SERIAL=emulator-5556 adb shell pm clear com.example",
+        {
+          sessionId: "sess-1",
+          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+        }
+      );
+      assert.equal(envIgnoreGuard.allowed, false);
+      const envIgnoreExec = await cmdExec(
+        winDir,
+        ["env", "-i", "ANDROID_SERIAL=emulator-5556", "adb", "shell", "pm", "clear", "com.example"],
+        { session: "exec-wrap-sess" }
+      );
+      assert.equal(envIgnoreExec.exitCode, 3);
+
+      // resolveAvdHome honors ANDROID_USER_HOME and ANDROID_EMULATOR_HOME
+      assert.equal(resolveAvdHome({ ANDROID_USER_HOME: "/custom/user" }), path.join("/custom/user", "avd"));
+      assert.equal(
+        resolveAvdHome({ ANDROID_EMULATOR_HOME: "/custom/emu" }),
+        path.join("/custom/emu", "avd")
+      );
+
+      // resolveExecutable finds project-local gradlew.bat on win32
+      fs.writeFileSync(path.join(winDir, "gradlew.bat"), "@echo off\r\n", "utf8");
+      const resolvedLocalBare = resolveExecutable("gradlew", { PATH: "" }, winDir, "win32");
+      assert.equal(resolvedLocalBare.isBatch, true);
+      assert.equal(resolvedLocalBare.executable, path.join(winDir, "gradlew.bat"));
+      const resolvedLocalRel = resolveExecutable("./gradlew", { PATH: "" }, winDir, "win32");
+      assert.equal(resolvedLocalRel.isBatch, true);
+      assert.equal(resolvedLocalRel.executable, path.join(winDir, "gradlew.bat"));
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

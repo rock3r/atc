@@ -5,20 +5,54 @@ import path from "node:path";
 
 const SAFE_TOKEN_REGEX = /^[A-Za-z0-9._:/@=-]+$/;
 
-export function resolveExecutable(command, env = process.env) {
+export function resolveExecutable(
+  command,
+  env = process.env,
+  cwd = process.cwd(),
+  platform = process.platform,
+) {
   if (!command || typeof command !== "string") {
     throw new Error("Command must be a non-empty string");
   }
-  if (process.platform !== "win32") {
+  if (platform !== "win32") {
     return { executable: command, isBatch: false };
   }
 
-  const lower = command.toLowerCase();
+  const rawExts = (env.PATHEXT || env.PathExt || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((e) => e.trim().toLowerCase())
+    .filter((e) => e.startsWith("."));
+  const extensions = Array.from(new Set([".exe", ".cmd", ".bat", ".com", ...rawExts]));
+
+  const hasPathSep = command.includes("/") || command.includes("\\");
+  const normalizedCommand = hasPathSep ? command.replace(/\//g, path.sep) : command;
+  const lower = normalizedCommand.toLowerCase();
   if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
-    return { executable: command, isBatch: true };
+    const resolvedCmd = hasPathSep ? path.resolve(cwd, normalizedCommand) : normalizedCommand;
+    return { executable: resolvedCmd, isBatch: true };
   }
-  if (lower.endsWith(".exe")) {
-    return { executable: command, isBatch: false };
+  if (lower.endsWith(".exe") || lower.endsWith(".com")) {
+    const resolvedCmd = hasPathSep ? path.resolve(cwd, normalizedCommand) : normalizedCommand;
+    return { executable: resolvedCmd, isBatch: false };
+  }
+
+  // Check relative / project-local candidates in cwd first (handles `./gradlew`, `.\gradlew`, and `gradlew`)
+  for (const ext of extensions) {
+    const localCandidate = path.resolve(cwd, normalizedCommand + ext);
+    try {
+      if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
+        return {
+          executable: localCandidate,
+          isBatch: ext === ".cmd" || ext === ".bat",
+        };
+      }
+    } catch {
+      // Ignore inaccessible local entry
+    }
+  }
+
+  if (hasPathSep) {
+    return { executable: path.resolve(cwd, normalizedCommand), isBatch: false };
   }
 
   const pathDirs = (env.PATH || env.Path || "").split(path.delimiter).filter(Boolean);
@@ -29,10 +63,9 @@ export function resolveExecutable(command, env = process.env) {
     path.join(os.homedir(), ".local", "bin"),
   );
 
-  const extensions = [".exe", ".cmd", ".bat"];
   for (const dir of pathDirs) {
     for (const ext of extensions) {
-      const candidate = path.join(dir, command + ext);
+      const candidate = path.join(dir, normalizedCommand + ext);
       try {
         if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
           return {
@@ -63,9 +96,11 @@ export function validateBatchArgs(args, strictInternal = false) {
 
 export function buildSpawnConfig(command, args = [], options = {}) {
   const env = options.env || process.env;
-  const resolved = resolveExecutable(command, env);
+  const cwd = options.cwd || process.cwd();
+  const platform = options.platform || process.platform;
+  const resolved = resolveExecutable(command, env, cwd, platform);
 
-  if (process.platform === "win32" && resolved.isBatch) {
+  if (platform === "win32" && resolved.isBatch) {
     validateBatchArgs(args, Boolean(options.strictInternal));
     const comspec = env.ComSpec || "cmd.exe";
     const quotedCmd = `"${resolved.executable}" ${args.map((a) => `"${String(a).replace(/"/g, '""')}"`).join(" ")}`;

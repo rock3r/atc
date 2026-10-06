@@ -168,7 +168,9 @@ export function expandVariables(str, vars = {}) {
 
 export function parseSegment(segment, inheritedVars = {}) {
   const tokens = tokenizeSegment(segment);
+  let baseVars = { ...inheritedVars };
   const envVars = {};
+  let stripsAndroidSerial = false;
   let idx = 0;
 
   while (idx < tokens.length) {
@@ -181,7 +183,10 @@ export function parseSegment(segment, inheritedVars = {}) {
     if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok.slice(0, eq))) {
       const k = tok.slice(0, eq);
       const rawVal = tok.slice(eq + 1);
-      envVars[k] = expandVariables(rawVal, { ...inheritedVars, ...envVars });
+      envVars[k] = expandVariables(rawVal, { ...baseVars, ...envVars });
+      if (k === "ANDROID_SERIAL") {
+        stripsAndroidSerial = false;
+      }
       idx++;
       continue;
     }
@@ -191,16 +196,66 @@ export function parseSegment(segment, inheritedVars = {}) {
     }
     if (TRANSPARENT_WRAPPERS.has(base)) {
       idx++;
-      if (base === "command") {
+      if (base === "env") {
+        while (idx < tokens.length && (tokens[idx] === "-" || tokens[idx].startsWith("-"))) {
+          const flag = tokens[idx];
+          idx++;
+          if (flag === "--") {
+            break;
+          }
+          if (flag === "-" || flag === "-i" || flag === "--ignore-environment") {
+            baseVars = {};
+            for (const k of Object.keys(envVars)) {
+              delete envVars[k];
+            }
+            stripsAndroidSerial = true;
+          } else if (flag === "-u" || flag === "--unset") {
+            const unsetKey = tokens[idx] || "";
+            if (idx < tokens.length) idx++;
+            delete baseVars[unsetKey];
+            delete envVars[unsetKey];
+            if (unsetKey === "ANDROID_SERIAL") {
+              stripsAndroidSerial = true;
+            }
+          } else if (flag.startsWith("--unset=") || (flag.startsWith("-u") && flag.length > 2)) {
+            const unsetKey = flag.startsWith("--unset=") ? flag.slice("--unset=".length) : flag.slice(2);
+            delete baseVars[unsetKey];
+            delete envVars[unsetKey];
+            if (unsetKey === "ANDROID_SERIAL") {
+              stripsAndroidSerial = true;
+            }
+          } else if (flag === "-S" || flag === "--split-string") {
+            const splitStr = tokens[idx] || "";
+            if (idx < tokens.length) {
+              tokens.splice(idx, 1, ...tokenizeSegment(splitStr));
+            }
+          } else if (flag.startsWith("--split-string=") || (flag.startsWith("-S") && flag.length > 2)) {
+            const splitStr = flag.startsWith("--split-string=") ? flag.slice("--split-string=".length) : flag.slice(2);
+            tokens.splice(idx, 0, ...tokenizeSegment(splitStr));
+          } else if ((flag === "-C" || flag === "--chdir") && idx < tokens.length) {
+            idx++;
+          }
+        }
+      } else if (base === "command") {
         while (idx < tokens.length && (tokens[idx] === "-p" || tokens[idx] === "--")) {
           idx++;
         }
-      } else if (base === "timeout" && idx < tokens.length && /^\d+[smhd]?$/.test(tokens[idx])) {
-        idx++;
+      } else if (base === "timeout") {
+        while (idx < tokens.length && tokens[idx].startsWith("-")) {
+          const flag = tokens[idx++];
+          if (flag === "--") break;
+          if ((flag === "-k" || flag === "-s") && idx < tokens.length) {
+            idx++;
+          }
+        }
+        if (idx < tokens.length && /^\d+(?:\.\d+)?[smhd]?$/.test(tokens[idx])) {
+          idx++;
+        }
       } else if (base === "sudo") {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx];
           idx++;
+          if (flag === "--") break;
           if (
             (flag === "-u" ||
               flag === "-g" ||
@@ -217,6 +272,7 @@ export function parseSegment(segment, inheritedVars = {}) {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx];
           idx++;
+          if (flag === "--") break;
           if (flag === "-n" && idx < tokens.length) {
             idx++;
           }
@@ -227,7 +283,7 @@ export function parseSegment(segment, inheritedVars = {}) {
     break;
   }
 
-  const allVars = { ...inheritedVars, ...envVars };
+  const allVars = { ...baseVars, ...envVars };
   const remaining = tokens.slice(idx).map((t) => expandVariables(t, allVars));
   const cmd = remaining[0] || "";
   const baseCmd = path.basename(cmd, path.extname(cmd)).toLowerCase();
@@ -235,6 +291,7 @@ export function parseSegment(segment, inheritedVars = {}) {
   return {
     raw: expandVariables(segment, allVars),
     envVars: allVars,
+    stripsAndroidSerial,
     cmd,
     baseCmd,
     args,
@@ -276,6 +333,9 @@ export function extractTargetSerial(parsed) {
   }
   if (parsed.envVars.ANDROID_SERIAL) {
     return parsed.envVars.ANDROID_SERIAL;
+  }
+  if (parsed.stripsAndroidSerial) {
+    return "<stripped-ANDROID_SERIAL>";
   }
   return null;
 }

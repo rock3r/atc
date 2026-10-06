@@ -1108,7 +1108,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 
 export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
-  const avdHome = options.avdHome || resolveAvdHome();
+  const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
   // Pre-lock disk check (pure statfs, never spawns subprocesses under atc.lock)
   const freeDiskMb =
@@ -1391,7 +1391,7 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
 
 export function cmdSnapshot(stateDir, action, name = null, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
-  const avdHome = options.avdHome || resolveAvdHome();
+  const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
   if (action === "list") {
     const targetAvd = flags.avd || null;
@@ -1676,8 +1676,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
 export function cmdStatus(stateDir, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
+  const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
   const cfg = readState(stateDir).config || DEFAULT_CONFIG;
-  const inventory = options.inventory || discoverFleet({ runner, cfg });
+  const inventory = options.inventory || discoverFleet({ runner, avdHome, cfg });
   const req = {
     kind: flags.kind || "any",
     deviceType: flags.type || null,

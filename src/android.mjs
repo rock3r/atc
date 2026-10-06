@@ -69,7 +69,10 @@ export function inferServices(playStoreEnabled, sysDir = "", tagId = "") {
 
 export function resolveAvdHome(env = process.env) {
   if (env.ANDROID_AVD_HOME) return env.ANDROID_AVD_HOME;
+  if (env.ANDROID_USER_HOME) return path.join(env.ANDROID_USER_HOME, "avd");
+  if (env.ANDROID_EMULATOR_HOME) return path.join(env.ANDROID_EMULATOR_HOME, "avd");
   if (env.ANDROID_PREFS_ROOT) return path.join(env.ANDROID_PREFS_ROOT, ".android", "avd");
+  if (env.ANDROID_SDK_HOME) return path.join(env.ANDROID_SDK_HOME, ".android", "avd");
   return path.join(os.homedir(), ".android", "avd");
 }
 
