@@ -1282,10 +1282,40 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.equal(execWrongSerialGuard.allowed, false);
 
-      // cmdConfig rejects bootTimeoutSec / stopTimeoutSec below minimum threshold
+      // cmdConfig rejects bootTimeoutSec / stopTimeoutSec below minimum threshold and maxTtlSec < 10
       const shortBootCfg = cmdConfig(winDir, "set", "bootTimeoutSec", "2");
       assert.equal(shortBootCfg.exitCode, 1);
       assert.match(shortBootCfg.error, /at least 5 seconds/);
+
+      const shortMaxTtl = cmdConfig(winDir, "set", "maxTtlSec", "5");
+      assert.equal(shortMaxTtl.exitCode, 1);
+      assert.match(shortMaxTtl.error, /at least 10 seconds/);
+
+      // Non-Android child commands can pass unrelated -s flags in buildChildInvocation
+      const nodeInv = buildChildInvocation(
+        "node",
+        ["tool.mjs", "-s", "smoke"],
+        { serial: "emulator-5554", leaseId: "lease-1" },
+        "sess-1"
+      );
+      assert.deepEqual(nodeInv.args, ["tool.mjs", "-s", "smoke"]);
+
+      // computeUsedEmulatorSlots counts active emulator leases during transient inventory gaps
+      assert.equal(
+        computeUsedEmulatorSlots(
+          {
+            leases: {
+              "avd:Pixel_8_API_35": {
+                kind: "emulator",
+                state: "active",
+                avd: "Pixel_8_API_35",
+              },
+            },
+          },
+          { running: [] }
+        ),
+        1
+      );
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

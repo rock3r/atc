@@ -580,6 +580,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               victimLeaseId,
               ttlMs,
               bootTimeoutMs,
+              stopTimeoutMs,
               knownAvdNames,
             },
           };
@@ -706,7 +707,15 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 }
 
 function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome, platform }) {
-  const { lease, selection, victimLeaseId, ttlMs, bootTimeoutMs, knownAvdNames } = txOutcome;
+  const {
+    lease,
+    selection,
+    victimLeaseId,
+    ttlMs,
+    bootTimeoutMs,
+    stopTimeoutMs,
+    knownAvdNames,
+  } = txOutcome;
   const candidate = selection.candidate;
   const hbTimer = startWorkerDeadlineHeartbeat(
     stateDir,
@@ -714,6 +723,15 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     lease.leaseId,
     bootTimeoutMs,
   );
+  const victimHbTimer =
+    selection.victim && victimLeaseId
+      ? startWorkerDeadlineHeartbeat(
+          stateDir,
+          selection.victim.deviceKey,
+          victimLeaseId,
+          stopTimeoutMs || 60_000,
+        )
+      : null;
   let resolvedSerial = candidate.serial;
   let bootedNewEmulator = false;
 
@@ -722,14 +740,19 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
   try {
     // 1. Evict victim if replacingAvd is set
     if (selection.victim) {
+      const effectiveStopTimeoutMs = stopTimeoutMs || 60_000;
       const stopRes =
         isWin && selection.victim.serial
-          ? runner("adb", ["-s", selection.victim.serial, "emu", "kill"], { strictInternal: true })
+          ? runner("adb", ["-s", selection.victim.serial, "emu", "kill"], {
+              strictInternal: true,
+              timeoutMs: effectiveStopTimeoutMs,
+            })
           : runner(
               "android",
               ["emulator", "stop", selection.victim.serial || selection.victim.avd],
-              { strictInternal: true },
+              { strictInternal: true, timeoutMs: effectiveStopTimeoutMs },
             );
+      victimHbTimer?.stop();
       if (stopRes.status !== 0) {
         throw new Error(
           `Failed to stop idle victim emulator ${selection.victim.avd}: ${stopRes.stderr || stopRes.stdout}`,
@@ -974,6 +997,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     return { exitCode: 0, lease: activeLease, idempotent: false };
   } catch (err) {
     hbTimer.stop();
+    victimHbTimer?.stop();
     if (bootedNewEmulator) {
       try {
         if (isWin && resolvedSerial) {
@@ -1641,7 +1665,37 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
             },
           };
         }
+        if ((key === "defaultTtlSec" || key === "maxTtlSec") && n < 10) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `Config key "${key}" must be at least 10 seconds.`,
+            },
+          };
+        }
+        if (key === "queueHeartbeatTimeoutSec" && n < 1) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `Config key "${key}" must be at least 1 second.`,
+            },
+          };
+        }
         parsedVal = Math.round(n);
+        if (key === "defaultTtlSec" && parsedVal > (state.config.maxTtlSec ?? 3600)) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `defaultTtlSec (${parsedVal}) cannot exceed maxTtlSec (${state.config.maxTtlSec ?? 3600}).`,
+            },
+          };
+        }
+        if (key === "maxTtlSec" && (state.config.defaultTtlSec ?? 600) > parsedVal) {
+          state.config.defaultTtlSec = parsedVal;
+        }
       } else if (typeof DEFAULT_CONFIG[key] === "boolean") {
         parsedVal = String(val).toLowerCase() === "true" || String(val) === "1";
       }

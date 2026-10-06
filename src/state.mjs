@@ -429,7 +429,11 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
     }
   }
   for (const lease of Object.values(state.leases)) {
-    if (lease.kind === "emulator" && lease.state === "stopping" && lease.avd) {
+    if (
+      lease.kind === "emulator" &&
+      (lease.state === "stopping" || lease.state === "active") &&
+      lease.avd
+    ) {
       runningOrStopping.add(lease.avd);
     }
   }
