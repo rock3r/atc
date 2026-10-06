@@ -1372,6 +1372,23 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(wrappedExecConflict.exitCode, 3);
       assert.match(wrappedExecConflict.error, /Conflicting device selector "emulator-5556"/);
 
+      // Non-serial ADB target selectors (-d, -e, -t) are rejected in buildChildInvocation and guard
+      assert.throws(
+        () =>
+          buildChildInvocation(
+            "adb",
+            ["-d", "shell", "pm", "clear", "com.example"],
+            { serial: "emulator-5554", leaseId: "lease-1" },
+            "sess-1"
+          ),
+        /Non-serial adb device selector "-d"/
+      );
+      const adbDashDGuard = evaluateCommandGuard("adb -d shell pm clear com.example", {
+        sessionId: "sess-1",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      });
+      assert.equal(adbDashDGuard.allowed, false);
+
       // computeUsedEmulatorSlots counts active emulator leases during transient inventory gaps
       assert.equal(
         computeUsedEmulatorSlots(

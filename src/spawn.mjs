@@ -151,7 +151,22 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     let subIdx = 0;
     while (subIdx < args.length) {
       const a = String(args[subIdx]);
-      if (a === "-s" || a === "-t" || a === "-H" || a === "-P") {
+      if (a === "-d" || a === "-e" || a === "-t" || a.startsWith("-t")) {
+        throw new Error(
+          `Non-serial adb device selector "${a}" is not permitted under ATC; use -s "${lease.serial}" or omit selector flags to use ANDROID_SERIAL.`,
+        );
+      }
+      if (a.startsWith("-s") && a.length > 2) {
+        const inlineSerial = a.slice(2);
+        if (lease.serial && inlineSerial !== lease.serial) {
+          throw new Error(
+            `Conflicting device selector "${inlineSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          );
+        }
+        subIdx += 1;
+        continue;
+      }
+      if (a === "-s" || a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
         subIdx += 1;

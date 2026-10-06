@@ -242,10 +242,29 @@ export function parseSegment(segment, inheritedVars = {}) {
 }
 
 export function extractTargetSerial(parsed) {
-  if (parsed.envVars.ANDROID_SERIAL) {
-    return parsed.envVars.ANDROID_SERIAL;
+  const { baseCmd, args } = parsed;
+  if (baseCmd === "adb") {
+    let subIdx = 0;
+    while (subIdx < args.length) {
+      const a = String(args[subIdx]);
+      if (a === "-d" || a === "-e" || a === "-t" || a.startsWith("-t")) {
+        return a === "-t" && subIdx + 1 < args.length ? `-t ${args[subIdx + 1]}` : a;
+      }
+      if (a === "-s" && subIdx + 1 < args.length) {
+        return String(args[subIdx + 1]);
+      }
+      if (a.startsWith("-s") && a.length > 2) {
+        return a.slice(2);
+      }
+      if (a === "-H" || a === "-P" || a === "-L") {
+        subIdx += 2;
+      } else if (a.startsWith("-")) {
+        subIdx += 1;
+      } else {
+        break;
+      }
+    }
   }
-  const { args } = parsed;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith("--device=")) {
@@ -254,6 +273,9 @@ export function extractTargetSerial(parsed) {
     if ((a === "--device" || a === "-s") && i + 1 < args.length) {
       return args[i + 1];
     }
+  }
+  if (parsed.envVars.ANDROID_SERIAL) {
+    return parsed.envVars.ANDROID_SERIAL;
   }
   return null;
 }
