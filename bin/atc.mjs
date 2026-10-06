@@ -2,4 +2,4 @@
 import { runCli } from "../src/cli.mjs";
 
 const code = await runCli(process.argv.slice(2), process.env);
-process.exit(code);
+process.exitCode = code;

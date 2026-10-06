@@ -1322,6 +1322,31 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.equal(cmdSubExecGuard.allowed, false);
 
+      // Cursor native beforeShellExecution hook format
+      const cursorFastAllow = handlePreToolUseHook(
+        winDir,
+        JSON.stringify({
+          conversation_id: "cursor-conv-1",
+          hook_event_name: "beforeShellExecution",
+          command: "git status",
+        }),
+        { ppid: process.pid }
+      );
+      assert.equal(cursorFastAllow.exitCode, 0);
+      assert.equal(JSON.parse(cursorFastAllow.stdout).permission, "allow");
+
+      const cursorDeny = handlePreToolUseHook(
+        winDir,
+        JSON.stringify({
+          conversation_id: "cursor-conv-1",
+          hook_event_name: "beforeShellExecution",
+          command: "adb shell pm clear com.example",
+        }),
+        { ppid: process.pid }
+      );
+      assert.equal(cursorDeny.exitCode, 2);
+      assert.equal(JSON.parse(cursorDeny.stdout).permission, "deny");
+
       // computeUsedEmulatorSlots counts active emulator leases during transient inventory gaps
       assert.equal(
         computeUsedEmulatorSlots(

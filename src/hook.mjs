@@ -39,7 +39,27 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
     };
   }
 
-  // Claude Code / Codex / Cursor format
+  // Cursor beforeShellExecution format (top-level `command` field)
+  if (
+    payload.hook_event_name === "beforeShellExecution" ||
+    (typeof payload.command === "string" && !payload.tool_name && !payload.toolName)
+  ) {
+    const rawSession =
+      payload.conversation_id ||
+      payload.conversationId ||
+      payload.session_id ||
+      payload.sessionId ||
+      `ppid-${ppid}`;
+    return {
+      hostFormat: "cursor",
+      isShellTool: true,
+      command: typeof payload.command === "string" ? payload.command : "",
+      sessionId: sanitizeSessionId(rawSession, ppid),
+      anchorPid: ppid,
+    };
+  }
+
+  // Claude Code / Codex format
   const toolName = String(payload.tool_name || payload.toolName || "");
   const toolInput = payload.tool_input || payload.input || {};
   const command = toolInput.command ?? toolInput.CommandLine ?? "";
@@ -70,13 +90,15 @@ function sanitizeSessionId(raw, ppid) {
 export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const payload = typeof rawStdin === "string" ? parseHookInput(rawStdin) : rawStdin;
   const norm = normalizeHookPayload(payload, options.ppid ?? process.ppid);
+  const cursorAllowOut =
+    norm.hostFormat === "cursor" ? JSON.stringify({ permission: "allow" }) + "\n" : "";
   if (!norm.isShellTool || !norm.command) {
-    return { exitCode: 0, stdout: "", stderr: "" };
+    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
   }
 
   // Fast Path (<2ms, Zero Lock)
   if (!hasAndroidOrAtcTokens(norm.command)) {
-    return { exitCode: 0, stdout: "", stderr: "" };
+    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
   }
 
   const cwd = options.cwd || process.cwd();
@@ -158,15 +180,21 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     const denyJson =
       norm.hostFormat === "antigravity"
         ? { decision: "block", reason: evalResult.reason }
-        : {
-            decision: "block",
-            reason: evalResult.reason,
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "deny",
-              permissionDecisionReason: evalResult.reason,
-            },
-          };
+        : norm.hostFormat === "cursor"
+          ? {
+              permission: "deny",
+              user_message: evalResult.reason,
+              agent_message: evalResult.reason,
+            }
+          : {
+              decision: "block",
+              reason: evalResult.reason,
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason: evalResult.reason,
+              },
+            };
     return {
       exitCode: 2,
       stdout: JSON.stringify(denyJson) + "\n",
@@ -174,7 +202,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     };
   }
 
-  if (evalResult.rewrittenCommand) {
+  if (evalResult.rewrittenCommand && norm.hostFormat !== "cursor") {
     const allowJson =
       norm.hostFormat === "antigravity"
         ? {
@@ -199,7 +227,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     };
   }
 
-  return { exitCode: 0, stdout: "", stderr: "" };
+  return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
 }
 
 export function handleStopHook(stateDir, rawStdin, options = {}) {
