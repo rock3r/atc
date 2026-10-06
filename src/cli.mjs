@@ -260,7 +260,13 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   }
 
   // Priority 4: Auto-create missing AVD (--create-if-missing)
-  if (req.createIfMissing && bootPool.length === 0 && usedSlots < effectiveMax) {
+  const anyExistingMatch = [
+    ...(inventory.running || []),
+    ...(inventory.offline || []),
+    ...Object.values(state.leases || {}),
+  ].some((d) => d.kind === "emulator" && matchesProfile(d, req));
+
+  if (req.createIfMissing && !anyExistingMatch && usedSlots < effectiveMax) {
     const creatablePool = (inventory.creatable || []).filter((c) =>
       matchesProfile({ kind: "emulator", profile: c.profile || c }, req),
     );
@@ -401,6 +407,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           ) {
             lease.renewedAtMs = now;
             lease.expiresAtMs = now + ttlMs;
+            if (req.snapshotSaveOnFree) {
+              lease.saveSnapshotOnFree = req.snapshotSaveOnFree;
+            }
+            if (req.reason) {
+              lease.reason = req.reason;
+            }
             return {
               mutated: true,
               value: { status: "claimed_immediate", lease, idempotent: true },
@@ -926,14 +938,21 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
 
   const allFreed = [...(outcome.freedImmediate || [])];
   const actionErrors = [];
-  for (const item of outcome.stoppingQueue || []) {
+  const stoppingItems = outcome.stoppingQueue || [];
+  const heartbeats = new Map(
+    stoppingItems.map((item) => [
+      item.lease.leaseId,
+      startWorkerDeadlineHeartbeat(
+        stateDir,
+        item.lease.deviceKey,
+        item.lease.leaseId,
+        item.stopTimeoutMs,
+      ),
+    ]),
+  );
+
+  for (const item of stoppingItems) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
-    const hb = startWorkerDeadlineHeartbeat(
-      stateDir,
-      lease.deviceKey,
-      lease.leaseId,
-      stopTimeoutMs,
-    );
     let itemFailed = false;
     try {
       if (saveSnap && lease.serial) {
@@ -975,7 +994,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
       }
     } finally {
-      clearInterval(hb);
+      clearInterval(heartbeats.get(lease.leaseId));
       withStateTransaction(stateDir, (state) => {
         const cur = state.leases[lease.deviceKey];
         if (cur && cur.leaseId === lease.leaseId) {
@@ -1113,6 +1132,15 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       return {
         mutated: false,
         value: { exitCode: 3, error: `Session "${identity.sessionId}" holds no active emulator lease.` },
+      };
+    }
+    if (owned.length > 1 && !flags.serial && !flags.avd) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Session "${identity.sessionId}" holds multiple active emulator leases; pass --serial <serial> or --avd <avd>.`,
+        },
       };
     }
     const lease = owned[0];
@@ -1521,9 +1549,14 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "hook": {
-      const hookType = parsed.positionals[0] || "pre-tool-use";
+      const hookType = String(parsed.positionals[0] || "pre-tool-use").toLowerCase();
       const rawStdin = readStdinSync();
-      if (hookType === "stop" || hookType === "session-end") {
+      if (
+        hookType === "stop" ||
+        hookType === "session-end" ||
+        hookType === "session_end" ||
+        hookType === "session_shutdown"
+      ) {
         const res = handleStopHook(stateDir, rawStdin);
         return res.exitCode;
       }

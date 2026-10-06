@@ -67,7 +67,6 @@ const READ_ONLY_ADB_SUBCOMMANDS = new Set([
   "version",
   "help",
   "start-server",
-  "kill-server",
   "--version",
   "--help",
 ]);
@@ -219,6 +218,14 @@ export function classifySegment(segment) {
     }
     const adbSub = args[subIdx] || "";
     const adbRest = args.slice(subIdx + 1);
+    if (adbSub === "kill-server") {
+      return {
+        kind: "deny_lifecycle",
+        reason:
+          'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
+        parsed,
+      };
+    }
     if (adbSub === "emu" && adbRest[0] === "kill") {
       return {
         kind: "deny_lifecycle",

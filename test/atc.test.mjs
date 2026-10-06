@@ -345,6 +345,14 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   });
   assert.equal(bashLifecycle.allowed, false);
   assert.match(bashLifecycle.reason, /Direct emulator launch is disabled/);
+
+  // adb kill-server is denied as a host-wide lifecycle command
+  const killServer = evaluateCommandGuard("adb kill-server", {
+    sessionId: "sess-1",
+    activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+  });
+  assert.equal(killServer.allowed, false);
+  assert.match(killServer.reason, /adb kill-server/);
 });
 
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
@@ -658,11 +666,16 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     assert.equal(guardMulti.exitCode, 2);
     assert.equal(guardMulti.allowed, false);
 
-    // 7. Idempotent re-claim with --reset-app executes pm clear
+    // 7. Idempotent re-claim with --reset-app and --snapshot-save-on-free executes pm clear and persists saveSnapshotOnFree
     const resetCalls = [];
     const idemReset = cmdClaim(
       dir,
-      { session: "sess-1", api: "35", resetApp: "com.example.app" },
+      {
+        session: "sess-1",
+        api: "35",
+        resetApp: "com.example.app",
+        snapshotSaveOnFree: "post-test-snap",
+      },
       {
         inventory: mockInventory,
         runner: (cmd, args) => {
@@ -673,6 +686,10 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     );
     assert.equal(idemReset.exitCode, 0);
     assert.equal(idemReset.idempotent, true);
+    assert.equal(
+      readState(dir).leases["avd:Pixel_8_API_35"].saveSnapshotOnFree,
+      "post-test-snap"
+    );
     assert.ok(
       resetCalls.includes("adb -s emulator-5554 shell pm clear com.example.app")
     );
