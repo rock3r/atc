@@ -1548,11 +1548,15 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
     abi: flags.abi || null,
   };
 
-  return withStateTransaction(stateDir, (state) => {
+  return withStateTransaction(stateDir, (state, { now }) => {
+    reconcileOfflineLeases(state, inventory, null, now);
     const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
     const usedSlots = computeUsedEmulatorSlots(state, inventory);
     const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
     const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
+    const creatable = (inventory.creatable || []).filter((d) =>
+      matchesProfile({ ...d, kind: d.kind || "emulator" }, req),
+    );
 
     return {
       mutated: true,
@@ -1568,7 +1572,7 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
         fleet: {
           running,
           offline,
-          creatable: inventory.creatable || [],
+          creatable,
         },
         leases: state.leases,
         queue: state.queue,

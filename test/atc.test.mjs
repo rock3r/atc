@@ -794,6 +794,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         headless: true,
       },
       {
+        platform: "linux",
         avdHome,
         inventory: offlineInventory,
         runner: (cmd, args) => {
@@ -824,6 +825,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       bootRes.lease.leaseId,
       { session: "sess-boot", shutdown: true },
       {
+        platform: "linux",
         avdHome,
         runner: (cmd, args) => {
           freeCalls.push([cmd, ...args].join(" "));
@@ -845,6 +847,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         createIfMissing: true,
       },
       {
+        platform: "linux",
         avdHome,
         inventory: offlineInventory,
         runner: (cmd, args) => {
@@ -1212,6 +1215,52 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.equal(winFree.exitCode, 0);
       assert.deepEqual(winFreeCalls, ["adb -s emulator-5554 emu kill"]);
+
+      // cmdStatus filters creatable profiles and reconciles offline leases
+      withStateTransaction(winDir, (state, { now }) => {
+        state.leases["avd:Dead_Emu"] = {
+          leaseId: "lease-dead-emu",
+          deviceKey: "avd:Dead_Emu",
+          avd: "Dead_Emu",
+          serial: "emulator-5599",
+          kind: "emulator",
+          state: "active",
+          sessionId: "other-sess",
+          anchorPid: null,
+          claimedAtMs: now - 20_000,
+          renewedAtMs: now - 20_000,
+          expiresAtMs: now + 60_000,
+          firstSeenOfflineAtMs: now - 10_000,
+        };
+        return { mutated: true };
+      });
+      const statusFiltered = cmdStatus(
+        winDir,
+        { type: "wear", api: "35" },
+        {
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [],
+            offline: [],
+            creatable: [
+              {
+                kind: "emulator",
+                deviceName: "medium_phone",
+                profile: { deviceType: "phone", apiLevel: "android-36" },
+              },
+              {
+                kind: "emulator",
+                deviceName: "wearos_small_round",
+                profile: { deviceType: "wear", apiLevel: "android-35" },
+              },
+            ],
+          },
+        }
+      );
+      assert.equal(statusFiltered.exitCode, 0);
+      assert.equal(statusFiltered.leases["avd:Dead_Emu"], undefined);
+      assert.equal(statusFiltered.fleet.creatable.length, 1);
+      assert.equal(statusFiltered.fleet.creatable[0].deviceName, "wearos_small_round");
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
