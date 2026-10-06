@@ -563,6 +563,19 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     }
 
     if (txOutcome.status === "claimed_immediate") {
+      if (txOutcome.idempotent && req.resetApp && txOutcome.lease?.serial) {
+        const resetRes = runner(
+          "adb",
+          ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
+          { strictInternal: true },
+        );
+        if (resetRes.status !== 0) {
+          return {
+            exitCode: 1,
+            error: `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`,
+          };
+        }
+      }
       return { exitCode: 0, lease: txOutcome.lease, idempotent: txOutcome.idempotent };
     }
 
@@ -614,6 +627,8 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
     lease.leaseId,
     bootTimeoutMs,
   );
+  let resolvedSerial = candidate.serial;
+  let bootedNewEmulator = false;
 
   try {
     // 1. Evict victim if replacingAvd is set
@@ -651,8 +666,6 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
         );
       }
     }
-
-    let resolvedSerial = candidate.serial;
 
     // 3. Warm state preparation vs Cold/Wipe boot
     if (selection.priority === 1 && selection.needsWarmPrep) {
@@ -706,6 +719,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
           `Failed to boot emulator ${candidate.avd}: ${bootRes.stderr || bootRes.stdout}`,
         );
       }
+      bootedNewEmulator = true;
 
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
       resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
@@ -758,6 +772,15 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner }) {
     return { exitCode: 0, lease: activeLease, idempotent: false };
   } catch (err) {
     clearInterval(hbTimer);
+    if (bootedNewEmulator) {
+      try {
+        runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
+          strictInternal: true,
+        });
+      } catch {
+        // Best-effort cleanup of newly booted emulator
+      }
+    }
     withStateTransaction(stateDir, (state) => {
       const current = state.leases[lease.deviceKey];
       if (current && current.leaseId === lease.leaseId) {
@@ -902,7 +925,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         const saveRes = runner(
           "adb",
           ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap],
-          { strictInternal: true },
+          { strictInternal: true, timeoutMs: stopTimeoutMs },
         );
         if (saveRes.status !== 0) {
           itemFailed = true;
@@ -915,7 +938,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         const loadRes = runner(
           "adb",
           ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap],
-          { strictInternal: true },
+          { strictInternal: true, timeoutMs: stopTimeoutMs },
         );
         if (loadRes.status !== 0) {
           itemFailed = true;
@@ -927,6 +950,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       if (!itemFailed && doStop) {
         const stopRes = runner("android", ["emulator", "stop", lease.serial || lease.avd], {
           strictInternal: true,
+          timeoutMs: stopTimeoutMs,
         });
         if (stopRes.status !== 0) {
           itemFailed = true;

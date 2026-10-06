@@ -2,14 +2,15 @@ import { execFileSync } from "node:child_process";
 
 /**
  * Pi / Ohm / Tau Coding Agent Extension for Android Traffic Control (atc).
- * Intercepts bash tool invocations via `atc guard` and releases session leases on exit.
+ * Intercepts bash tool invocations via `atc guard` and releases session leases on shutdown.
  */
 export default function atcExtension(pi: any) {
   const sessionId =
     process.env.ATC_SESSION_ID || process.env.ATC_SESSION || `pi-${process.pid}`;
 
   pi.on("tool_call", async (event: any) => {
-    if (event.name !== "bash" && event.name !== "shell") return;
+    const toolName = String(event.toolName ?? event.name ?? "").toLowerCase();
+    if (toolName !== "bash" && toolName !== "shell") return;
     const command = event.input?.command ?? event.arguments?.command ?? "";
     if (!command) return;
 
@@ -48,11 +49,14 @@ export default function atcExtension(pi: any) {
     }
   });
 
-  pi.on("session_end", async () => {
+  const releaseSessionLeases = async () => {
     try {
       execFileSync("atc", ["free", "--session", sessionId], { stdio: "ignore" });
     } catch {
       // ignore if no active lease
     }
-  });
+  };
+
+  pi.on("session_shutdown", releaseSessionLeases);
+  pi.on("session_end", releaseSessionLeases);
 }

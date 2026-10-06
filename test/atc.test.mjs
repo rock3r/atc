@@ -643,6 +643,25 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     );
     assert.equal(guardMulti.exitCode, 2);
     assert.equal(guardMulti.allowed, false);
+
+    // 7. Idempotent re-claim with --reset-app executes pm clear
+    const resetCalls = [];
+    const idemReset = cmdClaim(
+      dir,
+      { session: "sess-1", api: "35", resetApp: "com.example.app" },
+      {
+        inventory: mockInventory,
+        runner: (cmd, args) => {
+          resetCalls.push([cmd, ...args].join(" "));
+          return { status: 0, stdout: "Success", stderr: "" };
+        },
+      }
+    );
+    assert.equal(idemReset.exitCode, 0);
+    assert.equal(idemReset.idempotent, true);
+    assert.ok(
+      resetCalls.includes("adb -s emulator-5554 shell pm clear com.example.app")
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
