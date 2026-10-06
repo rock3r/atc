@@ -78,7 +78,9 @@ export function hasAndroidOrAtcTokens(command) {
 
 export function splitShellSegments(command) {
   if (!command || typeof command !== "string") return [];
-  const normalized = command.replace(/\$\(([^)]+)\)/g, " ; $1 ; ");
+  const normalized = command
+    .replace(/\$\(([^)]+)\)/g, " ; $1 ; ")
+    .replace(/`([^`]+)`/g, " ; $1 ; ");
   return normalized
     .split(/(?:&&|\|\||[;|\n&])+/)
     .map((s) => s.trim())

@@ -564,7 +564,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         const reorderWindowMs =
           (flags.reorderWindow !== undefined
             ? Number(flags.reorderWindow)
-            : state.config.reorderWindowSec || 120) * 1000;
+            : (state.config?.reorderWindowSec ?? DEFAULT_CONFIG.reorderWindowSec ?? 120)) * 1000;
         const waitExpiresAtMs = startWaitMs + waitSec * 1000;
         if (now >= waitExpiresAtMs) {
           state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);

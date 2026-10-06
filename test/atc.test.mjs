@@ -862,6 +862,13 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(createRes.lease.deviceKey, "avd:Medium_Phone_API_36");
     assert.ok(createCalls.includes("android emulator create medium_phone"));
     assert.ok(createCalls.includes("android emulator start Medium_Phone_API_36"));
+
+    // Backtick command substitution is inspected by guard
+    const backtickGuard = evaluateCommandGuard("echo `adb shell pm clear com.example`", {
+      sessionId: "sess-unleased",
+      activeLeases: [],
+    });
+    assert.equal(backtickGuard.allowed, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

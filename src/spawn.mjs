@@ -99,9 +99,10 @@ export function runCommandSync(command, args = [], options = {}) {
   });
   const res = spawnSync(cfg.command, cfg.args, cfg.options);
   return {
-    status: res.status ?? (res.error ? 1 : 0),
+    status: res.status ?? (res.error || res.signal ? 1 : 0),
+    signal: res.signal || null,
     stdout: res.stdout || "",
-    stderr: res.stderr || "",
+    stderr: res.stderr || (res.signal ? `Terminated by signal ${res.signal}` : ""),
     error: res.error || null,
   };
 }
@@ -154,14 +155,23 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
       reject(err);
     });
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearInterval(timer);
       try {
         onHeartbeat();
       } catch {
         // Ignore final heartbeat error
       }
-      resolve(code ?? 0);
+      if (typeof code === "number") {
+        resolve(code);
+        return;
+      }
+      if (signal) {
+        const sigNum = os.constants?.signals?.[signal];
+        resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
+        return;
+      }
+      resolve(1);
     });
   });
 }

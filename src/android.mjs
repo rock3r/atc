@@ -165,17 +165,9 @@ export function wipeAvdUserData(avdId, avdHome = resolveAvdHome(), cfg = DEFAULT
     "encryptionkey.img.qcow2",
   ];
   for (const name of filesToRemove) {
-    try {
-      fs.rmSync(path.join(avdPath, name), { force: true });
-    } catch {
-      // Best-effort cleanup
-    }
+    fs.rmSync(path.join(avdPath, name), { force: true });
   }
-  try {
-    fs.rmSync(path.join(avdPath, "snapshots", "default_boot"), { recursive: true, force: true });
-  } catch {
-    // Best-effort cleanup
-  }
+  fs.rmSync(path.join(avdPath, "snapshots", "default_boot"), { recursive: true, force: true });
 }
 
 export function parseAdbDevicesOutput(stdout) {
