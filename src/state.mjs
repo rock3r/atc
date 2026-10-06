@@ -256,34 +256,48 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
 export function reconcileOfflineLeases(state, inventory, callerSessionId, now = Date.now()) {
   if (!inventory) return;
   const graceMs = state.config?.offlineGraceMs ?? 5000;
+  const probes = inventory.probes || { emulatorListOk: true, adbDevicesOk: true };
+  const emulatorListOk = probes.emulatorListOk !== false;
+  const adbDevicesOk = probes.adbDevicesOk !== false;
   const onlineAvds = new Set(
     (inventory.running || []).filter((d) => d.kind === "emulator").map((d) => d.avd),
   );
-  const onlineSerials = new Set((inventory.running || []).map((d) => d.serial).filter(Boolean));
+  const onlineSerials = new Set([
+    ...(inventory.running || []).map((d) => d.serial).filter(Boolean),
+    ...(inventory.onlineSerials || []).filter(Boolean),
+  ]);
 
   for (const [deviceKey, lease] of Object.entries(state.leases)) {
     if (lease.state !== "active") continue;
-    let confirmedOffline = false;
     if (lease.kind === "physical") {
-      confirmedOffline = !lease.serial || !onlineSerials.has(lease.serial);
-    } else {
-      const avdOnline = lease.avd && onlineAvds.has(lease.avd);
-      const serialOnline = lease.serial && onlineSerials.has(lease.serial);
-      confirmedOffline = !avdOnline && !serialOnline;
-    }
-
-    if (confirmedOffline) {
-      if (lease.sessionId === callerSessionId) {
-        delete state.leases[deviceKey];
+      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
+      if (serialOnline) {
+        lease.firstSeenOfflineAtMs = null;
         continue;
       }
-      if (!lease.firstSeenOfflineAtMs) {
-        lease.firstSeenOfflineAtMs = now;
-      } else if (now - lease.firstSeenOfflineAtMs >= graceMs) {
-        delete state.leases[deviceKey];
+      if (!adbDevicesOk) {
+        continue;
       }
     } else {
-      lease.firstSeenOfflineAtMs = null;
+      const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
+      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
+      if (avdOnline || serialOnline) {
+        lease.firstSeenOfflineAtMs = null;
+        continue;
+      }
+      if (!emulatorListOk || !adbDevicesOk) {
+        continue;
+      }
+    }
+
+    if (lease.sessionId === callerSessionId) {
+      delete state.leases[deviceKey];
+      continue;
+    }
+    if (!lease.firstSeenOfflineAtMs) {
+      lease.firstSeenOfflineAtMs = now;
+    } else if (now - lease.firstSeenOfflineAtMs >= graceMs) {
+      delete state.leases[deviceKey];
     }
   }
 }

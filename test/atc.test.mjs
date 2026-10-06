@@ -52,6 +52,7 @@ import {
   cmdStatus,
   cmdConfig,
   cmdGuard,
+  selectCandidateUnderLock,
 } from "../src/cli.mjs";
 
 function makeTempStateDir() {
@@ -177,6 +178,15 @@ test("state: reconcileOfflineLeases requires 5s dual-source confirmation", () =>
   reconcileOfflineLeases(state, { running: [] }, "sess-other", now);
   assert.ok(state.leases["avd:Pixel_8_API_35"]);
   assert.equal(state.leases["avd:Pixel_8_API_35"].firstSeenOfflineAtMs, now);
+
+  // If either probe fails, offline reconciliation is skipped and does not revoke the lease
+  reconcileOfflineLeases(
+    state,
+    { running: [], probes: { emulatorListOk: false, adbDevicesOk: true } },
+    "sess-owner",
+    now + 6000,
+  );
+  assert.ok(state.leases["avd:Pixel_8_API_35"]);
 
   // 3 seconds later -> still within 5s grace window
   reconcileOfflineLeases(state, { running: [] }, "sess-other", now + 3000);
@@ -1405,6 +1415,56 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         ),
         1
       );
+
+      // cmdConfig rejects queueHeartbeatTimeoutSec < 5
+      const badQueueHb = cmdConfig(winDir, ["set", "queueHeartbeatTimeoutSec", "1"]);
+      assert.equal(badQueueHb.exitCode, 1);
+
+      // Starvation-protected physical ticket does not block emulator claims
+      const schedNow = 1_700_000_000_000;
+      const schedState = createDefaultState();
+      schedState.queue.push({
+        ticketId: "t-phys",
+        sessionId: "sess-phys",
+        requestedKind: "physical",
+        requestedAvd: null,
+        requestedSerial: "R58N999999Z",
+        requestedProfile: { kind: "physical", serial: "R58N999999Z" },
+        enqueuedAtMs: schedNow - 200_000,
+        starvationDeadlineMs: schedNow - 80_000,
+        lastHeartbeatAtMs: schedNow,
+        waitExpiresAtMs: schedNow + 100_000,
+      });
+      const schedInventory = {
+        host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+        running: [
+          {
+            deviceKey: "avd:Pixel_8_API_35",
+            avd: "Pixel_8_API_35",
+            serial: "emulator-5554",
+            kind: "emulator",
+            online: true,
+            profile: {
+              apiLevel: "android-35",
+              deviceType: "phone",
+              services: "play",
+              playStore: true,
+              abi: "arm64-v8a",
+            },
+          },
+        ],
+        offline: [],
+        creatable: [],
+      };
+      const emuSelection = selectCandidateUnderLock(
+        schedState,
+        schedInventory,
+        { kind: "emulator", apiSpec: "35" },
+        null,
+        schedNow,
+      );
+      assert.equal(emuSelection.priority, 1);
+      assert.equal(emuSelection.candidate.avd, "Pixel_8_API_35");
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

@@ -472,7 +472,9 @@ export function discoverFleet({
 
   // 2. Query android emulator list --long
   const emuListRes = runner("android", ["emulator", "list", "--long"], { timeoutMs: 8000 });
-  if (emuListRes.status === 0 && emuListRes.stdout) {
+  const emulatorListOk = emuListRes.status === 0;
+  const onlineSerials = new Set();
+  if (emulatorListOk && emuListRes.stdout) {
     for (const item of parseAndroidEmulatorListOutput(emuListRes.stdout)) {
       const existing = knownAvds.get(item.avd) || {
         ...readLocalAvdMetadata(item.avd, avdHome, cfg),
@@ -483,7 +485,10 @@ export function discoverFleet({
         existing.profile.apiLevel = item.apiLevel;
       }
       existing.online = Boolean(item.online);
-      if (item.serial) existing.serial = item.serial;
+      if (item.serial) {
+        existing.serial = item.serial;
+        if (existing.online) onlineSerials.add(item.serial);
+      }
       knownAvds.set(item.avd, existing);
     }
   }
@@ -491,8 +496,10 @@ export function discoverFleet({
   // 3. Query adb devices for online emulators and physical USB/Wi-Fi devices
   const physicalDevices = [];
   const adbRes = runner("adb", ["devices"], { timeoutMs: 8000 });
-  if (adbRes.status === 0 && adbRes.stdout) {
+  const adbDevicesOk = adbRes.status === 0;
+  if (adbDevicesOk && adbRes.stdout) {
     for (const dev of parseAdbDevicesOutput(adbRes.stdout)) {
+      if (dev.serial) onlineSerials.add(dev.serial);
       if (dev.kind === "emulator") {
         const alreadyMapped = Array.from(knownAvds.values()).find((a) => a.serial === dev.serial);
         if (alreadyMapped) {
@@ -572,6 +579,11 @@ export function discoverFleet({
     running,
     offline,
     creatable,
+    onlineSerials: Array.from(onlineSerials),
+    probes: {
+      emulatorListOk,
+      adbDevicesOk,
+    },
   };
 }
 

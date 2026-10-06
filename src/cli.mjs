@@ -180,8 +180,82 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
     requestedProfile: req,
   };
 
+  function matchesCreatableEntry(c, targetReq) {
+    const p = c.profile || c;
+    const profileName = c.deviceName || p.deviceName;
+    if (
+      targetReq.avd &&
+      c.avd !== targetReq.avd &&
+      profileName !== targetReq.avd &&
+      String(profileName || "").toLowerCase() !== String(targetReq.avd).toLowerCase()
+    ) {
+      return false;
+    }
+    const effectiveReq = {
+      ...targetReq,
+      apiSpec: p.apiLevel ? targetReq.apiSpec : null,
+      services: p.services ? targetReq.services : null,
+      play: typeof p.playStore === "boolean" || p.services ? targetReq.play : null,
+      abi: p.abi ? targetReq.abi : null,
+      snapshotLoad: null,
+    };
+    return matchesProfile(
+      { kind: "emulator", avd: targetReq.avd || c.avd || profileName, profile: p },
+      effectiveReq,
+    );
+  }
+
+  function doesTicketNeedEmulatorCapacity(earlierReq) {
+    if (earlierReq.kind === "physical") return false;
+    const hasOfflineMatch = (inventory.offline || []).some(
+      (d) => !state.leases[d.deviceKey] && matchesProfile(d, earlierReq),
+    );
+    if (hasOfflineMatch) return true;
+    const hasStoppingMatch = Object.values(state.leases || {}).some(
+      (l) => l.kind === "emulator" && l.state === "stopping" && matchesProfile(l, earlierReq),
+    );
+    if (hasStoppingMatch) return true;
+    if (
+      (earlierReq.wipeData || earlierReq.coldBoot) &&
+      (inventory.running || []).some(
+        (d) =>
+          d.kind === "emulator" && !state.leases[d.deviceKey] && matchesProfile(d, earlierReq),
+      )
+    ) {
+      return true;
+    }
+    if (earlierReq.createIfMissing) {
+      const anyExisting = [
+        ...(inventory.running || []),
+        ...(inventory.offline || []),
+        ...Object.values(state.leases || {}),
+      ].some((d) => d.kind === "emulator" && matchesProfile(d, earlierReq));
+      if (
+        !anyExisting &&
+        (inventory.creatable || []).some((c) => matchesCreatableEntry(c, earlierReq))
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function isReservedForEarlierTicket(device, isColdOrEvict = false) {
     for (const earlier of earlierTickets) {
+      const earlierReq = {
+        kind: earlier.requestedKind || "emulator",
+        avd: earlier.requestedAvd || null,
+        serial: earlier.requestedSerial || null,
+        ...earlier.requestedProfile,
+      };
+      const canUseCandidate = Boolean(device?.kind) && matchesProfile(device, earlierReq);
+      const needsEmulatorCapacity =
+        device?.kind !== "physical" &&
+        (isColdOrEvict || cfg.autoStopIdleOnContention !== false) &&
+        doesTicketNeedEmulatorCapacity(earlierReq);
+      if (!canUseCandidate && !needsEmulatorCapacity) {
+        continue;
+      }
       if (isTicketStarvationProtected(earlier, now, cfg)) {
         return true;
       }
@@ -293,62 +367,39 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   ].some((d) => d.kind === "emulator" && matchesProfile(d, req));
 
   if (req.createIfMissing && !anyExistingMatch && usedSlots < effectiveMax) {
-    const creatablePool = (inventory.creatable || []).filter((c) => {
-      const p = c.profile || c;
-      const profileName = c.deviceName || p.deviceName;
-      if (
-        req.avd &&
-        c.avd !== req.avd &&
-        profileName !== req.avd &&
-        String(profileName || "").toLowerCase() !== String(req.avd).toLowerCase()
-      ) {
-        return false;
-      }
-      const effectiveReq = {
-        ...req,
-        apiSpec: p.apiLevel ? req.apiSpec : null,
-        services: p.services ? req.services : null,
-        play: typeof p.playStore === "boolean" || p.services ? req.play : null,
-        abi: p.abi ? req.abi : null,
-        snapshotLoad: null,
-      };
-      return matchesProfile(
-        { kind: "emulator", avd: req.avd || c.avd || profileName, profile: p },
-        effectiveReq,
-      );
-    });
+    const creatablePool = (inventory.creatable || []).filter((c) => matchesCreatableEntry(c, req));
     if (creatablePool.length > 0) {
       const matchedCreatable = creatablePool[0];
       const baseProfile = matchedCreatable.profile || matchedCreatable;
       const profileName = matchedCreatable.deviceName || baseProfile.deviceName || "pixel_9";
       const avdId = req.avd || matchedCreatable.avd || profileName || deterministicCreatedAvdId(req);
       const deviceKey = `avd:${avdId}`;
-      if (!state.leases[deviceKey] && !isReservedForEarlierTicket({ online: false }, true)) {
-        const syntheticCandidate = {
-          avd: avdId,
-          deviceKey,
-          kind: "emulator",
-          online: false,
-          ramSizeMb: 2048,
-          requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
-          dataDiskMb: 6656,
-          profile: {
-            deviceType: baseProfile.deviceType || req.deviceType || "phone",
-            deviceName: profileName,
-            apiLevel:
-              baseProfile.apiLevel ||
-              (req.apiSpec
-                ? `android-${String(req.apiSpec).replace(/\D/g, "") || "36"}`
-                : "android-36"),
-            services:
-              baseProfile.services || req.services || (req.play === false ? "aosp" : "play"),
-            playStore:
-              typeof baseProfile.playStore === "boolean"
-                ? baseProfile.playStore
-                : req.play !== false,
-            abi: baseProfile.abi || req.abi || (process.arch === "arm64" ? "arm64-v8a" : "x86_64"),
-          },
-        };
+      const syntheticCandidate = {
+        avd: avdId,
+        deviceKey,
+        kind: "emulator",
+        online: false,
+        ramSizeMb: 2048,
+        requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
+        dataDiskMb: 6656,
+        profile: {
+          deviceType: baseProfile.deviceType || req.deviceType || "phone",
+          deviceName: profileName,
+          apiLevel:
+            baseProfile.apiLevel ||
+            (req.apiSpec
+              ? `android-${String(req.apiSpec).replace(/\D/g, "") || "36"}`
+              : "android-36"),
+          services:
+            baseProfile.services || req.services || (req.play === false ? "aosp" : "play"),
+          playStore:
+            typeof baseProfile.playStore === "boolean"
+              ? baseProfile.playStore
+              : req.play !== false,
+          abi: baseProfile.abi || req.abi || (process.arch === "arm64" ? "arm64-v8a" : "x86_64"),
+        },
+      };
+      if (!state.leases[deviceKey] && !isReservedForEarlierTicket(syntheticCandidate, true)) {
         try {
           checkResourceAdmission(syntheticCandidate, inventory.host, state, inventory, {
             wipeOrCreate: true,
@@ -634,9 +685,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           ticket.waiterPid = process.pid;
         }
 
+        const hbTimeoutSec =
+          state.config?.queueHeartbeatTimeoutSec ?? DEFAULT_CONFIG.queueHeartbeatTimeoutSec ?? 10;
         return {
           mutated: true,
-          value: { status: "queued", ticket },
+          value: { status: "queued", ticket, hbTimeoutSec },
         };
       });
     } catch (err) {
@@ -680,20 +733,29 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
     // Two-Stage Poll Loop (§5.3 Step 6)
     let tick = 0;
+    let pollSleepCapMs = Math.max(100, Math.floor(((txOutcome.hbTimeoutSec || 10) * 1000) / 4));
     while (true) {
-      sleepSync(900 + Math.floor(Math.random() * 200));
+      const baseSleepMs = 900 + Math.floor(Math.random() * 200);
+      sleepSync(Math.min(baseSleepMs, pollSleepCapMs));
       tick++;
       const stageA = withStateTransaction(stateDir, (state, { now }) => {
         const ticket = state.queue.find((t) => t.ticketId === txOutcome.ticket.ticketId);
         if (ticket) {
           ticket.lastHeartbeatAtMs = now;
         }
+        const hbTimeoutSec =
+          state.config?.queueHeartbeatTimeoutSec ?? DEFAULT_CONFIG.queueHeartbeatTimeoutSec ?? 10;
         const activeCount = Object.values(state.leases).length;
         return {
           mutated: Boolean(ticket),
-          value: { activeCount, expired: now >= txOutcome.ticket.waitExpiresAtMs },
+          value: {
+            activeCount,
+            expired: now >= txOutcome.ticket.waitExpiresAtMs,
+            hbTimeoutSec,
+          },
         };
       });
+      pollSleepCapMs = Math.max(100, Math.floor((stageA.hbTimeoutSec * 1000) / 4));
       if (stageA.expired) {
         break;
       }
@@ -1709,12 +1771,12 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
             },
           };
         }
-        if (key === "queueHeartbeatTimeoutSec" && n < 1) {
+        if (key === "queueHeartbeatTimeoutSec" && n < 5) {
           return {
             mutated: false,
             value: {
               exitCode: 1,
-              error: `Config key "${key}" must be at least 1 second.`,
+              error: `Config key "${key}" must be at least 5 seconds.`,
             },
           };
         }
