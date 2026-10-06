@@ -257,9 +257,44 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   // Precedence 1: ATC commands (`atc ...`)
   if (baseCmd === "atc") {
+    const subcommand = args[0] || "";
+    let execTargetSerial = null;
+    if (subcommand === "exec") {
+      const dashDashIdx = args.indexOf("--");
+      let wrappedTokens = [];
+      if (dashDashIdx !== -1) {
+        wrappedTokens = args.slice(dashDashIdx + 1);
+      } else {
+        let i = 1;
+        while (i < args.length) {
+          const a = args[i];
+          if ((a === "--session" || a === "--role" || a === "--serial" || a === "--lease") && i + 1 < args.length) {
+            i += 2;
+          } else if (a.startsWith("--")) {
+            i += 1;
+          } else {
+            break;
+          }
+        }
+        wrappedTokens = args.slice(i);
+      }
+      if (wrappedTokens.length > 0) {
+        const wrappedSeg = wrappedTokens
+          .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
+          .join(" ");
+        const innerClass = classifySegment(wrappedSeg, parsed.envVars, depth + 1);
+        if (innerClass.kind === "deny_lifecycle") {
+          return innerClass;
+        }
+        if (innerClass.targetSerial) {
+          execTargetSerial = innerClass.targetSerial;
+        }
+      }
+    }
     return {
       kind: "atc",
-      subcommand: args[0] || "",
+      subcommand,
+      execTargetSerial,
       parsed,
     };
   }
@@ -458,6 +493,24 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
     }
 
     if (c.kind === "atc") {
+      if (c.execTargetSerial) {
+        const ownsExecTarget =
+          Array.isArray(activeLeases) && activeLeases.some((l) => l.serial === c.execTargetSerial);
+        if (!ownsExecTarget) {
+          const ownedSerials =
+            Array.isArray(activeLeases) && activeLeases.length > 0
+              ? activeLeases.map((l) => l.serial).join(", ")
+              : "none";
+          return {
+            allowed: false,
+            reason:
+              `Blocked by ATC guardrail: "atc exec" payload targets device "${c.execTargetSerial}", which is not owned by session "${sessionId || "current"}".\n` +
+              `  Owned lease serial(s): ${ownedSerials}`,
+            rewrittenCommand: null,
+          };
+        }
+        targetSerials.add(c.execTargetSerial);
+      }
       const hasSession =
         Boolean(c.parsed.envVars.ATC_SESSION_ID) ||
         c.parsed.args.some(

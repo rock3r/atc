@@ -2,6 +2,7 @@ import { workerData } from "node:worker_threads";
 import { withStateTransaction } from "./state.mjs";
 
 const { stateDir, deviceKey, leaseId, timeoutMs, workerPid } = workerData;
+const intervalMs = Math.max(250, Math.min(15_000, Math.floor((Number(timeoutMs) || 15_000) / 3)));
 
 setInterval(() => {
   try {
@@ -23,4 +24,4 @@ setInterval(() => {
   } catch {
     // Ignore transient lock contention during background heartbeat
   }
-}, 15000);
+}, intervalMs);

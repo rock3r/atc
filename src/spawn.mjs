@@ -130,6 +130,20 @@ export function runCommandSync(command, args = [], options = {}) {
 }
 
 export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i]);
+    let explicitSerial = null;
+    if (a.startsWith("--device=")) {
+      explicitSerial = a.slice("--device=".length);
+    } else if ((a === "--device" || a === "-s") && i + 1 < args.length) {
+      explicitSerial = String(args[i + 1]);
+    }
+    if (explicitSerial && lease.serial && explicitSerial !== lease.serial) {
+      throw new Error(
+        `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+      );
+    }
+  }
   const env = {
     ...baseEnv,
     ANDROID_SERIAL: lease.serial,

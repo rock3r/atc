@@ -1261,6 +1261,31 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(statusFiltered.leases["avd:Dead_Emu"], undefined);
       assert.equal(statusFiltered.fleet.creatable.length, 1);
       assert.equal(statusFiltered.fleet.creatable[0].deviceName, "wearos_small_round");
+
+      // buildChildInvocation and evaluateCommandGuard reject conflicting explicit device selectors in atc exec
+      assert.throws(
+        () =>
+          buildChildInvocation(
+            "adb",
+            ["-s", "emulator-5556", "shell", "wm", "size"],
+            { serial: "emulator-5554", leaseId: "lease-1" },
+            "sess-1"
+          ),
+        /Conflicting device selector/
+      );
+      const execWrongSerialGuard = evaluateCommandGuard(
+        "atc exec -- adb -s emulator-5556 shell wm size",
+        {
+          sessionId: "sess-1",
+          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+        }
+      );
+      assert.equal(execWrongSerialGuard.allowed, false);
+
+      // cmdConfig rejects bootTimeoutSec / stopTimeoutSec below minimum threshold
+      const shortBootCfg = cmdConfig(winDir, "set", "bootTimeoutSec", "2");
+      assert.equal(shortBootCfg.exitCode, 1);
+      assert.match(shortBootCfg.error, /at least 5 seconds/);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

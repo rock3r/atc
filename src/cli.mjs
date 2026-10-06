@@ -15,7 +15,7 @@ import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./gua
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
 import { randomNonce, resolveStateDir, sleepSync } from "./lock.mjs";
 import { startMcpServer } from "./mcp.mjs";
-import { runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
+import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
   DEFAULT_CONFIG,
   canJumpAhead,
@@ -1489,6 +1489,18 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       };
     }
     const lease = owned[0];
+    const [cmd, ...args] = commandArgs;
+    try {
+      buildChildInvocation(cmd, args, lease, identity.sessionId, options.env);
+    } catch (err) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: err.message,
+        },
+      };
+    }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
@@ -1618,6 +1630,15 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
           return {
             mutated: false,
             value: { exitCode: 1, error: `Config key "${key}" requires a non-negative number.` },
+          };
+        }
+        if ((key === "bootTimeoutSec" || key === "stopTimeoutSec") && n < 5) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `Config key "${key}" must be at least 5 seconds.`,
+            },
           };
         }
         parsedVal = Math.round(n);
