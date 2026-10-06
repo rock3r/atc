@@ -1366,8 +1366,8 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
     lease.renewedAtMs = now;
-    lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
-    return { mutated: true, value: { exitCode: 0, lease: { ...lease }, stopTimeoutMs } };
+    lease.expiresAtMs = Math.max(lease.expiresAtMs, now + Math.max(ttlMs, stopTimeoutMs * 2));
+    return { mutated: true, value: { exitCode: 0, lease: { ...lease }, ttlMs, stopTimeoutMs } };
   });
 
   if (leaseCheck.exitCode !== 0) {
@@ -1386,22 +1386,26 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     };
   }
 
-  let finalLease = leaseCheck.lease;
   if (action === "load") {
     try {
       waitForEmulatorReady(runner, leaseCheck.lease.serial, leaseCheck.stopTimeoutMs);
     } catch (err) {
       return { exitCode: 1, error: err.message };
     }
-    finalLease = withStateTransaction(stateDir, (state) => {
-      const cur = state.leases[leaseCheck.lease.deviceKey];
-      if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
-        cur.loadedSnapshot = name;
-        return { mutated: true, value: { ...cur } };
-      }
-      return { mutated: false, value: leaseCheck.lease };
-    });
   }
+
+  const finalLease = withStateTransaction(stateDir, (state, { now }) => {
+    const cur = state.leases[leaseCheck.lease.deviceKey];
+    if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
+      cur.renewedAtMs = now;
+      cur.expiresAtMs = Math.max(cur.expiresAtMs, now + leaseCheck.ttlMs);
+      if (action === "load") {
+        cur.loadedSnapshot = name;
+      }
+      return { mutated: true, value: { ...cur } };
+    }
+    return { mutated: false, value: leaseCheck.lease };
+  });
 
   return { exitCode: 0, lease: finalLease, snapshot: name, action };
 }

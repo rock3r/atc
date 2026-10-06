@@ -548,7 +548,7 @@ export function resolveSessionIdentity({
     if (val && SESSION_ID_REGEX.test(val)) {
       return {
         sessionId: val,
-        anchorPid: explicitAnchor || ppid,
+        anchorPid: findHookAnchorForSession(val),
         source: `env_${key.toLowerCase()}`,
       };
     }
@@ -606,9 +606,10 @@ export function resolveSessionIdentity({
   const termKey = env.TMUX_PANE || env.TERM_SESSION_ID;
   if (termKey) {
     const sanitized = termKey.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 96);
+    const sid = validateSessionId(`term-${sanitized}`);
     return {
-      sessionId: validateSessionId(`term-${sanitized}`),
-      anchorPid: explicitAnchor || ppid,
+      sessionId: sid,
+      anchorPid: findHookAnchorForSession(sid),
       source: "terminal_env",
     };
   }

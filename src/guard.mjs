@@ -97,16 +97,35 @@ export function tokenizeSegment(segment) {
   return tokens;
 }
 
-export function parseSegment(segment) {
+export function expandVariables(str, vars = {}) {
+  if (!str || typeof str !== "string" || !vars || Object.keys(vars).length === 0) {
+    return str;
+  }
+  return str.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (full, k1, k2) => {
+      const key = k1 || k2;
+      return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : full;
+    },
+  );
+}
+
+export function parseSegment(segment, inheritedVars = {}) {
   const tokens = tokenizeSegment(segment);
   const envVars = {};
   let idx = 0;
 
   while (idx < tokens.length) {
     const tok = tokens[idx];
+    if (tok === "export") {
+      idx++;
+      continue;
+    }
     const eq = tok.indexOf("=");
     if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok.slice(0, eq))) {
-      envVars[tok.slice(0, eq)] = tok.slice(eq + 1);
+      const k = tok.slice(0, eq);
+      const rawVal = tok.slice(eq + 1);
+      envVars[k] = expandVariables(rawVal, { ...inheritedVars, ...envVars });
       idx++;
       continue;
     }
@@ -145,13 +164,14 @@ export function parseSegment(segment) {
     break;
   }
 
-  const remaining = tokens.slice(idx);
+  const allVars = { ...inheritedVars, ...envVars };
+  const remaining = tokens.slice(idx).map((t) => expandVariables(t, allVars));
   const cmd = remaining[0] || "";
   const baseCmd = path.basename(cmd, path.extname(cmd)).toLowerCase();
   const args = remaining.slice(1);
   return {
-    raw: segment,
-    envVars,
+    raw: expandVariables(segment, allVars),
+    envVars: allVars,
     cmd,
     baseCmd,
     args,
@@ -175,9 +195,10 @@ export function extractTargetSerial(parsed) {
   return null;
 }
 
-export function classifySegment(segment) {
-  const parsed = parseSegment(segment);
+export function classifySegment(segment, inheritedVars = {}) {
+  const parsed = parseSegment(segment, inheritedVars);
   const { baseCmd, args } = parsed;
+  const effectiveSegment = parsed.raw || segment;
 
   if (!baseCmd) {
     return { kind: "ignore", parsed };
@@ -288,14 +309,16 @@ export function classifySegment(segment) {
   }
 
   // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`)
-  if (SHELL_WRAPPERS.has(baseCmd) && FAST_PATH_REGEX.test(segment)) {
+  if (SHELL_WRAPPERS.has(baseCmd) && FAST_PATH_REGEX.test(effectiveSegment)) {
     const innerStrings = args.filter((a) => FAST_PATH_REGEX.test(a));
     if (innerStrings.length > 0) {
       let chosen = { kind: "ignore", parsed };
       const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
       for (const inner of innerStrings) {
+        const innerVars = { ...parsed.envVars };
         for (const subSeg of splitShellSegments(inner)) {
-          const subClass = classifySegment(subSeg);
+          const subClass = classifySegment(subSeg, innerVars);
+          Object.assign(innerVars, subClass.parsed?.envVars || {});
           if ((rank[subClass.kind] || 0) > (rank[chosen.kind] || 0)) {
             chosen = subClass;
           }
@@ -321,7 +344,7 @@ export function classifySegment(segment) {
 
   if (
     (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) || isExecutablePassive) &&
-    FAST_PATH_REGEX.test(segment)
+    FAST_PATH_REGEX.test(effectiveSegment)
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {
@@ -346,7 +369,7 @@ export function classifySegment(segment) {
         const nestedSegment = cleanedArgs
           .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        return classifySegment(nestedSegment);
+        return classifySegment(nestedSegment, parsed.envVars);
       }
     }
     return {
@@ -369,9 +392,11 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
   let hasDeviceAction = false;
   let hasUnscopedDeviceAction = false;
   const targetSerials = new Set();
+  const shellVars = {};
 
   for (const seg of segments) {
-    const c = classifySegment(seg);
+    const c = classifySegment(seg, shellVars);
+    Object.assign(shellVars, c.parsed?.envVars || {});
     if (c.kind === "ignore" || c.kind === "read_only") {
       continue;
     }

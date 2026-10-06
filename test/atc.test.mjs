@@ -1031,12 +1031,27 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(explicitId.sessionId, "explicit-builder");
     assert.equal(explicitId.anchorPid, null);
 
-    // find -exec is inspected by guard rather than treated as passive
+    // find -exec and variable-expanded commands are inspected by guard
     const findExecGuard = evaluateCommandGuard("find . -exec adb shell pm clear com.example \\;", {
       sessionId: "sess-unleased",
       activeLeases: [],
     });
     assert.equal(findExecGuard.allowed, false);
+
+    const varExpandedGuard = evaluateCommandGuard('tool=adb; "$tool" shell pm clear com.example', {
+      sessionId: "sess-unleased",
+      activeLeases: [],
+    });
+    assert.equal(varExpandedGuard.allowed, false);
+
+    const ambientId = resolveSessionIdentity({
+      flags: {},
+      env: { CODEX_SESSION_ID: "codex-123" },
+      state: { hookSessions: {} },
+      ppid: 99999999,
+    });
+    assert.equal(ambientId.sessionId, "codex-123");
+    assert.equal(ambientId.anchorPid, null);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });
