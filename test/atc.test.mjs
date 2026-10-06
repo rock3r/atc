@@ -643,9 +643,11 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
       "clean-snap",
       { session: "sess-1" },
       {
-        runner: (_cmd, _args, opts) => {
-          assert.equal(opts.timeoutMs, 60_000);
-          return { status: 0, stdout: "OK", stderr: "" };
+        runner: (_cmd, args, opts) => {
+          if (args.includes("snapshot")) {
+            assert.equal(opts.timeoutMs, 60_000);
+          }
+          return { status: 0, stdout: "1\n", stderr: "" };
         },
       }
     );
@@ -807,6 +809,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.deepEqual(bootCalls, [
       "android emulator start Pixel_8_API_35 --headless --cold",
       "adb -s emulator-5554 emu avd snapshot load clean-base",
+      "adb -s emulator-5554 shell getprop sys.boot_completed",
     ]);
 
     // Free with --shutdown synonym
@@ -1006,6 +1009,24 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     const afterHookState = readState(dir);
     assert.ok(afterHookState.leases["avd:Pixel_8_API_35"].expiresAtMs > shortExpiry + 100_000);
     assert.equal(afterHookState.leases["avd:Medium_Phone_API_36"].expiresAtMs, shortExpiry);
+
+    // sudo -n does not consume the wrapped command
+    const sudoNonInteractive = evaluateCommandGuard("sudo -n adb kill-server", {
+      sessionId: "sess-create",
+      activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+    });
+    assert.equal(sudoNonInteractive.allowed, false);
+    assert.match(sudoNonInteractive.reason, /adb kill-server/);
+
+    // Explicit --session without ATC_ANCHOR_PID leaves anchorPid null so ephemeral shell exit does not GC lease
+    const explicitId = resolveSessionIdentity({
+      flags: { session: "explicit-builder" },
+      env: {},
+      state: { hookSessions: {} },
+      ppid: 99999999,
+    });
+    assert.equal(explicitId.sessionId, "explicit-builder");
+    assert.equal(explicitId.anchorPid, null);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

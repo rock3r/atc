@@ -491,17 +491,31 @@ export function resolveSessionIdentity({
     ? Number(env.ATC_ANCHOR_PID)
     : null;
 
-  if (flags.session) {
+  const findHookAnchorForSession = (sid) => {
+    if (explicitAnchor) return explicitAnchor;
+    if (state?.hookSessions) {
+      const matched = Object.values(state.hookSessions).find(
+        (h) => h && h.sessionId === sid && h.agentPid,
+      );
+      if (matched) return Number(matched.agentPid);
+    }
+    return null;
+  };
+
+  const explicitSessionFlag = flags.session || flags.role;
+  if (explicitSessionFlag) {
+    const sid = validateSessionId(explicitSessionFlag);
     return {
-      sessionId: validateSessionId(flags.session),
-      anchorPid: explicitAnchor || ppid,
+      sessionId: sid,
+      anchorPid: findHookAnchorForSession(sid),
       source: "flag",
     };
   }
   if (env.ATC_SESSION_ID) {
+    const sid = validateSessionId(env.ATC_SESSION_ID);
     return {
-      sessionId: validateSessionId(env.ATC_SESSION_ID),
-      anchorPid: explicitAnchor || ppid,
+      sessionId: sid,
+      anchorPid: findHookAnchorForSession(sid),
       source: "env_atc",
     };
   }

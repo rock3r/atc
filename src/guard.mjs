@@ -115,11 +115,27 @@ export function parseSegment(segment) {
       idx++;
       if (base === "timeout" && idx < tokens.length && /^\d+[smhd]?$/.test(tokens[idx])) {
         idx++;
-      } else if (base === "sudo" || base === "nice") {
+      } else if (base === "sudo") {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx];
           idx++;
-          if ((flag === "-u" || flag === "-g" || flag === "-n") && idx < tokens.length) {
+          if (
+            (flag === "-u" ||
+              flag === "-g" ||
+              flag === "-C" ||
+              flag === "-D" ||
+              flag === "-R" ||
+              flag === "-T") &&
+            idx < tokens.length
+          ) {
+            idx++;
+          }
+        }
+      } else if (base === "nice") {
+        while (idx < tokens.length && tokens[idx].startsWith("-")) {
+          const flag = tokens[idx];
+          idx++;
+          if (flag === "-n" && idx < tokens.length) {
             idx++;
           }
         }
@@ -334,7 +350,13 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
     if (c.kind === "atc") {
       const hasSession =
         Boolean(c.parsed.envVars.ATC_SESSION_ID) ||
-        c.parsed.args.some((a) => a === "--session" || a.startsWith("--session="));
+        c.parsed.args.some(
+          (a) =>
+            a === "--session" ||
+            a.startsWith("--session=") ||
+            a === "--role" ||
+            a.startsWith("--role="),
+        );
       if (!hasSession && sessionId) {
         needsAtcRewrite = true;
       }

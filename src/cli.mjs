@@ -137,6 +137,29 @@ function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
   };
 }
 
+function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const propRes = runner(
+      "adb",
+      ["-s", serial, "shell", "getprop", "sys.boot_completed"],
+      {
+        strictInternal: true,
+        timeoutMs: Math.min(5000, Math.max(1000, deadline - Date.now())),
+      },
+    );
+    if (propRes.status === 0) {
+      const out = String(propRes.stdout || "").trim();
+      if (out === "1" || out === "OK" || out === "") {
+        return true;
+      }
+    }
+    if (Date.now() + 250 >= deadline) break;
+    sleepSync(250);
+  }
+  throw new Error(`Timed out waiting for emulator ${serial} to finish restoring snapshot.`);
+}
+
 export function selectCandidateUnderLock(state, inventory, req, callerTicket, now = Date.now()) {
   const cfg = state.config || DEFAULT_CONFIG;
   const effectiveMax = computeEffectiveMaxEmulators(cfg, inventory.host);
@@ -811,6 +834,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
             `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
           );
         }
+        waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
       }
       if (req.resetApp) {
         const resetRes = runner(
@@ -881,6 +905,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
             `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
           );
         }
+        waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
       }
 
       if (req.resetApp) {
@@ -1356,6 +1381,11 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 
   let finalLease = leaseCheck.lease;
   if (action === "load") {
+    try {
+      waitForEmulatorReady(runner, leaseCheck.lease.serial, leaseCheck.stopTimeoutMs);
+    } catch (err) {
+      return { exitCode: 1, error: err.message };
+    }
     finalLease = withStateTransaction(stateDir, (state) => {
       const cur = state.leases[leaseCheck.lease.deviceKey];
       if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
