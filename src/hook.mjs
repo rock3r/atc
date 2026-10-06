@@ -1,6 +1,13 @@
 import fs from "node:fs";
-import { discoverFleet } from "./android.mjs";
-import { evaluateCommandGuard, hasAndroidOrAtcTokens } from "./guard.mjs";
+import { parseAdbDevicesOutput } from "./android.mjs";
+import { cmdFree } from "./cli.mjs";
+import {
+  classifySegment,
+  evaluateCommandGuard,
+  hasAndroidOrAtcTokens,
+  splitShellSegments,
+} from "./guard.mjs";
+import { runCommandSync } from "./spawn.mjs";
 import { validateSessionId, withStateTransaction } from "./state.mjs";
 
 export function parseHookInput(rawStdin) {
@@ -74,9 +81,23 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 
   const cwd = options.cwd || process.cwd();
   const inventory = options.inventory || null;
-  const runningCount = inventory
-    ? (inventory.running || []).length
-    : 1;
+  let probedRunningCount = inventory ? (inventory.running || []).length : 0;
+
+  if (!inventory && options.runningCount === undefined) {
+    const hasUnscopedDeviceAction = splitShellSegments(norm.command).some((seg) => {
+      const c = classifySegment(seg);
+      return c.kind === "device_action" && !c.targetSerial;
+    });
+    if (hasUnscopedDeviceAction) {
+      const runner = options.runner || runCommandSync;
+      const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
+      if (adbRes.status === 0 && adbRes.stdout) {
+        probedRunningCount = parseAdbDevicesOutput(adbRes.stdout).length;
+      }
+    }
+  } else if (options.runningCount !== undefined) {
+    probedRunningCount = options.runningCount;
+  }
 
   const evalResult = withStateTransaction(stateDir, (state, { now }) => {
     state.hookSessions[String(norm.anchorPid)] = {
@@ -89,6 +110,8 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     const activeLeases = Object.values(state.leases).filter(
       (l) => l.state === "active" && l.sessionId === norm.sessionId,
     );
+    const totalLeasedCount = Object.keys(state.leases).length;
+    const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
 
     const guardRes = evaluateCommandGuard(norm.command, {
       sessionId: norm.sessionId,
@@ -169,26 +192,26 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
     payload?.conversation_id ||
     null;
 
-  const freed = withStateTransaction(stateDir, (state) => {
-    let targetSessionId = rawSession ? sanitizeSessionId(rawSession, ppid) : null;
-    if (!targetSessionId && state.hookSessions[String(ppid)]) {
-      targetSessionId = state.hookSessions[String(ppid)].sessionId;
+  const targetSessionId = withStateTransaction(stateDir, (state) => {
+    let resolvedId = rawSession ? sanitizeSessionId(rawSession, ppid) : null;
+    if (!resolvedId && state.hookSessions[String(ppid)]) {
+      resolvedId = state.hookSessions[String(ppid)].sessionId;
     }
-    const released = [];
-    if (!targetSessionId) {
-      return { mutated: false, value: released };
-    }
-    for (const [deviceKey, lease] of Object.entries(state.leases)) {
-      if (lease.state === "active" && lease.sessionId === targetSessionId) {
-        released.push(lease.leaseId);
-        delete state.leases[deviceKey];
-      }
-    }
+    const hadHookSession = Boolean(state.hookSessions[String(ppid)]);
     delete state.hookSessions[String(ppid)];
-    return { mutated: released.length > 0, value: released };
+    return { mutated: hadHookSession, value: resolvedId };
   });
 
-  return { exitCode: 0, freed };
+  if (!targetSessionId) {
+    return { exitCode: 0, freed: [] };
+  }
+
+  const freeRes = cmdFree(stateDir, null, { session: targetSessionId }, options);
+  return {
+    exitCode: freeRes.exitCode,
+    freed: freeRes.freed || [],
+    error: freeRes.error,
+  };
 }
 
 export function readStdinSync() {

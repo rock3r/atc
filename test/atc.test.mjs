@@ -315,6 +315,26 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   });
   assert.equal(wrongSerial.allowed, false);
   assert.match(wrongSerial.reason, /emulator-5556/);
+
+  // Wrapped Android commands (`sudo`, `bash -c`, custom wrappers) fail closed without a lease
+  const sudoWrap = evaluateCommandGuard("sudo adb shell pm list packages", {
+    sessionId: "sess-1",
+    activeLeases: [],
+  });
+  assert.equal(sudoWrap.allowed, false);
+
+  const bashWrap = evaluateCommandGuard("bash -c 'adb shell pm list packages'", {
+    sessionId: "sess-1",
+    activeLeases: [],
+  });
+  assert.equal(bashWrap.allowed, false);
+
+  const bashLifecycle = evaluateCommandGuard("bash -c 'emulator -avd Pixel_8_API_35'", {
+    sessionId: "sess-1",
+    activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+  });
+  assert.equal(bashLifecycle.allowed, false);
+  assert.match(bashLifecycle.reason, /Direct emulator launch is disabled/);
 });
 
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
@@ -350,6 +370,68 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
     assert.match(
       rewriteOut.hookSpecificOutput.updatedInput.command,
       /ATC_SESSION_ID=claude-sess-1/
+    );
+
+    // 3. Multi-device ambiguity is enforced when two sessions hold leases
+    const mockInventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      running: [
+        {
+          deviceKey: "avd:Pixel_8_API_35",
+          avd: "Pixel_8_API_35",
+          serial: "emulator-5554",
+          kind: "emulator",
+          online: true,
+          profile: { deviceType: "phone", apiLevel: "android-35" },
+        },
+        {
+          deviceKey: "avd:Pixel_9_API_36",
+          avd: "Pixel_9_API_36",
+          serial: "emulator-5556",
+          kind: "emulator",
+          online: true,
+          profile: { deviceType: "phone", apiLevel: "android-36" },
+        },
+      ],
+      offline: [],
+      creatable: [],
+    };
+    cmdClaim(
+      dir,
+      { session: "sess-a", avd: "Pixel_8_API_35", snapshotSaveOnFree: "snap-a" },
+      { inventory: mockInventory }
+    );
+    cmdClaim(dir, { session: "sess-b", avd: "Pixel_9_API_36" }, { inventory: mockInventory });
+
+    const unscopedPre = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        session_id: "sess-a",
+        tool_name: "Bash",
+        tool_input: { command: "adb shell wm size" },
+      }),
+      {
+        ppid: process.pid,
+        runner: () => ({ status: 0, stdout: "List of devices attached\n", stderr: "" }),
+      }
+    );
+    assert.equal(unscopedPre.exitCode, 2);
+    assert.match(unscopedPre.stderr, /multiple devices are connected or leased/);
+
+    // 4. Stop hook executes deferred snapshotSaveOnFree before releasing lease
+    const runnerCalls = [];
+    const stopRes = handleStopHook(dir, JSON.stringify({ session_id: "sess-a" }), {
+      ppid: process.pid,
+      host: { freeDiskMb: 65536 },
+      runner: (cmd, args) => {
+        runnerCalls.push([cmd, ...args].join(" "));
+        return { status: 0, stdout: "OK", stderr: "" };
+      },
+    });
+    assert.equal(stopRes.exitCode, 0);
+    assert.equal(stopRes.freed.length, 1);
+    assert.ok(
+      runnerCalls.some((c) => c.includes("adb -s emulator-5554 emu avd snapshot save snap-a"))
     );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -524,6 +606,15 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     assert.equal(freeFail.exitCode, 1);
     assert.match(freeFail.error, /Failed to stop emulator/);
     assert.deepEqual(freeFail.freed, []);
+
+    // 4. Non-finite --wait duration is rejected with exitCode 1
+    const badWait = cmdClaim(
+      dir,
+      { session: "sess-1", wait: "abc" },
+      { inventory: mockInventory }
+    );
+    assert.equal(badWait.exitCode, 1);
+    assert.match(badWait.error, /Invalid --wait duration/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

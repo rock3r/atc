@@ -328,8 +328,23 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     reason: flags.reason || null,
   };
 
-  let inventory = options.inventory || discoverFleet({ runner });
   const waitSec = flags.wait !== undefined ? Number(flags.wait) : DEFAULT_CONFIG.defaultWaitSec;
+  if (!Number.isFinite(waitSec) || waitSec < 0) {
+    return {
+      exitCode: 1,
+      error: `Invalid --wait duration "${flags.wait}". Expected a non-negative number of seconds.`,
+    };
+  }
+  if (flags.reorderWindow !== undefined) {
+    const rw = Number(flags.reorderWindow);
+    if (!Number.isFinite(rw) || rw < 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --reorder-window duration "${flags.reorderWindow}". Expected a non-negative number of seconds.`,
+      };
+    }
+  }
+  let inventory = options.inventory || discoverFleet({ runner });
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
 
@@ -1278,11 +1293,14 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
     const activeLeases = Object.values(state.leases).filter(
       (l) => l.state === "active" && l.sessionId === identity.sessionId,
     );
+    const totalLeasedCount = Object.keys(state.leases).length;
+    const runningCount =
+      options.runningCount ?? Math.max(totalLeasedCount, activeLeases.length);
     const guard = evaluateCommandGuard(commandStr, {
       sessionId: identity.sessionId,
       anchorPid: identity.anchorPid,
       activeLeases,
-      runningCount: options.runningCount ?? activeLeases.length,
+      runningCount,
     });
     return { mutated: false, value: guard };
   });

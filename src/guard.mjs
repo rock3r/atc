@@ -1,7 +1,49 @@
 import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|atc)\b/i;
-const TRANSPARENT_WRAPPERS = new Set(["env", "command", "nohup", "timeout", "build-brief"]);
+const TRANSPARENT_WRAPPERS = new Set([
+  "env",
+  "command",
+  "nohup",
+  "timeout",
+  "build-brief",
+  "sudo",
+  "nice",
+  "time",
+  "npx",
+]);
+const SHELL_WRAPPERS = new Set(["sh", "bash", "zsh", "dash", "ksh", "pwsh", "powershell", "cmd"]);
+const PASSIVE_NON_EXEC_COMMANDS = new Set([
+  "echo",
+  "printf",
+  "git",
+  "rg",
+  "grep",
+  "sed",
+  "awk",
+  "cat",
+  "ls",
+  "cd",
+  "pwd",
+  "mkdir",
+  "rm",
+  "cp",
+  "mv",
+  "touch",
+  "chmod",
+  "chown",
+  "find",
+  "head",
+  "tail",
+  "wc",
+  "sort",
+  "uniq",
+  "tr",
+  "cut",
+  "jq",
+  "true",
+  "false",
+]);
 
 const READ_ONLY_ANDROID_SUBCOMMANDS = new Set([
   "docs",
@@ -72,6 +114,14 @@ export function parseSegment(segment) {
       idx++;
       if (base === "timeout" && idx < tokens.length && /^\d+[smhd]?$/.test(tokens[idx])) {
         idx++;
+      } else if (base === "sudo" || base === "nice") {
+        while (idx < tokens.length && tokens[idx].startsWith("-")) {
+          const flag = tokens[idx];
+          idx++;
+          if ((flag === "-u" || flag === "-g" || flag === "-n") && idx < tokens.length) {
+            idx++;
+          }
+        }
       }
       continue;
     }
@@ -210,6 +260,46 @@ export function classifySegment(segment) {
       };
     }
     return { kind: "ignore", parsed };
+  }
+
+  // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`)
+  if (SHELL_WRAPPERS.has(baseCmd) && FAST_PATH_REGEX.test(segment)) {
+    const innerStrings = args.filter((a) => FAST_PATH_REGEX.test(a));
+    if (innerStrings.length > 0) {
+      let chosen = { kind: "ignore", parsed };
+      const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
+      for (const inner of innerStrings) {
+        for (const subSeg of splitShellSegments(inner)) {
+          const subClass = classifySegment(subSeg);
+          if ((rank[subClass.kind] || 0) > (rank[chosen.kind] || 0)) {
+            chosen = subClass;
+          }
+        }
+      }
+      if (chosen.kind !== "ignore") {
+        return chosen;
+      }
+    }
+  }
+
+  // Unrecognized wrapper around an Android command: peel to nested tool or fail closed
+  if (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) && FAST_PATH_REGEX.test(segment)) {
+    const nestedIdx = args.findIndex((a) => {
+      const b = path.basename(a, path.extname(a)).toLowerCase();
+      return ["atc", "emulator", "adb", "android", "gradlew", "gradle"].includes(b);
+    });
+    if (nestedIdx !== -1) {
+      const nestedSegment = args
+        .slice(nestedIdx)
+        .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
+        .join(" ");
+      return classifySegment(nestedSegment);
+    }
+    return {
+      kind: "device_action",
+      targetSerial: extractTargetSerial(parsed),
+      parsed,
+    };
   }
 
   return { kind: "ignore", parsed };
