@@ -752,6 +752,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           ramSizeMb: 2048,
           requiredRamMb: 3072,
           dataDiskMb: 6656,
+          snapshots: ["clean-base"],
           profile: {
             deviceType: "phone",
             deviceName: "pixel_8",
@@ -863,12 +864,102 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.ok(createCalls.includes("android emulator create medium_phone"));
     assert.ok(createCalls.includes("android emulator start Medium_Phone_API_36"));
 
-    // Backtick command substitution is inspected by guard
+    // Backtick and process substitutions are inspected by guard
     const backtickGuard = evaluateCommandGuard("echo `adb shell pm clear com.example`", {
       sessionId: "sess-unleased",
       activeLeases: [],
     });
     assert.equal(backtickGuard.allowed, false);
+
+    const procSubGuard = evaluateCommandGuard("cat <(adb shell pm clear com.example)", {
+      sessionId: "sess-unleased",
+      activeLeases: [],
+    });
+    assert.equal(procSubGuard.allowed, false);
+
+    // matchesProfile rejects online and offline emulators lacking requested snapshot
+    assert.equal(
+      matchesProfile(
+        { kind: "emulator", online: true, snapshots: [] },
+        { snapshotLoad: "clean-base" }
+      ),
+      false
+    );
+    assert.equal(
+      matchesProfile(
+        { kind: "emulator", online: false, snapshots: [] },
+        { snapshotLoad: "clean-base" }
+      ),
+      false
+    );
+    assert.equal(
+      matchesProfile(
+        { kind: "emulator", online: true, snapshots: ["clean-base"] },
+        { snapshotLoad: "clean-base" }
+      ),
+      true
+    );
+
+    // Ancestor PID disambiguation resolves concurrent hook sessions in the same cwd
+    const multiHookState = {
+      hookSessions: {
+        "1001": { sessionId: "agent-one", agentPid: 1001, cwd: "/repo" },
+        "2002": { sessionId: "agent-two", agentPid: 2002, cwd: "/repo" },
+      },
+    };
+    const resolvedByAncestor = resolveSessionIdentity({
+      env: {},
+      state: multiHookState,
+      cwd: "/repo",
+      ppid: 3003,
+      ancestorPids: [3003, 2500, 2002],
+    });
+    assert.equal(resolvedByAncestor.sessionId, "agent-two");
+
+    // Snapshot list honors --serial targeting
+    const snapBySerial = cmdSnapshot(
+      dir,
+      "list",
+      null,
+      { serial: "emulator-5554" },
+      {
+        avdHome,
+        inventory: {
+          running: [
+            {
+              kind: "emulator",
+              avd: "Pixel_8_API_35",
+              serial: "emulator-5554",
+              snapshots: ["clean-base"],
+            },
+            {
+              kind: "emulator",
+              avd: "Medium_Phone_API_36",
+              serial: "emulator-5556",
+              snapshots: ["other-snap"],
+            },
+          ],
+          offline: [],
+        },
+      }
+    );
+    assert.equal(snapBySerial.exitCode, 0);
+    assert.deepEqual(snapBySerial.snapshots, ["clean-base"]);
+
+    // Standalone cmdGuard renews lease on allowed device_action
+    const shortExpiry = Date.now() + 10_000;
+    withStateTransaction(dir, (state) => {
+      state.leases["avd:Medium_Phone_API_36"].expiresAtMs = shortExpiry;
+      return { mutated: true };
+    });
+    const guardRenew = cmdGuard(
+      dir,
+      "adb -s emulator-5556 shell wm size",
+      { session: "sess-create" },
+      { runningCount: 1 }
+    );
+    assert.equal(guardRenew.exitCode, 0);
+    assert.ok(readState(dir).leases["avd:Medium_Phone_API_36"].expiresAtMs > shortExpiry + 100_000);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

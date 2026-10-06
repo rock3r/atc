@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,61 @@ import {
   withLock,
   writeFileAtomic,
 } from "./lock.mjs";
+
+const ancestorPidCache = new Map();
+
+export function getAncestorPids(startPid = process.ppid) {
+  const numericStart = Number(startPid);
+  if (!Number.isInteger(numericStart) || numericStart <= 0) {
+    return [];
+  }
+  if (ancestorPidCache.has(numericStart)) {
+    return ancestorPidCache.get(numericStart);
+  }
+  const ancestors = [numericStart];
+  if (process.platform === "linux" && fs.existsSync(`/proc/${numericStart}/status`)) {
+    let cur = numericStart;
+    for (let depth = 0; depth < 16; depth++) {
+      try {
+        const statusText = fs.readFileSync(`/proc/${cur}/status`, "utf8");
+        const m = statusText.match(/^PPid:\s*(\d+)/m);
+        const parent = m ? Number(m[1]) : 0;
+        if (!parent || parent <= 1 || ancestors.includes(parent)) break;
+        ancestors.push(parent);
+        cur = parent;
+      } catch {
+        break;
+      }
+    }
+  } else if (process.platform !== "win32") {
+    try {
+      const res = spawnSync("ps", ["-Ao", "pid=,ppid="], {
+        encoding: "utf8",
+        timeout: 1500,
+      });
+      if (res.status === 0 && res.stdout) {
+        const parentMap = new Map();
+        for (const raw of res.stdout.split(/\r?\n/)) {
+          const m = raw.trim().match(/^(\d+)\s+(\d+)$/);
+          if (m) {
+            parentMap.set(Number(m[1]), Number(m[2]));
+          }
+        }
+        let cur = numericStart;
+        for (let depth = 0; depth < 16; depth++) {
+          const parent = parentMap.get(cur);
+          if (!parent || parent <= 1 || ancestors.includes(parent)) break;
+          ancestors.push(parent);
+          cur = parent;
+        }
+      }
+    } catch {
+      // Ignore ps lookup error
+    }
+  }
+  ancestorPidCache.set(numericStart, ancestors);
+  return ancestors;
+}
 
 export const DEFAULT_CONFIG = Object.freeze({
   maxRunningEmulators: 2,
@@ -233,6 +289,10 @@ export function reconcileOfflineLeases(state, inventory, callerSessionId, now = 
 }
 
 export function withStateTransaction(stateDir, fn, options = {}) {
+  // Pre-warm ancestor PID cache strictly outside atc.lock so resolveSessionIdentity never spawns subprocesses under lock
+  if (!options.ancestorPids) {
+    getAncestorPids(options.ppid ?? process.ppid);
+  }
   return withLock(
     stateDir,
     (lockHandle) => {
@@ -327,9 +387,11 @@ export function matchesProfile(device, req = {}) {
   if (req.abi && (device.profile?.abi || "").toLowerCase() !== req.abi.toLowerCase()) {
     return false;
   }
-  if (req.snapshotLoad && device.online === false) {
-    const snaps = device.snapshots || [];
-    if (snaps.length > 0 && !snaps.includes(req.snapshotLoad)) {
+  if (req.snapshotLoad && device.kind === "emulator") {
+    if (device.loadedSnapshot === req.snapshotLoad) {
+      return true;
+    }
+    if (Array.isArray(device.snapshots) && !device.snapshots.includes(req.snapshotLoad)) {
       return false;
     }
   }
@@ -423,6 +485,7 @@ export function resolveSessionIdentity({
   state = null,
   cwd = process.cwd(),
   ppid = process.ppid,
+  ancestorPids = null,
 } = {}) {
   const explicitAnchor = env.ATC_ANCHOR_PID && /^\d+$/.test(env.ATC_ANCHOR_PID)
     ? Number(env.ATC_ANCHOR_PID)
@@ -486,6 +549,17 @@ export function resolveSessionIdentity({
         source: "hook_ppid",
       };
     }
+    const ancestors = ancestorPids || ancestorPidCache.get(Number(ppid)) || [Number(ppid)];
+    for (const ancPid of ancestors) {
+      const ancMatch = state.hookSessions[String(ancPid)];
+      if (ancMatch && SESSION_ID_REGEX.test(ancMatch.sessionId)) {
+        return {
+          sessionId: ancMatch.sessionId,
+          anchorPid: Number(ancMatch.agentPid || ancPid),
+          source: "hook_ancestor_pid",
+        };
+      }
+    }
     const cwdMatches = Object.values(state.hookSessions).filter((h) => h && h.cwd === cwd);
     if (cwdMatches.length === 1 && SESSION_ID_REGEX.test(cwdMatches[0].sessionId)) {
       return {
@@ -495,6 +569,18 @@ export function resolveSessionIdentity({
       };
     }
     if (cwdMatches.length > 1) {
+      const ancestorSet = new Set(ancestors.map(Number));
+      const ancestorCwdMatches = cwdMatches.filter((h) => ancestorSet.has(Number(h.agentPid)));
+      if (
+        ancestorCwdMatches.length === 1 &&
+        SESSION_ID_REGEX.test(ancestorCwdMatches[0].sessionId)
+      ) {
+        return {
+          sessionId: ancestorCwdMatches[0].sessionId,
+          anchorPid: Number(ancestorCwdMatches[0].agentPid || ppid),
+          source: "hook_cwd_ancestor",
+        };
+      }
       const err = new Error(
         `Multiple active agent sessions detected in ${cwd}; pass --session <unique_id> or ATC_SESSION_ID explicitly.`,
       );

@@ -1185,11 +1185,45 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 
   if (action === "list") {
     const targetAvd = flags.avd || null;
-    if (targetAvd) {
+    const targetSerial = flags.serial || null;
+    if (targetAvd && !targetSerial) {
       const meta = readLocalAvdMetadata(targetAvd, avdHome);
       return { exitCode: 0, snapshots: meta.snapshots };
     }
     const fleet = options.inventory || discoverFleet({ avdHome, runner });
+    if (targetSerial || targetAvd) {
+      const allDevs = [...(fleet.running || []), ...(fleet.offline || [])];
+      const matched = allDevs.find(
+        (d) =>
+          d.kind === "emulator" &&
+          (!targetSerial || d.serial === targetSerial) &&
+          (!targetAvd || d.avd === targetAvd),
+      );
+      if (!matched && targetSerial) {
+        const state = readState(stateDir);
+        const leased = Object.values(state.leases || {}).find(
+          (l) =>
+            l.kind === "emulator" &&
+            l.serial === targetSerial &&
+            (!targetAvd || l.avd === targetAvd) &&
+            l.avd,
+        );
+        if (leased) {
+          const meta = readLocalAvdMetadata(leased.avd, avdHome);
+          return { exitCode: 0, snapshots: meta.snapshots };
+        }
+      }
+      if (!matched) {
+        return {
+          exitCode: 1,
+          error: `No emulator found matching ${targetSerial ? `serial "${targetSerial}"` : `AVD "${targetAvd}"`}.`,
+        };
+      }
+      const snaps = Array.isArray(matched.snapshots)
+        ? matched.snapshots
+        : readLocalAvdMetadata(matched.avd, avdHome).snapshots;
+      return { exitCode: 0, snapshots: snaps };
+    }
     const byAvd = {};
     for (const d of [...fleet.running, ...fleet.offline]) {
       if (d.kind === "emulator" && d.avd) {
@@ -1505,7 +1539,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
     probedRunningCount = options.runningCount;
   }
 
-  const evalRes = withStateTransaction(stateDir, (state) => {
+  const evalRes = withStateTransaction(stateDir, (state, { now }) => {
     const identity = resolveSessionIdentity({
       flags,
       env: options.env || process.env,
@@ -1524,7 +1558,18 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       activeLeases,
       runningCount,
     });
-    return { mutated: false, value: guard };
+    let mutated = false;
+    if (guard.allowed && guard.renewLease && activeLeases.length > 0) {
+      const ttlMs = (state.config?.defaultTtlSec ?? DEFAULT_CONFIG.defaultTtlSec ?? 600) * 1000;
+      for (const lease of activeLeases) {
+        if (!guard.targetSerial || lease.serial === guard.targetSerial) {
+          lease.renewedAtMs = now;
+          lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
+          mutated = true;
+        }
+      }
+    }
+    return { mutated, value: guard };
   });
 
   return {
