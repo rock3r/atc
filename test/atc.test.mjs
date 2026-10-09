@@ -1929,6 +1929,65 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         winCompoundRewrite.rewrittenCommand,
         'atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell "echo hi" && atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell input keyevent 3',
       );
+
+      // Device commands invalidate loadedSnapshot, and idempotent re-claim with --snapshot-load reloads the snapshot
+      const snapReloadDir = makeTempStateDir();
+      try {
+        const snapInv = {
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+          running: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              avd: "Pixel_8_API_35",
+              serial: "emulator-5554",
+              kind: "emulator",
+              online: true,
+              snapshots: ["clean-base"],
+              profile: { deviceType: "phone", apiLevel: "android-35" },
+            },
+          ],
+          offline: [],
+          creatable: [],
+        };
+        const snapCalls = [];
+        const snapRunner = (cmd, args) => {
+          snapCalls.push([cmd, ...args].join(" "));
+          if (cmd === "adb" && args.includes("getprop")) {
+            return { status: 0, stdout: "1\n", stderr: "" };
+          }
+          return { status: 0, stdout: "OK", stderr: "" };
+        };
+        const c1 = cmdClaim(
+          snapReloadDir,
+          { session: "snap-sess", api: "35", snapshotLoad: "clean-base" },
+          { inventory: snapInv, runner: snapRunner },
+        );
+        assert.equal(c1.exitCode, 0);
+        assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-base");
+
+        // Mutating device command via cmdGuard invalidates loadedSnapshot
+        cmdGuard(
+          snapReloadDir,
+          "adb -s emulator-5554 shell pm clear com.example.app",
+          { session: "snap-sess" },
+          { runningCount: 1 },
+        );
+        assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, null);
+
+        // Re-claiming with --snapshot-load restores the snapshot again
+        snapCalls.length = 0;
+        const c2 = cmdClaim(
+          snapReloadDir,
+          { session: "snap-sess", api: "35", snapshotLoad: "clean-base" },
+          { inventory: snapInv, runner: snapRunner },
+        );
+        assert.equal(c2.exitCode, 0);
+        assert.equal(c2.idempotent, true);
+        assert.ok(snapCalls.includes("adb -s emulator-5554 emu avd snapshot load clean-base"));
+        assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-base");
+      } finally {
+        fs.rmSync(snapReloadDir, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

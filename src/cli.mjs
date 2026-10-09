@@ -509,17 +509,35 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
         // Step 3: Idempotent Re-Claim (Same Session)
         for (const lease of Object.values(state.leases)) {
+          const invDev = (inventory.running || []).find(
+            (d) =>
+              d.deviceKey === lease.deviceKey ||
+              (d.avd && d.avd === lease.avd) ||
+              (d.serial && d.serial === lease.serial),
+          );
+          const candidateForMatch = invDev
+            ? { ...invDev, ...lease, snapshots: invDev.snapshots }
+            : lease;
           if (
             lease.state === "active" &&
             lease.sessionId === identity.sessionId &&
-            matchesProfile(lease, req) &&
+            matchesProfile(candidateForMatch, { ...req, snapshotLoad: null }) &&
+            (!req.snapshotLoad ||
+              (lease.kind === "emulator" &&
+                (lease.loadedSnapshot === req.snapshotLoad ||
+                  !Array.isArray(candidateForMatch.snapshots) ||
+                  candidateForMatch.snapshots.includes(req.snapshotLoad)))) &&
             !req.wipeData &&
-            !req.coldBoot &&
-            (!req.snapshotLoad || lease.loadedSnapshot === req.snapshotLoad)
+            !req.coldBoot
           ) {
-            lease.workerPid = req.resetApp ? process.pid : null;
-          lease.renewedAtMs = now;
-            lease.expiresAtMs = now + ttlMs;
+            const needsPrep = Boolean(req.resetApp || req.snapshotLoad);
+            const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
+            lease.workerPid = needsPrep ? process.pid : null;
+            lease.renewedAtMs = now;
+            lease.expiresAtMs = Math.max(
+              now + ttlMs,
+              needsPrep ? now + stopTimeoutMs * 2 : 0,
+            );
             if (req.snapshotSaveOnFree) {
               lease.saveSnapshotOnFree = req.snapshotSaveOnFree;
             }
@@ -528,7 +546,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             }
             return {
               mutated: true,
-              value: { status: "claimed_immediate", lease, idempotent: true },
+              value: {
+                status: "claimed_immediate",
+                lease,
+                idempotent: true,
+                stopTimeoutMs,
+              },
             };
           }
         }
@@ -715,25 +738,64 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     }
 
     if (txOutcome.status === "claimed_immediate") {
-      if (txOutcome.idempotent && req.resetApp && txOutcome.lease?.serial) {
+      if (txOutcome.idempotent && (req.snapshotLoad || req.resetApp) && txOutcome.lease?.serial) {
+        let loadedSnap = null;
+        let prepUpdatedSnap = false;
         try {
-          const resetRes = runner(
-            "adb",
-            ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
-            { strictInternal: true },
-          );
-          if (resetRes.status !== 0) {
-            return {
-              exitCode: 1,
-              error: `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`,
-            };
+          if (req.snapshotLoad) {
+            const snapTimeoutMs = txOutcome.stopTimeoutMs || 60_000;
+            const snapRes = runner(
+              "adb",
+              [
+                "-s",
+                txOutcome.lease.serial,
+                "emu",
+                "avd",
+                "snapshot",
+                "load",
+                req.snapshotLoad,
+              ],
+              { strictInternal: true, timeoutMs: snapTimeoutMs },
+            );
+            if (snapRes.status !== 0) {
+              return {
+                exitCode: 1,
+                error: `Failed to load snapshot "${req.snapshotLoad}" on ${txOutcome.lease.serial}: ${snapRes.stderr || snapRes.stdout}`,
+              };
+            }
+            waitForEmulatorReady(runner, txOutcome.lease.serial, snapTimeoutMs);
+            loadedSnap = req.snapshotLoad;
+            prepUpdatedSnap = true;
           }
+          if (req.resetApp) {
+            const resetRes = runner(
+              "adb",
+              ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
+              { strictInternal: true },
+            );
+            if (resetRes.status !== 0) {
+              return {
+                exitCode: 1,
+                error: `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`,
+              };
+            }
+            loadedSnap = null;
+            prepUpdatedSnap = true;
+          }
+        } catch (err) {
+          return { exitCode: 1, error: err.message };
         } finally {
           const livenessCheck = options.livenessCheck || isPidAlive;
           withStateTransaction(stateDir, (state) => {
             const cur = state.leases[txOutcome.lease.deviceKey];
-            if (cur && cur.leaseId === txOutcome.lease.leaseId && cur.workerPid === process.pid) {
-              cur.workerPid = null;
+            if (cur && cur.leaseId === txOutcome.lease.leaseId) {
+              if (cur.workerPid === process.pid) {
+                cur.workerPid = null;
+              }
+              if (prepUpdatedSnap) {
+                cur.loadedSnapshot = loadedSnap;
+                txOutcome.lease.loadedSnapshot = loadedSnap;
+              }
               if (
                 cur.anchorPid !== null &&
                 cur.anchorPid !== undefined &&
@@ -1688,6 +1750,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     lease.workerPid = process.pid;
+    if (wrappedClass.kind !== "read_only") {
+      lease.loadedSnapshot = null;
+    }
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
     return {
@@ -1954,6 +2019,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
             : null;
       for (const lease of activeLeases) {
         if (!targeted || targeted.has(lease.serial)) {
+          lease.loadedSnapshot = null;
           lease.renewedAtMs = now;
           lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
           mutated = true;

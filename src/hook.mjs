@@ -194,6 +194,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
               : null;
         for (const lease of activeLeases) {
           if (!targeted || targeted.has(lease.serial)) {
+            lease.loadedSnapshot = null;
             lease.renewedAtMs = now;
             lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
           }
