@@ -11,13 +11,13 @@
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
         "matcher": ".*",
         "hooks": [
           {
             "type": "command",
-            "command": "atc hook Stop"
+            "command": "atc hook SessionEnd"
           }
         ]
       }

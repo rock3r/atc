@@ -12,15 +12,17 @@ export class ResourceError extends Error {
   }
 }
 
-export function parseSizeMb(val, fallbackMb) {
+export function parseSizeMb(val, fallbackMb, defaultUnit = "M") {
   if (val === undefined || val === null || val === "") return fallbackMb;
   const s = String(val).trim().toUpperCase();
-  const m = s.match(/^(\d+(?:\.\d+)?)\s*(K|KB|M|MB|G|GB)?$/);
+  const m = s.match(/^(\d+(?:\.\d+)?)\s*(B|K|KB|M|MB|G|GB)?$/);
   if (!m) return fallbackMb;
   const num = Number(m[1]);
-  const unit = m[2] || "M";
+  if (num === 0) return 0;
+  const unit = m[2] || defaultUnit.toUpperCase();
   if (unit.startsWith("G")) return Math.round(num * 1024);
   if (unit.startsWith("K")) return Math.max(1, Math.round(num / 1024));
+  if (unit === "B") return Math.max(1, Math.round(num / (1024 * 1024)));
   return Math.round(num);
 }
 
@@ -115,8 +117,8 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   const abi = configIni["abi.type"] || "arm64-v8a";
   const ramSizeMb = parseSizeMb(configIni["hw.ramSize"], 2048);
   const cpuCores = Number(configIni["hw.cpu.ncore"]) || 4;
-  const dataPartitionMb = parseSizeMb(configIni["disk.dataPartition.size"], 6144);
-  const sdcardMb = parseSizeMb(configIni["sdcard.size"], 512);
+  const dataPartitionMb = parseSizeMb(configIni["disk.dataPartition.size"], 6144, "B");
+  const sdcardMb = parseSizeMb(configIni["sdcard.size"], 512, "B");
   const dataDiskMb = dataPartitionMb + sdcardMb;
   const requiredRamMb = ramSizeMb + (cfg.qemuOverheadRamMb ?? 1024);
 

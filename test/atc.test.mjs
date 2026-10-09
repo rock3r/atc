@@ -35,6 +35,7 @@ import {
   deterministicCreatedAvdId,
   discoverFleet,
   resolveAvdHome,
+  readLocalAvdMetadata,
 } from "../src/android.mjs";
 import { handleMcpRequest } from "../src/mcp.mjs";
 import {
@@ -1807,6 +1808,18 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         sessionId: "sess-1",
       };
       assert.equal(computeUsedEmulatorSlots(unmappedSlotState, { running: [] }), 1);
+
+      // readLocalAvdMetadata interprets unitless disk.dataPartition.size as bytes
+      const bytePartitionAvdDir = path.join(avdHome, "Byte_Partition_API_35.avd");
+      fs.mkdirSync(bytePartitionAvdDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(bytePartitionAvdDir, "config.ini"),
+        "hw.ramSize=2048\ndisk.dataPartition.size=6442450944\nsdcard.size=536870912\n",
+        "utf8",
+      );
+      const byteAvdMeta = readLocalAvdMetadata("Byte_Partition_API_35", avdHome);
+      assert.equal(byteAvdMeta.ramSizeMb, 2048);
+      assert.equal(byteAvdMeta.dataDiskMb, 6144 + 512);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

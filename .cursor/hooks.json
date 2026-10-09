@@ -6,9 +6,9 @@
         "command": "atc hook PreToolUse"
       }
     ],
-    "stop": [
+    "sessionEnd": [
       {
-        "command": "atc hook Stop"
+        "command": "atc hook SessionEnd"
       }
     ]
   }
