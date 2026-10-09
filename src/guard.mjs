@@ -521,11 +521,11 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   if (baseCmd === "adb") {
-    // Strip -s <serial> / -d / -e flags to find the adb subcommand
+    // Strip -s <serial> / -d / -e / -t / -H / -P / -L flags to find the adb subcommand
     let subIdx = 0;
     while (subIdx < args.length) {
       const a = args[subIdx];
-      if (a === "-s" || a === "-t" || a === "-H" || a === "-P") {
+      if (a === "-s" || a === "-t" || a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
         subIdx += 1;
@@ -786,7 +786,36 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
   }
 
   let rewrittenCommand = null;
-  if (needsAtcRewrite && sessionId) {
+  const serialList = hasUnscopedDeviceAction ? null : Array.from(targetSerials);
+
+  if (hasDeviceAction && activeLeases.length > 0) {
+    if (targetSerials.size > 1) {
+      return {
+        allowed: false,
+        reason:
+          'Blocked by ATC guardrail: command targets multiple devices in one invocation; run each device command via "atc exec --serial <serial> -- <command>".',
+        rewrittenCommand: null,
+      };
+    }
+    const execSerial =
+      serialList && serialList.length === 1 ? serialList[0] : activeLeases[0].serial;
+    const envPrefix = sessionId
+      ? anchorPid
+        ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
+        : `ATC_SESSION_ID=${sessionId} `
+      : "";
+    const isSimpleSingleCommand =
+      segments.length === 1 &&
+      !needsAtcRewrite &&
+      !/[<>|&;`$()\r\n]/.test(command) &&
+      !tokenizeSegment(command)[0]?.includes("=");
+    if (isSimpleSingleCommand) {
+      rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- ${command}`;
+    } else {
+      const escaped = `'${String(command).replace(/'/g, `'\\''`)}'`;
+      rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
+    }
+  } else if (needsAtcRewrite && sessionId) {
     if (segments.length > 1) {
       const exportVars = anchorPid
         ? `export ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid}; `
@@ -800,12 +829,11 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
     }
   }
 
-  const serialList = hasUnscopedDeviceAction ? null : Array.from(targetSerials);
-
   return {
     allowed: true,
     fastPath: false,
     rewrittenCommand,
+    hasDirectDeviceAction: hasDeviceAction,
     renewLease: hasDeviceAction && activeLeases.length > 0,
     targetSerial: serialList && serialList.length === 1 ? serialList[0] : null,
     targetSerials: serialList,

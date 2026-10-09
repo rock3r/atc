@@ -339,7 +339,7 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   assert.equal(deniedNoLease.allowed, false);
   assert.match(deniedNoLease.reason, /holds no active device lease/);
 
-  // Device action with active lease -> allowed & renews lease
+  // Device action with active lease -> allowed, renews lease, and rewrites to atc exec for lifetime heartbeat
   const allowedWithLease = evaluateCommandGuard("./gradlew connectedDebugAndroidTest", {
     sessionId: "sess-1",
     activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
@@ -347,6 +347,10 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
   });
   assert.equal(allowedWithLease.allowed, true);
   assert.equal(allowedWithLease.renewLease, true);
+  assert.equal(
+    allowedWithLease.rewrittenCommand,
+    "ATC_SESSION_ID=sess-1 atc exec --serial emulator-5554 -- ./gradlew connectedDebugAndroidTest",
+  );
 
   // Device action targeting another agent's serial -> denied
   const wrongSerial = evaluateCommandGuard("adb -s emulator-5556 shell input keyevent 82", {
@@ -1670,6 +1674,18 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       reconcileOfflineLeases(unmappedLeaseState, schedInventory, "sess-other", schedNow);
       assert.equal(unmappedLeaseState.leases["serial:emulator-5554"], undefined);
       assert.equal(unmappedLeaseState.leases["avd:Pixel_8_API_35"].leaseId, "lease-unmapped-serial");
+
+      // adb -L <socket> lifecycle commands are denied even with an active lease
+      const adbDashLKill = evaluateCommandGuard("adb -L tcp:localhost:5037 kill-server", {
+        sessionId: "sess-1",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      });
+      assert.equal(adbDashLKill.allowed, false);
+      const adbDashLEmuKill = evaluateCommandGuard("adb -L tcp:localhost:5037 emu kill", {
+        sessionId: "sess-1",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      });
+      assert.equal(adbDashLEmuKill.allowed, false);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

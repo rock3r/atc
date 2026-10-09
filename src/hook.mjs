@@ -157,6 +157,19 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
         runningCount,
       });
 
+      if (guardRes.allowed && norm.hostFormat === "cursor" && guardRes.hasDirectDeviceAction) {
+        return {
+          mutated: true,
+          value: {
+            allowed: false,
+            reason:
+              `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to attach a lease heartbeat.\n` +
+              `  Run device commands via: atc exec -- ${norm.command}`,
+            rewrittenCommand: null,
+          },
+        };
+      }
+
       if (guardRes.allowed && guardRes.renewLease) {
         const ttlMs = (state.config?.defaultTtlSec ?? 600) * 1000;
         const targeted =
