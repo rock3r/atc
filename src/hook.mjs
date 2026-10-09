@@ -8,7 +8,12 @@ import {
   splitShellSegments,
 } from "./guard.mjs";
 import { runCommandSync } from "./spawn.mjs";
-import { validateSessionId, withStateTransaction } from "./state.mjs";
+import {
+  getAncestorPids,
+  resolveStableParentPid,
+  validateSessionId,
+  withStateTransaction,
+} from "./state.mjs";
 
 export function parseHookInput(rawStdin) {
   if (!rawStdin || !String(rawStdin).trim()) return null;
@@ -89,17 +94,21 @@ function sanitizeSessionId(raw, ppid) {
 
 export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const payload = typeof rawStdin === "string" ? parseHookInput(rawStdin) : rawStdin;
-  const norm = normalizeHookPayload(payload, options.ppid ?? process.ppid);
+  const rawPpid = options.ppid ?? process.ppid;
+  const fastNorm = normalizeHookPayload(payload, rawPpid);
   const cursorAllowOut =
-    norm.hostFormat === "cursor" ? JSON.stringify({ permission: "allow" }) + "\n" : "";
-  if (!norm.isShellTool || !norm.command) {
+    fastNorm.hostFormat === "cursor" ? JSON.stringify({ permission: "allow" }) + "\n" : "";
+  if (!fastNorm.isShellTool || !fastNorm.command) {
     return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
   }
 
   // Fast Path (<2ms, Zero Lock)
-  if (!hasAndroidOrAtcTokens(norm.command)) {
+  if (!hasAndroidOrAtcTokens(fastNorm.command)) {
     return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
   }
+
+  getAncestorPids(rawPpid);
+  const norm = normalizeHookPayload(payload, resolveStableParentPid(rawPpid, options.processChain));
 
   const cwd = options.cwd || process.cwd();
   const inventory = options.inventory || null;
@@ -265,7 +274,9 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
   if (payload && payload.fullyIdle === false) {
     return { exitCode: 0, freed: [] };
   }
-  const ppid = options.ppid ?? process.ppid;
+  const rawPpid = options.ppid ?? process.ppid;
+  getAncestorPids(rawPpid);
+  const ppid = resolveStableParentPid(rawPpid, options.processChain);
   const rawSession =
     payload?.session_id ||
     payload?.sessionId ||

@@ -28,6 +28,7 @@ import {
   reconcileOfflineLeases,
   removeLeaseWorker,
   resolveSessionIdentity,
+  resolveStableParentPid,
   syncLeaseWorkers,
   withStateTransaction,
 } from "./state.mjs";
@@ -528,6 +529,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           state,
           cwd: options.cwd || process.cwd(),
           ppid: options.ppid ?? process.ppid,
+          ancestorPids: options.ancestorPids,
+          processChain: options.processChain,
         });
         const ttlSec = clampTtlSec(flags.ttl, state.config);
         const ttlMs = ttlSec * 1000;
@@ -604,7 +607,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             profile: dev.profile,
             sessionId: identity.sessionId,
             anchorPid: identity.anchorPid,
-            parentPid: options.ppid ?? process.ppid,
+            parentPid: resolveStableParentPid(
+              options.ppid ?? process.ppid,
+              options.processChain,
+            ),
             state: "active",
             workerPid: null,
             replacingAvd: null,
@@ -669,7 +675,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             profile: dev.profile,
             sessionId: identity.sessionId,
             anchorPid: identity.anchorPid,
-            parentPid: options.ppid ?? process.ppid,
+            parentPid: resolveStableParentPid(
+              options.ppid ?? process.ppid,
+              options.processChain,
+            ),
             state: "starting",
             workerPid: process.pid,
             replacingAvd: selection.victim ? selection.victim.avd : null,
@@ -1251,6 +1260,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         state,
         cwd: options.cwd || process.cwd(),
         ppid: options.ppid ?? process.ppid,
+        ancestorPids: options.ancestorPids,
+        processChain: options.processChain,
       });
 
       const matches = [];
@@ -1511,6 +1522,8 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       state,
       cwd: options.cwd || process.cwd(),
       ppid: options.ppid ?? process.ppid,
+      ancestorPids: options.ancestorPids,
+      processChain: options.processChain,
     });
     const ttlSec = clampTtlSec(flags.ttl, state.config);
     const ttlMs = ttlSec * 1000;
@@ -1558,7 +1571,7 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       mutated: true,
       value: { exitCode: 0, lease },
     };
-  });
+  }, options);
 }
 
 export function cmdSnapshot(stateDir, action, name = null, flags = {}, options = {}) {
@@ -1640,6 +1653,8 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       state,
       cwd: options.cwd || process.cwd(),
       ppid: options.ppid ?? process.ppid,
+      ancestorPids: options.ancestorPids,
+      processChain: options.processChain,
     });
     const owned = Object.values(state.leases).filter(
       (l) =>
@@ -1762,6 +1777,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       state,
       cwd: options.cwd || process.cwd(),
       ppid: options.ppid ?? process.ppid,
+      ancestorPids: options.ancestorPids,
+      processChain: options.processChain,
     });
     const owned = Object.values(state.leases).filter(
       (l) =>
@@ -2077,6 +2094,8 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       state,
       cwd: options.cwd || process.cwd(),
       ppid: options.ppid ?? process.ppid,
+      ancestorPids: options.ancestorPids,
+      processChain: options.processChain,
     });
     const activeLeases = Object.values(state.leases).filter(
       (l) => l.state === "active" && l.sessionId === identity.sessionId,
@@ -2109,7 +2128,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       }
     }
     return { mutated, value: guard };
-  });
+  }, options);
 
   return {
     exitCode: evalRes.allowed ? 0 : 2,

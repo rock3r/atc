@@ -11,6 +11,80 @@ import {
 } from "./lock.mjs";
 
 const ancestorPidCache = new Map();
+const ancestorProcessCache = new Map();
+
+export function isTransientWrapperProcess(proc) {
+  if (!proc || typeof proc !== "object") return false;
+  const args = String(proc.args || "").trim();
+  const firstToken =
+    args.match(/^(?:"([^"]+)"|'([^']+)'|(\S+))/)?.slice(1).find(Boolean) ||
+    String(proc.comm || "").trim();
+  const base = firstToken
+    .split(/[\\/]/)
+    .pop()
+    .toLowerCase()
+    .replace(/^[-]+/, "")
+    .replace(/\.(exe|cmd|bat|com|ps1|sh)$/, "");
+  const commBase = String(proc.comm || "")
+    .split(/[\\/]/)
+    .pop()
+    .toLowerCase()
+    .replace(/^[-]+/, "")
+    .replace(/\.(exe|cmd|bat|com|ps1|sh)$/, "");
+
+  const wrapperBins = new Set(["npm", "npx", "pnpm", "pnpx", "yarn", "bunx", "corepack"]);
+  if (wrapperBins.has(base) || wrapperBins.has(commBase)) {
+    return true;
+  }
+
+  if (
+    (base === "node" || base === "nodejs" || commBase === "node" || commBase === "nodejs") &&
+    /(?:^|[\\/"'\s])(?:npx(?:-cli)?|npm(?:-cli)?|pnpm(?:-cli)?|pnpx|yarn|corepack|bunx)(?:\.[cm]?js|\.exe|\.cmd)?(?:\s|"|'|$)/i.test(
+      args,
+    )
+  ) {
+    return true;
+  }
+
+  if ((base === "bun" || commBase === "bun") && /\bbun(?:\.exe)?\s+x\b/i.test(args)) {
+    return true;
+  }
+
+  const shellBins = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+  if (
+    (shellBins.has(base) || shellBins.has(commBase)) &&
+    /(?:^|\s)-(?:[a-zA-Z]*c[a-zA-Z]*)\b/.test(args)
+  ) {
+    return true;
+  }
+
+  if (
+    (base === "cmd" || commBase === "cmd") &&
+    /(?:^|\s)\/(?:[dDsS]\s+\/)*[cC]\b/.test(args)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export function resolveStableParentPid(startPid = process.ppid, processChain = null) {
+  const numericStart = Number(startPid);
+  if (!Number.isInteger(numericStart) || numericStart <= 0) {
+    return startPid;
+  }
+  const chain = processChain || ancestorProcessCache.get(numericStart) || [];
+  let candidate = numericStart;
+  for (const proc of chain) {
+    if (proc.pid !== candidate) break;
+    if (isTransientWrapperProcess(proc) && Number.isInteger(proc.ppid) && proc.ppid > 1) {
+      candidate = proc.ppid;
+    } else {
+      break;
+    }
+  }
+  return candidate;
+}
 
 export function getAncestorPids(startPid = process.ppid) {
   const numericStart = Number(startPid);
@@ -21,13 +95,26 @@ export function getAncestorPids(startPid = process.ppid) {
     return ancestorPidCache.get(numericStart);
   }
   const ancestors = [numericStart];
+  const chain = [];
   if (process.platform === "linux" && fs.existsSync(`/proc/${numericStart}/status`)) {
     let cur = numericStart;
     for (let depth = 0; depth < 16; depth++) {
       try {
         const statusText = fs.readFileSync(`/proc/${cur}/status`, "utf8");
         const m = statusText.match(/^PPid:\s*(\d+)/m);
+        const nameMatch = statusText.match(/^Name:\s*(.+)$/m);
+        let cmdline = "";
+        try {
+          cmdline = fs
+            .readFileSync(`/proc/${cur}/cmdline`, "utf8")
+            .replace(/\0+/g, " ")
+            .trim();
+        } catch {
+          // Ignore cmdline read failure
+        }
         const parent = m ? Number(m[1]) : 0;
+        const comm = nameMatch ? nameMatch[1].trim() : "";
+        chain.push({ pid: cur, ppid: parent, comm, args: cmdline || comm });
         if (!parent || parent <= 1 || ancestors.includes(parent)) break;
         ancestors.push(parent);
         cur = parent;
@@ -37,21 +124,29 @@ export function getAncestorPids(startPid = process.ppid) {
     }
   } else if (process.platform !== "win32") {
     try {
-      const res = spawnSync("ps", ["-Ao", "pid=,ppid="], {
+      const res = spawnSync("ps", ["-Ao", "pid=,ppid=,args="], {
         encoding: "utf8",
         timeout: 1500,
       });
       if (res.status === 0 && res.stdout) {
-        const parentMap = new Map();
+        const procMap = new Map();
         for (const raw of res.stdout.split(/\r?\n/)) {
-          const m = raw.trim().match(/^(\d+)\s+(\d+)$/);
+          const m = raw.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
           if (m) {
-            parentMap.set(Number(m[1]), Number(m[2]));
+            const pid = Number(m[1]);
+            const ppid = Number(m[2]);
+            const args = m[3].trim();
+            const firstToken =
+              args.match(/^(?:"([^"]+)"|'([^']+)'|(\S+))/)?.slice(1).find(Boolean) || "";
+            procMap.set(pid, { pid, ppid, comm: firstToken, args });
           }
         }
         let cur = numericStart;
         for (let depth = 0; depth < 16; depth++) {
-          const parent = parentMap.get(cur);
+          const info = procMap.get(cur);
+          if (!info) break;
+          chain.push(info);
+          const parent = info.ppid;
           if (!parent || parent <= 1 || ancestors.includes(parent)) break;
           ancestors.push(parent);
           cur = parent;
@@ -60,8 +155,48 @@ export function getAncestorPids(startPid = process.ppid) {
     } catch {
       // Ignore ps lookup error
     }
+  } else if (numericStart === process.ppid) {
+    try {
+      const psCmd =
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress";
+      const res = spawnSync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", psCmd],
+        { encoding: "utf8", timeout: 2500, windowsHide: true },
+      );
+      if (res.status === 0 && res.stdout) {
+        const parsed = JSON.parse(res.stdout.trim());
+        const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+        const procMap = new Map();
+        for (const r of rows) {
+          const pid = Number(r.ProcessId);
+          const ppid = Number(r.ParentProcessId);
+          if (pid > 0) {
+            procMap.set(pid, {
+              pid,
+              ppid,
+              comm: String(r.Name || ""),
+              args: String(r.CommandLine || r.Name || ""),
+            });
+          }
+        }
+        let cur = numericStart;
+        for (let depth = 0; depth < 16; depth++) {
+          const info = procMap.get(cur);
+          if (!info) break;
+          chain.push(info);
+          const parent = info.ppid;
+          if (!parent || parent <= 1 || ancestors.includes(parent)) break;
+          ancestors.push(parent);
+          cur = parent;
+        }
+      }
+    } catch {
+      // Ignore powershell lookup error
+    }
   }
   ancestorPidCache.set(numericStart, ancestors);
+  ancestorProcessCache.set(numericStart, chain);
   return ancestors;
 }
 
@@ -601,10 +736,12 @@ export function resolveSessionIdentity({
   cwd = process.cwd(),
   ppid = process.ppid,
   ancestorPids = null,
+  processChain = null,
 } = {}) {
   const rawAnchor = flags.anchorPid ?? env.ATC_ANCHOR_PID;
   const explicitAnchor =
     rawAnchor && /^\d+$/.test(String(rawAnchor)) ? Number(rawAnchor) : null;
+  const stablePpid = resolveStableParentPid(ppid, processChain);
 
   const findHookAnchorForSession = (sid) => {
     if (explicitAnchor) return explicitAnchor;
@@ -653,7 +790,7 @@ export function resolveSessionIdentity({
       if (found) {
         return {
           sessionId: found.sessionId,
-          anchorPid: found.anchorPid || explicitAnchor || ppid,
+          anchorPid: found.anchorPid || explicitAnchor || stablePpid,
           source: "lease_token",
         };
       }
@@ -705,7 +842,7 @@ export function resolveSessionIdentity({
     if (cwdMatches.length === 1 && SESSION_ID_REGEX.test(cwdMatches[0].sessionId)) {
       return {
         sessionId: cwdMatches[0].sessionId,
-        anchorPid: Number(cwdMatches[0].agentPid || ppid),
+        anchorPid: Number(cwdMatches[0].agentPid || stablePpid),
         source: "hook_cwd",
       };
     }
@@ -718,7 +855,7 @@ export function resolveSessionIdentity({
       ) {
         return {
           sessionId: ancestorCwdMatches[0].sessionId,
-          anchorPid: Number(ancestorCwdMatches[0].agentPid || ppid),
+          anchorPid: Number(ancestorCwdMatches[0].agentPid || stablePpid),
           source: "hook_cwd_ancestor",
         };
       }
@@ -736,14 +873,14 @@ export function resolveSessionIdentity({
     const sid = validateSessionId(`term-${sanitized}`);
     return {
       sessionId: sid,
-      anchorPid: findHookAnchorForSession(sid) || ppid,
+      anchorPid: findHookAnchorForSession(sid) || stablePpid,
       source: "terminal_env",
     };
   }
 
   return {
-    sessionId: validateSessionId(`ppid-${ppid}`),
-    anchorPid: explicitAnchor || ppid,
+    sessionId: validateSessionId(`ppid-${stablePpid}`),
+    anchorPid: explicitAnchor || stablePpid,
     source: "ppid_fallback",
   };
 }

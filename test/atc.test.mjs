@@ -2142,6 +2142,66 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       });
       assert.equal(winAtcSpawn.command, "C:\\Windows\\System32\\cmd.exe");
       assert.equal(winAtcSpawn.options.windowsVerbatimArguments, true);
+
+      // Wrapper-launched invocations (`npx atc ...` / `sh -c ...`) anchor to the stable parent shell PID
+      const npxDir = makeTempStateDir();
+      try {
+        const npxInv = {
+          running: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              kind: "emulator",
+              avd: "Pixel_8_API_35",
+              serial: "emulator-5554",
+              online: true,
+              profile: { deviceType: "phone", apiLevel: "android-35", numericApi: 35, hasPlayStore: true },
+              snapshots: [],
+            },
+          ],
+          offline: [],
+          creatable: [],
+        };
+        const npxClaim = cmdClaim(
+          npxDir,
+          { api: "35" },
+          {
+            env: {},
+            ppid: 88001,
+            ancestorPids: [88001, 88000, 5050],
+            processChain: [
+              { pid: 88001, ppid: 88000, comm: "node", args: "node /usr/local/bin/npx-cli.js atc claim" },
+              { pid: 88000, ppid: 5050, comm: "sh", args: "sh -c npx atc claim" },
+              { pid: 5050, ppid: 1, comm: "-zsh", args: "-zsh" },
+            ],
+            inventory: npxInv,
+            livenessCheck: (pid) => pid === 5050,
+          },
+        );
+        assert.equal(npxClaim.exitCode, 0);
+        assert.equal(npxClaim.lease.sessionId, "ppid-5050");
+        assert.equal(npxClaim.lease.anchorPid, 5050);
+
+        // Next `npx atc renew` with a new transient npx PID (88002, while 88001 is dead) retains and renews the lease
+        const npxRenew = cmdRenew(
+          npxDir,
+          null,
+          {},
+          {
+            env: {},
+            ppid: 88002,
+            ancestorPids: [88002, 5050],
+            processChain: [
+              { pid: 88002, ppid: 5050, comm: "npx", args: "npx atc renew" },
+              { pid: 5050, ppid: 1, comm: "-zsh", args: "-zsh" },
+            ],
+            livenessCheck: (pid) => pid === 5050,
+          },
+        );
+        assert.equal(npxRenew.exitCode, 0);
+        assert.equal(npxRenew.lease.leaseId, npxClaim.lease.leaseId);
+      } finally {
+        fs.rmSync(npxDir, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
