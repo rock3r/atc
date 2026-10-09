@@ -2314,44 +2314,63 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         const execShellSerialVarRes = await cmdExec(
           npxDir,
           [
-            "sh",
-            "-c",
-            `${JSON.stringify(process.execPath)} -e "if (process.env.ANDROID_SERIAL !== 'emulator-5554') process.exit(44);" && true || adb -s "$ANDROID_SERIAL" shell get-state`,
+            process.execPath,
+            "-e",
+            "if (process.env.ANDROID_SERIAL !== 'emulator-5554') process.exit(44);",
+            "--",
+            "adb",
+            "-s",
+            "$ANDROID_SERIAL",
+            "shell",
+            "get-state",
           ],
           { session: "ppid-5050" },
           { livenessCheck: () => true },
         );
         assert.equal(execShellSerialVarRes.exitCode, 0);
 
-        // Cold restart of online emulator honors configured stopTimeoutSec
+        // Cold restart of online emulator honors configured stopTimeoutSec on both POSIX and Windows
         const stopTimeoutDir = makeTempStateDir();
         try {
           const customState = readState(stopTimeoutDir);
           customState.config.stopTimeoutSec = 95;
           fs.writeFileSync(path.join(stopTimeoutDir, "state.json"), JSON.stringify(customState));
-          let capturedStopTimeoutMs = null;
-          const coldRestartRes = cmdClaim(
-            stopTimeoutDir,
-            { session: "cold-sess", avd: "Pixel_8_API_35", cold: true, force: true, wait: 0 },
-            {
-              inventory: npxInv,
-              runner: (cmd, args, opts) => {
-                if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
-                  capturedStopTimeoutMs = opts?.timeoutMs;
+          for (const testPlatform of ["darwin", "win32"]) {
+            let capturedStopTimeoutMs = null;
+            const coldRestartRes = cmdClaim(
+              stopTimeoutDir,
+              { session: `cold-sess-${testPlatform}`, avd: "Pixel_8_API_35", cold: true, force: true, wait: 0 },
+              {
+                platform: testPlatform,
+                inventory: npxInv,
+                runner: (cmd, args, opts) => {
+                  if (
+                    (cmd === "android" && args[0] === "emulator" && args[1] === "stop") ||
+                    (cmd === "adb" && args.includes("emu") && args.includes("kill"))
+                  ) {
+                    capturedStopTimeoutMs = opts?.timeoutMs;
+                    return { status: 0, stdout: "", stderr: "" };
+                  }
+                  if (
+                    (cmd === "android" && args[0] === "emulator" && args[1] === "start") ||
+                    cmd === "emulator"
+                  ) {
+                    return { status: 0, stdout: JSON.stringify({ serial: "emulator-5554" }), stderr: "" };
+                  }
+                  if (cmd === "adb" && args[0] === "devices") {
+                    return { status: 0, stdout: "List of devices attached\nemulator-5554\tdevice\n", stderr: "" };
+                  }
+                  if (cmd === "adb") {
+                    return { status: 0, stdout: "1\n", stderr: "" };
+                  }
                   return { status: 0, stdout: "", stderr: "" };
-                }
-                if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
-                  return { status: 0, stdout: JSON.stringify({ serial: "emulator-5554" }), stderr: "" };
-                }
-                if (cmd === "adb") {
-                  return { status: 0, stdout: "1\n", stderr: "" };
-                }
-                return { status: 0, stdout: "", stderr: "" };
+                },
               },
-            },
-          );
-          assert.equal(coldRestartRes.exitCode, 0);
-          assert.equal(capturedStopTimeoutMs, 95_000);
+            );
+            assert.equal(coldRestartRes.exitCode, 0);
+            assert.equal(capturedStopTimeoutMs, 95_000);
+            cmdFree(stopTimeoutDir, coldRestartRes.lease.leaseId, { session: `cold-sess-${testPlatform}` });
+          }
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }
