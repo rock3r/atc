@@ -334,18 +334,23 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     ATC_SESSION_ID: sessionId,
   };
   let nextArgs = [...args];
-  if (
-    base === "android" &&
-    androidParsed &&
-    ["run", "install", "layout", "screen"].includes(androidParsed.sub)
-  ) {
+  if (base === "android" && androidParsed) {
     const hasDeviceFlag = nextArgs.some((a) => a === "--device" || a.startsWith("--device="));
-    if (!hasDeviceFlag && lease.serial) {
-      nextArgs = [
-        ...nextArgs.slice(0, androidParsed.subIdx + 1),
-        `--device=${lease.serial}`,
-        ...nextArgs.slice(androidParsed.subIdx + 1),
-      ];
+    const isHelp = nextArgs.includes("--help") || nextArgs.includes("-h");
+    if (!hasDeviceFlag && !isHelp && lease.serial) {
+      if (["run", "install", "layout"].includes(androidParsed.sub)) {
+        nextArgs = [
+          ...nextArgs.slice(0, androidParsed.subIdx + 1),
+          `--device=${lease.serial}`,
+          ...nextArgs.slice(androidParsed.subIdx + 1),
+        ];
+      } else if (androidParsed.sub === "screen" && androidParsed.action === "capture") {
+        nextArgs = [
+          ...nextArgs.slice(0, androidParsed.actIdx + 1),
+          `--device=${lease.serial}`,
+          ...nextArgs.slice(androidParsed.actIdx + 1),
+        ];
+      }
     }
   }
   return { cmd, args: nextArgs, env };

@@ -560,10 +560,18 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     };
   }
 
-  // Precedence 3: Read-only Android commands (including top-level `android create` project creation)
+  // Precedence 3: Read-only Android commands (including top-level `android create` project creation and `android screen resolve`)
   if (baseCmd === "android") {
     const sub = androidSubInfo.sub;
-    if (!sub || READ_ONLY_ANDROID_SUBCOMMANDS.has(sub)) {
+    const action = androidSubInfo.action;
+    if (
+      !sub ||
+      READ_ONLY_ANDROID_SUBCOMMANDS.has(sub) ||
+      args.includes("--help") ||
+      args.includes("-h") ||
+      (sub === "screen" &&
+        (!action || action === "resolve" || action === "--help" || action === "-h"))
+    ) {
       return { kind: "read_only", parsed };
     }
     return {

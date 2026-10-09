@@ -1686,6 +1686,32 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
       });
       assert.equal(adbDashLEmuKill.allowed, false);
+
+      // android screen capture injects --device after capture, while screen resolve is read-only
+      const screenCaptureInv = buildChildInvocation(
+        "android",
+        ["screen", "capture", "--output=out.png"],
+        { leaseId: "lease-1", serial: "emulator-5554" },
+        "sess-1",
+      );
+      assert.deepEqual(screenCaptureInv.args, [
+        "screen",
+        "capture",
+        "--device=emulator-5554",
+        "--output=out.png",
+      ]);
+      const screenResolveInv = buildChildInvocation(
+        "android",
+        ["screen", "resolve", "A1", "--file=out.png"],
+        { leaseId: "lease-1", serial: "emulator-5554" },
+        "sess-1",
+      );
+      assert.deepEqual(screenResolveInv.args, ["screen", "resolve", "A1", "--file=out.png"]);
+      const screenResolveGuard = evaluateCommandGuard(
+        "android screen resolve A1 --file=out.png",
+        { sessionId: "sess-1", activeLeases: [] },
+      );
+      assert.equal(screenResolveGuard.allowed, true);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
