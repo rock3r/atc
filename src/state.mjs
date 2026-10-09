@@ -230,14 +230,23 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       continue;
     }
     if (lease.state === "active") {
+      const aliveWorkers = syncLeaseWorkers(lease, livenessCheck);
+      const workerAlive = aliveWorkers.length > 0;
+      if (workerAlive) {
+        const defaultTtlMs = (cfg.defaultTtlSec || 600) * 1000;
+        lease.renewedAtMs = Math.max(lease.renewedAtMs || 0, now);
+        lease.expiresAtMs = Math.max(
+          lease.expiresAtMs || 0,
+          now + Math.min(defaultTtlMs, maxTtlMs),
+        );
+      }
       const lastRenewedMs =
         typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;
       const expired =
-        now >= lease.expiresAtMs ||
-        now < lease.claimedAtMs ||
-        (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
-      const aliveWorkers = syncLeaseWorkers(lease, livenessCheck);
-      const workerAlive = aliveWorkers.length > 0;
+        !workerAlive &&
+        (now >= lease.expiresAtMs ||
+          now < lease.claimedAtMs ||
+          (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs));
       const deadAnchor =
         lease.anchorPid !== null &&
         lease.anchorPid !== undefined &&

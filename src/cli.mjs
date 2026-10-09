@@ -819,7 +819,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           return { exitCode: 1, error: err.message };
         } finally {
           const livenessCheck = options.livenessCheck || isPidAlive;
-          withStateTransaction(stateDir, (state) => {
+          withStateTransaction(stateDir, (state, { now }) => {
             const cur = state.leases[txOutcome.lease.deviceKey];
             if (cur && cur.leaseId === txOutcome.lease.leaseId) {
               const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
@@ -835,6 +835,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                     !livenessCheck(cur.anchorPid)))
               ) {
                 delete state.leases[txOutcome.lease.deviceKey];
+              } else {
+                const ttlMs = clampTtlSec(flags.ttl, state.config) * 1000;
+                cur.renewedAtMs = now;
+                cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
               }
               return { mutated: true };
             }
@@ -1873,7 +1877,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   } finally {
     try {
       const livenessCheck = options.livenessCheck || isPidAlive;
-      withStateTransaction(stateDir, (state) => {
+      withStateTransaction(stateDir, (state, { now }) => {
         const cur = state.leases[check.lease.deviceKey];
         if (cur && cur.leaseId === check.lease.leaseId) {
           const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
@@ -1885,6 +1889,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 !livenessCheck(cur.anchorPid)))
           ) {
             delete state.leases[check.lease.deviceKey];
+          } else {
+            cur.renewedAtMs = now;
+            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
           }
           return { mutated: true };
         }

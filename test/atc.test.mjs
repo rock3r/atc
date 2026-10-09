@@ -2105,6 +2105,22 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].state, "active");
         assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
 
+        // Even when now advances beyond maxTtlSec while worker 71002 is alive, GC does not expire the lease
+        withStateTransaction(
+          workerKeepDir,
+          (state) => {
+            state.config.maxTtlSec = 10;
+            state.config.defaultTtlSec = 10;
+            return { mutated: true };
+          },
+          { livenessCheck: liveness },
+        );
+        withStateTransaction(workerKeepDir, () => ({ mutated: false }), {
+          livenessCheck: liveness,
+          now: Date.now() + 120_000,
+        });
+        assert.ok(readState(workerKeepDir).leases["avd:Pixel_8_API_35"]);
+
         // Once the exec worker also exits, GC prunes the dead-anchor / deferred-free lease
         execWorkerAlive = false;
         withStateTransaction(workerKeepDir, () => ({ mutated: false }), {
