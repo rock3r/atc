@@ -1648,6 +1648,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       };
     }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
+    lease.workerPid = process.pid;
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
     return {
@@ -1659,7 +1660,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         ttlMs,
       },
     };
-  });
+  }, options);
 
   if (check.exitCode !== 0) {
     return check;
@@ -1676,21 +1677,44 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         return { mutated: true };
       }
       return { mutated: false };
-    });
+    }, options);
   };
 
-  const exitCode = await spawnWithHeartbeat(
-    cmd,
-    args,
-    check.lease,
-    check.sessionId,
-    onHeartbeat,
-    {
-      ...options,
-      heartbeatIntervalMs,
-    },
-  );
-  return { exitCode };
+  try {
+    const exitCode = await spawnWithHeartbeat(
+      cmd,
+      args,
+      check.lease,
+      check.sessionId,
+      onHeartbeat,
+      {
+        ...options,
+        heartbeatIntervalMs,
+      },
+    );
+    return { exitCode };
+  } finally {
+    try {
+      const livenessCheck = options.livenessCheck || isPidAlive;
+      withStateTransaction(stateDir, (state) => {
+        const cur = state.leases[check.lease.deviceKey];
+        if (cur && cur.leaseId === check.lease.leaseId && cur.workerPid === process.pid) {
+          cur.workerPid = null;
+          if (
+            cur.anchorPid !== null &&
+            cur.anchorPid !== undefined &&
+            !livenessCheck(cur.anchorPid)
+          ) {
+            delete state.leases[check.lease.deviceKey];
+          }
+          return { mutated: true };
+        }
+        return { mutated: false };
+      }, options);
+    } catch {
+      // Best-effort workerPid cleanup
+    }
+  }
 }
 
 export function cmdStatus(stateDir, flags = {}, options = {}) {
@@ -1878,6 +1902,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       anchorPid: identity.anchorPid,
       activeLeases,
       runningCount,
+      platform: options.platform,
     });
     let mutated = false;
     if (guard.allowed && guard.renewLease && activeLeases.length > 0) {

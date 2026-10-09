@@ -824,7 +824,10 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   return { kind: "ignore", parsed };
 }
 
-export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeases = [], runningCount = 0 } = {}) {
+export function evaluateCommandGuard(
+  command,
+  { sessionId, anchorPid, activeLeases = [], runningCount = 0, platform = process.platform } = {},
+) {
   if (!hasAndroidOrAtcTokens(command)) {
     return { allowed: true, fastPath: true, rewrittenCommand: null };
   }
@@ -936,6 +939,7 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
 
   let rewrittenCommand = null;
   const serialList = hasUnscopedDeviceAction ? null : Array.from(targetSerials);
+  const isWin = platform === "win32";
 
   if (hasDeviceAction && activeLeases.length > 0) {
     if (targetSerials.size > 1) {
@@ -948,24 +952,36 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
     }
     const execSerial =
       serialList && serialList.length === 1 ? serialList[0] : activeLeases[0].serial;
-    const envPrefix = sessionId
-      ? anchorPid
-        ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
-        : `ATC_SESSION_ID=${sessionId} `
-      : "";
     const isSimpleSingleCommand =
       segments.length === 1 &&
       !needsAtcRewrite &&
       !/[<>|&;`$()\r\n]/.test(command) &&
       !tokenizeSegment(command)[0]?.includes("=");
-    if (isSimpleSingleCommand) {
-      rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- ${command}`;
+    if (isWin) {
+      const sessionFlag = sessionId ? ` --session ${sessionId}` : "";
+      if (isSimpleSingleCommand) {
+        rewrittenCommand = `atc exec${sessionFlag} --serial ${execSerial} -- ${command}`;
+      } else {
+        const escapedWin = `"${String(command).replace(/"/g, '\\"')}"`;
+        rewrittenCommand = `atc exec${sessionFlag} --serial ${execSerial} -- cmd /d /s /c ${escapedWin}`;
+      }
     } else {
-      const escaped = `'${String(command).replace(/'/g, `'\\''`)}'`;
-      rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
+      const envPrefix = sessionId
+        ? anchorPid
+          ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
+          : `ATC_SESSION_ID=${sessionId} `
+        : "";
+      if (isSimpleSingleCommand) {
+        rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- ${command}`;
+      } else {
+        const escaped = `'${String(command).replace(/'/g, `'\\''`)}'`;
+        rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
+      }
     }
   } else if (needsAtcRewrite && sessionId) {
-    if (segments.length > 1) {
+    if (isWin) {
+      rewrittenCommand = command.replace(/\batc(\s+[A-Za-z0-9_-]+)/gi, `atc$1 --session ${sessionId}`);
+    } else if (segments.length > 1) {
       const exportVars = anchorPid
         ? `export ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid}; `
         : `export ATC_SESSION_ID=${sessionId}; `;

@@ -1873,6 +1873,57 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
       });
       assert.equal(bareDisconnectGuard.allowed, false);
+
+      // GC preserves active lease while an in-flight exec workerPid is alive even if anchorPid exited
+      const execAliveState = createDefaultState();
+      const nowExec = Date.now();
+      execAliveState.leases["avd:Pixel_8_API_35"] = {
+        leaseId: "lease-exec-alive",
+        deviceKey: "avd:Pixel_8_API_35",
+        avd: "Pixel_8_API_35",
+        serial: "emulator-5554",
+        kind: "emulator",
+        state: "active",
+        sessionId: "sess-exec",
+        anchorPid: 99001,
+        workerPid: 99002,
+        claimedAtMs: nowExec,
+        renewedAtMs: nowExec,
+        expiresAtMs: nowExec + 60_000,
+      };
+      runGarbageCollection(execAliveState, null, nowExec, (pid) => pid === 99002);
+      assert.ok(execAliveState.leases["avd:Pixel_8_API_35"]);
+      runGarbageCollection(execAliveState, null, nowExec, () => false);
+      assert.equal(execAliveState.leases["avd:Pixel_8_API_35"], undefined);
+
+      // Windows hook rewrites omit POSIX env prefixes and sh -c
+      const winSimpleRewrite = evaluateCommandGuard("adb shell wm size", {
+        sessionId: "win-sess",
+        anchorPid: 1234,
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+        runningCount: 1,
+        platform: "win32",
+      });
+      assert.equal(winSimpleRewrite.allowed, true);
+      assert.equal(
+        winSimpleRewrite.rewrittenCommand,
+        "atc exec --session win-sess --serial emulator-5554 -- adb shell wm size",
+      );
+      const winCompoundRewrite = evaluateCommandGuard(
+        "adb shell wm size && adb shell input keyevent 3",
+        {
+          sessionId: "win-sess",
+          anchorPid: 1234,
+          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+          runningCount: 1,
+          platform: "win32",
+        },
+      );
+      assert.equal(winCompoundRewrite.allowed, true);
+      assert.equal(
+        winCompoundRewrite.rewrittenCommand,
+        'atc exec --session win-sess --serial emulator-5554 -- cmd /d /s /c "adb shell wm size && adb shell input keyevent 3"',
+      );
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

@@ -188,10 +188,15 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
         now >= lease.expiresAtMs ||
         now < lease.claimedAtMs ||
         (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
+      const workerAlive = Boolean(lease.workerPid && livenessCheck(lease.workerPid));
+      if (!workerAlive && lease.workerPid) {
+        lease.workerPid = null;
+      }
       const deadAnchor =
         lease.anchorPid !== null &&
         lease.anchorPid !== undefined &&
-        !livenessCheck(lease.anchorPid);
+        !livenessCheck(lease.anchorPid) &&
+        !workerAlive;
       if (expired || deadAnchor) {
         pruned.leases.push({
           deviceKey,

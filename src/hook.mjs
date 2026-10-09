@@ -168,6 +168,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
         anchorPid: norm.anchorPid,
         activeLeases,
         runningCount,
+        platform: options.platform,
       });
 
       if (guardRes.allowed && norm.hostFormat === "cursor" && guardRes.hasDirectDeviceAction) {
