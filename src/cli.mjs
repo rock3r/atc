@@ -2043,6 +2043,7 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
       const rawStdin = readStdinSync();
       if (
         hookType === "stop" ||
+        hookType === "sessionend" ||
         hookType === "session-end" ||
         hookType === "session_end" ||
         hookType === "session_shutdown"
