@@ -455,8 +455,12 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
       serialToLeasedAvd.set(lease.serial, lease.avd);
     }
   }
+  const inventoryEmulatorSerials = new Set();
   for (const dev of inventory.running || []) {
     if (dev.kind === "emulator") {
+      if (dev.serial) {
+        inventoryEmulatorSerials.add(dev.serial);
+      }
       const key = dev.avd || serialToLeasedAvd.get(dev.serial) || (dev.serial ? `serial:${dev.serial}` : null);
       if (key) {
         runningOrStopping.add(key);
@@ -466,10 +470,13 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
   for (const lease of Object.values(state.leases || {})) {
     if (
       lease.kind === "emulator" &&
-      (lease.state === "stopping" || lease.state === "active") &&
-      lease.avd
+      (lease.state === "stopping" || lease.state === "active")
     ) {
-      runningOrStopping.add(lease.avd);
+      if (lease.avd) {
+        runningOrStopping.add(lease.avd);
+      } else if (lease.serial && !inventoryEmulatorSerials.has(lease.serial)) {
+        runningOrStopping.add(`serial:${lease.serial}`);
+      }
     }
   }
   let startingExtra = 0;

@@ -140,7 +140,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
             (l) =>
               l.state === "active" &&
               (l.sessionId === fallbackPpidSession ||
-                (l.anchorPid === norm.anchorPid &&
+                ((l.anchorPid === norm.anchorPid || l.parentPid === norm.anchorPid) &&
                   (String(l.sessionId).startsWith("ppid-") ||
                     String(l.sessionId).startsWith("mcp-")))),
           )
@@ -288,7 +288,7 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
             (l) =>
               l.state === "active" &&
               (l.sessionId === fallbackPpidSession ||
-                (l.anchorPid === ppid &&
+                ((l.anchorPid === ppid || l.parentPid === ppid) &&
                   (String(l.sessionId).startsWith("ppid-") ||
                     String(l.sessionId).startsWith("mcp-")))),
           )

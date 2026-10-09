@@ -1739,11 +1739,18 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             method: "tools/call",
             params: { name: "atc_claim", arguments: { api: "35", waitSec: 0 } },
           },
-          { ppid: process.pid, pid: 41001, env: {}, inventory: mcpInv },
+          {
+            ppid: process.pid,
+            pid: 41001,
+            env: {},
+            inventory: mcpInv,
+            livenessCheck: () => true,
+          },
         );
         const mcp1Res = JSON.parse(mcp1.result.content[0].text);
         assert.equal(mcp1Res.exitCode, 0);
         assert.equal(mcp1Res.lease.sessionId, "mcp-41001");
+        assert.equal(mcp1Res.lease.anchorPid, 41001);
 
         const mcp2 = handleMcpRequest(
           multiMcpDir,
@@ -1753,13 +1760,53 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             method: "tools/call",
             params: { name: "atc_claim", arguments: { api: "35", waitSec: 0 } },
           },
-          { ppid: process.pid, pid: 41002, env: {}, inventory: mcpInv },
+          {
+            ppid: process.pid,
+            pid: 41002,
+            env: {},
+            inventory: mcpInv,
+            livenessCheck: () => true,
+          },
         );
         const mcp2Res = JSON.parse(mcp2.result.content[0].text);
         assert.equal(mcp2Res.exitCode, 2);
+
+        // When MCP server 41001 crashes without close cleanup, its anchorPid is dead so GC reclaims the lease
+        const mcp2AfterCrash = handleMcpRequest(
+          multiMcpDir,
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "atc_claim", arguments: { api: "35", waitSec: 0 } },
+          },
+          {
+            ppid: process.pid,
+            pid: 41002,
+            env: {},
+            inventory: mcpInv,
+            livenessCheck: (pid) => pid !== 41001,
+          },
+        );
+        const mcp2AfterCrashRes = JSON.parse(mcp2AfterCrash.result.content[0].text);
+        assert.equal(mcp2AfterCrashRes.exitCode, 0);
+        assert.equal(mcp2AfterCrashRes.lease.sessionId, "mcp-41002");
       } finally {
         fs.rmSync(multiMcpDir, { recursive: true, force: true });
       }
+
+      // computeUsedEmulatorSlots counts serial-keyed active emulator leases when discovery probes fail
+      const unmappedSlotState = createDefaultState();
+      unmappedSlotState.leases["serial:emulator-5554"] = {
+        leaseId: "lease-unmapped-slot",
+        deviceKey: "serial:emulator-5554",
+        avd: null,
+        serial: "emulator-5554",
+        kind: "emulator",
+        state: "active",
+        sessionId: "sess-1",
+      };
+      assert.equal(computeUsedEmulatorSlots(unmappedSlotState, { running: [] }), 1);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

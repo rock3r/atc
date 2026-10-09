@@ -547,6 +547,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             profile: dev.profile,
             sessionId: identity.sessionId,
             anchorPid: identity.anchorPid,
+            parentPid: options.ppid ?? process.ppid,
             state: "active",
             workerPid: null,
             replacingAvd: null,
@@ -611,6 +612,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             profile: dev.profile,
             sessionId: identity.sessionId,
             anchorPid: identity.anchorPid,
+            parentPid: options.ppid ?? process.ppid,
             state: "starting",
             workerPid: process.pid,
             replacingAvd: selection.victim ? selection.victim.avd : null,
@@ -703,7 +705,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           mutated: true,
           value: { status: "queued", ticket, hbTimeoutSec },
         };
-      });
+      }, options);
     } catch (err) {
       if (err instanceof ResourceError) {
         return { exitCode: err.exitCode, error: err.message };

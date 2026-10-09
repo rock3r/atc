@@ -110,7 +110,7 @@ function resolveMcpCallOptions(sessionOptions = {}) {
   const mcpEnv = {
     ...baseEnv,
     ATC_SESSION_ID: defaultSessionId,
-    ATC_ANCHOR_PID: baseEnv.ATC_ANCHOR_PID || String(hostAgentPid),
+    ATC_ANCHOR_PID: baseEnv.ATC_ANCHOR_PID || String(mcpPid),
   };
   return {
     ...sessionOptions,
