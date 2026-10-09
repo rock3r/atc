@@ -2199,6 +2199,55 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         );
         assert.equal(npxRenew.exitCode, 0);
         assert.equal(npxRenew.lease.leaseId, npxClaim.lease.leaseId);
+
+        // Non-owner `claim --wait 0` persists firstSeenOfflineAtMs so a subsequent non-blocking claim after grace period succeeds
+        const offlineInvForReconcile = {
+          running: [],
+          offline: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              kind: "emulator",
+              avd: "Pixel_8_API_35",
+              serial: null,
+              online: false,
+              profile: { deviceType: "phone", apiLevel: "android-35", numericApi: 35, hasPlayStore: true },
+              snapshots: [],
+            },
+          ],
+          creatable: [
+            {
+              kind: "emulator",
+              deviceName: "medium_phone",
+              profile: { deviceType: "phone", deviceName: "medium_phone", apiLevel: null, services: null, playStore: null, abi: null },
+            },
+          ],
+          probes: { emulatorListOk: true, adbDevicesOk: true },
+        };
+        const t0 = Date.now();
+        const busyFirst = cmdClaim(
+          npxDir,
+          { session: "other-sess", api: "35", wait: 0 },
+          { inventory: offlineInvForReconcile, now: t0, livenessCheck: () => true },
+        );
+        assert.equal(busyFirst.exitCode, 2);
+        assert.equal(readState(npxDir).leases["avd:Pixel_8_API_35"].firstSeenOfflineAtMs, t0);
+
+        // Bare hardware profile without API/services/ABI metadata does not match explicit --api / --services / --abi in --create-if-missing
+        const noBlindCreate = cmdClaim(
+          npxDir,
+          { session: "other-sess", api: "35", services: "aosp", abi: "x86_64", createIfMissing: true, wait: 0 },
+          { inventory: offlineInvForReconcile, now: t0, livenessCheck: () => true },
+        );
+        assert.equal(noBlindCreate.exitCode, 2);
+
+        // matchesProfile rejects physical devices when emulator-only flags like --snapshot-load are requested
+        assert.equal(
+          matchesProfile(
+            { kind: "physical", serial: "R58N123456A", profile: { deviceType: "phone", apiLevel: "android-35" } },
+            { kind: "any", serial: "R58N123456A", snapshotLoad: "clean-base" },
+          ),
+          false,
+        );
       } finally {
         fs.rmSync(npxDir, { recursive: true, force: true });
       }

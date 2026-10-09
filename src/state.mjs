@@ -450,7 +450,8 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
 }
 
 export function reconcileOfflineLeases(state, inventory, callerSessionId, now = Date.now()) {
-  if (!inventory) return;
+  if (!inventory) return false;
+  let mutated = false;
   const graceMs = state.config?.offlineGraceMs ?? 5000;
   const probes = inventory.probes || { emulatorListOk: true, adbDevicesOk: true };
   const emulatorListOk = probes.emulatorListOk !== false;
@@ -474,13 +475,17 @@ export function reconcileOfflineLeases(state, inventory, callerSessionId, now = 
         lease.deviceKey = mappedDev.deviceKey;
         lease.profile = mappedDev.profile || lease.profile;
         state.leases[mappedDev.deviceKey] = lease;
+        mutated = true;
       }
     }
     if (lease.state !== "active") continue;
     if (lease.kind === "physical") {
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
       if (serialOnline) {
-        lease.firstSeenOfflineAtMs = null;
+        if (lease.firstSeenOfflineAtMs !== null) {
+          lease.firstSeenOfflineAtMs = null;
+          mutated = true;
+        }
         continue;
       }
       if (!adbDevicesOk) {
@@ -490,7 +495,10 @@ export function reconcileOfflineLeases(state, inventory, callerSessionId, now = 
       const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
       if (avdOnline || serialOnline) {
-        lease.firstSeenOfflineAtMs = null;
+        if (lease.firstSeenOfflineAtMs !== null) {
+          lease.firstSeenOfflineAtMs = null;
+          mutated = true;
+        }
         continue;
       }
       if (!emulatorListOk || !adbDevicesOk) {
@@ -500,14 +508,18 @@ export function reconcileOfflineLeases(state, inventory, callerSessionId, now = 
 
     if (lease.sessionId === callerSessionId) {
       delete state.leases[deviceKey];
+      mutated = true;
       continue;
     }
     if (!lease.firstSeenOfflineAtMs) {
       lease.firstSeenOfflineAtMs = now;
+      mutated = true;
     } else if (now - lease.firstSeenOfflineAtMs >= graceMs) {
       delete state.leases[deviceKey];
+      mutated = true;
     }
   }
+  return mutated;
 }
 
 export function withStateTransaction(stateDir, fn, options = {}) {
@@ -615,6 +627,12 @@ export function matchesProfile(device, req = {}) {
     return false;
   }
   if (req.abi && (device.profile?.abi || "").toLowerCase() !== req.abi.toLowerCase()) {
+    return false;
+  }
+  if (
+    (req.snapshotLoad || req.snapshotSaveOnFree || req.wipeData || req.coldBoot) &&
+    device.kind !== "emulator"
+  ) {
     return false;
   }
   if (req.snapshotLoad && device.kind === "emulator") {

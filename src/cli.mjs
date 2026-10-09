@@ -216,6 +216,9 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   };
 
   function matchesCreatableEntry(c, targetReq) {
+    if (targetReq.snapshotLoad) {
+      return false;
+    }
     const p = c.profile || c;
     const profileName = c.deviceName || p.deviceName;
     if (
@@ -226,17 +229,9 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
     ) {
       return false;
     }
-    const effectiveReq = {
-      ...targetReq,
-      apiSpec: p.apiLevel ? targetReq.apiSpec : null,
-      services: p.services ? targetReq.services : null,
-      play: typeof p.playStore === "boolean" || p.services ? targetReq.play : null,
-      abi: p.abi ? targetReq.abi : null,
-      snapshotLoad: null,
-    };
     return matchesProfile(
       { kind: "emulator", avd: targetReq.avd || c.avd || profileName, profile: p },
-      effectiveReq,
+      targetReq,
     );
   }
 
@@ -535,7 +530,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         const ttlSec = clampTtlSec(flags.ttl, state.config);
         const ttlMs = ttlSec * 1000;
 
-        reconcileOfflineLeases(state, inventory, identity.sessionId, now);
+        const reconciledMutated = reconcileOfflineLeases(
+          state,
+          inventory,
+          identity.sessionId,
+          now,
+        );
 
         // Step 3: Idempotent Re-Claim (Same Session)
         for (const lease of Object.values(state.leases)) {
@@ -720,7 +720,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         // No candidate available right now
         if (waitSec <= 0) {
           return {
-            mutated: false,
+            mutated: reconciledMutated,
             value: { status: "busy" },
           };
         }
