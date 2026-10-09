@@ -1644,6 +1644,32 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         { avdHome, host: { freeDiskMb: 5000 } }
       );
       assert.equal(multiSnapDiskFail.exitCode, 5);
+
+      // Serial-keyed unmapped emulator lease prevents re-claiming after AVD mapping recovers and migrates key
+      const unmappedLeaseState = createDefaultState();
+      unmappedLeaseState.leases["serial:emulator-5554"] = {
+        leaseId: "lease-unmapped-serial",
+        deviceKey: "serial:emulator-5554",
+        avd: null,
+        serial: "emulator-5554",
+        kind: "emulator",
+        state: "active",
+        sessionId: "sess-unmapped-owner",
+        claimedAtMs: schedNow,
+        renewedAtMs: schedNow,
+        expiresAtMs: schedNow + 60_000,
+      };
+      const selWhenMapped = selectCandidateUnderLock(
+        unmappedLeaseState,
+        schedInventory,
+        { kind: "emulator", apiSpec: "35" },
+        null,
+        schedNow,
+      );
+      assert.equal(selWhenMapped.priority, null);
+      reconcileOfflineLeases(unmappedLeaseState, schedInventory, "sess-other", schedNow);
+      assert.equal(unmappedLeaseState.leases["serial:emulator-5554"], undefined);
+      assert.equal(unmappedLeaseState.leases["avd:Pixel_8_API_35"].leaseId, "lease-unmapped-serial");
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

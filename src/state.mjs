@@ -268,6 +268,18 @@ export function reconcileOfflineLeases(state, inventory, callerSessionId, now = 
   ]);
 
   for (const [deviceKey, lease] of Object.entries(state.leases)) {
+    if (!lease.avd && lease.kind === "emulator" && lease.serial) {
+      const mappedDev = (inventory.running || []).find(
+        (d) => d.kind === "emulator" && d.serial === lease.serial && d.avd,
+      );
+      if (mappedDev && mappedDev.deviceKey && mappedDev.deviceKey !== deviceKey) {
+        delete state.leases[deviceKey];
+        lease.avd = mappedDev.avd;
+        lease.deviceKey = mappedDev.deviceKey;
+        lease.profile = mappedDev.profile || lease.profile;
+        state.leases[mappedDev.deviceKey] = lease;
+      }
+    }
     if (lease.state !== "active") continue;
     if (lease.kind === "physical") {
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));

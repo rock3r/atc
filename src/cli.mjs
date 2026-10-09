@@ -164,6 +164,13 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   const cfg = state.config || DEFAULT_CONFIG;
   const effectiveMax = computeEffectiveMaxEmulators(cfg, inventory.host);
   const usedSlots = computeUsedEmulatorSlots(state, inventory);
+  const leasedSerials = new Set(
+    Object.values(state.leases || {})
+      .map((l) => l.serial)
+      .filter(Boolean),
+  );
+  const isDeviceOccupied = (d) =>
+    Boolean(state.leases[d.deviceKey] || (d.serial && leasedSerials.has(d.serial)));
 
   const earlierTickets = [];
   for (const t of state.queue) {
@@ -208,7 +215,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   function doesTicketNeedEmulatorCapacity(earlierReq) {
     if (earlierReq.kind === "physical") return false;
     const hasOfflineMatch = (inventory.offline || []).some(
-      (d) => !state.leases[d.deviceKey] && matchesProfile(d, earlierReq),
+      (d) => !isDeviceOccupied(d) && matchesProfile(d, earlierReq),
     );
     if (hasOfflineMatch) return true;
     const hasStoppingMatch = Object.values(state.leases || {}).some(
@@ -218,8 +225,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
     if (
       (earlierReq.wipeData || earlierReq.coldBoot) &&
       (inventory.running || []).some(
-        (d) =>
-          d.kind === "emulator" && !state.leases[d.deviceKey] && matchesProfile(d, earlierReq),
+        (d) => d.kind === "emulator" && !isDeviceOccupied(d) && matchesProfile(d, earlierReq),
       )
     ) {
       return true;
@@ -272,7 +278,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
   // Priority 1: Tier 0 Warm Idle Match
   if (!req.wipeData && !req.coldBoot) {
     const warmCandidates = (inventory.running || []).filter(
-      (d) => !state.leases[d.deviceKey] && matchesProfile(d, req),
+      (d) => !isDeviceOccupied(d) && matchesProfile(d, req),
     );
     for (const dev of warmCandidates) {
       if (!isReservedForEarlierTicket(dev, false)) {
@@ -302,7 +308,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
       ? (inventory.running || []).filter((d) => d.kind === "emulator" && d.avd)
       : []),
     ...(hasUnmappedRunningEmulator ? [] : inventory.offline || []),
-  ].filter((d) => !state.leases[d.deviceKey] && matchesProfile(d, req));
+  ].filter((d) => !isDeviceOccupied(d) && matchesProfile(d, req));
 
   let firstResourceErr = null;
 
@@ -335,7 +341,7 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
       (d) =>
         d.kind === "emulator" &&
         d.avd &&
-        !state.leases[d.deviceKey] &&
+        !isDeviceOccupied(d) &&
         !isReservedForEarlierTicket(d, true),
     );
 
