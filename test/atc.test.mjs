@@ -2264,6 +2264,34 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         assert.equal(freeThrown.exitCode, 1);
         assert.deepEqual(freeThrown.freed, []);
         assert.equal(readState(npxDir).leases["avd:Pixel_8_API_35"].state, "active");
+
+        // `adb wait-for-*` prefixes are unwrapped before lifecycle checks in guard and buildChildInvocation
+        const waitKillServerGuard = evaluateCommandGuard("adb wait-for-device kill-server", {
+          sessionId: "ppid-5050",
+          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+        });
+        assert.equal(waitKillServerGuard.allowed, false);
+        assert.match(waitKillServerGuard.reason, /adb kill-server/);
+        assert.throws(
+          () =>
+            buildChildInvocation(
+              "adb",
+              ["wait-for-device", "kill-server"],
+              { serial: "emulator-5554", leaseId: "lease-1" },
+              "ppid-5050",
+            ),
+          /adb kill-server/,
+        );
+        assert.throws(
+          () =>
+            buildChildInvocation(
+              "adb",
+              ["wait-for-device", "emu", "kill"],
+              { serial: "emulator-5554", leaseId: "lease-1" },
+              "ppid-5050",
+            ),
+          /adb emu kill/,
+        );
       } finally {
         fs.rmSync(npxDir, { recursive: true, force: true });
       }

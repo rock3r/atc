@@ -297,6 +297,8 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         subIdx += 2;
       } else if (a.startsWith("-")) {
         subIdx += 1;
+      } else if (a.startsWith("wait-for-") && subIdx + 1 < args.length) {
+        subIdx += 1;
       } else {
         break;
       }

@@ -617,13 +617,17 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   if (baseCmd === "adb") {
-    // Strip -s <serial> / -d / -e / -t / -H / -P / -L flags to find the adb subcommand
+    // Strip -s <serial> / -d / -e / -t / -H / -P / -L flags and wait-for-* prefixes to find the adb subcommand
     let subIdx = 0;
+    let hadWaitPrefix = false;
     while (subIdx < args.length) {
       const a = args[subIdx];
       if (a === "-s" || a === "-t" || a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
+        subIdx += 1;
+      } else if (a.startsWith("wait-for-") && subIdx + 1 < args.length) {
+        hadWaitPrefix = true;
         subIdx += 1;
       } else {
         break;
@@ -666,7 +670,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         parsed,
       };
     }
-    if (!adbSub || READ_ONLY_ADB_SUBCOMMANDS.has(adbSub)) {
+    if (!hadWaitPrefix && (!adbSub || READ_ONLY_ADB_SUBCOMMANDS.has(adbSub))) {
       return { kind: "read_only", parsed };
     }
     return {
