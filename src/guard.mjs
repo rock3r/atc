@@ -93,6 +93,55 @@ export function hasAndroidOrAtcTokens(command) {
   return FAST_PATH_REGEX.test(command);
 }
 
+function splitOutsideQuotes(str, sepType) {
+  const parts = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === "\\" && !inSingle && i + 1 < str.length) {
+      cur += ch + str[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      cur += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      cur += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      if (sepType === "clause") {
+        if ((ch === "&" && str[i + 1] === "&") || (ch === "|" && str[i + 1] === "|")) {
+          if (cur.trim()) parts.push(cur.trim());
+          cur = "";
+          i++;
+          continue;
+        }
+        if (ch === ";" || ch === "\n" || ch === "&") {
+          if (cur.trim()) parts.push(cur.trim());
+          cur = "";
+          continue;
+        }
+      } else if (sepType === "pipe") {
+        if (ch === "|" && str[i + 1] !== "|") {
+          if (cur.trim()) parts.push(cur.trim());
+          cur = "";
+          continue;
+        }
+      }
+    }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur.trim());
+  return parts;
+}
+
 export function splitShellSegments(command) {
   if (!command || typeof command !== "string") return [];
   const innerSubstitutions = [];
@@ -108,16 +157,10 @@ export function splitShellSegments(command) {
     innerSubstitutions.length > 0
       ? `${inlineExpanded} ; ${innerSubstitutions.join(" ; ")}`
       : inlineExpanded;
-  const clauses = normalized
-    .split(/(?:&&|\|\||[;\n&])+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const clauses = splitOutsideQuotes(normalized, "clause");
   const segments = [];
   for (const clause of clauses) {
-    const stages = clause
-      .split("|")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const stages = splitOutsideQuotes(clause, "pipe");
     const upstreamArgs = [];
     for (let i = 0; i < stages.length; i++) {
       const stage = stages[i];
@@ -170,22 +213,73 @@ export function parseSegment(segment, inheritedVars = {}) {
   const tokens = tokenizeSegment(segment);
   let baseVars = { ...inheritedVars };
   const envVars = {};
-  let stripsAndroidSerial = false;
+  let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
   let idx = 0;
 
   while (idx < tokens.length) {
     const tok = tokens[idx];
     if (tok === "export") {
       idx++;
+      let isUnexport = false;
+      while (idx < tokens.length && tokens[idx].startsWith("-")) {
+        const flag = tokens[idx++];
+        if (flag === "--") break;
+        if (
+          flag === "-n" ||
+          (flag.startsWith("-") && !flag.startsWith("--") && flag.slice(1).includes("n"))
+        ) {
+          isUnexport = true;
+        }
+      }
+      if (isUnexport) {
+        while (idx < tokens.length) {
+          const arg = tokens[idx++];
+          const k = arg.split("=")[0];
+          delete baseVars[k];
+          delete envVars[k];
+          if (k === "ANDROID_SERIAL") {
+            stripsAndroidSerial = true;
+            envVars.__atc_stripped_android_serial = "1";
+          }
+        }
+        break;
+      }
       continue;
+    }
+    if (tok === "unset") {
+      idx++;
+      while (idx < tokens.length && tokens[idx].startsWith("-")) {
+        const flag = tokens[idx++];
+        if (flag === "--") break;
+      }
+      while (idx < tokens.length) {
+        const k = tokens[idx++];
+        delete baseVars[k];
+        delete envVars[k];
+        if (k === "ANDROID_SERIAL") {
+          stripsAndroidSerial = true;
+          envVars.__atc_stripped_android_serial = "1";
+        }
+      }
+      break;
     }
     const eq = tok.indexOf("=");
     if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok.slice(0, eq))) {
       const k = tok.slice(0, eq);
       const rawVal = tok.slice(eq + 1);
-      envVars[k] = expandVariables(rawVal, { ...baseVars, ...envVars });
+      const expandedVal = expandVariables(rawVal, { ...baseVars, ...envVars });
+      envVars[k] = expandedVal;
       if (k === "ANDROID_SERIAL") {
-        stripsAndroidSerial = false;
+        if (expandedVal) {
+          stripsAndroidSerial = false;
+          delete baseVars.__atc_stripped_android_serial;
+          delete envVars.__atc_stripped_android_serial;
+        } else {
+          delete baseVars.ANDROID_SERIAL;
+          delete envVars.ANDROID_SERIAL;
+          stripsAndroidSerial = true;
+          envVars.__atc_stripped_android_serial = "1";
+        }
       }
       idx++;
       continue;
@@ -626,8 +720,29 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
           if (subSeg.trim() === effectiveSegment.trim()) continue;
           const subClass = classifySegment(subSeg, innerVars, depth + 1);
           Object.assign(innerVars, subClass.parsed?.envVars || {});
+          if (subClass.parsed?.stripsAndroidSerial) {
+            delete innerVars.ANDROID_SERIAL;
+            innerVars.__atc_stripped_android_serial = "1";
+          } else if (subClass.parsed?.envVars?.ANDROID_SERIAL) {
+            delete innerVars.__atc_stripped_android_serial;
+          }
           if ((rank[subClass.kind] || 0) > (rank[chosen.kind] || 0)) {
             chosen = subClass;
+          } else if (subClass.kind === "device_action" && chosen.kind === "device_action") {
+            if (subClass.targetSerial === "<stripped-ANDROID_SERIAL>") {
+              chosen = subClass;
+            } else if (!chosen.targetSerial && subClass.targetSerial) {
+              chosen = subClass;
+            } else if (
+              chosen.targetSerial &&
+              subClass.targetSerial &&
+              chosen.targetSerial !== subClass.targetSerial
+            ) {
+              chosen = {
+                ...subClass,
+                targetSerial: `${chosen.targetSerial},${subClass.targetSerial}`,
+              };
+            }
           }
         }
       }
@@ -704,6 +819,12 @@ export function evaluateCommandGuard(command, { sessionId, anchorPid, activeLeas
   for (const seg of segments) {
     const c = classifySegment(seg, shellVars);
     Object.assign(shellVars, c.parsed?.envVars || {});
+    if (c.parsed?.stripsAndroidSerial) {
+      delete shellVars.ANDROID_SERIAL;
+      shellVars.__atc_stripped_android_serial = "1";
+    } else if (c.parsed?.envVars?.ANDROID_SERIAL) {
+      delete shellVars.__atc_stripped_android_serial;
+    }
     if (c.kind === "ignore" || c.kind === "read_only") {
       continue;
     }

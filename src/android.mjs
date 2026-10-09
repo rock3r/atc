@@ -213,16 +213,19 @@ export function parseAndroidEmulatorListOutput(stdout) {
     if (!line || line.startsWith("AVD") || line.startsWith("---") || line.startsWith("No ")) {
       continue;
     }
-    const cols = line.split(/\s{2,}/).map((c) => c.trim()).filter(Boolean);
-    if (cols.length === 1 && /^[A-Za-z0-9._-]+$/.test(cols[0])) {
-      avds.push({ avd: cols[0], online: false, serial: null, apiLevel: null });
+    const tokens = line.split(/\s+/).filter(Boolean);
+    if (tokens.length === 1 && /^[A-Za-z0-9._-]+$/.test(tokens[0])) {
+      avds.push({ avd: tokens[0], online: false, serial: null, apiLevel: null });
       continue;
     }
-    if (cols.length >= 2) {
-      const avd = cols[0].split(/\s+/)[0];
-      const online = line.toLowerCase().includes("online");
-      const serialMatch = line.match(/\b(emulator-\d+)\b/);
-      const apiMatch = line.match(/\b(?:android-)?(\d{2})\b/i);
+    if (tokens.length >= 2) {
+      const avd = tokens[0];
+      const statusToken = tokens[1].toLowerCase();
+      const online = statusToken === "online";
+      const restOfLine = tokens.slice(1).join(" ");
+      const serialMatch = restOfLine.match(/\b(emulator-\d+)\b/);
+      const apiMatch =
+        restOfLine.match(/\b(?:android-)?(\d{2})\b/i) || line.match(/\b(?:android-)?(\d{2})\b/i);
       avds.push({
         avd,
         online,

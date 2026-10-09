@@ -1820,6 +1820,32 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       const byteAvdMeta = readLocalAvdMetadata("Byte_Partition_API_35", avdHome);
       assert.equal(byteAvdMeta.ramSizeMb, 2048);
       assert.equal(byteAvdMeta.dataDiskMb, 6144 + 512);
+
+      // Shell payloads that unset or export -n ANDROID_SERIAL are rejected by guard and atc exec
+      const unsetInShellGuard = evaluateCommandGuard(
+        "atc exec -- sh -c 'unset ANDROID_SERIAL; adb shell wm size'",
+        {
+          sessionId: "sess-1",
+          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+        },
+      );
+      assert.equal(unsetInShellGuard.allowed, false);
+      const exportNInShellGuard = evaluateCommandGuard(
+        "atc exec -- bash -c 'export -n ANDROID_SERIAL; adb shell wm size'",
+        {
+          sessionId: "sess-1",
+          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+        },
+      );
+      assert.equal(exportNInShellGuard.allowed, false);
+
+      // parseAndroidEmulatorListOutput checks the status column rather than substring "online" in AVD name
+      const parsedOnlineNamedAvd = parseAndroidEmulatorListOutput(
+        "AVD                 Status    Serial          API\nOnline_Test_API_35  offline   -               android-35\n",
+      );
+      assert.equal(parsedOnlineNamedAvd.length, 1);
+      assert.equal(parsedOnlineNamedAvd[0].avd, "Online_Test_API_35");
+      assert.equal(parsedOnlineNamedAvd[0].online, false);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
