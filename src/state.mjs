@@ -547,9 +547,21 @@ export function resolveSessionIdentity({
     return null;
   };
 
+  const resolveMigratedMcpSession = (sid) => {
+    if (sid.startsWith("mcp-") && state?.leases) {
+      const migrated = Object.values(state.leases).find(
+        (l) => l && l.state === "active" && l.mcpSessionId === sid,
+      );
+      if (migrated && migrated.sessionId) {
+        return migrated.sessionId;
+      }
+    }
+    return sid;
+  };
+
   const explicitSessionFlag = flags.session || flags.role;
   if (explicitSessionFlag) {
-    const sid = validateSessionId(explicitSessionFlag);
+    const sid = resolveMigratedMcpSession(validateSessionId(explicitSessionFlag));
     return {
       sessionId: sid,
       anchorPid: findHookAnchorForSession(sid),
@@ -557,7 +569,7 @@ export function resolveSessionIdentity({
     };
   }
   if (env.ATC_SESSION_ID) {
-    const sid = validateSessionId(env.ATC_SESSION_ID);
+    const sid = resolveMigratedMcpSession(validateSessionId(env.ATC_SESSION_ID));
     return {
       sessionId: sid,
       anchorPid: findHookAnchorForSession(sid),

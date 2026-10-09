@@ -1712,6 +1712,54 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         { sessionId: "sess-1", activeLeases: [] },
       );
       assert.equal(screenResolveGuard.allowed, true);
+
+      // Multiple MCP servers under the same parent PID get distinct default session IDs and cannot hijack each other's lease
+      const multiMcpDir = makeTempStateDir();
+      try {
+        const mcpInv = {
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+          running: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              avd: "Pixel_8_API_35",
+              serial: "emulator-5554",
+              kind: "emulator",
+              online: true,
+              profile: { deviceType: "phone", apiLevel: "android-35" },
+            },
+          ],
+          offline: [],
+          creatable: [],
+        };
+        const mcp1 = handleMcpRequest(
+          multiMcpDir,
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "atc_claim", arguments: { api: "35", waitSec: 0 } },
+          },
+          { ppid: process.pid, pid: 41001, env: {}, inventory: mcpInv },
+        );
+        const mcp1Res = JSON.parse(mcp1.result.content[0].text);
+        assert.equal(mcp1Res.exitCode, 0);
+        assert.equal(mcp1Res.lease.sessionId, "mcp-41001");
+
+        const mcp2 = handleMcpRequest(
+          multiMcpDir,
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "atc_claim", arguments: { api: "35", waitSec: 0 } },
+          },
+          { ppid: process.pid, pid: 41002, env: {}, inventory: mcpInv },
+        );
+        const mcp2Res = JSON.parse(mcp2.result.content[0].text);
+        assert.equal(mcp2Res.exitCode, 2);
+      } finally {
+        fs.rmSync(multiMcpDir, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

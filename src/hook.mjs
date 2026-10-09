@@ -134,13 +134,26 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
       };
 
       const fallbackPpidSession = `ppid-${norm.anchorPid}`;
-      for (const l of Object.values(state.leases)) {
-        if (
-          l.state === "active" &&
-          (l.sessionId === fallbackPpidSession ||
-            (l.anchorPid === norm.anchorPid && String(l.sessionId).startsWith("ppid-")))
-        ) {
-          l.sessionId = norm.sessionId;
+      const candidateFallbackSessions = new Set(
+        Object.values(state.leases)
+          .filter(
+            (l) =>
+              l.state === "active" &&
+              (l.sessionId === fallbackPpidSession ||
+                (l.anchorPid === norm.anchorPid &&
+                  (String(l.sessionId).startsWith("ppid-") ||
+                    String(l.sessionId).startsWith("mcp-")))),
+          )
+          .map((l) => l.sessionId),
+      );
+      if (candidateFallbackSessions.size === 1) {
+        for (const l of Object.values(state.leases)) {
+          if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
+            if (String(l.sessionId).startsWith("mcp-")) {
+              l.mcpSessionId = l.mcpSessionId || l.sessionId;
+            }
+            l.sessionId = norm.sessionId;
+          }
         }
       }
 
@@ -269,17 +282,27 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
       let mutated = Boolean(state.hookSessions[String(ppid)]);
       delete state.hookSessions[String(ppid)];
 
-      for (const l of Object.values(state.leases)) {
-        if (
-          l.state === "active" &&
-          (l.sessionId === fallbackPpidSession ||
-            (l.anchorPid === ppid && String(l.sessionId).startsWith("ppid-")))
-        ) {
-          if (resolvedId) {
-            l.sessionId = resolvedId;
-            mutated = true;
-          } else {
-            resolvedId = l.sessionId;
+      const candidateFallbackSessions = new Set(
+        Object.values(state.leases)
+          .filter(
+            (l) =>
+              l.state === "active" &&
+              (l.sessionId === fallbackPpidSession ||
+                (l.anchorPid === ppid &&
+                  (String(l.sessionId).startsWith("ppid-") ||
+                    String(l.sessionId).startsWith("mcp-")))),
+          )
+          .map((l) => l.sessionId),
+      );
+      if (candidateFallbackSessions.size === 1) {
+        for (const l of Object.values(state.leases)) {
+          if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
+            if (resolvedId) {
+              l.sessionId = resolvedId;
+              mutated = true;
+            } else {
+              resolvedId = l.sessionId;
+            }
           }
         }
       }
