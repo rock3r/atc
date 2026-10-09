@@ -57,9 +57,11 @@ export function resolveExecutable(
 
   const pathDirs = (env.PATH || env.Path || "").split(path.delimiter).filter(Boolean);
   const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   pathDirs.push(
     path.join(localAppData, "Android", "Sdk", "platform-tools"),
     path.join(localAppData, "Android", "Sdk", "emulator"),
+    path.join(appData, "npm"),
     path.join(os.homedir(), ".local", "bin"),
   );
 
@@ -77,6 +79,10 @@ export function resolveExecutable(
         // Ignore inaccessible PATH entry
       }
     }
+  }
+
+  if (lower === "atc") {
+    return { executable: "atc.cmd", isBatch: true };
   }
 
   return { executable: command, isBatch: false };

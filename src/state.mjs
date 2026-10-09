@@ -166,6 +166,54 @@ export function sweepOrphanFiles(stateDir, now = Date.now()) {
   }
 }
 
+export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
+  if (!lease || typeof lease !== "object") return [];
+  const raw = [];
+  if (Array.isArray(lease.workerPids)) {
+    raw.push(...lease.workerPids);
+  }
+  if (lease.workerPid !== null && lease.workerPid !== undefined) {
+    raw.push(lease.workerPid);
+  }
+  const seen = new Set();
+  const alive = [];
+  for (const val of raw) {
+    const pid = Number(val);
+    if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
+    seen.add(pid);
+    if (livenessCheck(pid)) {
+      alive.push(pid);
+    }
+  }
+  return alive;
+}
+
+export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
+  const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
+  lease.workerPids = alive;
+  lease.workerPid = alive[0] ?? null;
+  return alive;
+}
+
+export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
+  const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
+  const numericPid = Number(pid);
+  if (Number.isInteger(numericPid) && numericPid > 0 && !alive.includes(numericPid)) {
+    alive.push(numericPid);
+  }
+  lease.workerPids = alive;
+  lease.workerPid = alive[0] ?? null;
+  return alive;
+}
+
+export function removeLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
+  const numericPid = Number(pid);
+  const alive = getLiveLeaseWorkerPids(lease, livenessCheck).filter((p) => p !== numericPid);
+  lease.workerPids = alive;
+  lease.workerPid = alive[0] ?? null;
+  return alive;
+}
+
 export function runGarbageCollection(state, stateDir, now = Date.now(), livenessCheck = isPidAlive) {
   const pruned = {
     leases: [],
@@ -188,10 +236,8 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
         now >= lease.expiresAtMs ||
         now < lease.claimedAtMs ||
         (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
-      const workerAlive = Boolean(lease.workerPid && livenessCheck(lease.workerPid));
-      if (!workerAlive && lease.workerPid) {
-        lease.workerPid = null;
-      }
+      const aliveWorkers = syncLeaseWorkers(lease, livenessCheck);
+      const workerAlive = aliveWorkers.length > 0;
       const deadAnchor =
         lease.anchorPid !== null &&
         lease.anchorPid !== undefined &&
@@ -331,7 +377,9 @@ export function withStateTransaction(stateDir, fn, options = {}) {
       const state = readState(stateDir);
       const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
       const result = fn(state, { now, pruned, lockHandle });
-      if (result && result.mutated !== false) {
+      const gcMutated =
+        pruned.leases.length > 0 || pruned.queue.length > 0 || pruned.hookSessions.length > 0;
+      if ((result && result.mutated !== false) || gcMutated) {
         commitState(stateDir, state, lockHandle);
       }
       return result?.value !== undefined ? result.value : result;

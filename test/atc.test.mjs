@@ -44,7 +44,12 @@ import {
   splitShellSegments,
 } from "../src/guard.mjs";
 import { handlePreToolUseHook, handleStopHook } from "../src/hook.mjs";
-import { buildChildInvocation, resolveExecutable, runCommandSync } from "../src/spawn.mjs";
+import {
+  buildChildInvocation,
+  buildSpawnConfig,
+  resolveExecutable,
+  runCommandSync,
+} from "../src/spawn.mjs";
 import {
   cmdClaim,
   cmdFree,
@@ -2014,6 +2019,96 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(parsedBoolFalse.flags.cold, false);
       assert.equal(parsedBoolFalse.flags.force, false);
       assert.equal(parsedBoolFalse.flags.stop, false);
+
+      // Idempotent re-claim preserves an existing live exec workerPid even if anchorPid later exits
+      const workerKeepDir = makeTempStateDir();
+      try {
+        const workerInv = {
+          running: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              kind: "emulator",
+              avd: "Pixel_8_API_35",
+              serial: "emulator-5554",
+              online: true,
+              profile: { deviceType: "phone", apiLevel: "android-35", numericApi: 35, hasPlayStore: true },
+              snapshots: ["clean-base"],
+            },
+          ],
+          offline: [],
+          creatable: [],
+        };
+        let anchorAlive = true;
+        let execWorkerAlive = true;
+        const liveness = (pid) => {
+          if (pid === 71001) return anchorAlive;
+          if (pid === 71002) return execWorkerAlive;
+          if (pid === process.pid) return true;
+          return false;
+        };
+        const wc1 = cmdClaim(
+          workerKeepDir,
+          { session: "worker-keep-sess", anchorPid: 71001, api: "35" },
+          { inventory: workerInv, livenessCheck: liveness },
+        );
+        assert.equal(wc1.exitCode, 0);
+        withStateTransaction(
+          workerKeepDir,
+          (state) => {
+            const lease = state.leases["avd:Pixel_8_API_35"];
+            lease.workerPid = 71002;
+            lease.workerPids = [71002];
+            return { mutated: true };
+          },
+          { livenessCheck: liveness },
+        );
+
+        // Plain idempotent re-claim does not clear the live exec worker (71002)
+        const wc2 = cmdClaim(
+          workerKeepDir,
+          { session: "worker-keep-sess", anchorPid: 71001, api: "35" },
+          { inventory: workerInv, livenessCheck: liveness },
+        );
+        assert.equal(wc2.exitCode, 0);
+        assert.equal(wc2.idempotent, true);
+        assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
+
+        // Even when anchor exits and an idempotent re-claim with --reset-app runs, lease survives while 71002 is alive
+        anchorAlive = false;
+        const wc3 = cmdClaim(
+          workerKeepDir,
+          { session: "worker-keep-sess", anchorPid: 71001, api: "35", resetApp: "com.example.app" },
+          {
+            inventory: workerInv,
+            livenessCheck: liveness,
+            runner: () => ({ status: 0, stdout: "Success", stderr: "" }),
+          },
+        );
+        assert.equal(wc3.exitCode, 0);
+        assert.ok(readState(workerKeepDir).leases["avd:Pixel_8_API_35"]);
+        assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
+
+        // Once the exec worker also exits, GC prunes the dead-anchor lease
+        execWorkerAlive = false;
+        withStateTransaction(workerKeepDir, () => ({ mutated: false }), {
+          livenessCheck: liveness,
+        });
+        assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"], undefined);
+      } finally {
+        fs.rmSync(workerKeepDir, { recursive: true, force: true });
+      }
+
+      // Windows resolveExecutable and buildSpawnConfig treat npm `atc` shim as batch (.cmd) launched via cmd.exe
+      const winAtcResolved = resolveExecutable("atc", { PATH: "" }, winDir, "win32");
+      assert.equal(winAtcResolved.isBatch, true);
+      assert.equal(winAtcResolved.executable, "atc.cmd");
+      const winAtcSpawn = buildSpawnConfig("atc", ["free", "--session", "pi-1"], {
+        env: { PATH: "", ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+        cwd: winDir,
+        platform: "win32",
+      });
+      assert.equal(winAtcSpawn.command, "C:\\Windows\\System32\\cmd.exe");
+      assert.equal(winAtcSpawn.options.windowsVerbatimArguments, true);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

@@ -18,6 +18,7 @@ import { startMcpServer } from "./mcp.mjs";
 import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
   DEFAULT_CONFIG,
+  addLeaseWorker,
   canJumpAhead,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
@@ -25,7 +26,9 @@ import {
   matchesProfile,
   readState,
   reconcileOfflineLeases,
+  removeLeaseWorker,
   resolveSessionIdentity,
+  syncLeaseWorkers,
   withStateTransaction,
 } from "./state.mjs";
 
@@ -556,7 +559,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           ) {
             const needsPrep = Boolean(req.resetApp || req.snapshotLoad);
             const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
-            lease.workerPid = needsPrep ? process.pid : null;
+            const livenessCheck = options.livenessCheck || isPidAlive;
+            if (needsPrep) {
+              addLeaseWorker(lease, process.pid, livenessCheck);
+            } else {
+              syncLeaseWorkers(lease, livenessCheck);
+            }
             lease.renewedAtMs = now;
             lease.expiresAtMs = Math.max(
               now + ttlMs,
@@ -813,14 +821,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           withStateTransaction(stateDir, (state) => {
             const cur = state.leases[txOutcome.lease.deviceKey];
             if (cur && cur.leaseId === txOutcome.lease.leaseId) {
-              if (cur.workerPid === process.pid) {
-                cur.workerPid = null;
-              }
+              const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
               if (prepUpdatedSnap) {
                 cur.loadedSnapshot = loadedSnap;
                 txOutcome.lease.loadedSnapshot = loadedSnap;
               }
               if (
+                aliveWorkers.length === 0 &&
                 cur.anchorPid !== null &&
                 cur.anchorPid !== undefined &&
                 !livenessCheck(cur.anchorPid)
@@ -1167,6 +1174,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       }
       current.state = "active";
       current.workerPid = null;
+      current.workerPids = [];
       current.replacingAvd = null;
       current.serial = resolvedSerial;
       current.activatedAtMs = now;
@@ -1429,7 +1437,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         if (cur && cur.leaseId === lease.leaseId) {
           if (itemFailed) {
             cur.state = "active";
-            cur.workerPid = null;
+            removeLeaseWorker(cur, process.pid, options.livenessCheck || isPidAlive);
             cur.deadlineMs = null;
             const ttlMs = (state.config?.defaultTtlSec || 600) * 1000;
             cur.renewedAtMs = now;
@@ -1635,7 +1643,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
-    lease.workerPid = process.pid;
+    addLeaseWorker(lease, process.pid, options.livenessCheck || isPidAlive);
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + Math.max(ttlMs, stopTimeoutMs * 2));
     return { mutated: true, value: { exitCode: 0, lease: { ...lease }, ttlMs, stopTimeoutMs } };
@@ -1650,10 +1658,9 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     return withStateTransaction(stateDir, (state, { now }) => {
       const cur = state.leases[leaseCheck.lease.deviceKey];
       if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
-        if (cur.workerPid === process.pid) {
-          cur.workerPid = null;
-        }
+        const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
         if (
+          aliveWorkers.length === 0 &&
           cur.anchorPid !== null &&
           cur.anchorPid !== undefined &&
           !livenessCheck(cur.anchorPid)
@@ -1672,11 +1679,17 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     }, options);
   };
 
-  const res = runner(
-    "adb",
-    ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", action, name],
-    { strictInternal: true, timeoutMs: leaseCheck.stopTimeoutMs },
-  );
+  let res;
+  try {
+    res = runner(
+      "adb",
+      ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", action, name],
+      { strictInternal: true, timeoutMs: leaseCheck.stopTimeoutMs },
+    );
+  } catch (err) {
+    clearSnapshotWorker(false);
+    return { exitCode: 1, error: err.message };
+  }
   if (res.status !== 0) {
     clearSnapshotWorker(false);
     return {
@@ -1775,7 +1788,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       };
     }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
-    lease.workerPid = process.pid;
+    addLeaseWorker(lease, process.pid, options.livenessCheck || isPidAlive);
     if (wrappedClass.kind !== "read_only") {
       lease.loadedSnapshot = null;
     }
@@ -1828,9 +1841,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       const livenessCheck = options.livenessCheck || isPidAlive;
       withStateTransaction(stateDir, (state) => {
         const cur = state.leases[check.lease.deviceKey];
-        if (cur && cur.leaseId === check.lease.leaseId && cur.workerPid === process.pid) {
-          cur.workerPid = null;
+        if (cur && cur.leaseId === check.lease.leaseId) {
+          const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
           if (
+            aliveWorkers.length === 0 &&
             cur.anchorPid !== null &&
             cur.anchorPid !== undefined &&
             !livenessCheck(cur.anchorPid)

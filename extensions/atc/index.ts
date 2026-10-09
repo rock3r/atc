@@ -1,6 +1,112 @@
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|atc)\b/i;
+
+export function resolveAtcExecutable(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+  platform: string = process.platform
+): { executable: string; isBatch: boolean } {
+  if (platform !== "win32") {
+    return { executable: "atc", isBatch: false };
+  }
+
+  const rawExts = (env.PATHEXT || env.PathExt || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((e) => e.trim().toLowerCase())
+    .filter((e) => e.startsWith("."));
+  const extensions = Array.from(new Set([".exe", ".cmd", ".bat", ".com", ...rawExts]));
+
+  for (const ext of extensions) {
+    const localCandidate = path.resolve(cwd, "atc" + ext);
+    try {
+      if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
+        return {
+          executable: localCandidate,
+          isBatch: ext === ".cmd" || ext === ".bat",
+        };
+      }
+    } catch {
+      // Ignore inaccessible local entry
+    }
+  }
+
+  const pathDirs = (env.PATH || env.Path || "").split(path.delimiter).filter(Boolean);
+  const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  pathDirs.push(path.join(appData, "npm"), path.join(os.homedir(), ".local", "bin"));
+
+  for (const dir of pathDirs) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, "atc" + ext);
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return {
+            executable: candidate,
+            isBatch: ext === ".cmd" || ext === ".bat",
+          };
+        }
+      } catch {
+        // Ignore inaccessible PATH entry
+      }
+    }
+  }
+
+  return { executable: "atc.cmd", isBatch: true };
+}
+
+export function buildAtcSpawnConfig(
+  args: string[] = [],
+  options: Record<string, any> = {}
+) {
+  const env = options.env || process.env;
+  const cwd = options.cwd || process.cwd();
+  const platform = options.platform || process.platform;
+  const resolved = resolveAtcExecutable(env, cwd, platform);
+
+  if (platform === "win32" && resolved.isBatch) {
+    for (const arg of args) {
+      const s = String(arg);
+      if (s.includes("\0") || s.includes("\r") || s.includes("\n") || s.includes("%")) {
+        throw new Error(`Unsafe character in Windows batch argument: ${JSON.stringify(s)}`);
+      }
+    }
+    const comspec = env.ComSpec || "cmd.exe";
+    const quotedCmd = `"${resolved.executable}" ${args
+      .map((a) => `"${String(a).replace(/"/g, '""')}"`)
+      .join(" ")}`;
+    return {
+      command: comspec,
+      args: ["/d", "/s", "/c", `"${quotedCmd}"`],
+      isBatch: true,
+      options: {
+        ...options,
+        env,
+        shell: false,
+        windowsHide: true,
+        windowsVerbatimArguments: true,
+      },
+    };
+  }
+
+  return {
+    command: resolved.executable,
+    args: args.map(String),
+    isBatch: false,
+    options: {
+      ...options,
+      env,
+      shell: false,
+    },
+  };
+}
+
+function runAtcSync(args: string[], options: Record<string, any> = {}) {
+  const cfg = buildAtcSpawnConfig(args, options);
+  return execFileSync(cfg.command, cfg.args, cfg.options);
+}
 
 /**
  * Pi / Ohm / Tau Coding Agent Extension for Android Traffic Control (atc).
@@ -40,18 +146,22 @@ export default function atcExtension(pi: any) {
       return undefined;
     };
 
+    const guardEnv = {
+      ...process.env,
+      ATC_ANCHOR_PID: process.env.ATC_ANCHOR_PID || String(process.pid),
+    };
+    const resolved = resolveAtcExecutable(guardEnv, process.cwd(), process.platform);
+    const useStdinOnly = process.platform === "win32" && resolved.isBatch;
+    const guardArgs = useStdinOnly
+      ? ["guard", "--session", sessionId, "--format=json"]
+      : ["guard", "--session", sessionId, "--format=json", "--", command];
+
     try {
-      const stdout = execFileSync(
-        "atc",
-        ["guard", "--session", sessionId, "--format=json", "--", command],
-        {
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            ATC_ANCHOR_PID: process.env.ATC_ANCHOR_PID || String(process.pid),
-          },
-        }
-      );
+      const stdout = runAtcSync(guardArgs, {
+        encoding: "utf8",
+        input: JSON.stringify({ command }),
+        env: guardEnv,
+      }) as string;
       return handleDecision(stdout);
     } catch (err: any) {
       if (err?.stdout) {
@@ -72,7 +182,7 @@ export default function atcExtension(pi: any) {
 
   const releaseSessionLeases = async () => {
     try {
-      execFileSync("atc", ["free", "--session", sessionId], {
+      runAtcSync(["free", "--session", sessionId], {
         stdio: "ignore",
         env: {
           ...process.env,
