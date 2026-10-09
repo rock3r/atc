@@ -1106,11 +1106,17 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       if (candidate.online && (req.wipeData || req.coldBoot)) {
         const rebootStopRes =
           isWin && candidate.serial
-            ? runner("adb", ["-s", candidate.serial, "emu", "kill"], { strictInternal: true })
+            ? runner("adb", ["-s", candidate.serial, "emu", "kill"], {
+                strictInternal: true,
+                timeoutMs: stopTimeoutMs || 60_000,
+              })
             : runner(
                 "android",
                 ["emulator", "stop", candidate.serial || candidate.avd],
-                { strictInternal: true },
+                {
+                  strictInternal: true,
+                  timeoutMs: stopTimeoutMs || 60_000,
+                },
               );
         if (rebootStopRes.status !== 0) {
           throw new Error(
@@ -1844,6 +1850,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     const [cmd, ...args] = commandArgs;
     const wrappedClass = classifySegment(
       [cmd, ...args].map((a) => (/\s/.test(String(a)) ? JSON.stringify(String(a)) : String(a))).join(" "),
+      lease.serial ? { ANDROID_SERIAL: lease.serial } : {},
     );
     if (wrappedClass.kind === "deny_lifecycle") {
       return {

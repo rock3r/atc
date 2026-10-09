@@ -191,7 +191,11 @@ export function tokenizeSegment(segment) {
   const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|(\S+)/g;
   let m;
   while ((m = re.exec(segment)) !== null) {
-    tokens.push(m[1] ?? m[2] ?? m[3]);
+    if (m[1] !== undefined) {
+      tokens.push(m[1].replace(/\\(["\\])/g, "$1"));
+    } else {
+      tokens.push(m[2] ?? m[3]);
+    }
   }
   return tokens;
 }
@@ -477,13 +481,19 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   // Precedence 1: ATC commands (`atc ...`)
   if (baseCmd === "atc") {
     let subIdx = 0;
+    let atcSerialFlag = null;
     while (subIdx < args.length) {
       const a = args[subIdx];
-      if (
+      if ((a === "--serial" || a === "-s") && subIdx + 1 < args.length) {
+        atcSerialFlag = args[subIdx + 1];
+        subIdx += 2;
+      } else if (a.startsWith("--serial=")) {
+        atcSerialFlag = a.slice("--serial=".length);
+        subIdx += 1;
+      } else if (
         (a === "--session" ||
           a === "--role" ||
           a === "--anchor-pid" ||
-          a === "--serial" ||
           a === "--lease" ||
           a === "--state-dir") &&
         subIdx + 1 < args.length
@@ -500,41 +510,64 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     if (subcommand === "exec") {
       const dashDashIdx = args.indexOf("--", subIdx + 1);
       let wrappedTokens = [];
+      let i = subIdx + 1;
+      const scanEnd = dashDashIdx !== -1 ? dashDashIdx : args.length;
+      while (i < scanEnd) {
+        const a = args[i];
+        if ((a === "--serial" || a === "-s") && i + 1 < scanEnd) {
+          atcSerialFlag = args[i + 1];
+          i += 2;
+        } else if (a.startsWith("--serial=")) {
+          atcSerialFlag = a.slice("--serial=".length);
+          i += 1;
+        } else if (
+          (a === "--session" ||
+            a === "--role" ||
+            a === "--anchor-pid" ||
+            a === "--lease" ||
+            a === "--state-dir") &&
+          i + 1 < scanEnd
+        ) {
+          i += 2;
+        } else if (a.startsWith("--")) {
+          i += 1;
+        } else {
+          break;
+        }
+      }
       if (dashDashIdx !== -1) {
         wrappedTokens = args.slice(dashDashIdx + 1);
       } else {
-        let i = subIdx + 1;
-        while (i < args.length) {
-          const a = args[i];
-          if (
-            (a === "--session" ||
-              a === "--role" ||
-              a === "--anchor-pid" ||
-              a === "--serial" ||
-              a === "--lease" ||
-              a === "--state-dir") &&
-            i + 1 < args.length
-          ) {
-            i += 2;
-          } else if (a.startsWith("--")) {
-            i += 1;
-          } else {
-            break;
-          }
-        }
         wrappedTokens = args.slice(i);
       }
       if (wrappedTokens.length > 0) {
         const wrappedSeg = wrappedTokens
           .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        const innerClass = classifySegment(wrappedSeg, parsed.envVars, depth + 1);
+        const execInheritedVars = { ...parsed.envVars };
+        if (atcSerialFlag) {
+          execInheritedVars.ANDROID_SERIAL = atcSerialFlag;
+        } else if (
+          !execInheritedVars.ANDROID_SERIAL &&
+          !parsed.stripsAndroidSerial &&
+          !execInheritedVars.__atc_stripped_android_serial
+        ) {
+          execInheritedVars.ANDROID_SERIAL = "__ATC_EXEC_INJECTED_SERIAL__";
+        }
+        const innerClass = classifySegment(wrappedSeg, execInheritedVars, depth + 1);
         if (innerClass.kind === "deny_lifecycle") {
           return innerClass;
         }
-        if (innerClass.targetSerial) {
+        if (
+          innerClass.targetSerial &&
+          innerClass.targetSerial !== "__ATC_EXEC_INJECTED_SERIAL__"
+        ) {
           execTargetSerial = innerClass.targetSerial;
+        } else if (atcSerialFlag) {
+          execTargetSerial = atcSerialFlag;
         }
+      } else if (atcSerialFlag) {
+        execTargetSerial = atcSerialFlag;
       }
     }
     return {

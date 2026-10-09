@@ -2292,6 +2292,69 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             ),
           /adb emu kill/,
         );
+
+        // `atc exec -- sh -c 'adb -s "$ANDROID_SERIAL" shell get-state'` expands injected ANDROID_SERIAL
+        const guardExecSerialVar = evaluateCommandGuard(
+          'atc exec -- sh -c \'adb -s "$ANDROID_SERIAL" shell get-state\'',
+          {
+            sessionId: "ppid-5050",
+            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+          },
+        );
+        assert.equal(guardExecSerialVar.allowed, true);
+
+        const execSerialVarRes = await cmdExec(
+          npxDir,
+          [process.execPath, "-e", 'if (process.env.ANDROID_SERIAL !== "emulator-5554") process.exit(43);'],
+          { session: "ppid-5050" },
+          { livenessCheck: () => true },
+        );
+        assert.equal(execSerialVarRes.exitCode, 0);
+
+        const execShellSerialVarRes = await cmdExec(
+          npxDir,
+          [
+            "sh",
+            "-c",
+            `${JSON.stringify(process.execPath)} -e "if (process.env.ANDROID_SERIAL !== 'emulator-5554') process.exit(44);" && true || adb -s "$ANDROID_SERIAL" shell get-state`,
+          ],
+          { session: "ppid-5050" },
+          { livenessCheck: () => true },
+        );
+        assert.equal(execShellSerialVarRes.exitCode, 0);
+
+        // Cold restart of online emulator honors configured stopTimeoutSec
+        const stopTimeoutDir = makeTempStateDir();
+        try {
+          const customState = readState(stopTimeoutDir);
+          customState.config.stopTimeoutSec = 95;
+          fs.writeFileSync(path.join(stopTimeoutDir, "state.json"), JSON.stringify(customState));
+          let capturedStopTimeoutMs = null;
+          const coldRestartRes = cmdClaim(
+            stopTimeoutDir,
+            { session: "cold-sess", avd: "Pixel_8_API_35", cold: true, force: true, wait: 0 },
+            {
+              inventory: npxInv,
+              runner: (cmd, args, opts) => {
+                if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                  capturedStopTimeoutMs = opts?.timeoutMs;
+                  return { status: 0, stdout: "", stderr: "" };
+                }
+                if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                  return { status: 0, stdout: JSON.stringify({ serial: "emulator-5554" }), stderr: "" };
+                }
+                if (cmd === "adb") {
+                  return { status: 0, stdout: "1\n", stderr: "" };
+                }
+                return { status: 0, stdout: "", stderr: "" };
+              },
+            },
+          );
+          assert.equal(coldRestartRes.exitCode, 0);
+          assert.equal(capturedStopTimeoutMs, 95_000);
+        } finally {
+          fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
+        }
       } finally {
         fs.rmSync(npxDir, { recursive: true, force: true });
       }
