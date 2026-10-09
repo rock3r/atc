@@ -2248,6 +2248,22 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           ),
           false,
         );
+
+        // cmdFree restores the lease to active if a snapshot/stop runner throws an exception
+        const freeThrown = cmdFree(
+          npxDir,
+          npxClaim.lease.leaseId,
+          { session: "ppid-5050", stop: true },
+          {
+            livenessCheck: () => true,
+            runner: () => {
+              throw new Error("Runner threw during stop");
+            },
+          },
+        );
+        assert.equal(freeThrown.exitCode, 1);
+        assert.deepEqual(freeThrown.freed, []);
+        assert.equal(readState(npxDir).leases["avd:Pixel_8_API_35"].state, "active");
       } finally {
         fs.rmSync(npxDir, { recursive: true, force: true });
       }

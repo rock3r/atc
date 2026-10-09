@@ -486,6 +486,24 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     reason: flags.reason || null,
   };
 
+  if (req.snapshotLoad && !/^[A-Za-z0-9._-]{1,64}$/.test(String(req.snapshotLoad))) {
+    return {
+      exitCode: 1,
+      error: `Invalid snapshot name "${req.snapshotLoad}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+    };
+  }
+  if (req.snapshotSaveOnFree && !/^[A-Za-z0-9._-]{1,64}$/.test(String(req.snapshotSaveOnFree))) {
+    return {
+      exitCode: 1,
+      error: `Invalid snapshot name "${req.snapshotSaveOnFree}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+    };
+  }
+  if (req.resetApp && !/^[A-Za-z0-9._]{1,128}$/.test(String(req.resetApp))) {
+    return {
+      exitCode: 1,
+      error: `Invalid package name "${req.resetApp}" for --reset-app.`,
+    };
+  }
   if (flags.wait !== undefined) {
     const parsedWait = Number(flags.wait);
     if (!Number.isFinite(parsedWait) || parsedWait < 0) {
@@ -1247,6 +1265,21 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
+  if (flags.snapshotSave && !/^[A-Za-z0-9._-]{1,64}$/.test(String(flags.snapshotSave))) {
+    return {
+      exitCode: 1,
+      error: `Invalid snapshot name "${flags.snapshotSave}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+      freed: [],
+    };
+  }
+  if (flags.snapshotLoad && !/^[A-Za-z0-9._-]{1,64}$/.test(String(flags.snapshotLoad))) {
+    return {
+      exitCode: 1,
+      error: `Invalid snapshot name "${flags.snapshotLoad}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+      freed: [],
+    };
+  }
+
   // Pre-lock disk check (pure statfs, never spawns subprocesses under atc.lock)
   const freeDiskMb =
     options.host?.freeDiskMb ?? (!flags.force ? readFreeDiskMb(avdHome) : 16384);
@@ -1478,6 +1511,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           );
         }
       }
+    } catch (err) {
+      itemFailed = true;
+      actionErrors.push(err?.message || String(err));
     } finally {
       heartbeats.get(lease.leaseId)?.stop();
       withStateTransaction(stateDir, (state, { now }) => {
