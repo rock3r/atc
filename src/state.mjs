@@ -243,11 +243,12 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
         lease.anchorPid !== undefined &&
         !livenessCheck(lease.anchorPid) &&
         !workerAlive;
-      if (expired || deadAnchor) {
+      const deferredFreeDone = Boolean(lease.releaseOnWorkerExit) && !workerAlive;
+      if (expired || deadAnchor || deferredFreeDone) {
         pruned.leases.push({
           deviceKey,
           leaseId: lease.leaseId,
-          reason: expired ? "expired" : "dead_anchor",
+          reason: expired ? "expired" : deferredFreeDone ? "deferred_free" : "dead_anchor",
         });
         delete state.leases[deviceKey];
       }

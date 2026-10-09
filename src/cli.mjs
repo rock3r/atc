@@ -565,6 +565,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             } else {
               syncLeaseWorkers(lease, livenessCheck);
             }
+            lease.releaseOnWorkerExit = false;
             lease.renewedAtMs = now;
             lease.expiresAtMs = Math.max(
               now + ttlMs,
@@ -828,9 +829,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               }
               if (
                 aliveWorkers.length === 0 &&
-                cur.anchorPid !== null &&
-                cur.anchorPid !== undefined &&
-                !livenessCheck(cur.anchorPid)
+                (cur.releaseOnWorkerExit ||
+                  (cur.anchorPid !== null &&
+                    cur.anchorPid !== undefined &&
+                    !livenessCheck(cur.anchorPid)))
               ) {
                 delete state.leases[txOutcome.lease.deviceKey];
               }
@@ -1283,19 +1285,36 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         return { mutated: false, value: { status: "empty", freed: [] } };
       }
 
+      const livenessCheck = options.livenessCheck || isPidAlive;
+      const isForced = parseBoolFlag(flags.force);
       const stoppingQueue = [];
       const freedImmediate = [];
+      const busyErrors = [];
       const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
       let cumulativeSnapshotMb = 0;
 
       for (const lease of matches) {
+        const activeWorkers =
+          lease.state === "active"
+            ? syncLeaseWorkers(lease, livenessCheck).filter((p) => p !== process.pid)
+            : lease.workerPid && lease.workerPid !== process.pid && livenessCheck(lease.workerPid)
+              ? [lease.workerPid]
+              : [];
+        if (activeWorkers.length > 0 && !isForced) {
+          lease.releaseOnWorkerExit = true;
+          busyErrors.push(
+            `Lease ${lease.leaseId} (${lease.deviceKey}) has active in-flight worker(s) (${activeWorkers.join(", ")}); wait for completion or pass --force.`,
+          );
+          continue;
+        }
+
         const saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree || null;
         const loadSnap = flags.snapshotLoad || null;
         const doStop =
           (parseBoolFlag(flags.stop) || parseBoolFlag(flags.shutdown)) &&
           lease.kind === "emulator";
 
-        if (saveSnap && !parseBoolFlag(flags.force) && lease.kind === "emulator") {
+        if (saveSnap && !isForced && lease.kind === "emulator") {
           const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
           cumulativeSnapshotMb += meta.ramSizeMb;
           if (freeDiskMb < cumulativeSnapshotMb + (state.config.minFreeDiskMb ?? 2048)) {
@@ -1326,12 +1345,19 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       return {
         mutated: true,
         value: {
-          status: "ok",
+          status:
+            busyErrors.length > 0 &&
+            !options.deferOnBusyWorker &&
+            freedImmediate.length === 0 &&
+            stoppingQueue.length === 0
+              ? "busy_worker"
+              : "ok",
           freedImmediate,
           stoppingQueue,
+          busyErrors: options.deferOnBusyWorker ? [] : busyErrors,
         },
       };
-    });
+    }, options);
   } catch (err) {
     if (err instanceof ResourceError) {
       return { exitCode: err.exitCode, error: err.message };
@@ -1342,9 +1368,16 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   if (outcome.status === "forbidden") {
     return { exitCode: 3, error: outcome.error };
   }
+  if (outcome.status === "busy_worker") {
+    return {
+      exitCode: 3,
+      error: outcome.busyErrors.join("; "),
+      freed: [],
+    };
+  }
 
   const allFreed = [...(outcome.freedImmediate || [])];
-  const actionErrors = [];
+  const actionErrors = [...(outcome.busyErrors || [])];
   const stoppingItems = outcome.stoppingQueue || [];
   const heartbeats = new Map(
     stoppingItems.map((item) => [
@@ -1661,9 +1694,10 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
         if (
           aliveWorkers.length === 0 &&
-          cur.anchorPid !== null &&
-          cur.anchorPid !== undefined &&
-          !livenessCheck(cur.anchorPid)
+          (cur.releaseOnWorkerExit ||
+            (cur.anchorPid !== null &&
+              cur.anchorPid !== undefined &&
+              !livenessCheck(cur.anchorPid)))
         ) {
           delete state.leases[leaseCheck.lease.deviceKey];
           return { mutated: true, value: { ...cur } };
@@ -1845,9 +1879,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
           if (
             aliveWorkers.length === 0 &&
-            cur.anchorPid !== null &&
-            cur.anchorPid !== undefined &&
-            !livenessCheck(cur.anchorPid)
+            (cur.releaseOnWorkerExit ||
+              (cur.anchorPid !== null &&
+                cur.anchorPid !== undefined &&
+                !livenessCheck(cur.anchorPid)))
           ) {
             delete state.leases[check.lease.deviceKey];
           }

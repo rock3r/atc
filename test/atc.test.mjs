@@ -2088,7 +2088,24 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         assert.ok(readState(workerKeepDir).leases["avd:Pixel_8_API_35"]);
         assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
 
-        // Once the exec worker also exits, GC prunes the dead-anchor lease
+        // cmdFree (both plain and with --stop) preserves the lease while registered worker 71002 is alive
+        const freeWhileBusy = cmdFree(
+          workerKeepDir,
+          null,
+          { session: "worker-keep-sess", stop: true },
+          {
+            livenessCheck: liveness,
+            runner: () => {
+              throw new Error("Should not stop emulator while worker 71002 is alive");
+            },
+          },
+        );
+        assert.equal(freeWhileBusy.exitCode, 3);
+        assert.ok(readState(workerKeepDir).leases["avd:Pixel_8_API_35"]);
+        assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].state, "active");
+        assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
+
+        // Once the exec worker also exits, GC prunes the dead-anchor / deferred-free lease
         execWorkerAlive = false;
         withStateTransaction(workerKeepDir, () => ({ mutated: false }), {
           livenessCheck: liveness,

@@ -317,7 +317,12 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
     return { exitCode: 0, freed: [] };
   }
 
-  const freeRes = cmdFree(stateDir, null, { session: targetSessionId }, options);
+  const freeRes = cmdFree(
+    stateDir,
+    null,
+    { session: targetSessionId },
+    { ...options, deferOnBusyWorker: true },
+  );
   return {
     exitCode: freeRes.exitCode,
     freed: freeRes.freed || [],
