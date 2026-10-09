@@ -644,6 +644,26 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         parsed,
       };
     }
+    if (adbSub === "disconnect") {
+      const disconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (disconnectTargets.length === 0) {
+        return {
+          kind: "deny_lifecycle",
+          reason:
+            'Bare "adb disconnect" is disabled under ATC because it disconnects all TCP/IP devices on the host; specify the leased target serial explicitly.',
+          parsed,
+        };
+      }
+      const explicitSel = extractTargetSerial(parsed);
+      const allTargets = Array.from(
+        new Set([...(explicitSel ? [explicitSel] : []), ...disconnectTargets]),
+      );
+      return {
+        kind: "device_action",
+        targetSerial: allTargets.length === 1 ? allTargets[0] : allTargets.join(","),
+        parsed,
+      };
+    }
     if (!adbSub || READ_ONLY_ADB_SUBCOMMANDS.has(adbSub)) {
       return { kind: "read_only", parsed };
     }

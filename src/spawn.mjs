@@ -307,6 +307,21 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         'Direct "adb emu kill" is disabled under ATC. Use "atc free --stop" instead.',
       );
     }
+    if (adbSub === "disconnect") {
+      const disconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (disconnectTargets.length === 0) {
+        throw new Error(
+          'Bare "adb disconnect" is disabled under ATC because it disconnects all TCP/IP devices on the host; specify the leased target serial explicitly.',
+        );
+      }
+      for (const target of disconnectTargets) {
+        if (lease.serial && target !== lease.serial) {
+          throw new Error(
+            `Conflicting device selector "${target}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          );
+        }
+      }
+    }
   }
 
   if (base === "adb" || base === "android") {

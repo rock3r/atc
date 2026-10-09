@@ -1846,6 +1846,33 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(parsedOnlineNamedAvd.length, 1);
       assert.equal(parsedOnlineNamedAvd[0].avd, "Online_Test_API_35");
       assert.equal(parsedOnlineNamedAvd[0].online, false);
+
+      // Bare `adb disconnect` and mismatched `adb disconnect <target>` are rejected in both buildChildInvocation and guard
+      assert.throws(
+        () =>
+          buildChildInvocation(
+            "adb",
+            ["disconnect"],
+            { leaseId: "lease-1", serial: "emulator-5554" },
+            "sess-1",
+          ),
+        /Bare "adb disconnect" is disabled/,
+      );
+      assert.throws(
+        () =>
+          buildChildInvocation(
+            "adb",
+            ["disconnect", "192.168.1.50:5555"],
+            { leaseId: "lease-1", serial: "emulator-5554" },
+            "sess-1",
+          ),
+        /Conflicting device selector/,
+      );
+      const bareDisconnectGuard = evaluateCommandGuard("adb disconnect", {
+        sessionId: "sess-1",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      });
+      assert.equal(bareDisconnectGuard.allowed, false);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
