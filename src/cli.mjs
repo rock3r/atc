@@ -29,6 +29,29 @@ import {
   withStateTransaction,
 } from "./state.mjs";
 
+function parseBoolFlag(val) {
+  if (val === undefined || val === null) return false;
+  if (typeof val === "boolean") return val;
+  const s = String(val).trim().toLowerCase();
+  if (s === "false" || s === "0" || s === "no" || s === "off" || s === "") {
+    return false;
+  }
+  return true;
+}
+
+const BOOLEAN_FLAG_KEYS = new Set([
+  "createIfMissing",
+  "wipeData",
+  "cold",
+  "headless",
+  "force",
+  "stop",
+  "shutdown",
+  "json",
+  "help",
+  "play",
+]);
+
 export function parseCliArgs(argv) {
   const args = [...argv];
   const dashDashIdx = args.indexOf("--");
@@ -82,7 +105,8 @@ export function parseCliArgs(argv) {
         .slice(0, eqIdx)
         .replace(/^-+/, "")
         .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-      flags[key] = tok.slice(eqIdx + 1);
+      const rawVal = tok.slice(eqIdx + 1);
+      flags[key] = BOOLEAN_FLAG_KEYS.has(key) ? parseBoolFlag(rawVal) : rawVal;
       continue;
     }
     const key = tok
@@ -450,16 +474,16 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     deviceType: flags.type || null,
     apiSpec: flags.api ? String(flags.api) : null,
     services: flags.services || null,
-    play: typeof flags.play === "boolean" ? flags.play : null,
+    play: flags.play === undefined || flags.play === null ? null : parseBoolFlag(flags.play),
     abi: flags.abi || null,
-    createIfMissing: Boolean(flags.createIfMissing),
+    createIfMissing: parseBoolFlag(flags.createIfMissing),
     snapshotLoad: flags.snapshotLoad || null,
     snapshotSaveOnFree: flags.snapshotSaveOnFree || null,
-    wipeData: Boolean(flags.wipeData),
-    coldBoot: Boolean(flags.cold),
+    wipeData: parseBoolFlag(flags.wipeData),
+    coldBoot: parseBoolFlag(flags.cold),
     resetApp: flags.resetApp || null,
-    headless: Boolean(flags.headless),
-    force: Boolean(flags.force),
+    headless: parseBoolFlag(flags.headless),
+    force: parseBoolFlag(flags.force),
     reason: flags.reason || null,
   };
 
@@ -1228,7 +1252,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         const isOwner =
           found.sessionId === identity.sessionId ||
           found.leaseId === target ||
-          Boolean(flags.force);
+          parseBoolFlag(flags.force);
         if (!isOwner) {
           return {
             mutated: false,
@@ -1259,9 +1283,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       for (const lease of matches) {
         const saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree || null;
         const loadSnap = flags.snapshotLoad || null;
-        const doStop = Boolean(flags.stop || flags.shutdown) && lease.kind === "emulator";
+        const doStop =
+          (parseBoolFlag(flags.stop) || parseBoolFlag(flags.shutdown)) &&
+          lease.kind === "emulator";
 
-        if (saveSnap && !flags.force && lease.kind === "emulator") {
+        if (saveSnap && !parseBoolFlag(flags.force) && lease.kind === "emulator") {
           const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
           cumulativeSnapshotMb += meta.ramSizeMb;
           if (freeDiskMb < cumulativeSnapshotMb + (state.config.minFreeDiskMb ?? 2048)) {
@@ -1594,7 +1620,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       };
     }
     const lease = owned[0];
-    if (action === "save" && !flags.force) {
+    if (action === "save" && !parseBoolFlag(flags.force)) {
       const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
       const minDisk = state.config.minFreeDiskMb ?? 2048;
       if (freeDiskMb < meta.ramSizeMb + minDisk) {

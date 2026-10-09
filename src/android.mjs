@@ -220,7 +220,21 @@ export function parseAndroidEmulatorListOutput(stdout) {
     }
     if (tokens.length >= 2) {
       const avd = tokens[0];
-      const statusToken = tokens[1].toLowerCase();
+      const secondLast =
+        tokens.length >= 4 ? tokens[tokens.length - 2].toLowerCase() : "";
+      const second = tokens[1].toLowerCase();
+      let statusToken = second;
+      if (secondLast === "online" || secondLast === "offline") {
+        statusToken = secondLast;
+      } else if (second !== "online" && second !== "offline") {
+        for (let i = tokens.length - 1; i >= 1; i--) {
+          const t = tokens[i].toLowerCase();
+          if (t === "online" || t === "offline") {
+            statusToken = t;
+            break;
+          }
+        }
+      }
       const online = statusToken === "online";
       const restOfLine = tokens.slice(1).join(" ");
       const serialMatch = restOfLine.match(/\b(emulator-\d+)\b/);

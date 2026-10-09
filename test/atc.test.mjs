@@ -54,6 +54,7 @@ import {
   cmdStatus,
   cmdConfig,
   cmdGuard,
+  parseCliArgs,
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
 
@@ -1988,6 +1989,31 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       } finally {
         fs.rmSync(snapReloadDir, { recursive: true, force: true });
       }
+
+      // parseAndroidEmulatorListOutput parses 5-column `android emulator list --long` output (AVD ID, Name, API, Status, Serial)
+      const longListParsed = parseAndroidEmulatorListOutput(
+        "myphone  Medium Phone  android-34  Online  emulator-5554\nOnline_Test  Online Test  android-35  Offline  -\n",
+      );
+      assert.equal(longListParsed.length, 2);
+      assert.equal(longListParsed[0].avd, "myphone");
+      assert.equal(longListParsed[0].online, true);
+      assert.equal(longListParsed[0].serial, "emulator-5554");
+      assert.equal(longListParsed[0].apiLevel, "android-34");
+      assert.equal(longListParsed[1].avd, "Online_Test");
+      assert.equal(longListParsed[1].online, false);
+
+      // parseCliArgs and command handlers parse `--wipe-data=false`, `--stop=false`, `--force=false` as false
+      const parsedBoolFalse = parseCliArgs([
+        "claim",
+        "--wipe-data=false",
+        "--cold=false",
+        "--force=false",
+        "--stop=false",
+      ]);
+      assert.equal(parsedBoolFalse.flags.wipeData, false);
+      assert.equal(parsedBoolFalse.flags.cold, false);
+      assert.equal(parsedBoolFalse.flags.force, false);
+      assert.equal(parsedBoolFalse.flags.stop, false);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
