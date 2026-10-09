@@ -544,9 +544,9 @@ export function resolveSessionIdentity({
   ppid = process.ppid,
   ancestorPids = null,
 } = {}) {
-  const explicitAnchor = env.ATC_ANCHOR_PID && /^\d+$/.test(env.ATC_ANCHOR_PID)
-    ? Number(env.ATC_ANCHOR_PID)
-    : null;
+  const rawAnchor = flags.anchorPid ?? env.ATC_ANCHOR_PID;
+  const explicitAnchor =
+    rawAnchor && /^\d+$/.test(String(rawAnchor)) ? Number(rawAnchor) : null;
 
   const findHookAnchorForSession = (sid) => {
     if (explicitAnchor) return explicitAnchor;

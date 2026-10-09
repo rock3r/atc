@@ -13,7 +13,7 @@ import {
 } from "./android.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
-import { randomNonce, resolveStateDir, sleepSync } from "./lock.mjs";
+import { isPidAlive, randomNonce, resolveStateDir, sleepSync } from "./lock.mjs";
 import { startMcpServer } from "./mcp.mjs";
 import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {

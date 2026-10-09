@@ -345,6 +345,7 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
     sessionId: "sess-1",
     activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
     runningCount: 1,
+    platform: "linux",
   });
   assert.equal(allowedWithLease.allowed, true);
   assert.equal(allowedWithLease.renewLease, true);
@@ -397,6 +398,7 @@ test("guard: fast-path, compound splitting, precedence rules, and serial validat
       sessionId: "sess-compound",
       anchorPid: 12345,
       activeLeases: [],
+      platform: "linux",
     }
   );
   assert.equal(compoundAtc.allowed, true);
@@ -438,7 +440,7 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
     const rewriteOut = JSON.parse(preRewrite.stdout);
     assert.match(
       rewriteOut.hookSpecificOutput.updatedInput.command,
-      /ATC_SESSION_ID=claude-sess-1/
+      /(?:ATC_SESSION_ID=claude-sess-1|--session claude-sess-1)/
     );
 
     // 3. Multi-device ambiguity is enforced when two sessions hold leases
@@ -1188,7 +1190,10 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       { env: { ATC_ANCHOR_PID: "4242" } }
     );
     assert.equal(piGuard.allowed, true);
-    assert.match(piGuard.rewrittenCommand, /ATC_SESSION_ID=pi-1234 ATC_ANCHOR_PID=4242/);
+    assert.match(
+      piGuard.rewrittenCommand,
+      /(?:ATC_SESSION_ID=pi-1234 ATC_ANCHOR_PID=4242|--session pi-1234 --anchor-pid 4242)/
+    );
 
     // Windows emulator lifecycle uses `emulator -avd` and `adb -s <serial> emu kill`
     const winDir = makeTempStateDir();
@@ -1907,7 +1912,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(winSimpleRewrite.allowed, true);
       assert.equal(
         winSimpleRewrite.rewrittenCommand,
-        "atc exec --session win-sess --serial emulator-5554 -- adb shell wm size",
+        "atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell wm size",
       );
       const winCompoundRewrite = evaluateCommandGuard(
         "adb shell wm size && adb shell input keyevent 3",
@@ -1922,7 +1927,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(winCompoundRewrite.allowed, true);
       assert.equal(
         winCompoundRewrite.rewrittenCommand,
-        'atc exec --session win-sess --serial emulator-5554 -- cmd /d /s /c "adb shell wm size && adb shell input keyevent 3"',
+        'atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- cmd /d /s /c "adb shell wm size && adb shell input keyevent 3"',
       );
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });

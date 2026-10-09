@@ -482,6 +482,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       if (
         (a === "--session" ||
           a === "--role" ||
+          a === "--anchor-pid" ||
           a === "--serial" ||
           a === "--lease" ||
           a === "--state-dir") &&
@@ -508,6 +509,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
           if (
             (a === "--session" ||
               a === "--role" ||
+              a === "--anchor-pid" ||
               a === "--serial" ||
               a === "--lease" ||
               a === "--state-dir") &&
@@ -958,7 +960,11 @@ export function evaluateCommandGuard(
       !/[<>|&;`$()\r\n]/.test(command) &&
       !tokenizeSegment(command)[0]?.includes("=");
     if (isWin) {
-      const sessionFlag = sessionId ? ` --session ${sessionId}` : "";
+      const sessionFlag = sessionId
+        ? anchorPid
+          ? ` --session ${sessionId} --anchor-pid ${anchorPid}`
+          : ` --session ${sessionId}`
+        : "";
       if (isSimpleSingleCommand) {
         rewrittenCommand = `atc exec${sessionFlag} --serial ${execSerial} -- ${command}`;
       } else {
@@ -980,7 +986,10 @@ export function evaluateCommandGuard(
     }
   } else if (needsAtcRewrite && sessionId) {
     if (isWin) {
-      rewrittenCommand = command.replace(/\batc(\s+[A-Za-z0-9_-]+)/gi, `atc$1 --session ${sessionId}`);
+      const sessionFlags = anchorPid
+        ? `--session ${sessionId} --anchor-pid ${anchorPid}`
+        : `--session ${sessionId}`;
+      rewrittenCommand = command.replace(/\batc(\s+[A-Za-z0-9_-]+)/gi, `atc$1 ${sessionFlags}`);
     } else if (segments.length > 1) {
       const exportVars = anchorPid
         ? `export ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid}; `
