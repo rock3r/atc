@@ -1915,7 +1915,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         "atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell wm size",
       );
       const winCompoundRewrite = evaluateCommandGuard(
-        "adb shell wm size && adb shell input keyevent 3",
+        'adb shell "echo hi" && adb shell input keyevent 3',
         {
           sessionId: "win-sess",
           anchorPid: 1234,
@@ -1927,7 +1927,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(winCompoundRewrite.allowed, true);
       assert.equal(
         winCompoundRewrite.rewrittenCommand,
-        'atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- cmd /d /s /c "adb shell wm size && adb shell input keyevent 3"',
+        'atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell "echo hi" && atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell input keyevent 3',
       );
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });

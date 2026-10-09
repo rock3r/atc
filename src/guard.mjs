@@ -826,6 +826,85 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   return { kind: "ignore", parsed };
 }
 
+function rewriteWindowsCommand(command, { sessionId, anchorPid, execSerial }) {
+  const sessionFlag = sessionId
+    ? anchorPid
+      ? ` --session ${sessionId} --anchor-pid ${anchorPid}`
+      : ` --session ${sessionId}`
+    : "";
+  const sessionFlags = sessionFlag.trim();
+  const tokens = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "\\" && !inSingle && i + 1 < command.length) {
+      cur += ch + command[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      cur += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      cur += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      if ((ch === "&" && command[i + 1] === "&") || (ch === "|" && command[i + 1] === "|")) {
+        tokens.push({ type: "stage", text: cur });
+        tokens.push({ type: "sep", text: ` ${ch}${command[i + 1]} ` });
+        cur = "";
+        i++;
+        continue;
+      }
+      if (ch === ";" || ch === "\n" || ch === "|") {
+        tokens.push({ type: "stage", text: cur });
+        tokens.push({ type: "sep", text: ch === "\n" ? "\n" : ` ${ch} ` });
+        cur = "";
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  if (cur) {
+    tokens.push({ type: "stage", text: cur });
+  }
+
+  const shellVars = {};
+  return tokens
+    .map((tok) => {
+      if (tok.type !== "stage") return tok.text;
+      const trimmed = tok.text.trim();
+      if (!trimmed) return tok.text;
+      const c = classifySegment(trimmed, shellVars);
+      Object.assign(shellVars, c.parsed?.envVars || {});
+      if (c.kind === "device_action" && execSerial) {
+        return `atc exec${sessionFlag} --serial ${execSerial} -- ${trimmed}`;
+      }
+      if (c.kind === "atc" && sessionFlags) {
+        const hasSession =
+          Boolean(c.parsed.envVars.ATC_SESSION_ID) ||
+          c.parsed.args.some(
+            (a) =>
+              a === "--session" ||
+              a.startsWith("--session=") ||
+              a === "--role" ||
+              a.startsWith("--role="),
+          );
+        if (!hasSession) {
+          return trimmed.replace(/\batc(\s+[A-Za-z0-9_-]+)/i, `atc$1 ${sessionFlags}`);
+        }
+      }
+      return trimmed;
+    })
+    .join("");
+}
+
 export function evaluateCommandGuard(
   command,
   { sessionId, anchorPid, activeLeases = [], runningCount = 0, platform = process.platform } = {},
@@ -960,17 +1039,11 @@ export function evaluateCommandGuard(
       !/[<>|&;`$()\r\n]/.test(command) &&
       !tokenizeSegment(command)[0]?.includes("=");
     if (isWin) {
-      const sessionFlag = sessionId
-        ? anchorPid
-          ? ` --session ${sessionId} --anchor-pid ${anchorPid}`
-          : ` --session ${sessionId}`
-        : "";
-      if (isSimpleSingleCommand) {
-        rewrittenCommand = `atc exec${sessionFlag} --serial ${execSerial} -- ${command}`;
-      } else {
-        const escapedWin = `"${String(command).replace(/"/g, '\\"')}"`;
-        rewrittenCommand = `atc exec${sessionFlag} --serial ${execSerial} -- cmd /d /s /c ${escapedWin}`;
-      }
+      rewrittenCommand = rewriteWindowsCommand(command, {
+        sessionId,
+        anchorPid,
+        execSerial,
+      });
     } else {
       const envPrefix = sessionId
         ? anchorPid
@@ -986,10 +1059,11 @@ export function evaluateCommandGuard(
     }
   } else if (needsAtcRewrite && sessionId) {
     if (isWin) {
-      const sessionFlags = anchorPid
-        ? `--session ${sessionId} --anchor-pid ${anchorPid}`
-        : `--session ${sessionId}`;
-      rewrittenCommand = command.replace(/\batc(\s+[A-Za-z0-9_-]+)/gi, `atc$1 ${sessionFlags}`);
+      rewrittenCommand = rewriteWindowsCommand(command, {
+        sessionId,
+        anchorPid,
+        execSerial: null,
+      });
     } else if (segments.length > 1) {
       const exportVars = anchorPid
         ? `export ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid}; `

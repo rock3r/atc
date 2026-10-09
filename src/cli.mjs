@@ -517,7 +517,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             !req.coldBoot &&
             (!req.snapshotLoad || lease.loadedSnapshot === req.snapshotLoad)
           ) {
-            lease.renewedAtMs = now;
+            lease.workerPid = req.resetApp ? process.pid : null;
+          lease.renewedAtMs = now;
             lease.expiresAtMs = now + ttlMs;
             if (req.snapshotSaveOnFree) {
               lease.saveSnapshotOnFree = req.snapshotSaveOnFree;
@@ -715,16 +716,35 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
     if (txOutcome.status === "claimed_immediate") {
       if (txOutcome.idempotent && req.resetApp && txOutcome.lease?.serial) {
-        const resetRes = runner(
-          "adb",
-          ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
-          { strictInternal: true },
-        );
-        if (resetRes.status !== 0) {
-          return {
-            exitCode: 1,
-            error: `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`,
-          };
+        try {
+          const resetRes = runner(
+            "adb",
+            ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
+            { strictInternal: true },
+          );
+          if (resetRes.status !== 0) {
+            return {
+              exitCode: 1,
+              error: `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`,
+            };
+          }
+        } finally {
+          const livenessCheck = options.livenessCheck || isPidAlive;
+          withStateTransaction(stateDir, (state) => {
+            const cur = state.leases[txOutcome.lease.deviceKey];
+            if (cur && cur.leaseId === txOutcome.lease.leaseId && cur.workerPid === process.pid) {
+              cur.workerPid = null;
+              if (
+                cur.anchorPid !== null &&
+                cur.anchorPid !== undefined &&
+                !livenessCheck(cur.anchorPid)
+              ) {
+                delete state.leases[txOutcome.lease.deviceKey];
+              }
+              return { mutated: true };
+            }
+            return { mutated: false };
+          }, options);
         }
       }
       return { exitCode: 0, lease: txOutcome.lease, idempotent: txOutcome.idempotent };
@@ -1527,14 +1547,42 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
+    lease.workerPid = process.pid;
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + Math.max(ttlMs, stopTimeoutMs * 2));
     return { mutated: true, value: { exitCode: 0, lease: { ...lease }, ttlMs, stopTimeoutMs } };
-  });
+  }, options);
 
   if (leaseCheck.exitCode !== 0) {
     return leaseCheck;
   }
+
+  const clearSnapshotWorker = (markLoaded = false) => {
+    const livenessCheck = options.livenessCheck || isPidAlive;
+    return withStateTransaction(stateDir, (state, { now }) => {
+      const cur = state.leases[leaseCheck.lease.deviceKey];
+      if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
+        if (cur.workerPid === process.pid) {
+          cur.workerPid = null;
+        }
+        if (
+          cur.anchorPid !== null &&
+          cur.anchorPid !== undefined &&
+          !livenessCheck(cur.anchorPid)
+        ) {
+          delete state.leases[leaseCheck.lease.deviceKey];
+          return { mutated: true, value: { ...cur } };
+        }
+        cur.renewedAtMs = now;
+        cur.expiresAtMs = Math.max(cur.expiresAtMs, now + leaseCheck.ttlMs);
+        if (markLoaded && action === "load") {
+          cur.loadedSnapshot = name;
+        }
+        return { mutated: true, value: { ...cur } };
+      }
+      return { mutated: false, value: leaseCheck.lease };
+    }, options);
+  };
 
   const res = runner(
     "adb",
@@ -1542,6 +1590,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     { strictInternal: true, timeoutMs: leaseCheck.stopTimeoutMs },
   );
   if (res.status !== 0) {
+    clearSnapshotWorker(false);
     return {
       exitCode: 1,
       error: `adb snapshot ${action} "${name}" failed: ${res.stderr || res.stdout}`,
@@ -1552,22 +1601,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     try {
       waitForEmulatorReady(runner, leaseCheck.lease.serial, leaseCheck.stopTimeoutMs);
     } catch (err) {
+      clearSnapshotWorker(false);
       return { exitCode: 1, error: err.message };
     }
   }
 
-  const finalLease = withStateTransaction(stateDir, (state, { now }) => {
-    const cur = state.leases[leaseCheck.lease.deviceKey];
-    if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
-      cur.renewedAtMs = now;
-      cur.expiresAtMs = Math.max(cur.expiresAtMs, now + leaseCheck.ttlMs);
-      if (action === "load") {
-        cur.loadedSnapshot = name;
-      }
-      return { mutated: true, value: { ...cur } };
-    }
-    return { mutated: false, value: leaseCheck.lease };
-  });
+  const finalLease = clearSnapshotWorker(true);
 
   return { exitCode: 0, lease: finalLease, snapshot: name, action };
 }
