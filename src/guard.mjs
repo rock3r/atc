@@ -252,10 +252,27 @@ export function parseSegment(segment, inheritedVars = {}) {
           idx++;
         }
       } else if (base === "sudo") {
+        let sudoPreservesSerial = false;
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx];
           idx++;
           if (flag === "--") break;
+          if (
+            flag === "-E" ||
+            flag === "--preserve-env" ||
+            (flag.startsWith("-") && !flag.startsWith("--") && flag.slice(1).includes("E"))
+          ) {
+            sudoPreservesSerial = true;
+          } else if (
+            flag.startsWith("--preserve-env=") &&
+            flag
+              .slice("--preserve-env=".length)
+              .split(",")
+              .map((s) => s.trim())
+              .includes("ANDROID_SERIAL")
+          ) {
+            sudoPreservesSerial = true;
+          }
           if (
             (flag === "-u" ||
               flag === "-g" ||
@@ -267,6 +284,13 @@ export function parseSegment(segment, inheritedVars = {}) {
           ) {
             idx++;
           }
+        }
+        if (!sudoPreservesSerial) {
+          baseVars = {};
+          for (const k of Object.keys(envVars)) {
+            delete envVars[k];
+          }
+          stripsAndroidSerial = true;
         }
       } else if (base === "nice") {
         while (idx < tokens.length && tokens[idx].startsWith("-")) {

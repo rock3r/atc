@@ -113,8 +113,10 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     if (hasUnscopedDeviceAction) {
       const runner = options.runner || runCommandSync;
       const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
-      if (adbRes.status === 0 && adbRes.stdout) {
+      if (adbRes.status === 0 && adbRes.stdout !== undefined && adbRes.stdout !== null) {
         probedRunningCount = parseAdbDevicesOutput(adbRes.stdout).length;
+      } else {
+        probedRunningCount = 2;
       }
     }
   } else if (options.runningCount !== undefined) {

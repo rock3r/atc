@@ -1583,6 +1583,67 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       });
       assert.notEqual(detachedMissing.status, 0);
       assert.match(detachedMissing.stderr, /ENOENT/);
+
+      // sudo without -E or explicit selector is rejected in atc exec, while sudo -E or -s <serial> is allowed
+      const sudoNoPreserveGuard = evaluateCommandGuard("atc exec -- sudo adb shell pm clear com.example", {
+        sessionId: "sess-1",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      });
+      assert.equal(sudoNoPreserveGuard.allowed, false);
+      const sudoPreserveGuard = evaluateCommandGuard("atc exec -- sudo -E adb shell pm clear com.example", {
+        sessionId: "sess-1",
+        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+      });
+      assert.equal(sudoPreserveGuard.allowed, true);
+
+      // Failed adb devices probe on unscoped device action fails closed in hook and cmdGuard
+      const failedProbeGuard = cmdGuard(
+        winDir,
+        "adb shell wm size",
+        { session: "exec-wrap-sess" },
+        { runner: () => ({ status: 1, stdout: "", stderr: "adb server error" }) }
+      );
+      assert.equal(failedProbeGuard.exitCode, 2);
+      assert.equal(failedProbeGuard.allowed, false);
+
+      // Multi-lease cmdFree accumulates snapshot disk requirements across all matched leases
+      withStateTransaction(winDir, (state, { now }) => {
+        state.leases["avd:Pixel_8_API_35"] = {
+          leaseId: "lease-snap-1",
+          deviceKey: "avd:Pixel_8_API_35",
+          avd: "Pixel_8_API_35",
+          serial: "emulator-5554",
+          kind: "emulator",
+          state: "active",
+          sessionId: "multi-snap-sess",
+          saveSnapshotOnFree: "snap-1",
+          claimedAtMs: now,
+          renewedAtMs: now,
+          expiresAtMs: now + 60_000,
+        };
+        state.leases["avd:Pixel_9_API_36"] = {
+          leaseId: "lease-snap-2",
+          deviceKey: "avd:Pixel_9_API_36",
+          avd: "Pixel_9_API_36",
+          serial: "emulator-5556",
+          kind: "emulator",
+          state: "active",
+          sessionId: "multi-snap-sess",
+          saveSnapshotOnFree: "snap-2",
+          claimedAtMs: now,
+          renewedAtMs: now,
+          expiresAtMs: now + 60_000,
+        };
+        return { mutated: true };
+      });
+      // Each AVD defaults to 2048MB RAM + 2048MB reserve -> 1 snapshot needs 4096MB, 2 need 6144MB
+      const multiSnapDiskFail = cmdFree(
+        winDir,
+        null,
+        { session: "multi-snap-sess" },
+        { avdHome, host: { freeDiskMb: 5000 } }
+      );
+      assert.equal(multiSnapDiskFail.exitCode, 5);
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }

@@ -1164,6 +1164,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       const stoppingQueue = [];
       const freedImmediate = [];
       const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
+      let cumulativeSnapshotMb = 0;
 
       for (const lease of matches) {
         const saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree || null;
@@ -1172,10 +1173,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
 
         if (saveSnap && !flags.force && lease.kind === "emulator") {
           const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
-          if (freeDiskMb < meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)) {
+          cumulativeSnapshotMb += meta.ramSizeMb;
+          if (freeDiskMb < cumulativeSnapshotMb + (state.config.minFreeDiskMb ?? 2048)) {
             throw new ResourceError(
               5,
-              `Insufficient disk space to save snapshot "${saveSnap}" on ${lease.avd}: needs ${meta.ramSizeMb + (state.config.minFreeDiskMb ?? 2048)}MB free.`,
+              `Insufficient disk space to save snapshot "${saveSnap}" on ${lease.avd}: needs ${cumulativeSnapshotMb + (state.config.minFreeDiskMb ?? 2048)}MB free.`,
             );
           }
         }
@@ -1840,8 +1842,10 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
     if (hasUnscopedDeviceAction) {
       const runner = options.runner || runCommandSync;
       const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
-      if (adbRes.status === 0 && adbRes.stdout) {
+      if (adbRes.status === 0 && adbRes.stdout !== undefined && adbRes.stdout !== null) {
         probedRunningCount = parseAdbDevicesOutput(adbRes.stdout).length;
+      } else {
+        probedRunningCount = 2;
       }
     }
   } else if (options.runningCount !== undefined) {
