@@ -2769,6 +2769,86 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 ),
               /adb --one-device/,
             );
+
+            // 15. Unknown options (e.g., --wipe-dtaa, --snapshot-laod, --stpo) are rejected instead of silently ignored
+            const badClaimFlag1 = cmdClaim(coldRediscoverDir, {
+              session: "cold-rediscover",
+              wipeDtaa: true,
+            });
+            assert.equal(badClaimFlag1.exitCode, 1);
+            assert.match(badClaimFlag1.error, /Unknown option "--wipe-dtaa" for "atc claim"/);
+
+            const badClaimFlag2 = await runCli(["claim", "--snapshot-laod", "clean"], {
+              ...process.env,
+              ATC_STATE_DIR: coldRediscoverDir,
+              ATC_SESSION_ID: "cold-rediscover",
+            });
+            assert.equal(badClaimFlag2, 1);
+
+            const badFreeFlag = cmdFree(coldRediscoverDir, null, {
+              session: "cold-rediscover",
+              stpo: true,
+            });
+            assert.equal(badFreeFlag.exitCode, 1);
+            assert.match(badFreeFlag.error, /Unknown option "--stpo" for "atc free"/);
+
+            // 16. Deferred cleanup on worker exit executes pending snapshot-save and stop before dropping lease
+            withStateTransaction(coldRediscoverDir, (state) => {
+              const cur = state.leases["avd:Pixel_8_API_35"];
+              cur.workerPids = [999001];
+              cur.workerPid = 999001;
+              return { mutated: true };
+            }, { livenessCheck: (pid) => pid === 999001 || pid === process.pid });
+
+            const busyDeferRes = cmdFree(
+              coldRediscoverDir,
+              null,
+              {
+                session: "cold-rediscover",
+                snapshotSave: "deferred-snap",
+                stop: true,
+              },
+              {
+                livenessCheck: (pid) => pid === 999001 || pid === process.pid,
+              },
+            );
+            assert.equal(busyDeferRes.exitCode, 3);
+            assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"].releaseOnWorkerExit, true);
+            assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"].pendingSnapshotSave, "deferred-snap");
+            assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"].pendingStop, true);
+
+            const deferredCalls = [];
+            let worker999Checks = 0;
+            const execFinishRes = await cmdExec(
+              coldRediscoverDir,
+              [process.execPath, "-e", "process.exit(0);"],
+              { session: "cold-rediscover" },
+              {
+                platform: "darwin",
+                avdHome,
+                host: { freeDiskMb: 16384 },
+                livenessCheck: (pid) => {
+                  if (pid === 999001) {
+                    return worker999Checks++ < 2;
+                  }
+                  return pid === process.pid;
+                },
+                runner: (cmd, args) => {
+                  deferredCalls.push([cmd, ...args].join(" "));
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(execFinishRes.exitCode, 0);
+            assert.ok(
+              deferredCalls.some((c) => c === "adb -s emulator-5558 emu avd snapshot save deferred-snap"),
+              `Expected deferred snapshot save, got: ${JSON.stringify(deferredCalls)}`,
+            );
+            assert.ok(
+              deferredCalls.some((c) => c === "android emulator stop emulator-5558"),
+              `Expected deferred emulator stop, got: ${JSON.stringify(deferredCalls)}`,
+            );
+            assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"], undefined);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

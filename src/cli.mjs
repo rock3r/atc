@@ -56,6 +56,94 @@ const BOOLEAN_FLAG_KEYS = new Set([
   "play",
 ]);
 
+const COMMON_ALLOWED_FLAGS = new Set([
+  "session",
+  "role",
+  "lease",
+  "anchorPid",
+  "json",
+  "help",
+  "h",
+]);
+
+const CLAIM_ALLOWED_FLAGS = new Set([
+  ...COMMON_ALLOWED_FLAGS,
+  "kind",
+  "avd",
+  "serial",
+  "type",
+  "api",
+  "services",
+  "play",
+  "abi",
+  "createIfMissing",
+  "snapshotLoad",
+  "snapshotSaveOnFree",
+  "wipeData",
+  "cold",
+  "resetApp",
+  "headless",
+  "force",
+  "reason",
+  "ttl",
+  "ttlSec",
+  "wait",
+  "waitSec",
+  "reorderWindow",
+  "reorderWindowSec",
+]);
+
+const FREE_ALLOWED_FLAGS = new Set([
+  ...COMMON_ALLOWED_FLAGS,
+  "target",
+  "snapshotSave",
+  "snapshotLoad",
+  "stop",
+  "shutdown",
+  "force",
+]);
+
+const RENEW_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "target", "ttl", "ttlSec"]);
+
+const SNAPSHOT_ALLOWED_FLAGS = new Set([
+  ...COMMON_ALLOWED_FLAGS,
+  "action",
+  "name",
+  "avd",
+  "serial",
+  "force",
+]);
+
+const EXEC_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "serial"]);
+
+const STATUS_ALLOWED_FLAGS = new Set([
+  ...COMMON_ALLOWED_FLAGS,
+  "kind",
+  "type",
+  "api",
+  "services",
+  "play",
+  "abi",
+]);
+
+const GUARD_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "format"]);
+
+function camelToFlagName(key) {
+  if (key.length === 1) return `-${key}`;
+  return `--${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
+}
+
+function validateCommandFlags(flags, allowedSet, subcommand) {
+  if (!flags || typeof flags !== "object") return null;
+  for (const [key, val] of Object.entries(flags)) {
+    if (val === undefined) continue;
+    if (!allowedSet.has(key)) {
+      return `Unknown option "${camelToFlagName(key)}" for "atc ${subcommand}".`;
+    }
+  }
+  return null;
+}
+
 export function parseCliArgs(argv) {
   const args = [...argv];
   const dashDashIdx = args.indexOf("--");
@@ -137,6 +225,76 @@ function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
   const n = rawTtl !== undefined ? Number(rawTtl) : def;
   if (!Number.isFinite(n)) return def;
   return Math.max(10, Math.min(max, Math.round(n)));
+}
+
+function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, onBeforeRelease = null) {
+  const livenessCheck = options.livenessCheck || isPidAlive;
+  const check = withStateTransaction(
+    stateDir,
+    (state, { now }) => {
+      const cur = state.leases[deviceKey];
+      if (!cur || cur.leaseId !== leaseId) {
+        return { mutated: false, value: { lease: null, deferredFree: false } };
+      }
+      if (onBeforeRelease) {
+        onBeforeRelease(cur, state, now);
+      }
+      const otherWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
+      const needsRelease =
+        otherWorkers.length === 0 &&
+        (cur.releaseOnWorkerExit ||
+          (cur.anchorPid !== null &&
+            cur.anchorPid !== undefined &&
+            !livenessCheck(cur.anchorPid)));
+      const hasPendingCleanup =
+        cur.kind === "emulator" &&
+        Boolean(
+          cur.saveSnapshotOnFree ||
+            cur.pendingSnapshotSave ||
+            cur.pendingSnapshotLoad ||
+            cur.pendingStop,
+        );
+      if (needsRelease) {
+        if (!hasPendingCleanup) {
+          delete state.leases[deviceKey];
+          return { mutated: true, value: { lease: { ...cur }, deferredFree: false } };
+        }
+        // Keep process.pid registered until cmdFree transitions the lease to "stopping"
+        // so runGarbageCollection does not prune the lease before deferred cleanup executes.
+        addLeaseWorker(cur, process.pid, livenessCheck);
+        cur.renewedAtMs = now;
+        cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+        return {
+          mutated: true,
+          value: {
+            lease: { ...cur },
+            deferredFree: true,
+          },
+        };
+      }
+      cur.renewedAtMs = now;
+      cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+      return { mutated: true, value: { lease: { ...cur }, deferredFree: false } };
+    },
+    options,
+  );
+
+  if (check?.deferredFree) {
+    cmdFree(stateDir, leaseId, {}, options);
+    withStateTransaction(
+      stateDir,
+      (state) => {
+        const cur = state.leases[deviceKey];
+        if (cur && cur.leaseId === leaseId) {
+          removeLeaseWorker(cur, process.pid, livenessCheck);
+          return { mutated: true };
+        }
+        return { mutated: false };
+      },
+      options,
+    );
+  }
+  return check?.lease || null;
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
@@ -465,6 +623,10 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
 }
 
 export function cmdClaim(stateDir, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, CLAIM_ALLOWED_FLAGS, "claim");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
   const runner = options.runner || runCommandSync;
   const req = {
     kind: flags.kind || (flags.serial && !String(flags.serial).startsWith("emulator-") ? "any" : "emulator"),
@@ -588,6 +750,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               syncLeaseWorkers(lease, livenessCheck);
             }
             lease.releaseOnWorkerExit = false;
+            delete lease.pendingSnapshotSave;
+            delete lease.pendingSnapshotLoad;
+            delete lease.pendingStop;
             lease.renewedAtMs = now;
             lease.expiresAtMs = Math.max(
               now + ttlMs,
@@ -846,32 +1011,23 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         } catch (err) {
           return { exitCode: 1, error: err.message };
         } finally {
-          const livenessCheck = options.livenessCheck || isPidAlive;
-          withStateTransaction(stateDir, (state, { now }) => {
-            const cur = state.leases[txOutcome.lease.deviceKey];
-            if (cur && cur.leaseId === txOutcome.lease.leaseId) {
-              const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
+          const fallbackTtlMs = clampTtlSec(flags.ttl) * 1000;
+          finishLeaseWorker(
+            stateDir,
+            txOutcome.lease.deviceKey,
+            txOutcome.lease.leaseId,
+            fallbackTtlMs,
+            options,
+            (cur, state, now) => {
               if (prepUpdatedSnap) {
                 cur.loadedSnapshot = loadedSnap;
                 txOutcome.lease.loadedSnapshot = loadedSnap;
               }
-              if (
-                aliveWorkers.length === 0 &&
-                (cur.releaseOnWorkerExit ||
-                  (cur.anchorPid !== null &&
-                    cur.anchorPid !== undefined &&
-                    !livenessCheck(cur.anchorPid)))
-              ) {
-                delete state.leases[txOutcome.lease.deviceKey];
-              } else {
-                const ttlMs = clampTtlSec(flags.ttl, state.config) * 1000;
-                cur.renewedAtMs = now;
-                cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
-              }
-              return { mutated: true };
-            }
-            return { mutated: false };
-          }, options);
+              const ttlMs = clampTtlSec(flags.ttl, state.config) * 1000;
+              cur.renewedAtMs = now;
+              cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+            },
+          );
         }
       }
       return { exitCode: 0, lease: txOutcome.lease, idempotent: txOutcome.idempotent };
@@ -1283,6 +1439,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 }
 
 export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, FREE_ALLOWED_FLAGS, "free");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr, freed: [] };
+  }
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
@@ -1371,16 +1531,28 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               : [];
         if (activeWorkers.length > 0 && !isForced) {
           lease.releaseOnWorkerExit = true;
+          if (flags.snapshotSave) {
+            lease.pendingSnapshotSave = flags.snapshotSave;
+          }
+          if (flags.snapshotLoad) {
+            lease.pendingSnapshotLoad = flags.snapshotLoad;
+          }
+          if (parseBoolFlag(flags.stop) || parseBoolFlag(flags.shutdown)) {
+            lease.pendingStop = true;
+          }
           busyErrors.push(
             `Lease ${lease.leaseId} (${lease.deviceKey}) has active in-flight worker(s) (${activeWorkers.join(", ")}); wait for completion or pass --force.`,
           );
           continue;
         }
 
-        const saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree || null;
-        const loadSnap = flags.snapshotLoad || null;
+        const saveSnap =
+          flags.snapshotSave || lease.pendingSnapshotSave || lease.saveSnapshotOnFree || null;
+        const loadSnap = flags.snapshotLoad || lease.pendingSnapshotLoad || null;
         const doStop =
-          (parseBoolFlag(flags.stop) || parseBoolFlag(flags.shutdown)) &&
+          (parseBoolFlag(flags.stop) ||
+            parseBoolFlag(flags.shutdown) ||
+            Boolean(lease.pendingStop)) &&
           lease.kind === "emulator";
 
         if (saveSnap && !isForced && lease.kind === "emulator") {
@@ -1572,6 +1744,10 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
 }
 
 export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, RENEW_ALLOWED_FLAGS, "renew");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
   return withStateTransaction(stateDir, (state, { now }) => {
     const identity = resolveSessionIdentity({
       flags,
@@ -1632,6 +1808,10 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
 }
 
 export function cmdSnapshot(stateDir, action, name = null, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, SNAPSHOT_ALLOWED_FLAGS, "snapshot");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
@@ -1763,30 +1943,19 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   }
 
   const clearSnapshotWorker = (markLoaded = false) => {
-    const livenessCheck = options.livenessCheck || isPidAlive;
-    return withStateTransaction(stateDir, (state, { now }) => {
-      const cur = state.leases[leaseCheck.lease.deviceKey];
-      if (cur && cur.leaseId === leaseCheck.lease.leaseId) {
-        const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
-        if (
-          aliveWorkers.length === 0 &&
-          (cur.releaseOnWorkerExit ||
-            (cur.anchorPid !== null &&
-              cur.anchorPid !== undefined &&
-              !livenessCheck(cur.anchorPid)))
-        ) {
-          delete state.leases[leaseCheck.lease.deviceKey];
-          return { mutated: true, value: { ...cur } };
-        }
-        cur.renewedAtMs = now;
-        cur.expiresAtMs = Math.max(cur.expiresAtMs, now + leaseCheck.ttlMs);
+    const updated = finishLeaseWorker(
+      stateDir,
+      leaseCheck.lease.deviceKey,
+      leaseCheck.lease.leaseId,
+      leaseCheck.ttlMs,
+      options,
+      (cur) => {
         if (markLoaded && action === "load") {
           cur.loadedSnapshot = name;
         }
-        return { mutated: true, value: { ...cur } };
-      }
-      return { mutated: false, value: leaseCheck.lease };
-    }, options);
+      },
+    );
+    return updated || leaseCheck.lease;
   };
 
   let res;
@@ -1823,6 +1992,10 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 }
 
 export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, EXEC_ALLOWED_FLAGS, "exec");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
   if (!commandArgs || commandArgs.length === 0) {
     return { exitCode: 1, error: "Usage: atc exec [--serial <serial>] -- <command> [args...]" };
   }
@@ -1951,27 +2124,13 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     return { exitCode };
   } finally {
     try {
-      const livenessCheck = options.livenessCheck || isPidAlive;
-      withStateTransaction(stateDir, (state, { now }) => {
-        const cur = state.leases[check.lease.deviceKey];
-        if (cur && cur.leaseId === check.lease.leaseId) {
-          const aliveWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
-          if (
-            aliveWorkers.length === 0 &&
-            (cur.releaseOnWorkerExit ||
-              (cur.anchorPid !== null &&
-                cur.anchorPid !== undefined &&
-                !livenessCheck(cur.anchorPid)))
-          ) {
-            delete state.leases[check.lease.deviceKey];
-          } else {
-            cur.renewedAtMs = now;
-            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
-          }
-          return { mutated: true };
-        }
-        return { mutated: false };
-      }, options);
+      finishLeaseWorker(
+        stateDir,
+        check.lease.deviceKey,
+        check.lease.leaseId,
+        check.ttlMs,
+        options,
+      );
     } catch {
       // Best-effort workerPid cleanup
     }
@@ -1979,6 +2138,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 }
 
 export function cmdStatus(stateDir, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, STATUS_ALLOWED_FLAGS, "status");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
   const cfg = readState(stateDir).config || DEFAULT_CONFIG;
@@ -2124,6 +2287,10 @@ export function cmdGc(stateDir) {
 }
 
 export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, GUARD_ALLOWED_FLAGS, "guard");
+  if (unknownFlagErr) {
+    return { exitCode: 1, allowed: false, reason: unknownFlagErr, error: unknownFlagErr };
+  }
   const inventory = options.inventory || null;
   let probedRunningCount = inventory ? (inventory.running || []).length : 0;
 
@@ -2219,6 +2386,12 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
 
   switch (parsed.subcommand) {
     case "claim": {
+      if (parsed.positionals.length > 0) {
+        process.stderr.write(
+          `[atc] Unexpected argument "${parsed.positionals[0]}" for "atc claim".\n`,
+        );
+        return 1;
+      }
       const res = cmdClaim(stateDir, parsed.flags, { env });
       if (res.exitCode !== 0) {
         process.stderr.write(`[atc] ${res.error}\n`);
@@ -2288,6 +2461,10 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
 
     case "status": {
       const res = cmdStatus(stateDir, parsed.flags, { env });
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
       if (parsed.flags.json) {
         process.stdout.write(JSON.stringify(res, null, 2) + "\n");
       } else {
@@ -2304,6 +2481,11 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "config": {
+      const unknownFlagErr = validateCommandFlags(parsed.flags, COMMON_ALLOWED_FLAGS, "config");
+      if (unknownFlagErr) {
+        process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
       const [action, key, val] = parsed.positionals;
       const res = cmdConfig(stateDir, action, key, val);
       if (res.exitCode !== 0) {
@@ -2315,6 +2497,11 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "gc": {
+      const unknownFlagErr = validateCommandFlags(parsed.flags, COMMON_ALLOWED_FLAGS, "gc");
+      if (unknownFlagErr) {
+        process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
       const res = cmdGc(stateDir);
       process.stdout.write(JSON.stringify(res.pruned, null, 2) + "\n");
       return 0;
@@ -2347,6 +2534,11 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "hook": {
+      const unknownFlagErr = validateCommandFlags(parsed.flags, COMMON_ALLOWED_FLAGS, "hook");
+      if (unknownFlagErr) {
+        process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
       const hookType = String(parsed.positionals[0] || "pre-tool-use").toLowerCase();
       const rawStdin = readStdinSync();
       if (
@@ -2366,6 +2558,11 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "mcp": {
+      const unknownFlagErr = validateCommandFlags(parsed.flags, COMMON_ALLOWED_FLAGS, "mcp");
+      if (unknownFlagErr) {
+        process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
       await startMcpServer(stateDir);
       return 0;
     }
