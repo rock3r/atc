@@ -280,13 +280,25 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
   );
 
   if (check?.deferredFree) {
-    cmdFree(stateDir, leaseId, {}, options);
+    const freeRes = cmdFree(stateDir, leaseId, {}, options);
     withStateTransaction(
       stateDir,
-      (state) => {
+      (state, { now }) => {
         const cur = state.leases[deviceKey];
         if (cur && cur.leaseId === leaseId) {
           removeLeaseWorker(cur, process.pid, livenessCheck);
+          if (freeRes.exitCode !== 0) {
+            cur.releaseOnWorkerExit = false;
+            if (
+              cur.anchorPid !== null &&
+              cur.anchorPid !== undefined &&
+              !livenessCheck(cur.anchorPid)
+            ) {
+              cur.anchorPid = null;
+            }
+            cur.renewedAtMs = now;
+            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+          }
           return { mutated: true };
         }
         return { mutated: false };
@@ -1725,23 +1737,36 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       actionErrors.push(err?.message || String(err));
     } finally {
       heartbeats.get(lease.leaseId)?.stop();
-      withStateTransaction(stateDir, (state, { now }) => {
-        const cur = state.leases[lease.deviceKey];
-        if (cur && cur.leaseId === lease.leaseId) {
-          if (itemFailed) {
-            cur.state = "active";
-            removeLeaseWorker(cur, process.pid, options.livenessCheck || isPidAlive);
-            cur.deadlineMs = null;
-            const ttlMs = (state.config?.defaultTtlSec || 600) * 1000;
-            cur.renewedAtMs = now;
-            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
-          } else {
-            delete state.leases[lease.deviceKey];
+      withStateTransaction(
+        stateDir,
+        (state, { now }) => {
+          const cur = state.leases[lease.deviceKey];
+          if (cur && cur.leaseId === lease.leaseId) {
+            if (itemFailed) {
+              const livenessCheck = options.livenessCheck || isPidAlive;
+              cur.state = "active";
+              removeLeaseWorker(cur, process.pid, livenessCheck);
+              cur.releaseOnWorkerExit = false;
+              if (
+                cur.anchorPid !== null &&
+                cur.anchorPid !== undefined &&
+                !livenessCheck(cur.anchorPid)
+              ) {
+                cur.anchorPid = null;
+              }
+              cur.deadlineMs = null;
+              const ttlMs = (state.config?.defaultTtlSec || 600) * 1000;
+              cur.renewedAtMs = now;
+              cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+            } else {
+              delete state.leases[lease.deviceKey];
+            }
+            return { mutated: true };
           }
-          return { mutated: true };
-        }
-        return { mutated: false };
-      });
+          return { mutated: false };
+        },
+        options,
+      );
       if (!itemFailed) {
         allFreed.push(lease.leaseId);
       }
@@ -1785,7 +1810,8 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       ancestorPids: options.ancestorPids,
       processChain: options.processChain,
     });
-    const ttlSec = clampTtlSec(flags.ttl ?? flags.ttlSec, state.config);
+    const rawExplicitTtl = flags.ttl ?? flags.ttlSec;
+    const ttlSec = clampTtlSec(rawExplicitTtl, state.config);
     const ttlMs = ttlSec * 1000;
 
     const leasesList = Object.values(state.leases).filter((l) => l.state === "active");
@@ -1826,7 +1852,8 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
     }
 
     lease.renewedAtMs = now;
-    lease.expiresAtMs = now + ttlMs;
+    lease.expiresAtMs =
+      rawExplicitTtl !== undefined ? now + ttlMs : Math.max(lease.expiresAtMs || 0, now + ttlMs);
     return {
       mutated: true,
       value: { exitCode: 0, lease },

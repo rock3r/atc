@@ -3008,6 +3008,66 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 ),
               /android device remote extend/,
             );
+
+            // 22. `atc renew` without `--ttl` preserves an existing later deadline on a long-TTL lease
+            const renewSetLong = cmdRenew(coldRediscoverDir, l2.lease.leaseId, {
+              session: "target-sess",
+              ttl: 3600,
+            });
+            assert.equal(renewSetLong.exitCode, 0);
+            const expectedLongExpiry = renewSetLong.lease.expiresAtMs;
+            const renewDefault = cmdRenew(coldRediscoverDir, l2.lease.leaseId, {
+              session: "target-sess",
+            });
+            assert.equal(renewDefault.exitCode, 0);
+            assert.ok(renewDefault.lease.expiresAtMs >= expectedLongExpiry);
+
+            // 23. Deferred cleanup failure on worker exit preserves the lease instead of letting GC delete it
+            withStateTransaction(
+              coldRediscoverDir,
+              (state) => {
+                const cur = state.leases["avd:Pixel_9_API_36"];
+                cur.workerPids = [999002];
+                cur.workerPid = 999002;
+                return { mutated: true };
+              },
+              { livenessCheck: (pid) => pid === 999002 || pid === process.pid },
+            );
+            const deferFailFree = cmdFree(
+              coldRediscoverDir,
+              l2.lease.leaseId,
+              {
+                session: "target-sess",
+                snapshotSave: "failing-snap",
+              },
+              {
+                livenessCheck: (pid) => pid === 999002 || pid === process.pid,
+              },
+            );
+            assert.equal(deferFailFree.exitCode, 3);
+            let worker999002Checks = 0;
+            const execDeferredFailRes = await cmdExec(
+              coldRediscoverDir,
+              [process.execPath, "-e", "process.exit(0);"],
+              { session: "target-sess" },
+              {
+                platform: "darwin",
+                avdHome,
+                host: { freeDiskMb: 16384 },
+                livenessCheck: (pid) => {
+                  if (pid === 999002) {
+                    return worker999002Checks++ < 2;
+                  }
+                  return pid === process.pid;
+                },
+                runner: () => ({ status: 1, stdout: "", stderr: "KO: snapshot save failed" }),
+              },
+            );
+            assert.equal(execDeferredFailRes.exitCode, 0);
+            const preservedLease = readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"];
+            assert.ok(preservedLease, "Lease should be preserved when deferred snapshot save fails");
+            assert.equal(preservedLease.state, "active");
+            assert.equal(preservedLease.releaseOnWorkerExit, false);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
