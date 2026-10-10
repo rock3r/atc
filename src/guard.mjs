@@ -69,7 +69,22 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "false",
   "which",
   "type",
+  "esac",
+  "fi",
+  "done",
+  "}",
 ]);
+
+const CASE_PREFIX_BEFORE_PIPE_RE =
+  /^(?:(?:(?:if|elif|while|until|then|else|do|\{|!)\s+)*case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in\s+)?\(?\s*(?:"[^"]*"|'[^']*'|[^\s|);(]+)$/;
+const CASE_SUFFIX_AFTER_PIPE_RE =
+  /^\s*(?:(?:"[^"]*"|'[^']*'|[^\s|);(]+)\s*\|\s*)*(?:"[^"]*"|'[^']*'|[^\s|);(]+)\)/;
+const LEADING_CONTROL_PREFIX_RE =
+  /^(?:(?:if|elif|while|until|then|else|do|\{|!)\s+|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in\s+|\(?\s*(?:(?:"[^"]*"|'[^']*'|[^\s|);(]+)\s*\|\s*)*(?:"[^"]*"|'[^']*'|[^\s|);(]+)\)\s*)+/;
+
+function isCasePatternAlternationPipe(cur, rest) {
+  return CASE_PREFIX_BEFORE_PIPE_RE.test(cur.trim()) && CASE_SUFFIX_AFTER_PIPE_RE.test(rest);
+}
 
 const READ_ONLY_ANDROID_SUBCOMMANDS = new Set([
   "docs",
@@ -138,7 +153,11 @@ function splitOutsideQuotes(str, sepType) {
           continue;
         }
       } else if (sepType === "pipe") {
-        if (ch === "|" && str[i + 1] !== "|") {
+        if (
+          ch === "|" &&
+          str[i + 1] !== "|" &&
+          !isCasePatternAlternationPipe(cur, str.slice(i + 1))
+        ) {
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
           continue;
@@ -223,7 +242,10 @@ export function expandVariables(str, vars = {}) {
 }
 
 export function parseSegment(segment, inheritedVars = {}) {
-  const tokens = tokenizeSegment(segment);
+  const strippedSegment = String(segment || "")
+    .trimStart()
+    .replace(LEADING_CONTROL_PREFIX_RE, "");
+  const tokens = tokenizeSegment(strippedSegment);
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
@@ -416,6 +438,12 @@ export function parseSegment(segment, inheritedVars = {}) {
 
   const allVars = { ...baseVars, ...envVars };
   const remaining = tokens.slice(idx).map((t) => expandVariables(t, allVars));
+  while (
+    remaining.length > 1 &&
+    ["fi", "done", "esac", "}"].includes(remaining[remaining.length - 1])
+  ) {
+    remaining.pop();
+  }
   const cmd = remaining[0] || "";
   const baseCmd = path.basename(cmd, path.extname(cmd)).toLowerCase();
   const args = remaining.slice(1);
@@ -551,7 +579,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       }
       if (wrappedTokens.length > 0) {
         const wrappedSeg = wrappedTokens
-          .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
+          .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
         const execInheritedVars = { ...parsed.envVars };
         if (atcSerialFlag) {
@@ -938,9 +966,38 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         .filter((a) => a !== ";" && a !== "\\;" && a !== "+");
       if (cleanedArgs.length > 0) {
         const nestedSegment = cleanedArgs
-          .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
+          .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
         return classifySegment(nestedSegment, parsed.envVars, depth + 1);
+      }
+    }
+    const embeddedCandidates = extractEmbeddedCommands(args.slice(startSearchIdx));
+    if (embeddedCandidates.length > 0) {
+      const embeddedSerials = new Set();
+      const baseEmbeddedVars = { ...parsed.envVars };
+      delete baseEmbeddedVars.ANDROID_SERIAL;
+      for (const candidate of embeddedCandidates) {
+        const innerVars = { ...baseEmbeddedVars };
+        for (const subSeg of splitShellSegments(candidate)) {
+          if (subSeg.trim() === effectiveSegment.trim()) continue;
+          const subClass = classifySegment(subSeg, innerVars, depth + 1);
+          Object.assign(innerVars, subClass.parsed?.envVars || {});
+          if (subClass.kind === "deny_lifecycle") {
+            return subClass;
+          }
+          if (subClass.kind === "device_action" && subClass.targetSerial) {
+            for (const s of String(subClass.targetSerial).split(",")) {
+              if (s) embeddedSerials.add(s);
+            }
+          }
+        }
+      }
+      if (embeddedSerials.size > 0) {
+        return {
+          kind: "device_action",
+          targetSerial: Array.from(embeddedSerials).join(","),
+          parsed,
+        };
       }
     }
     return {
@@ -951,6 +1008,45 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   return { kind: "ignore", parsed };
+}
+
+function extractEmbeddedCommands(args) {
+  const candidates = [];
+  const toolNames = new Set(["atc", "emulator", "adb", "android", "gradlew", "gradle"]);
+  for (const rawArg of args) {
+    if (!rawArg || !FAST_PATH_REGEX.test(rawArg)) continue;
+    const arg = String(rawArg).replace(/\\(["'`\\])/g, "$1");
+    const literals = [];
+    const litRe = /"([^"]*)"|'([^']*)'|`([^`]*)`/g;
+    let m;
+    while ((m = litRe.exec(arg)) !== null) {
+      const lit = m[1] ?? m[2] ?? m[3] ?? "";
+      if (lit) literals.push(lit);
+    }
+    for (const lit of literals) {
+      if (FAST_PATH_REGEX.test(lit) && /\s/.test(lit.trim())) {
+        candidates.push(lit.trim());
+      }
+    }
+    for (let i = 0; i < literals.length; i++) {
+      const base = path.basename(literals[i], path.extname(literals[i])).toLowerCase();
+      if (toolNames.has(base)) {
+        const joined = literals
+          .slice(i)
+          .map((l) => (/[\s"'\\]/.test(l) ? JSON.stringify(l) : l))
+          .join(" ");
+        if (joined) candidates.push(joined);
+        break;
+      }
+    }
+    const inlineRe = /\b(?:adb|android|emulator|gradlew|gradle|atc)\b[^;)"'`\]\r\n]*/gi;
+    let im;
+    while ((im = inlineRe.exec(arg)) !== null) {
+      const snippet = im[0].trim();
+      if (snippet) candidates.push(snippet);
+    }
+  }
+  return candidates;
 }
 
 function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, platform = "win32" }) {
@@ -996,7 +1092,27 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         i++;
         continue;
       }
-      if (ch === ";" || ch === "\n" || ch === "|") {
+      if (ch === ";") {
+        tokens.push({ type: "stage", text: cur });
+        if (command[i + 1] === ";" && command[i + 2] === "&") {
+          tokens.push({ type: "sep", text: " ;;& " });
+          i += 2;
+        } else if (command[i + 1] === ";") {
+          tokens.push({ type: "sep", text: " ;; " });
+          i += 1;
+        } else if (command[i + 1] === "&") {
+          tokens.push({ type: "sep", text: " ;& " });
+          i += 1;
+        } else {
+          tokens.push({ type: "sep", text: " ; " });
+        }
+        cur = "";
+        continue;
+      }
+      if (
+        ch === "\n" ||
+        (ch === "|" && !isCasePatternAlternationPipe(cur, command.slice(i + 1)))
+      ) {
         tokens.push({ type: "stage", text: cur });
         tokens.push({ type: "sep", text: ch === "\n" ? "\n" : ` ${ch} ` });
         cur = "";
@@ -1020,13 +1136,13 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       if (c.kind === "device_action" && execSerial) {
         let prefix = "";
         let cmdBody = trimmed;
-        const ctrlMatch = trimmed.match(/^(?:(?:if|elif|while|until|then|else|do|\{|!)\s+)+/);
+        const ctrlMatch = trimmed.match(LEADING_CONTROL_PREFIX_RE);
         if (ctrlMatch) {
           prefix = ctrlMatch[0];
           cmdBody = trimmed.slice(prefix.length).trim();
         }
         let suffix = "";
-        const trailMatch = cmdBody.match(/(\s+(?:fi|done|\}))$/);
+        const trailMatch = cmdBody.match(/((?:\s+(?:fi|done|esac|\}))+)$/);
         if (trailMatch) {
           suffix = trailMatch[1];
           cmdBody = cmdBody.slice(0, -suffix.length).trim();

@@ -3068,6 +3068,72 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.ok(preservedLease, "Lease should be preserved when deferred snapshot save fails");
             assert.equal(preservedLease.state, "active");
             assert.equal(preservedLease.releaseOnWorkerExit, false);
+
+            // 24. Inline interpreter lifecycle commands are rejected by both guard and cmdExec
+            const inlineKillGuard = evaluateCommandGuard(
+              `atc exec -- python -c 'import os; os.system("adb kill-server")'`,
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5556" }],
+              },
+            );
+            assert.equal(inlineKillGuard.allowed, false);
+            assert.match(inlineKillGuard.reason, /adb kill-server/);
+
+            const inlineKillExec = await cmdExec(
+              coldRediscoverDir,
+              ["python", "-c", 'import os; os.system("adb kill-server")'],
+              { session: "target-sess" },
+            );
+            assert.equal(inlineKillExec.exitCode, 3);
+            assert.match(inlineKillExec.error, /adb kill-server/);
+
+            const inlineListKillExec = await cmdExec(
+              coldRediscoverDir,
+              ["python", "-c", "import subprocess; subprocess.run(['adb', 'kill-server'])"],
+              { session: "target-sess" },
+            );
+            assert.equal(inlineListKillExec.exitCode, 3);
+            assert.match(inlineListKillExec.error, /adb kill-server/);
+
+            const inlineWrongSerialExec = await cmdExec(
+              coldRediscoverDir,
+              ["python", "-c", 'import os; os.system("adb -s emulator-5554 shell wm size")'],
+              { session: "target-sess" },
+            );
+            assert.equal(inlineWrongSerialExec.exitCode, 3);
+            assert.match(inlineWrongSerialExec.error, /Conflicting device selector "emulator-5554"/);
+
+            // 25. POSIX case ... in ... ;; ... esac blocks preserve ;; separators, pattern arms, and esac
+            const caseRewrite = evaluateCommandGuard(
+              'case "$x" in foo) adb shell get-state ;; *) echo no ;; esac',
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5556" }],
+                runningCount: 1,
+                platform: "linux",
+              },
+            );
+            assert.equal(caseRewrite.allowed, true);
+            assert.equal(
+              caseRewrite.rewrittenCommand,
+              'case "$x" in foo) ATC_SESSION_ID=target-sess atc exec --serial emulator-5556 -- adb shell get-state ;; *) echo no ;; esac',
+            );
+
+            const casePipePatternRewrite = evaluateCommandGuard(
+              'case "$x" in foo|bar) adb shell get-state ;; *) echo "adb skipped" ;; esac',
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5556" }],
+                runningCount: 1,
+                platform: "linux",
+              },
+            );
+            assert.equal(casePipePatternRewrite.allowed, true);
+            assert.equal(
+              casePipePatternRewrite.rewrittenCommand,
+              'case "$x" in foo|bar) ATC_SESSION_ID=target-sess atc exec --serial emulator-5556 -- adb shell get-state ;; *) echo "adb skipped" ;; esac',
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

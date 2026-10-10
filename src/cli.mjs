@@ -2095,7 +2095,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     const lease = owned[0];
     const [cmd, ...args] = commandArgs;
     const wrappedClass = classifySegment(
-      [cmd, ...args].map((a) => (/\s/.test(String(a)) ? JSON.stringify(String(a)) : String(a))).join(" "),
+      [cmd, ...args]
+        .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+        .join(" "),
       lease.serial ? { ANDROID_SERIAL: lease.serial } : {},
     );
     if (wrappedClass.kind === "deny_lifecycle") {
