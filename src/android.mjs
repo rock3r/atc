@@ -43,9 +43,16 @@ export function parseIniFile(content) {
 export function inferDeviceType(deviceName = "", sysDir = "", tagId = "") {
   const combined = `${deviceName} ${sysDir} ${tagId}`.toLowerCase();
   if (combined.includes("xr") || combined.includes("glasses")) return "xr";
-  if (combined.includes("wear") || /(?:^|[\s,_-])watch(?:$|[\s,_-])/.test(combined)) return "wear";
+  if (
+    combined.includes("wear") ||
+    /(?:^|[\s,/_\\-])watch(?:$|[\s,/_\\-])/.test(combined)
+  ) {
+    return "wear";
+  }
   if (combined.includes("tv") || combined.includes("atv")) return "tv";
-  if (/(?:^|[\s,_-])(automotive|auto|car)(?:$|[\s,_-])/.test(combined)) return "automotive";
+  if (/(?:^|[\s,/_\\-])(automotive|auto|car)(?:$|[\s,/_\\-])/.test(combined)) {
+    return "automotive";
+  }
   if (combined.includes("desktop")) return "desktop";
   if (combined.includes("fold")) return "foldable";
   if (combined.includes("tablet") || combined.includes("pixel_c")) return "tablet";
@@ -239,19 +246,20 @@ export function parseAndroidEmulatorListOutput(stdout) {
       }
       continue;
     }
-    if (tokens.length === 1 && /^(online|offline)$/i.test(tokens[0])) {
-      if (avds.length > 0) {
-        avds[avds.length - 1].online = tokens[0].toLowerCase() === "online";
-      }
-      continue;
-    }
     if (tokens.length === 1 && /^[A-Za-z0-9._-]+$/.test(tokens[0])) {
       avds.push({ avd: tokens[0], online: false, serial: null, apiLevel: null });
       continue;
     }
     if (tokens.length >= 2) {
       let avd = tokens[0];
-      if (hasLongHeader && avd.length % 2 === 0 && avd.length >= 50) {
+      const secondIsApiOrStatus =
+        /^(?:online|offline|android-[A-Za-z0-9._-]+|\d{2})$/i.test(tokens[1] || "");
+      if (
+        hasLongHeader &&
+        secondIsApiOrStatus &&
+        avd.length % 2 === 0 &&
+        avd.length >= 50
+      ) {
         const half = avd.length / 2;
         if (avd.slice(0, half) === avd.slice(half)) {
           avd = avd.slice(0, half);

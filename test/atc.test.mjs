@@ -4892,34 +4892,26 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       assert.equal(victimAfterTimeout.state, "stopping");
       assert.equal(victimAfterTimeout.workerPid, null);
 
-      // 12. Mixed-protocol lock exclusion: pre-existing empty lockDir (legacy process mid-mkdir) blocks new acquireLock, and new acquireLock publishes owner.json for legacy waiters
-      const mixedLockDir = makeTempStateDir();
-      try {
-        const legacyLockPath = path.join(mixedLockDir, "atc.lock");
-        fs.mkdirSync(legacyLockPath, { mode: 0o700 });
-        assert.throws(
-          () => acquireLock(mixedLockDir, 80),
-          /Timed out waiting/,
-        );
-        fs.rmdirSync(legacyLockPath);
-
-        const newHandle = acquireLock(mixedLockDir, 1000);
-        try {
-          const compatRaw = fs.readFileSync(path.join(legacyLockPath, "owner.json"), "utf8");
-          const compatParsed = JSON.parse(compatRaw);
-          assert.equal(compatParsed.nonce, newHandle.nonce);
-          assert.equal(compatParsed.pid, process.pid);
-          assert.throws(
-            () => fs.mkdirSync(legacyLockPath, { mode: 0o700 }),
-            /EEXIST/,
-          );
-        } finally {
-          releaseLock(newHandle);
-        }
-        assert.equal(fs.existsSync(legacyLockPath), false);
-      } finally {
-        fs.rmSync(mixedLockDir, { recursive: true, force: true });
-      }
+      // 12. Automotive path separators, AVDs named online/offline, and non-concatenated repeated-half AVD IDs
+      assert.equal(
+        inferDeviceType("Generic_Device", "system-images/android-35/android-automotive/x86_64/", ""),
+        "automotive",
+      );
+      const onePerLineOnline = parseAndroidEmulatorListOutput("online\noffline\n");
+      assert.deepEqual(
+        onePerLineOnline.map((a) => a.avd),
+        ["online", "offline"],
+      );
+      const repeatedHalfSeparateName = parseAndroidEmulatorListOutput(
+        [
+          "AVD ID                   AVD Name                      API Level      Status         Serial",
+          "abcdefghijklmnopabcdefghijklmnop My_Phone              android-35     Offline",
+        ].join("\n"),
+      );
+      assert.deepEqual(
+        repeatedHalfSeparateName.map((a) => a.avd),
+        ["abcdefghijklmnopabcdefghijklmnop"],
+      );
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
     }

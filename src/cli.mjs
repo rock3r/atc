@@ -383,26 +383,42 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
-  const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
-  const worker = new Worker(workerUrl, {
-    workerData: {
-      stateDir,
-      deviceKey,
-      leaseId,
-      timeoutMs,
-      workerPid: process.pid,
-    },
-  });
-  worker.on("error", () => {});
-  if (typeof worker.unref === "function") {
-    worker.unref();
+  let stopped = false;
+  let worker = null;
+  const spawnDelayMs = Math.max(
+    250,
+    Math.min(2000, Math.floor((Number(timeoutMs) || 15_000) / 4)),
+  );
+  const timer = setTimeout(() => {
+    if (stopped) return;
+    const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
+    worker = new Worker(workerUrl, {
+      workerData: {
+        stateDir,
+        deviceKey,
+        leaseId,
+        timeoutMs,
+        workerPid: process.pid,
+      },
+    });
+    worker.on("error", () => {});
+    if (typeof worker.unref === "function") {
+      worker.unref();
+    }
+  }, spawnDelayMs);
+  if (typeof timer.unref === "function") {
+    timer.unref();
   }
   return {
     stop() {
-      try {
-        worker.terminate();
-      } catch {
-        // Ignore termination error
+      stopped = true;
+      clearTimeout(timer);
+      if (worker) {
+        try {
+          worker.terminate();
+        } catch {
+          // Ignore termination error
+        }
       }
     },
   };
@@ -1677,16 +1693,38 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             newlyCreated.profile.apiLevel !== "unknown" &&
             !matchesProfile(newlyCreated, { ...reqWithoutAvd, snapshotLoad: null })
           ) {
+            const mismatchKey = `avd:${newlyCreated.avd}`;
+            const mismatchLeaseId = `lease_${randomNonce().slice(0, 12)}`;
             const canRemoveMismatched =
               !preFleetAvds.has(newlyCreated.avd) &&
-              withStateTransaction(stateDir, (state) => {
+              withStateTransaction(stateDir, (state, { now }) => {
                 const ownedByOther = Object.values(state.leases || {}).some(
                   (l) =>
                     l &&
                     l.leaseId !== lease.leaseId &&
-                    l.avd === newlyCreated.avd,
+                    (l.avd === newlyCreated.avd || l.deviceKey === mismatchKey),
                 );
-                return { mutated: false, value: !ownedByOther };
+                if (ownedByOther) {
+                  return { mutated: false, value: false };
+                }
+                state.leases[mismatchKey] = {
+                  leaseId: mismatchLeaseId,
+                  deviceKey: mismatchKey,
+                  kind: "emulator",
+                  avd: newlyCreated.avd,
+                  serial: null,
+                  profile: newlyCreated.profile,
+                  sessionId: lease.sessionId,
+                  anchorPid: lease.anchorPid ?? null,
+                  state: "stopping",
+                  workerPid: process.pid,
+                  workerPids: [process.pid],
+                  replacingAvd: null,
+                  requiredRamMb: 0,
+                  claimedAtMs: now,
+                  deadlineMs: now + (stopTimeoutMs || 60_000),
+                };
+                return { mutated: true, value: true };
               });
             if (canRemoveMismatched) {
               try {
@@ -1695,6 +1733,14 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 });
               } catch {
                 // Best-effort cleanup of mismatched created AVD
+              } finally {
+                withStateTransaction(stateDir, (state) => {
+                  if (state.leases[mismatchKey]?.leaseId === mismatchLeaseId) {
+                    delete state.leases[mismatchKey];
+                    return { mutated: true };
+                  }
+                  return { mutated: false };
+                });
               }
             }
             throw new Error(
