@@ -64,15 +64,63 @@ function parseWindowsPgidKey(rawPgid) {
   return null;
 }
 
+export function deriveWindowsTreeGenerationToken(pgid, entriesOrMap) {
+  const numPgid = Number(pgid);
+  if (!Number.isInteger(numPgid) || numPgid <= 1 || !entriesOrMap) {
+    return null;
+  }
+  const list =
+    entriesOrMap instanceof Map
+      ? Array.from(entriesOrMap.values())
+      : entriesOrMap instanceof Set || Array.isArray(entriesOrMap)
+        ? Array.from(entriesOrMap)
+        : typeof entriesOrMap === "object"
+          ? Object.entries(entriesOrMap).map(([k, v]) =>
+              v && typeof v === "object"
+                ? { pid: Number(k), ...v }
+                : { pid: Number(k), creationDate: v },
+            )
+          : [];
+  if (list.length === 0) return null;
+  const rootItem = list.find(
+    (item) =>
+      item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === numPgid,
+  );
+  const rootCreation = rootItem
+    ? normalizeCreationToken(
+        rootItem.creationDate ?? rootItem.CreationDate ?? rootItem.startToken ?? null,
+      )
+    : null;
+  if (rootCreation && rootCreation !== "__exited__") {
+    return rootCreation;
+  }
+  const descParts = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const pid = Number(item.pid ?? item.ProcessId);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === numPgid) continue;
+    const c = normalizeCreationToken(
+      item.creationDate ?? item.CreationDate ?? item.startToken ?? null,
+    );
+    if (c && c !== "__exited__") {
+      descParts.push(`${pid}:${c}`);
+    }
+  }
+  descParts.sort();
+  if (descParts.length > 0) {
+    return `__exited__:${descParts[0]}`;
+  }
+  return rootCreation === "__exited__" ? "__exited__" : null;
+}
+
 export function archiveWindowsProcessGroupGeneration(rawPgid) {
   const parsed = parseWindowsPgidKey(rawPgid);
   if (!parsed) return null;
   const existing = winKnownTreeDescendants.get(parsed.pid);
   if (!existing) return null;
-  const rootMeta = existing.get(parsed.pid);
-  const rootCreation = rootMeta?.creationDate;
-  if (rootCreation && rootCreation !== "__exited__") {
-    const archiveKey = `${parsed.pid}@${rootCreation}`;
+  const genToken = deriveWindowsTreeGenerationToken(parsed.pid, existing);
+  if (genToken) {
+    const archiveKey = `${parsed.pid}@${genToken}`;
     winKnownTreeDescendants.set(archiveKey, existing);
     winKnownTreeDescendants.delete(parsed.pid);
     return archiveKey;
@@ -113,27 +161,16 @@ export function seedWindowsKnownDescendants(pgidOrMap, entries) {
             )
           : [];
   if (targetKey === pgid) {
-    const rootItem = list.find(
-      (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === pgid,
-    );
-    const incomingRootCreation = rootItem
-      ? normalizeCreationToken(
-          rootItem.creationDate ?? rootItem.CreationDate ?? rootItem.startToken ?? null,
-        )
-      : null;
-    if (incomingRootCreation && incomingRootCreation !== "__exited__") {
-      const incomingArchiveKey = `${pgid}@${incomingRootCreation}`;
+    const incomingGenToken = deriveWindowsTreeGenerationToken(pgid, list);
+    if (incomingGenToken) {
+      const incomingArchiveKey = `${pgid}@${incomingGenToken}`;
       if (winKnownTreeDescendants.has(incomingArchiveKey)) {
         targetKey = incomingArchiveKey;
       } else {
         const existingBare = winKnownTreeDescendants.get(pgid);
-        const existingRootCreation = existingBare?.get(pgid)?.creationDate ?? null;
-        if (
-          existingRootCreation &&
-          existingRootCreation !== "__exited__" &&
-          incomingRootCreation !== existingRootCreation
-        ) {
-          winKnownTreeDescendants.set(`${pgid}@${existingRootCreation}`, existingBare);
+        const existingGenToken = deriveWindowsTreeGenerationToken(pgid, existingBare);
+        if (existingGenToken && incomingGenToken !== existingGenToken) {
+          winKnownTreeDescendants.set(`${pgid}@${existingGenToken}`, existingBare);
           winKnownTreeDescendants.delete(pgid);
         }
       }
@@ -262,13 +299,18 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
         let prevKnown = winKnownTreeDescendants.get(pgidKey);
         if (!prevKnown && explicitRootCreation) {
           const byBare = winKnownTreeDescendants.get(pgid);
-          if (byBare && byBare.get(pgid)?.creationDate === explicitRootCreation) {
+          if (byBare && deriveWindowsTreeGenerationToken(pgid, byBare) === explicitRootCreation) {
             prevKnown = byBare;
           }
         }
         prevKnown = prevKnown || new Map();
         const prevRootEntry = prevKnown.get(pgid);
-        const expectedRootCreation = prevRootEntry?.creationDate ?? explicitRootCreation ?? null;
+        const normalizedExplicitRoot =
+          explicitRootCreation && explicitRootCreation.startsWith("__exited__")
+            ? "__exited__"
+            : explicitRootCreation;
+        const expectedRootCreation =
+          prevRootEntry?.creationDate ?? normalizedExplicitRoot ?? null;
         let hasUnverifiableIdentity = isIdentityUnverifiable(
           pgid,
           expectedRootCreation,
@@ -429,28 +471,17 @@ function resolveWindowsPgidKey(parsedPgid, knownDescendants) {
   if (!Array.isArray(entries) || entries.length === 0) {
     return parsedPgid.key;
   }
-  const rootItem = entries.find(
-    (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === pgid,
-  );
-  const expectedCreation = rootItem
-    ? normalizeCreationToken(
-        rootItem.creationDate ?? rootItem.CreationDate ?? rootItem.startToken ?? null,
-      )
-    : null;
-  if (!expectedCreation || expectedCreation === "__exited__") {
+  const expectedGenToken = deriveWindowsTreeGenerationToken(pgid, entries);
+  if (!expectedGenToken) {
     return parsedPgid.key;
   }
-  const archiveKey = `${pgid}@${expectedCreation}`;
+  const archiveKey = `${pgid}@${expectedGenToken}`;
   if (winKnownTreeDescendants.has(archiveKey)) {
     return archiveKey;
   }
   const existingBare = winKnownTreeDescendants.get(pgid);
-  const existingRootCreation = existingBare?.get(pgid)?.creationDate ?? null;
-  if (
-    existingRootCreation &&
-    existingRootCreation !== "__exited__" &&
-    existingRootCreation !== expectedCreation
-  ) {
+  const existingGenToken = deriveWindowsTreeGenerationToken(pgid, existingBare);
+  if (existingGenToken && existingGenToken !== expectedGenToken) {
     return archiveKey;
   }
   return parsedPgid.key;

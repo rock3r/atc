@@ -8558,6 +8558,80 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       bashProcSubLoopRedir.rewrittenCommand,
       /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell cat <\(printf foo\) > \/tmp\/out\.txt' ; done$/,
     );
+
+    // 1q. Tombstoned-root generation (`creationDate: "__exited__"`) is archived under a synthetic generation key when root PID is reused
+    {
+      const tombLeaderPgid = 840001;
+      const tombOldChildPid = 840002;
+      const tombNewChildPid = 840003;
+      const tombOldChildCreation = "20261010235001.000000+000";
+      const tombNewRootCreation = "20261010235500.000000+000";
+      const tombNewChildCreation = "20261010235501.000000+000";
+      const expectedTombArchiveKey = `${tombLeaderPgid}@__exited__:${tombOldChildPid}:${tombOldChildCreation}`;
+      clearKnownWindowsTreeDescendants(tombLeaderPgid);
+      clearKnownWindowsTreeDescendants(expectedTombArchiveKey);
+      try {
+        const tombLeaseA = {
+          leaseId: "lease_win_tomb_a",
+          deviceKey: "avd:Pixel_Tomb_A",
+          workerPids: [tombLeaderPgid],
+          workerPid: tombLeaderPgid,
+          workerPgids: [tombLeaderPgid],
+          workerDescendants: {
+            [String(tombLeaderPgid)]: [
+              { pid: tombLeaderPgid, creationDate: "__exited__", alive: false },
+              { pid: tombOldChildPid, creationDate: tombOldChildCreation, alive: true },
+            ],
+          },
+        };
+        const tombLeaseB = {
+          leaseId: "lease_win_tomb_b",
+          deviceKey: "avd:Pixel_Tomb_B",
+          workerPids: [],
+          workerPid: null,
+        };
+        seedWindowsKnownDescendants(tombLeaseA.workerDescendants);
+        const archivedKey = archiveWindowsProcessGroupGeneration(tombLeaderPgid);
+        assert.equal(archivedKey, expectedTombArchiveKey);
+
+        const tombSnapshot = [
+          { ProcessId: tombLeaderPgid, ParentProcessId: 4000, CreationDate: tombNewRootCreation },
+          { ProcessId: tombNewChildPid, ParentProcessId: tombLeaderPgid, CreationDate: tombNewChildCreation },
+          { ProcessId: tombOldChildPid, ParentProcessId: 1, CreationDate: tombOldChildCreation },
+        ];
+        queryWindowsProcessGroups(
+          [expectedTombArchiveKey, tombLeaderPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify(tombSnapshot),
+            stderr: "",
+          }),
+          { knownDescendants: tombLeaseA.workerDescendants },
+        );
+
+        const liveCheck = (pid) =>
+          [tombLeaderPgid, tombOldChildPid, tombNewChildPid].includes(pid);
+        syncLeaseWorkers(tombLeaseA, liveCheck);
+        addLeaseWorker(tombLeaseB, tombLeaderPgid, liveCheck, {
+          isProcessGroup: true,
+          freshGeneration: true,
+        });
+
+        assert.deepEqual(tombLeaseA.workerPgids, [expectedTombArchiveKey]);
+        assert.deepEqual(tombLeaseB.workerPgids, [tombLeaderPgid]);
+        assert.deepEqual(
+          getKnownWindowsTreePids(expectedTombArchiveKey, { liveOnly: true }),
+          [tombOldChildPid],
+        );
+        assert.deepEqual(
+          getKnownWindowsTreePids(tombLeaderPgid, { liveOnly: true }).sort((a, b) => a - b),
+          [tombLeaderPgid, tombNewChildPid],
+        );
+      } finally {
+        clearKnownWindowsTreeDescendants(tombLeaderPgid);
+        clearKnownWindowsTreeDescendants(expectedTombArchiveKey);
+      }
+    }
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

@@ -6,6 +6,7 @@ import {
   archiveWindowsProcessGroupGeneration,
   canSweepBreakClaimDir,
   clearKnownWindowsTreeDescendants,
+  deriveWindowsTreeGenerationToken,
   getKnownWindowsTreeDescendants,
   getKnownWindowsTreePids,
   hasAliveProcessInGroup,
@@ -27,6 +28,7 @@ import {
 export {
   archiveWindowsProcessGroupGeneration,
   clearKnownWindowsTreeDescendants,
+  deriveWindowsTreeGenerationToken,
   getKnownWindowsTreeDescendants,
   getKnownWindowsTreePids,
   hasAliveProcessInGroup,
@@ -421,7 +423,15 @@ function isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck = isPidAlive) {
 function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
   if (!lease?.workerDescendants || typeof lease.workerDescendants !== "object") {
     if (freshPid) {
-      archiveWindowsProcessGroupGeneration(freshPid);
+      const curKnown = getKnownWindowsTreeDescendants(freshPid);
+      const curRoot = curKnown.find((e) => Number(e?.pid) === Number(freshPid));
+      if (
+        curRoot &&
+        (curRoot.creationDate === "__exited__" ||
+          !getKnownWindowsTreePids(freshPid, { liveOnly: true }).includes(Number(freshPid)))
+      ) {
+        archiveWindowsProcessGroupGeneration(freshPid);
+      }
     }
     return;
   }
@@ -431,28 +441,18 @@ function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
     }
     const numericPid = Number(key);
     if (!Number.isInteger(numericPid) || numericPid <= 1) continue;
-    const prevRoot = prevEntries.find(
-      (e) => e && typeof e === "object" && Number(e.pid ?? e.ProcessId) === numericPid,
-    );
-    const prevRootCreation =
-      prevRoot?.creationDate && prevRoot.creationDate !== "__exited__"
-        ? String(prevRoot.creationDate)
-        : null;
-    if (!prevRootCreation) continue;
-    const archiveKey = `${numericPid}@${prevRootCreation}`;
+    const prevGenToken = deriveWindowsTreeGenerationToken(numericPid, prevEntries);
+    if (!prevGenToken) continue;
+    const archiveKey = `${numericPid}@${prevGenToken}`;
     const archivedKnown = getKnownWindowsTreeDescendants(archiveKey);
     const curKnown = getKnownWindowsTreeDescendants(numericPid);
-    const curRoot = curKnown.find((e) => Number(e?.pid) === numericPid);
-    const curRootCreation =
-      curRoot?.creationDate && curRoot.creationDate !== "__exited__"
-        ? String(curRoot.creationDate)
-        : null;
-    if (freshPid === numericPid && curRootCreation === prevRootCreation) {
+    const curGenToken = deriveWindowsTreeGenerationToken(numericPid, curKnown);
+    if (freshPid === numericPid && curGenToken === prevGenToken) {
       archiveWindowsProcessGroupGeneration(numericPid);
     }
     const isNewGeneration =
       archivedKnown.length > 0 ||
-      (curRootCreation && curRootCreation !== prevRootCreation) ||
+      (curGenToken && curGenToken !== prevGenToken) ||
       freshPid === numericPid;
     if (isNewGeneration) {
       lease.workerDescendants[archiveKey] = prevEntries;
@@ -1287,15 +1287,9 @@ export function withStateTransaction(stateDir, fn, options = {}) {
             if (isTerminatedKey(k)) continue;
             if (!k.includes("@") && freshGenerationSet.has(Number(k)) && Array.isArray(v)) {
               const numPid = Number(k);
-              const prevRoot = v.find(
-                (e) => e && typeof e === "object" && Number(e.pid ?? e.ProcessId) === numPid,
-              );
-              const prevRootCreation =
-                prevRoot?.creationDate && prevRoot.creationDate !== "__exited__"
-                  ? String(prevRoot.creationDate)
-                  : null;
-              if (prevRootCreation) {
-                const archiveKey = `${numPid}@${prevRootCreation}`;
+              const prevGenToken = deriveWindowsTreeGenerationToken(numPid, v);
+              if (prevGenToken) {
+                const archiveKey = `${numPid}@${prevGenToken}`;
                 knownDescendants[archiveKey] = v;
                 pgids.push(archiveKey);
                 continue;
