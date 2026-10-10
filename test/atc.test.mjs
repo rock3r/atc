@@ -4539,14 +4539,71 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       [
         "AVD ID                   AVD Name                      API Level      Status         Serial",
         "Pixel_3a_API_33_arm64-v8aPixel_3a_API_33_arm64-v8a     android-33     Offline",
+        "abcdefghabcdefgh         abcdefghabcdefgh              android-34     Offline",
         "Medium_Phone             Medium Phone                  android-canary-20260805",
         "                                                                      Offline",
       ].join("\n"),
     );
     assert.deepEqual(
       wrappedList.map((a) => a.avd),
-      ["Pixel_3a_API_33_arm64-v8a", "Medium_Phone"],
+      ["Pixel_3a_API_33_arm64-v8a", "abcdefghabcdefgh", "Medium_Phone"],
     );
+
+    // 7. Rollback stop failure keeps the lease in "stopping" until the emulator is offline or the stop deadline expires
+    const rollbackHoldDir = makeTempStateDir();
+    try {
+      const rollbackClaim = cmdClaim(
+        rollbackHoldDir,
+        {
+          session: "rollback-hold-sess",
+          avd: "Pixel_Rollback_AVD",
+          resetApp: "com.example.app",
+          wait: 0,
+          force: true,
+        },
+        {
+          platform: "darwin",
+          avdHome,
+          runner: (cmd, args) => {
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+              return { status: 0, stdout: "Started on emulator-5568\n", stderr: "" };
+            }
+            if (cmd === "adb" && args.includes("clear")) {
+              return { status: 1, stdout: "", stderr: "Failed to clear package\n" };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+              return { status: 1, stdout: "", stderr: "Stop timed out\n" };
+            }
+            return { status: 0, stdout: "OK\n", stderr: "" };
+          },
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [],
+            offline: [
+              {
+                deviceKey: "avd:Pixel_Rollback_AVD",
+                kind: "emulator",
+                avd: "Pixel_Rollback_AVD",
+                serial: null,
+                online: false,
+                profile: { deviceType: "phone", apiLevel: "android-35" },
+              },
+            ],
+            creatable: [],
+          },
+        },
+      );
+      assert.equal(rollbackClaim.exitCode, 1);
+      const stateAfterFailedRollback = readState(rollbackHoldDir);
+      const heldLease = stateAfterFailedRollback.leases["avd:Pixel_Rollback_AVD"];
+      assert.ok(heldLease, "Expected failed rollback stop to keep stopping reservation");
+      assert.equal(heldLease.state, "stopping");
+      assert.equal(heldLease.workerPid, null);
+      assert.equal(heldLease.serial, "emulator-5568");
+      assert.ok(heldLease.deadlineMs > Date.now());
+    } finally {
+      fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

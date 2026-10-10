@@ -2071,6 +2071,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         withStateTransaction(
           stateDir,
           (state, { now }) => {
+            const cur = state.leases[lease.deviceKey];
             if (stoppedCleanly) {
               recordDeviceStoppedInState(
                 state,
@@ -2081,10 +2082,14 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 },
                 now,
               );
-            }
-            const cur = state.leases[lease.deviceKey];
-            if (cur && cur.leaseId === lease.leaseId) {
-              delete state.leases[lease.deviceKey];
+              if (cur && cur.leaseId === lease.leaseId) {
+                delete state.leases[lease.deviceKey];
+              }
+            } else if (cur && cur.leaseId === lease.leaseId) {
+              cur.state = "stopping";
+              removeLeaseWorker(cur, process.pid, livenessCheck);
+              cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
+              cur.deadlineMs = now + effectiveStopTimeoutMs;
             }
             return { mutated: true };
           },

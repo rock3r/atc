@@ -209,8 +209,13 @@ export function parseAdbGetpropOutput(stdout) {
 export function parseAndroidEmulatorListOutput(stdout) {
   const avds = [];
   const lines = String(stdout).split(/\r?\n/);
+  let hasLongHeader = false;
   for (const raw of lines) {
     const line = raw.trim();
+    if (/^AVD\s+ID\s+AVD\s+NAME\b/i.test(line)) {
+      hasLongHeader = true;
+      continue;
+    }
     if (
       !line ||
       /^AVD(?:\s+(?:ID|NAME))*\s+(?:AVD\s+NAME\s+)?(?:API(?:\s+LEVEL)?|STATUS|STATE|SERIAL)\b/i.test(line) ||
@@ -246,7 +251,7 @@ export function parseAndroidEmulatorListOutput(stdout) {
     }
     if (tokens.length >= 2) {
       let avd = tokens[0];
-      if (avd.length % 2 === 0 && avd.length >= 16) {
+      if (hasLongHeader && avd.length % 2 === 0 && avd.length >= 50) {
         const half = avd.length / 2;
         if (avd.slice(0, half) === avd.slice(half)) {
           avd = avd.slice(0, half);
