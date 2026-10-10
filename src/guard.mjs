@@ -95,6 +95,7 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "[[",
   "test",
   "sleep",
+  "set",
   "shift",
   "break",
   "continue",
@@ -2394,7 +2395,9 @@ function stageRequiresBashShell(cmdBody) {
         if (
           inner.startsWith("!") ||
           /\[[^\]]+\]/.test(inner) ||
-          /^[A-Za-z_][A-Za-z0-9_]*(?:\/|\^|,|@[A-Za-z]|:(?![-=?+]))/.test(inner)
+          /^(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*|[@*])(?:\/|\^|,|@[A-Za-z]|:(?![-=?+]))/.test(
+            inner,
+          )
         ) {
           return true;
         }
@@ -2446,6 +2449,86 @@ function stageRequiresBashShell(cmdBody) {
           return true;
         }
       }
+    }
+  }
+  return false;
+}
+
+function stageReferencesPositionalParams(cmdBody) {
+  const s = String(cmdBody || "");
+  let inSingle = false;
+  let inDouble = false;
+  const subStack = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && !inSingle && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && ch === "$" && s[i + 1] === "(" && s[i + 2] !== "(") {
+      subStack.push(inDouble);
+      inDouble = false;
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && subStack.length > 0) {
+      if (ch === "(") {
+        subStack.push(null);
+        continue;
+      }
+      if (ch === ")") {
+        const popped = subStack.pop();
+        if (typeof popped === "boolean") {
+          inDouble = popped;
+        }
+        continue;
+      }
+    }
+    if (inSingle) continue;
+    if (ch === "$") {
+      const next = s[i + 1] || "";
+      if (/^[1-9@*#]$/.test(next)) {
+        return true;
+      }
+      if (next === "{") {
+        let j = i + 2;
+        let depth = 1;
+        while (j < s.length && depth > 0) {
+          if (s[j] === "\\" && j + 1 < s.length) {
+            j += 2;
+            continue;
+          }
+          if (s[j] === "{") depth++;
+          else if (s[j] === "}") depth--;
+          j++;
+        }
+        if (depth === 0) {
+          const inner = s.slice(i + 2, j - 1);
+          if (
+            /^[@*#]$|^[#!]*[1-9][0-9]*(?:$|[^A-Za-z0-9_\[])|^[#!]+[@*](?:$|[^A-Za-z0-9_\[])|^[@*](?:$|[^A-Za-z0-9_\[])/.test(
+              inner,
+            )
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    if (
+      !inDouble &&
+      (i === 0 || /[\s;(]/.test(s[i - 1])) &&
+      s.slice(i, i + 5) === "shift" &&
+      (i + 5 === s.length || /[\s;)]/.test(s[i + 5]))
+    ) {
+      return true;
     }
   }
   return false;
@@ -2870,8 +2953,6 @@ function rewriteCompoundCommand(
             }
           }
 
-          const singleAtExpr =
-            atArrayExprs.length === 1 && !atArrayExprs[0].hasDistinctModifier;
           let rewrittenArrBody = "";
           let arrInSingle = false;
           let arrInDouble = false;
@@ -2944,13 +3025,9 @@ function rewriteCompoundCommand(
                     prefixOp !== "#" &&
                     (subscript === "@" || (subscript === "*" && !arrInDouble));
                   if (isPositionalArray) {
-                    if (singleAtExpr) {
-                      rewrittenArrBody += arrInDouble ? "$@" : '"$@"';
-                    } else {
-                      const baseKey = `${prefixOp}${arrName}[@]`;
-                      const entry = atExprMap.get(baseKey);
-                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${subscript}]${modifier}}`;
-                    }
+                    const baseKey = `${prefixOp}${arrName}[@]`;
+                    const entry = atExprMap.get(baseKey);
+                    rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${subscript}]${modifier}}`;
                     i = closeIdx;
                     continue;
                   }
@@ -2985,13 +3062,9 @@ function rewriteCompoundCommand(
                       prefixOp === "!" &&
                       (modifier === "@" || (modifier === "*" && !arrInDouble));
                     if (isPositionalPrefix) {
-                      if (singleAtExpr) {
-                        rewrittenArrBody += arrInDouble ? "$@" : '"$@"';
-                      } else {
-                        const baseKey = `${prefixOp}${varName}@`;
-                        const entry = atExprMap.get(baseKey);
-                        rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
-                      }
+                      const baseKey = `${prefixOp}${varName}@`;
+                      const entry = atExprMap.get(baseKey);
+                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
                       i = closeIdx;
                       continue;
                     }
@@ -3116,6 +3189,7 @@ function rewriteCompoundCommand(
           }
           cmdBody = arithRewritten;
         }
+        const hasPositionalParams = stageReferencesPositionalParams(cmdBody);
         const hasUnquotedAlias = Boolean(arrayEnvEntries.hasUnquotedAlias);
         const arrayEnvAssigns = Array.from(arrayEnvEntries.entries())
           .map(([alias, expr]) => `${alias}="\${${expr}}" `)
@@ -3128,9 +3202,7 @@ function rewriteCompoundCommand(
           )
           .map((k) => `${k}="$${k}" `)
           .join("");
-        const singleAtExpr =
-          atArrayExprs.length === 1 && !atArrayExprs[0].hasDistinctModifier;
-        if (atArrayExprs.length > 0 && !singleAtExpr) {
+        if (atArrayExprs.length > 0) {
           const needsOuterIfs =
             atArrayExprs.some((entry) => entry.hasUnquoted) || hasUnquotedAlias;
           const ifsPrelude = needsOuterIfs
@@ -3156,7 +3228,8 @@ function rewriteCompoundCommand(
                   ? `"\${${entry.baseKey}}" "--"`
                   : `"\${#${entry.arrName}[@]}" "\${${entry.baseKey}}"`,
               )
-              .join(" ");
+              .join(" ") +
+            (hasPositionalParams ? ' "$@"' : "");
           return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- bash -c ${escaped} bash ${trailingArrays}${suffix}`;
         }
         const shIfsEnv = hasUnquotedAlias ? '__atc_ifs_set="${IFS+1}" __atc_ifs="${IFS-}" ' : "";
@@ -3165,11 +3238,7 @@ function rewriteCompoundCommand(
           : "";
         const targetShell = stageRequiresBashShell(cmdBody) ? "bash" : "sh";
         const escaped = `'${String(shIfsPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
-        const trailingAtArgs = singleAtExpr
-          ? atArrayExprs[0].quoted
-            ? ` ${targetShell} "\${${atArrayExprs[0].inner}}"`
-            : ` ${targetShell} \${${atArrayExprs[0].inner}}`
-          : "";
+        const trailingAtArgs = hasPositionalParams ? ` ${targetShell} "$@"` : "";
         return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${targetShell} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {

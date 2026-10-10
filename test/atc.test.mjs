@@ -7590,7 +7590,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(readWholeArrayRedir.allowed, true);
     assert.match(
       readWholeArrayRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb install-multiple "\$@" > \/tmp\/out\.txt' sh "\$\{parts\[@\]\}" ; done < rows\.txt$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
     );
 
     const readArrayKeysAtRedir = evaluateCommandGuard(
@@ -7604,7 +7604,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(readArrayKeysAtRedir.allowed, true);
     assert.match(
       readArrayKeysAtRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$@" > \/tmp\/out\.txt' sh "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
     );
 
     const readArrayKeysStarRedir = evaluateCommandGuard(
@@ -7848,7 +7848,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(fs.existsSync(raceLockFile), true);
     assert.equal(fs.readFileSync(raceLockFile, "utf8").trim(), "99222");
 
-    // 3e. Unquoted ${parts[*]} and ${!parts[*]} expand in the outer shell so custom outer IFS splitting is preserved
+    // 3e. Unquoted ${parts[*]} and ${!parts[*]} forward outer IFS and array elements into bash -c without reusing $@
     const readUnquotedStarRedir = evaluateCommandGuard(
       "IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} > /tmp/out.txt; done < rows.txt",
       {
@@ -7860,7 +7860,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(readUnquotedStarRedir.allowed, true);
     assert.match(
       readUnquotedStarRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb install-multiple "\$@" > \/tmp\/out\.txt' sh \$\{parts\[\*\]\} ; done < rows\.txt$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
     );
 
     const readUnquotedKeysStarRedir = evaluateCommandGuard(
@@ -7874,7 +7874,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(readUnquotedKeysStarRedir.allowed, true);
     assert.match(
       readUnquotedKeysStarRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$@" > \/tmp\/out\.txt' sh \$\{!parts\[\*\]\} ; done < rows\.txt$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
     );
 
     // 1i. cmdGc and cmdFree on Windows reap orphaned grandchildren even when exited group leader PID is reused by an unrelated process
@@ -8189,7 +8189,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(prefixNameAtRedir.allowed, true);
     assert.match(
       prefixNameAtRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell printf "%s\\n" "\$@" > \/tmp\/out\.txt' sh "\$\{!x@\}" ; done$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!x@\}" "--" ; done$/,
     );
 
     const prefixNameUnquotedStarRedir = evaluateCommandGuard(
@@ -8203,7 +8203,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(prefixNameUnquotedStarRedir.allowed, true);
     assert.match(
       prefixNameUnquotedStarRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell printf "%s\\n" "\$@" > \/tmp\/out\.txt' sh \$\{!x\*\} ; done$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{!x@\}" "--" ; done$/,
     );
 
     // 1n. POSIX killProcessGroupTree does not signal positive childPid when kill(-childPid) returns ESRCH
@@ -8923,6 +8923,35 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.match(
       extglobLoopRedir.rewrittenCommand,
       /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3r. Positional parameters ($1, $@) inside functions or after `set --` are forwarded into rewritten shells and not clobbered by array transport
+    const funcPositionalLoopRedir = evaluateCommandGuard(
+      'f() { for x in 1; do adb shell echo "$1" > /tmp/out.txt; done; }; f expected',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(funcPositionalLoopRedir.allowed, true);
+    assert.match(
+      funcPositionalLoopRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$1" > \/tmp\/out\.txt' sh "\$@" ; done ; \} ; f expected$/,
+    );
+
+    const funcArrayAndPositionalLoopRedir = evaluateCommandGuard(
+      'f() { while read -ra parts; do adb shell echo "$1" "${parts[@]}" > /tmp/out.txt; done < rows.txt; }; f expected',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(funcArrayAndPositionalLoopRedir.allowed, true);
+    assert.match(
+      funcArrayAndPositionalLoopRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$1" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
     );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
