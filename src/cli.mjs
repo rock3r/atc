@@ -491,16 +491,27 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
       adbDevicesOk && adbRes.stdout ? parseAdbDevicesOutput(adbRes.stdout) : [];
 
     const probesOk = Boolean(adbDevicesOk && emulatorListOk);
+    const mappedAvdForSerial = serial
+      ? listedAvds.find((item) => item.online && item.serial === serial)
+      : null;
+    const serialReassignedToOtherAvd = Boolean(
+      mappedAvdForSerial &&
+        resolvedAvd &&
+        mappedAvdForSerial.avd &&
+        mappedAvdForSerial.avd !== resolvedAvd,
+    );
     const avdStillOnline = Boolean(
       listedAvds.some(
         (item) =>
           item.online &&
           ((resolvedAvd && item.avd === resolvedAvd) ||
-            (serial && item.serial === serial)),
+            (serial && !serialReassignedToOtherAvd && item.serial === serial)),
       ),
     );
     const serialStillOnline = Boolean(
-      serial && adbDevices.some((dev) => dev.serial === serial),
+      serial &&
+        !serialReassignedToOtherAvd &&
+        adbDevices.some((dev) => dev.serial === serial),
     );
     if (!resolvedAvd && serial && serialStillOnline) {
       const remMs = deadline - Date.now();
@@ -2835,7 +2846,6 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             (cumulativeSnapshotMbByFs.get(otherFsKey) || 0) + otherLease.requiredDiskMb,
           );
         } else if (
-          otherLease.state === "stopping" &&
           typeof otherLease.pendingSnapshotDiskMb === "number" &&
           otherLease.pendingSnapshotDiskMb > 0
         ) {
@@ -3408,8 +3418,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       };
     }
     const lease = owned[0];
-    if (effectiveAction === "save" && !parseBoolFlag(flags.force)) {
-      const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
+    const saveMeta =
+      effectiveAction === "save"
+        ? readLocalAvdMetadata(lease.avd, avdHome, state.config)
+        : null;
+    if (effectiveAction === "save" && !parseBoolFlag(flags.force) && saveMeta) {
+      const meta = saveMeta;
       const minDisk = state.config.minFreeDiskMb ?? 2048;
       const targetFsKey =
         options.host?.freeDiskMb !== undefined
@@ -3436,7 +3450,6 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         ) {
           reservedDiskMb += otherLease.requiredDiskMb;
         } else if (
-          otherLease.state === "stopping" &&
           typeof otherLease.pendingSnapshotDiskMb === "number" &&
           otherLease.pendingSnapshotDiskMb > 0
         ) {
@@ -3480,7 +3493,10 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       };
     }
     addLeaseWorker(lease, process.pid, livenessCheck);
-    if (effectiveAction === "load") {
+    if (effectiveAction === "save" && saveMeta) {
+      lease.pendingSnapshotDiskMb = saveMeta.ramSizeMb || 2048;
+      lease.fsDev = saveMeta.fsDev ?? lease.fsDev ?? null;
+    } else if (effectiveAction === "load") {
       lease.state = "starting";
       lease.workerPid = process.pid;
       lease.deadlineMs = now + stopTimeoutMs;
@@ -3514,7 +3530,9 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       leaseCheck.ttlMs,
       options,
       (cur) => {
-        if (effectiveAction === "load") {
+        if (effectiveAction === "save") {
+          delete cur.pendingSnapshotDiskMb;
+        } else if (effectiveAction === "load") {
           cur.state = "active";
           cur.deadlineMs = null;
           cur.loadedSnapshot = markLoaded ? effectiveName : null;

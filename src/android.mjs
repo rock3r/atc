@@ -534,7 +534,6 @@ export function checkResourceAdmission(
       if (isStarting && typeof lease.requiredDiskMb === "number" && lease.requiredDiskMb > 0) {
         unaccountedDiskMb += lease.requiredDiskMb;
       } else if (
-        lease.state === "stopping" &&
         typeof lease.pendingSnapshotDiskMb === "number" &&
         lease.pendingSnapshotDiskMb > 0
       ) {

@@ -202,21 +202,17 @@ export function snapshotProcessGroupsOutsideLock(pgids) {
     return snapshot;
   }
   if (process.platform === "win32") {
-    const exitedCandidates = [];
+    const validCandidates = [];
     for (const raw of pgids) {
       const pgid = Number(raw);
       if (!Number.isInteger(pgid) || pgid <= 1 || snapshot.has(pgid)) continue;
-      if (isPidAlive(pgid)) {
-        snapshot.set(pgid, true);
-      } else {
-        exitedCandidates.push(pgid);
-        snapshot.set(pgid, false);
-      }
+      validCandidates.push(pgid);
+      snapshot.set(pgid, isPidAlive(pgid));
     }
-    if (exitedCandidates.length > 0) {
-      const winRes = queryWindowsProcessGroups(exitedCandidates);
+    if (validCandidates.length > 0) {
+      const winRes = queryWindowsProcessGroups(validCandidates);
       for (const [pgid, alive] of winRes.entries()) {
-        snapshot.set(pgid, alive);
+        snapshot.set(pgid, Boolean(snapshot.get(pgid)) || alive);
       }
     }
     return snapshot;

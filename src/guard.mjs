@@ -2103,6 +2103,14 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       }
       const c = classifySegment(classifyInput, shellVars);
       Object.assign(shellVars, c.parsed?.envVars || {});
+      const forVarMatch = trimmed.match(/^(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+      if (forVarMatch) {
+        shellVars[forVarMatch[1]] = "__atc_cmd_sub__";
+      }
+      const readVarMatch = trimmed.match(/(?:^|\b)read\s+(?:-[A-Za-z0-9]+\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*$/);
+      if (readVarMatch) {
+        shellVars[readVarMatch[1]] = "__atc_cmd_sub__";
+      }
       for (const arg of parsedStage.args) {
         if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
           pipeUpstreamArgs.push(arg);
@@ -2140,7 +2148,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
         const isSimpleStage =
-          !/[<>|&;`$()\r\n]/.test(cmdBody) && !requiresShellExecution(cmdBody);
+          !/[<>|&;`()\r\n]/.test(cmdBody) && !requiresShellExecution(cmdBody);
         if (isSimpleStage) {
           return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
@@ -2307,7 +2315,7 @@ export function evaluateCommandGuard(
     const isSimpleSingleCommand =
       segments.length === 1 &&
       !needsAtcRewrite &&
-      !/[<>|&;`$()\r\n]/.test(command) &&
+      !/[<>|&;`()\r\n]/.test(command) &&
       !requiresShellExecution(command);
     if (isWin) {
       rewrittenCommand = rewriteCompoundCommand(command, {

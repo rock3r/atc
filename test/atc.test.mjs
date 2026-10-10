@@ -6891,7 +6891,17 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         assert.doesNotMatch(cmdSubApkGuard.rewrittenCommand, /__atc_cmd_sub__/);
         assert.match(
           cmdSubApkGuard.rewrittenCommand,
-          /APK="\$APK" ATC_SESSION_ID=apk-sub-sess atc exec --serial emulator-5554 -- sh -c 'adb install "\$APK"'$/,
+          /ATC_SESSION_ID=apk-sub-sess atc exec --serial emulator-5554 -- adb install "\$APK"$/,
+        );
+        const loopApkGuard = evaluateCommandGuard("for apk in *.apk; do adb install \"$apk\"; done", {
+          sessionId: "apk-loop-sess",
+          activeLeases: [{ leaseId: "lease_apk", serial: "emulator-5554" }],
+          platform: "linux",
+        });
+        assert.equal(loopApkGuard.allowed, true);
+        assert.equal(
+          loopApkGuard.rewrittenCommand,
+          'for apk in *.apk ; do ATC_SESSION_ID=apk-loop-sess atc exec --serial emulator-5554 -- adb install "$apk" ; done',
         );
 
         // Astra #25 Finding 4: Relocated AVD disk admission and per-filesystem reservation aggregation

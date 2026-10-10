@@ -802,16 +802,22 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
           finishClose();
           return;
         }
-        const pollMs = process.platform === "win32" ? 200 : 50;
-        const waitGroupTimer = setInterval(() => {
-          if (wrapperSignal) {
-            terminateChildTree(childPid, wrapperSignal);
-          }
-          if (!isProcessGroupAlive(childPid)) {
-            clearInterval(waitGroupTimer);
-            finishClose();
-          }
-        }, pollMs);
+        let pollDelayMs = process.platform === "win32" ? 200 : 50;
+        const maxPollDelayMs = process.platform === "win32" ? 1500 : 1000;
+        const scheduleNextGroupPoll = () => {
+          const t = setTimeout(() => {
+            if (wrapperSignal) {
+              terminateChildTree(childPid, wrapperSignal);
+            }
+            if (!isProcessGroupAlive(childPid)) {
+              finishClose();
+              return;
+            }
+            pollDelayMs = Math.min(maxPollDelayMs, pollDelayMs * 2);
+            scheduleNextGroupPoll();
+          }, pollDelayMs);
+        };
+        scheduleNextGroupPoll();
         return;
       }
 
