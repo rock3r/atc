@@ -17,8 +17,27 @@ function expandVariables(str: string, vars: Record<string, string> = {}): string
   );
 }
 
+function decodeShellEscapes(str: string): string {
+  if (!str || typeof str !== "string" || !str.includes("\\")) return str;
+  return str.replace(
+    /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|0([0-7]{1,3})|([0-7]{1,3})|([abefnrtv\\'"?]))/g,
+    (full, hex, u4, u8, oct0, oct, single) => {
+      if (hex) return String.fromCharCode(parseInt(hex, 16));
+      if (u4) return String.fromCharCode(parseInt(u4, 16));
+      if (u8) return String.fromCodePoint(parseInt(u8, 16));
+      if (oct0) return String.fromCharCode(parseInt(oct0, 8));
+      if (oct) return String.fromCharCode(parseInt(oct, 8));
+      if (single === "n") return "\n";
+      if (single === "r") return "\r";
+      if (single === "t") return "\t";
+      return single || full;
+    }
+  );
+}
+
 function resolveStaticSubValue(expandedInner: string, prefixWord = "", suffixWord = ""): string {
-  const cleaned = String(expandedInner || "")
+  const decodedInner = decodeShellEscapes(String(expandedInner || ""));
+  const cleaned = decodedInner
     .replace(/\\(.)/g, "$1")
     .replace(/["']/g, "")
     .trim();
@@ -31,18 +50,31 @@ function resolveStaticSubValue(expandedInner: string, prefixWord = "", suffixWor
     while (idx < args.length && /^-[neE]+$/.test(args[idx])) {
       idx++;
     }
-    return args.slice(idx).join(" ");
+    return decodeShellEscapes(args.slice(idx).join(" "));
   }
 
   if (cmd === "printf") {
     let idx = 0;
     if (args[idx] === "--") idx++;
     if (args[idx] === "-v") return "";
-    const fmt = args[idx] ?? "";
-    const fmtArgs = args.slice(idx + 1);
-    if (fmtArgs.length === 0) return fmt;
+    const rawFmt = decodeShellEscapes(args[idx] ?? "");
+    const fmtArgs = args.slice(idx + 1).map((a) => decodeShellEscapes(a));
+    if (fmtArgs.length === 0) return rawFmt;
+    if (!/%[-+ #0]*\d*(?:\.\d+)?[sbc]/.test(rawFmt)) {
+      return rawFmt + fmtArgs.join("");
+    }
+    let out = "";
     let argIdx = 0;
-    return fmt.replace(/%[sb]/g, () => (argIdx < fmtArgs.length ? fmtArgs[argIdx++] : ""));
+    while (argIdx < fmtArgs.length) {
+      const prevIdx = argIdx;
+      out += rawFmt.replace(/%[-+ #0]*\d*(?:\.\d+)?([sbc])/g, (_m, spec) => {
+        if (argIdx >= fmtArgs.length) return "";
+        const val = fmtArgs[argIdx++];
+        return spec === "c" ? val.slice(0, 1) : val;
+      });
+      if (argIdx === prevIdx) break;
+    }
+    return out;
   }
 
   if (
@@ -176,9 +208,14 @@ export function hasAndroidOrAtcTokens(command: string): boolean {
       ? expandCommandSubstitutionsForFastPath(command, subParts)
       : command;
   const combined = subParts.length > 0 ? `${subExpanded} ; ${subParts.join(" ; ")}` : subExpanded;
-  if (FAST_PATH_REGEX.test(combined)) return true;
-  const normalizedVars = combined.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
-  const collapsed = normalizedVars.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+  const ansiDecoded = combined.replace(/\$'((?:\\.|[^'])*)'/g, (_m, inner) =>
+    decodeShellEscapes(inner)
+  );
+  if (FAST_PATH_REGEX.test(ansiDecoded)) return true;
+  const normalizedVars = ansiDecoded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const collapsed = decodeShellEscapes(normalizedVars)
+    .replace(/\\(.)/g, "$1")
+    .replace(/["']/g, "");
   if (FAST_PATH_REGEX.test(collapsed)) return true;
   if (collapsed.includes("$")) {
     const vars: Record<string, string> = {};

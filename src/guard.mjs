@@ -114,6 +114,24 @@ const READ_ONLY_ADB_SUBCOMMANDS = new Set([
 
 const TOOL_NAMES = ["android", "adb", "emulator", "gradlew", "gradle", "atc"];
 
+function decodeShellEscapes(str) {
+  if (!str || typeof str !== "string" || !str.includes("\\")) return str;
+  return str.replace(
+    /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|0([0-7]{1,3})|([0-7]{1,3})|([abefnrtv\\'"?]))/g,
+    (full, hex, u4, u8, oct0, oct, single) => {
+      if (hex) return String.fromCharCode(parseInt(hex, 16));
+      if (u4) return String.fromCharCode(parseInt(u4, 16));
+      if (u8) return String.fromCodePoint(parseInt(u8, 16));
+      if (oct0) return String.fromCharCode(parseInt(oct0, 8));
+      if (oct) return String.fromCharCode(parseInt(oct, 8));
+      if (single === "n") return "\n";
+      if (single === "r") return "\r";
+      if (single === "t") return "\t";
+      return single || full;
+    },
+  );
+}
+
 function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") {
   const tokens = tokenizeSegment(
     String(expandedInner || "")
@@ -128,7 +146,7 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
     while (idx < args.length && /^-[neE]+$/.test(args[idx])) {
       idx++;
     }
-    return args.slice(idx).join(" ");
+    return decodeShellEscapes(args.slice(idx).join(" "));
   }
 
   if (cmd === "printf") {
@@ -137,13 +155,26 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
     if (args[idx] === "-v") {
       return "";
     }
-    const fmt = args[idx] ?? "";
-    const fmtArgs = args.slice(idx + 1);
+    const rawFmt = decodeShellEscapes(args[idx] ?? "");
+    const fmtArgs = args.slice(idx + 1).map((a) => decodeShellEscapes(a));
     if (fmtArgs.length === 0) {
-      return fmt;
+      return rawFmt;
     }
+    if (!/%[-+ #0]*\d*(?:\.\d+)?[sbc]/.test(rawFmt)) {
+      return rawFmt + fmtArgs.join("");
+    }
+    let out = "";
     let argIdx = 0;
-    return fmt.replace(/%[sb]/g, () => (argIdx < fmtArgs.length ? fmtArgs[argIdx++] : ""));
+    while (argIdx < fmtArgs.length) {
+      const prevIdx = argIdx;
+      out += rawFmt.replace(/%[-+ #0]*\d*(?:\.\d+)?([sbc])/g, (_m, spec) => {
+        if (argIdx >= fmtArgs.length) return "";
+        const val = fmtArgs[argIdx++];
+        return spec === "c" ? val.slice(0, 1) : val;
+      });
+      if (argIdx === prevIdx) break;
+    }
+    return out;
   }
 
   if (
@@ -177,9 +208,14 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}) {
   if (FAST_PATH_REGEX.test(str)) return true;
   const subExpanded =
     str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, []) : str;
-  if (FAST_PATH_REGEX.test(subExpanded)) return true;
-  const normalizedVars = subExpanded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
-  const collapsed = normalizedVars.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+  const ansiDecoded = subExpanded.replace(/\$'((?:\\.|[^'])*)'/g, (_m, inner) =>
+    decodeShellEscapes(inner),
+  );
+  if (FAST_PATH_REGEX.test(ansiDecoded)) return true;
+  const normalizedVars = ansiDecoded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const collapsed = decodeShellEscapes(normalizedVars)
+    .replace(/\\(.)/g, "$1")
+    .replace(/["']/g, "");
   if (FAST_PATH_REGEX.test(collapsed)) return true;
   if (collapsed.includes("$")) {
     const vars = { ...inheritedVars };
@@ -445,6 +481,19 @@ export function tokenizeSegment(segment) {
           }
         }
         if (j < rawWord.length) j++;
+      } else if (ch === "$" && rawWord[j + 1] === "'") {
+        j += 2;
+        let ansiInner = "";
+        while (j < rawWord.length && rawWord[j] !== "'") {
+          if (rawWord[j] === "\\" && j + 1 < rawWord.length) {
+            ansiInner += rawWord[j] + rawWord[j + 1];
+            j += 2;
+          } else {
+            ansiInner += rawWord[j++];
+          }
+        }
+        if (j < rawWord.length) j++;
+        tok += decodeShellEscapes(ansiInner);
       } else if (ch === "'") {
         j++;
         while (j < rawWord.length && rawWord[j] !== "'") {

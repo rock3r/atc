@@ -4018,6 +4018,26 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               subPrintfDeviceRewrite.rewrittenCommand,
               "ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c '$(printf ad)b shell getprop'",
             );
+
+            const subPrintfHexKill = evaluateCommandGuard(
+              "$(printf '%b' '\\x61\\x64\\x62') kill-server",
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              },
+            );
+            assert.equal(subPrintfHexKill.allowed, false);
+            assert.match(subPrintfHexKill.reason, /adb kill-server/);
+
+            const subPrintfOctalKill = evaluateCommandGuard(
+              "$(printf '\\141\\144\\142') kill-server",
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              },
+            );
+            assert.equal(subPrintfOctalKill.allowed, false);
+            assert.match(subPrintfOctalKill.reason, /adb kill-server/);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
