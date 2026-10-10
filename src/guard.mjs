@@ -692,6 +692,14 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     let hadWaitPrefix = false;
     while (subIdx < args.length) {
       const a = args[subIdx];
+      if (a === "--one-device" || a.startsWith("--one-device=")) {
+        return {
+          kind: "deny_lifecycle",
+          reason:
+            'Direct "adb --one-device" is disabled under ATC because it restricts the shared ADB server on the host.',
+          parsed,
+        };
+      }
       if (a === "-s" || a === "-t" || a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
@@ -710,6 +718,14 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         kind: "deny_lifecycle",
         reason:
           'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
+        parsed,
+      };
+    }
+    if (adbSub === "reconnect" && adbRest.includes("offline")) {
+      return {
+        kind: "deny_lifecycle",
+        reason:
+          'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
         parsed,
       };
     }

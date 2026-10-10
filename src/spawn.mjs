@@ -302,6 +302,11 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
           `Non-serial adb device selector "${a}" is not permitted under ATC; use -s "${lease.serial}" or omit selector flags to use ANDROID_SERIAL.`,
         );
       }
+      if (a === "--one-device" || a.startsWith("--one-device=")) {
+        throw new Error(
+          'Direct "adb --one-device" is disabled under ATC because it restricts the shared ADB server on the host.',
+        );
+      }
       if (a.startsWith("-s") && a.length > 2) {
         const inlineSerial = a.slice(2);
         if (lease.serial && inlineSerial !== lease.serial) {
@@ -327,6 +332,11 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     if (adbSub === "kill-server") {
       throw new Error(
         'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
+      );
+    }
+    if (adbSub === "reconnect" && adbRest.includes("offline")) {
+      throw new Error(
+        'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
       );
     }
     if (adbSub === "emu" && adbRest[0] === "kill") {

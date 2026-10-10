@@ -2728,6 +2728,47 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             );
             assert.equal(execLongRes.exitCode, 0);
             assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"].expiresAtMs >= longExpiresAt);
+
+            // 14. Host-wide `adb reconnect offline` and `adb --one-device` are rejected in guard and buildChildInvocation
+            const guardReconnectOffline = evaluateCommandGuard("adb reconnect offline", {
+              sessionId: "cold-rediscover",
+              activeLeases: [coldRediscoverRes.lease],
+            });
+            assert.equal(guardReconnectOffline.allowed, false);
+            assert.match(guardReconnectOffline.reason, /adb reconnect offline/);
+
+            const guardOneDevice = evaluateCommandGuard(
+              "adb --one-device emulator-5558 start-server",
+              {
+                sessionId: "cold-rediscover",
+                activeLeases: [coldRediscoverRes.lease],
+              },
+            );
+            assert.equal(guardOneDevice.allowed, false);
+            assert.match(guardOneDevice.reason, /adb --one-device/);
+
+            assert.throws(
+              () => buildChildInvocation("adb", ["reconnect", "offline"], coldRediscoverRes.lease),
+              /adb reconnect offline/,
+            );
+            assert.throws(
+              () =>
+                buildChildInvocation(
+                  "adb",
+                  ["--one-device", "emulator-5558", "start-server"],
+                  coldRediscoverRes.lease,
+                ),
+              /adb --one-device/,
+            );
+            assert.throws(
+              () =>
+                buildChildInvocation(
+                  "adb",
+                  ["--one-device=emulator-5558", "shell", "id"],
+                  coldRediscoverRes.lease,
+                ),
+              /adb --one-device/,
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
