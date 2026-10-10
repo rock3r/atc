@@ -1,6 +1,6 @@
 # Releasing
 
-Releases publish one public npm CLI package (`android-traffic-control`) and the matching portable Agent Plugins (`plugin.json`), Claude Code (`.claude-plugin/`), Codex (`.codex-plugin/`), and skill (`skills/atc/`) payload from the same tagged source tree.
+Releases publish one public npm CLI package (`@rock3r/atc`) and the matching portable Agent Plugins (`plugin.json`), Claude Code (`.claude-plugin/`), Codex (`.codex-plugin/`), and skill (`skills/atc/`) payload from the same tagged source tree.
 
 ## Lockstep Version Locations
 
@@ -30,7 +30,7 @@ Use `tools/check-versions.sh` to inspect or bump all 8 locations in one command:
 
 1. Publish the repository at `https://github.com/rock3r/atc` and set that URL as `origin`. npm provenance requires `repository.url` in `package.json` (`git+https://github.com/rock3r/atc.git`) to match.
 2. Create a GitHub environment named `npm` on `rock3r/atc` (require reviewer approval if desired).
-3. If `android-traffic-control` has not been published to npm yet, bootstrap the initial package creation once (or create the package entry on npmjs.com), then configure **npm Trusted Publishing** for:
+3. If `@rock3r/atc` has not been published to npm yet, bootstrap the initial package creation once (`npm login && npm publish --access public`), then configure **npm Trusted Publishing** for:
    - GitHub owner/repository: `rock3r/atc`
    - Workflow filename: `release.yml`
    - Environment name: `npm`

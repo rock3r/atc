@@ -28,6 +28,9 @@ const refName = process.env.GITHUB_REF_NAME;
 const actualTag =
   process.argv[2] ?? (refName && refName.startsWith("v") ? refName : expectedTag);
 
+if (packageManifest.name !== "@rock3r/atc") {
+  throw new Error(`package.json name must be @rock3r/atc, got ${packageManifest.name}`);
+}
 if (!semanticVersion.test(packageManifest.version)) {
   throw new Error(`package.json version must be strict semver, got ${packageManifest.version}`);
 }

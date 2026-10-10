@@ -25,7 +25,7 @@ Coordinate exclusive Android emulator (AVD) and physical USB/Wi-Fi device leases
 **1. Install `atc`.**
 
 ```bash
-npm install -g android-traffic-control
+npm install -g @rock3r/atc
 ```
 
 Then check your host capacity and discovered Android fleet:

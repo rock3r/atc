@@ -7037,7 +7037,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     const skillText = fs.readFileSync(new URL("skills/atc/SKILL.md", rootDir), "utf8");
     assert.match(skillText, /atc guide/);
     const installRefText = fs.readFileSync(new URL("skills/atc/references/install.md", rootDir), "utf8");
-    assert.match(installRefText, /npm install -g android-traffic-control/);
+    assert.match(installRefText, /npm install -g @rock3r\/atc/);
     const userGuideText = fs.readFileSync(new URL("docs/user-guide.md", rootDir), "utf8");
     assert.match(userGuideText, /# `atc` user guide/);
     assert.match(userGuideText, /atc guide/);

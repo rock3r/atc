@@ -9,7 +9,7 @@ You need Node.js 20 or newer on macOS, Linux, or Windows, plus the Android SDK (
 **1. Install the CLI.**
 
 ```bash
-npm install -g android-traffic-control
+npm install -g @rock3r/atc
 ```
 
 Or from a local clone of the repository:

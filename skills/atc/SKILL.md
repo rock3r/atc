@@ -13,7 +13,7 @@ metadata:
 The `atc` CLI coordinates Android emulators and physical test devices and carries its own built-in guides. This skill gets you started.
 
 1. Run `atc status`.
-   - `atc: command not found`: ask the user, then install it as [references/install.md](references/install.md) says (`npm install -g android-traffic-control`).
+   - `atc: command not found`: ask the user, then install it as [references/install.md](references/install.md) says (`npm install -g @rock3r/atc`).
    - Check `Host Capacity` (`slots: X/Y used`, available RAM, free disk), `Running` devices, `Offline` AVDs, and active `Leases` / `Queue`.
 2. Run `atc guide` and follow it. It covers the claim-exec-free workflow, rules, and a done checklist.
    - Read `atc guide profiles` when choosing `--type`, `--api`, `--play`/`--no-play`, or claiming a physical USB/Wi-Fi phone (`--serial <id>` / `--kind physical`).

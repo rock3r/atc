@@ -7,7 +7,7 @@ Ask the user before installing global packages or modifying agent configuration.
 Requires Node.js 20 or newer (`node --version`) on macOS, Linux, or Windows:
 
 ```bash
-npm install -g android-traffic-control
+npm install -g @rock3r/atc
 ```
 
 Or install directly from a local checkout:

@@ -80,13 +80,13 @@ try {
 
   const packageRoot =
     process.platform === "win32"
-      ? path.join(prefix, "node_modules", "android-traffic-control")
-      : path.join(prefix, "lib", "node_modules", "android-traffic-control");
+      ? path.join(prefix, "node_modules", "@rock3r", "atc")
+      : path.join(prefix, "lib", "node_modules", "@rock3r", "atc");
   const manifest = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
   const sourceManifest = JSON.parse(
     await readFile(path.join(process.cwd(), "package.json"), "utf8"),
   );
-  if (manifest.name !== "android-traffic-control" || manifest.version !== sourceManifest.version) {
+  if (manifest.name !== "@rock3r/atc" || manifest.version !== sourceManifest.version) {
     throw new Error(`unexpected installed package identity: ${manifest.name}@${manifest.version}`);
   }
 
