@@ -2453,9 +2453,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                     prefixOp !== "#" &&
                     (subscript === "@" || (subscript === "*" && !scanInDouble));
                   if (isPositionalArray) {
-                    const baseKey = scanInDouble
-                      ? `${prefixOp}${arrName}[@]`
-                      : `unquoted:${inner}`;
+                    const baseKey = `${prefixOp}${arrName}[@]`;
                     if (!atExprMap.has(baseKey)) {
                       const entry = {
                         idx: atArrayExprs.length,
@@ -2466,11 +2464,18 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                         subscript,
                         modifier,
                         quoted: scanInDouble,
+                        hasUnquoted: !scanInDouble,
                       };
                       atExprMap.set(baseKey, entry);
                       atArrayExprs.push(entry);
-                    } else if (inner !== atExprMap.get(baseKey).inner) {
-                      atExprMap.get(baseKey).hasDistinctModifier = true;
+                    } else {
+                      const existing = atExprMap.get(baseKey);
+                      if (!scanInDouble) {
+                        existing.hasUnquoted = true;
+                      }
+                      if (inner !== existing.inner || scanInDouble !== existing.quoted) {
+                        existing.hasDistinctModifier = true;
+                      }
                     }
                   }
                 }
@@ -2516,13 +2521,9 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                     if (singleAtExpr) {
                       rewrittenArrBody += arrInDouble ? "$@" : '"$@"';
                     } else {
-                      const baseKey = arrInDouble
-                        ? `${prefixOp}${arrName}[@]`
-                        : `unquoted:${inner}`;
+                      const baseKey = `${prefixOp}${arrName}[@]`;
                       const entry = atExprMap.get(baseKey);
-                      rewrittenArrBody += entry.quoted
-                        ? `\${__atc_arr_at_${entry.idx}[@]${modifier}}`
-                        : `"\${__atc_arr_at_${entry.idx}[@]}"`;
+                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${subscript}]${modifier}}`;
                     }
                     i = closeIdx;
                     continue;
@@ -2562,22 +2563,26 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         const singleAtExpr =
           atArrayExprs.length === 1 && !atArrayExprs[0].hasDistinctModifier;
         if (atArrayExprs.length > 0 && !singleAtExpr) {
+          const needsOuterIfs = atArrayExprs.some((entry) => entry.hasUnquoted);
+          const ifsPrelude = needsOuterIfs
+            ? 'if [ -n "$1" ]; then IFS=$2; else unset IFS; fi; shift 2; '
+            : "";
           const prelude =
+            ifsPrelude +
             atArrayExprs
-              .map((entry) =>
-                entry.quoted
-                  ? `__atc_n=$1; shift; __atc_arr_at_${entry.idx}=("\${@:1:$__atc_n}"); shift "$__atc_n"`
-                  : `__atc_arr_at_${entry.idx}=(); while [ "$#" -gt 0 ] && [ "$1" != "__atc_end_arr_${entry.idx}__" ]; do __atc_arr_at_${entry.idx}+=("$1"); shift; done; shift`,
+              .map(
+                (entry) =>
+                  `__atc_n=$1; shift; __atc_arr_at_${entry.idx}=("\${@:1:$__atc_n}"); shift "$__atc_n"`,
               )
-              .join("; ") + "; ";
+              .join("; ") +
+            "; ";
           const escaped = `'${String(prelude + cmdBody).replace(/'/g, `'\\''`)}'`;
-          const trailingArrays = atArrayExprs
-            .map((entry) =>
-              entry.quoted
-                ? `"\${#${entry.arrName}[@]}" "\${${entry.baseKey}}"`
-                : `\${${entry.inner}} __atc_end_arr_${entry.idx}__`,
-            )
-            .join(" ");
+          const ifsArgs = needsOuterIfs ? '"${IFS+1}" "${IFS-}" ' : "";
+          const trailingArrays =
+            ifsArgs +
+            atArrayExprs
+              .map((entry) => `"\${#${entry.arrName}[@]}" "\${${entry.baseKey}}"`)
+              .join(" ");
           return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- bash -c ${escaped} bash ${trailingArrays}${suffix}`;
         }
         const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;

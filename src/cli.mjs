@@ -86,7 +86,7 @@ function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, optio
         triState: true,
       },
     );
-    if (qRes.refreshed) {
+    if (qRes.refreshed && qRes.get(num) !== null) {
       return getKnownWindowsTreePids(num, { liveOnly: true }).includes(num);
     }
   }

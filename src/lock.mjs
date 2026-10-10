@@ -169,19 +169,42 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
         if (prevAlive === false || expectedCreation === "__exited__") return false;
         if (!expectedCreation) return true;
         const actualCreation = creationByPid.get(pid) ?? null;
-        if (!actualCreation) return true;
+        if (!actualCreation) return false;
         return actualCreation === expectedCreation;
       };
+      const isIdentityUnverifiable = (pid, expectedCreation, prevAlive = true) =>
+        alivePids.has(pid) &&
+        prevAlive !== false &&
+        Boolean(expectedCreation) &&
+        expectedCreation !== "__exited__" &&
+        !creationByPid.get(pid);
       for (const rawPgid of pgids || []) {
         const pgid = Number(rawPgid);
         if (!Number.isInteger(pgid) || pgid <= 1) continue;
         const prevKnown = winKnownTreeDescendants.get(pgid) || new Map();
+        const prevRootEntry = prevKnown.get(pgid);
+        let hasUnverifiableIdentity = isIdentityUnverifiable(
+          pgid,
+          prevRootEntry?.creationDate,
+          prevRootEntry?.alive,
+        );
+        if (!hasUnverifiableIdentity) {
+          for (const [kPid, prevMeta] of prevKnown.entries()) {
+            if (isIdentityUnverifiable(kPid, prevMeta?.creationDate, prevMeta?.alive)) {
+              hasUnverifiableIdentity = true;
+              break;
+            }
+          }
+        }
+        if (hasUnverifiableIdentity) {
+          result.set(pgid, triState ? null : true);
+          continue;
+        }
         const nextKnown = new Map();
         const queue = [];
         const visited = new Set();
         const liveMembers = new Set();
 
-        const prevRootEntry = prevKnown.get(pgid);
         const rootCreation =
           prevRootEntry?.creationDate ?? creationByPid.get(pgid) ?? null;
         const rootReused =

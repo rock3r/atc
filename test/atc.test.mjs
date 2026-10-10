@@ -7946,6 +7946,76 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     } finally {
       clearKnownWindowsTreeDescendants(reusedLeaderPgid);
     }
+
+    // 1j. Missing/null CreationDate in CIM snapshot for a PID with an expected token is treated as unverifiable and aborts taskkill
+    const nullTokenPgid = 770001;
+    seedWindowsKnownDescendants({
+      [String(nullTokenPgid)]: [
+        { pid: nullTokenPgid, creationDate: "20261010210000.000000+000" },
+        { pid: 770002, creationDate: "20261010210001.000000+000" },
+      ],
+    });
+    try {
+      const nullTokenKilled = [];
+      const nullTokenRes = killProcessGroupTree(nullTokenPgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                // Live PID 770002 returned with null CreationDate (e.g., privileged replacement process)
+                { ProcessId: 770002, ParentProcessId: 4000, CreationDate: null },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            nullTokenKilled.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(nullTokenRes, []);
+      assert.deepEqual(
+        nullTokenRes.terminatedPgids,
+        [],
+        "killProcessGroupTree must abort destructive termination when expected CreationDate cannot be verified against a null CIM token",
+      );
+      assert.deepEqual(
+        nullTokenKilled,
+        [],
+        "killProcessGroupTree must not pass PID with missing CreationDate to taskkill /F",
+      );
+      assert.equal(
+        getKnownWindowsTreeDescendants(nullTokenPgid).length,
+        2,
+        "Cached descendants must remain intact when CreationDate is unverifiable",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(nullTokenPgid);
+    }
+
+    // 3f. Multi-array unquoted expansions use collision-free length framing (no in-band sentinel)
+    const multiUnquotedArraysRedir = evaluateCommandGuard(
+      'IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} "${!parts[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(multiUnquotedArraysRedir.allowed, true);
+    assert.doesNotMatch(
+      multiUnquotedArraysRedir.rewrittenCommand,
+      /__atc_end_arr_/,
+      "Multi-array forwarding must use length framing rather than an in-band sentinel",
+    );
+    assert.match(
+      multiUnquotedArraysRedir.rewrittenCommand,
+      /bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
