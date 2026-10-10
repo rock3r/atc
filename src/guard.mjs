@@ -217,6 +217,7 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}) {
     .replace(/\\(.)/g, "$1")
     .replace(/["']/g, "");
   if (FAST_PATH_REGEX.test(collapsed)) return true;
+  let expandedForCmdCheck = collapsed;
   if (collapsed.includes("$")) {
     const vars = { ...inheritedVars };
     const assignRe = /\b([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&)]+)/g;
@@ -227,6 +228,27 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}) {
     let expanded = expandVariables(collapsed, vars);
     expanded = expandVariables(expanded, vars);
     if (FAST_PATH_REGEX.test(expanded)) return true;
+    expandedForCmdCheck = expanded;
+  }
+  if (expandedForCmdCheck.includes("__atc_cmd_sub__")) {
+    for (const rawClause of expandedForCmdCheck.split(/[;&|\r\n]+/)) {
+      const strippedClause = rawClause.trimStart().replace(LEADING_CONTROL_PREFIX_RE, "");
+      const tokens = strippedClause
+        .trim()
+        .split(/\s+/)
+        .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+      while (
+        tokens.length > 0 &&
+        /^(?:env|command|nohup|timeout|sudo|nice|time|then|else|do|if|elif|while|until|!|\{|\()+$/i.test(
+          tokens[0],
+        )
+      ) {
+        tokens.shift();
+      }
+      if (tokens[0] && tokens[0].includes("__atc_cmd_sub__")) {
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -515,16 +537,159 @@ export function tokenizeSegment(segment) {
   return tokens;
 }
 
-export function expandVariables(str, vars = {}) {
-  if (!str || typeof str !== "string" || !vars || Object.keys(vars).length === 0) {
+function shellPatToRegExpStr(pat, greedy = true) {
+  let out = "";
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i];
+    if (c === "\\" && i + 1 < pat.length) {
+      out += "\\" + pat[++i].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    } else if (c === "*") {
+      out += greedy ? ".*" : ".*?";
+    } else if (c === "?") {
+      out += ".";
+    } else {
+      out += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return out;
+}
+
+function expandSingleBraceExpression(full, inner, vars, opaqueFallback) {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(inner)) {
+    return Object.prototype.hasOwnProperty.call(vars, inner) ? vars[inner] : full;
+  }
+  const failValue = opaqueFallback !== null ? opaqueFallback : full;
+  if (/^#[A-Za-z_][A-Za-z0-9_]*$/.test(inner)) {
+    const key = inner.slice(1);
+    return Object.prototype.hasOwnProperty.call(vars, key)
+      ? String(vars[key]).length.toString()
+      : failValue;
+  }
+  const m = inner.match(/^([A-Za-z_][A-Za-z0-9_]*)(.+)$/s);
+  if (!m) {
+    return failValue;
+  }
+  const key = m[1];
+  const hasKey = Object.prototype.hasOwnProperty.call(vars, key);
+  const val = hasKey ? String(vars[key]) : "";
+  const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (rawRef, k) =>
+    Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : rawRef,
+  );
+
+  // Substring expansion: ${var:offset} or ${var:offset:length}
+  const subSliceMatch = rest.match(/^:(?:\s+(-?\d+)|(\d+))(?::\s*(-?\d+))?$/);
+  if (subSliceMatch) {
+    if (!hasKey) return failValue;
+    const offset = parseInt(subSliceMatch[1] ?? subSliceMatch[2], 10);
+    const start = offset < 0 ? Math.max(0, val.length + offset) : offset;
+    if (subSliceMatch[3] === undefined) {
+      return val.slice(start);
+    }
+    const len = parseInt(subSliceMatch[3], 10);
+    return len < 0
+      ? val.slice(start, Math.max(start, val.length + len))
+      : val.slice(start, start + len);
+  }
+
+  // Default / alternate value operators: :-, -, :=, =, :+, +, :?, ?
+  const defMatch = rest.match(/^(:?[-=+?])(.*)$/s);
+  if (defMatch) {
+    const op = defMatch[1];
+    const word = defMatch[2];
+    const isSetAndNonEmpty = hasKey && val !== "";
+    if (op === ":-" || op === ":=") {
+      if (isSetAndNonEmpty) return val;
+      return !word.includes("$") ? word : failValue;
+    }
+    if (op === "-" || op === "=") {
+      if (hasKey) return val;
+      return !word.includes("$") ? word : failValue;
+    }
+    if (op === ":+") {
+      if (!hasKey) return failValue;
+      if (val === "") return "";
+      return !word.includes("$") ? word : failValue;
+    }
+    if (op === "+") {
+      if (!hasKey) return failValue;
+      return !word.includes("$") ? word : failValue;
+    }
+    if (op === ":?" || op === "?") {
+      if (hasKey && (op === "?" || val !== "")) return val;
+      return failValue;
+    }
+  }
+
+  // Prefix removal: ${var#pat} or ${var##pat}
+  const prefMatch = rest.match(/^(#{1,2})(.*)$/s);
+  if (prefMatch) {
+    if (!hasKey || prefMatch[2].includes("$")) return failValue;
+    const greedy = prefMatch[1] === "##";
+    const re = new RegExp("^" + shellPatToRegExpStr(prefMatch[2], greedy));
+    return val.replace(re, "");
+  }
+
+  // Suffix removal: ${var%pat} or ${var%%pat}
+  const sufMatch = rest.match(/^(%{1,2})(.*)$/s);
+  if (sufMatch) {
+    if (!hasKey || sufMatch[2].includes("$")) return failValue;
+    const greedy = sufMatch[1] === "%%";
+    const re = new RegExp("^" + shellPatToRegExpStr(sufMatch[2], true) + "$");
+    if (greedy) {
+      for (let i = 0; i <= val.length; i++) {
+        if (re.test(val.slice(i))) return val.slice(0, i);
+      }
+      return val;
+    }
+    for (let i = val.length; i >= 0; i--) {
+      if (re.test(val.slice(i))) return val.slice(0, i);
+    }
+    return val;
+  }
+
+  // Pattern substitution: ${var/pat/rep}, ${var//pat/rep}, ${var/#pat/rep}, ${var/%pat/rep}
+  const patSubMatch = rest.match(/^(\/{1,2}|\/#|\/%)([^/]*)(?:\/(.*))?$/s);
+  if (patSubMatch) {
+    if (
+      !hasKey ||
+      patSubMatch[2].includes("$") ||
+      (patSubMatch[3] && patSubMatch[3].includes("$"))
+    ) {
+      return failValue;
+    }
+    const mode = patSubMatch[1];
+    const patStr = shellPatToRegExpStr(patSubMatch[2], true);
+    const rep = patSubMatch[3] ?? "";
+    const prefix = mode === "/#" ? "^" : "";
+    const suffix = mode === "/%" ? "$" : "";
+    const flags = mode === "//" ? "g" : "";
+    return val.replace(new RegExp(prefix + patStr + suffix, flags), () => rep);
+  }
+
+  // Case modification: ^, ^^, ,, ,,
+  if (rest === "^^") return hasKey ? val.toUpperCase() : failValue;
+  if (rest === "^") return hasKey ? (val ? val[0].toUpperCase() + val.slice(1) : "") : failValue;
+  if (rest === ",,") return hasKey ? val.toLowerCase() : failValue;
+  if (rest === ",") return hasKey ? (val ? val[0].toLowerCase() + val.slice(1) : "") : failValue;
+
+  return failValue;
+}
+
+export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_sub__" } = {}) {
+  if (!str || typeof str !== "string" || !str.includes("$")) {
     return str;
   }
-  return str.replace(
-    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-    (full, k1, k2) => {
-      const key = k1 || k2;
-      return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : full;
-    },
+  const safeVars = vars || {};
+  let out = str;
+  for (let pass = 0; pass < 4 && out.includes("${"); pass++) {
+    const next = out.replace(/\$\{([^{}]+)\}/g, (full, inner) =>
+      expandSingleBraceExpression(full, inner, safeVars, opaqueFallback),
+    );
+    if (next === out) break;
+    out = next;
+  }
+  return out.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (full, key) =>
+    Object.prototype.hasOwnProperty.call(safeVars, key) ? safeVars[key] : full,
   );
 }
 
@@ -1652,7 +1817,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
             /\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g,
             (m, k) => (Object.prototype.hasOwnProperty.call(shellVars, k) ? `\${${k}}` : m),
           );
-          cmdBody = expandVariables(normalizedBody, shellVars);
+          cmdBody = expandVariables(normalizedBody, shellVars, { opaqueFallback: null });
         }
         if (isWin) {
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;

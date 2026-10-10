@@ -4145,6 +4145,77 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             } finally {
               fs.rmSync(staleRaceDir, { recursive: true, force: true });
             }
+
+            // 51. Parameter-expansion executables (`${x:2}`, `${x#xx}`, `${x%xx}`, `${x/x/}`, `${!p}`) are caught and blocked
+            for (const cmd of [
+              "x=xxadb; ${x:2} kill-server",
+              "x=xxadb; ${x#xx} kill-server",
+              "x=adbxx; ${x%xx} kill-server",
+              "x=xadb; ${x/x/} kill-server",
+              "x=ADB; ${x,,} kill-server",
+              "${x:-adb} kill-server",
+              "p=x; x=adb; ${!p} kill-server",
+            ]) {
+              const res = evaluateCommandGuard(cmd, {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              });
+              assert.equal(res.allowed, false, `Expected ${cmd} to be blocked`);
+            }
+
+            // 52. Deferred release (`free --force`) during boot activation completes release instead of returning an active lease
+            const bootDeferDir = makeTempStateDir();
+            try {
+              let stoppedOnDeferredFree = false;
+              const bootClaimRes = cmdClaim(
+                bootDeferDir,
+                { session: "boot-defer-sess", avd: "Pixel_8_API_35", wait: 0, force: true },
+                {
+                  platform: "darwin",
+                  avdHome,
+                  inventory: {
+                    host: singleMatchInv.host,
+                    running: [],
+                    offline: [
+                      {
+                        deviceKey: "avd:Pixel_8_API_35",
+                        avd: "Pixel_8_API_35",
+                        serial: null,
+                        kind: "emulator",
+                        online: false,
+                        profile: { deviceType: "phone", apiLevel: "android-35" },
+                      },
+                    ],
+                    creatable: [],
+                  },
+                  runner: (cmd, args) => {
+                    if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                      // Concurrent `free --force --stop` arrives while boot worker is still running
+                      const deferFree = cmdFree(
+                        bootDeferDir,
+                        "Pixel_8_API_35",
+                        { session: "boot-defer-sess", force: true, stop: true },
+                        { deferOnBusyWorker: true },
+                      );
+                      assert.equal(deferFree.exitCode, 0);
+                      return { status: 0, stdout: "Started on emulator-5562\n", stderr: "" };
+                    }
+                    if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                      stoppedOnDeferredFree = true;
+                      return { status: 0, stdout: "Stopped\n", stderr: "" };
+                    }
+                    return { status: 0, stdout: "OK\n", stderr: "" };
+                  },
+                },
+              );
+              assert.equal(bootClaimRes.exitCode, 1);
+              assert.match(bootClaimRes.error, /released during boot/);
+              assert.equal(stoppedOnDeferredFree, true);
+              const postBootDeferState = readState(bootDeferDir);
+              assert.equal(Object.keys(postBootDeferState.leases).length, 0);
+            } finally {
+              fs.rmSync(bootDeferDir, { recursive: true, force: true });
+            }
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
