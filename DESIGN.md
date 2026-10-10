@@ -420,6 +420,7 @@ Usage: `atc exec [--serial <serial>] [--session <id>] -- <command> [args...]`
 ### 6.1 Unified CLI Subcommands
 | Command | Purpose | Exit Codes |
 | :--- | :--- | :--- |
+| `atc guide [topic] [--json]` | Print built-in workflow, profile, snapshot, multi-agent, or troubleshooting guides (`workflow`, `profiles`, `snapshots`, `multi-agent`, `traps`) | `0` ok, `1` unknown topic |
 | `atc claim [options]` | Claim by profile (`--type`, `--api`, `--play`/`--no-play`, `--avd`), prepare state (`--snapshot-load`, `--wipe-data`, `--cold`, `--reset-app`), or wait in bounded-window affinity queue | `0` ok, `2` busy/timeout, `5` insufficient RAM/disk (`--force` to bypass), `1` error |
 | `atc free [target] [options]` | Release lease(s) (`leaseId` > `serial` > `avd`); optional `--snapshot-save`, `--snapshot-load`, `--stop`, `--force` | `0` ok, `3` not owner, `5` disk full on snapshot save, `1` error |
 | `atc renew [target] [--ttl <sec>]` | Extend lease expiration time (clamped to `maxTtlSec`) | `0` ok, `3` not owner, `1` error |
@@ -432,12 +433,13 @@ Usage: `atc exec [--serial <serial>] [--session <id>] -- <command> [args...]`
 | `atc mcp` | Start zero-dep JSON-RPC 2.0 Stdio MCP server | `0` on EOF |
 
 ### 6.2 Stdio MCP Server (`atc mcp`)
-For MCP-centric agent hosts, `atc mcp` implements the MCP stdio transport exposing five tools:
+For MCP-centric agent hosts, `atc mcp` implements the MCP stdio transport exposing six tools:
 - `atc_claim({ type?, api?, services?, play?, abi?, avd?, serial?, kind?, createIfMissing?, snapshotLoad?, snapshotSaveOnFree?, wipeData?, cold?, resetApp?, headless?, force?, ttlSec?, waitSec?, reorderWindowSec?, reason? })`
 - `atc_free({ target?, snapshotSave?, snapshotLoad?, stop?, force? })`
 - `atc_renew({ target?, ttlSec? })`
 - `atc_snapshot({ action: "list" | "save" | "load" | "delete", name?, target?, force? })`
 - `atc_status({ type?, api?, services?, play? })` — returns `{ hostCapacity, fleet: { running, offline, creatable }, leases, queue }`
+- `atc_guide({ topic?: "workflow" | "profiles" | "snapshots" | "multi-agent" | "traps" })` — returns `{ topic, topics, text }`
 
 ---
 
@@ -451,6 +453,8 @@ atc/
 │   └── atc.mjs                        # Cross-platform CLI + Guard + Hook + MCP entrypoint
 ├── src/                               # Modular zero-dep ESM implementation
 │   ├── cli.mjs
+│   ├── guide.mjs                      # Built-in guide command & topic loader
+│   ├── guides/                        # Embedded Markdown guides (workflow, profiles, snapshots, multi-agent, traps)
 │   ├── lock.mjs
 │   ├── state.mjs
 │   ├── android.mjs
@@ -458,9 +462,13 @@ atc/
 │   ├── guard.mjs                      # Host-agnostic shell command classifier & rewriter
 │   ├── hook.mjs                       # Stdin JSON adapter for PreToolUse / Stop hooks
 │   └── mcp.mjs                        # Zero-dep JSON-RPC 2.0 Stdio MCP server
+├── docs/
+│   └── user-guide.md                  # End-to-end user & agent guide
 ├── skills/
 │   └── atc/
-│       └── SKILL.md                   # Universal agent skill (Codex, Pi, Cursor, Antigravity, Claude)
+│       ├── SKILL.md                   # Universal agent skill (Codex, Pi, Cursor, Antigravity, Claude)
+│       └── references/
+│           └── install.md             # CLI & multi-host plugin installation reference
 ├── extensions/
 │   └── atc/
 │       └── index.ts                   # Pi extension (`pi.on("tool_call")` -> `atc guard`)

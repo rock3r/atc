@@ -19,14 +19,18 @@
   "files": [
     "bin/",
     "src/",
+    "docs/",
+    "assets/",
     "skills/",
     "extensions/",
     "hooks/",
     ".codex-plugin/",
     ".cursor/",
     ".claude-plugin/",
+    ".mcp.json",
     "hooks.json",
     "plugin.json",
+    "privacy.md",
     "DESIGN.md",
     "README.md",
     "LICENSE"

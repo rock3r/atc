@@ -16,6 +16,7 @@ import {
   wipeAvdUserData,
 } from "./android.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
+import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
 import {
   isPidAlive,
@@ -46,6 +47,8 @@ import {
   syncLeaseWorkers,
   withStateTransaction,
 } from "./state.mjs";
+
+export { GUIDE_TOPICS, cmdGuide };
 
 function parseBoolFlag(val) {
   if (val === undefined || val === null) return false;
@@ -141,6 +144,8 @@ const STATUS_ALLOWED_FLAGS = new Set([
 ]);
 
 const GUARD_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "format"]);
+
+const GUIDE_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "topic"]);
 
 function camelToFlagName(key) {
   if (key.length === 1) return `-${key}`;
@@ -4067,9 +4072,24 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
   const stateDir = resolveStateDir(env.ATC_STATE_DIR);
 
   if (parsed.flags.help || parsed.flags.h || parsed.subcommand === "help") {
+    const helpTopic =
+      parsed.subcommand === "help" ? parsed.positionals[0] : parsed.subcommand;
+    if (helpTopic === "guide") {
+      process.stdout.write(
+        `Usage: atc guide [workflow|profiles|snapshots|multi-agent|traps] [--json]\n\n` +
+          `Without a topic, prints the workflow guide. Read it before your first claim.\n\n` +
+          `  workflow     claim -> exec -> snapshot -> free loop, rules, and done checklist\n` +
+          `  profiles     3-tier fleet discovery, profile flags, and physical device safety\n` +
+          `  snapshots    QEMU snapshots, wipe/cold/reset-app flags, and RAM/disk guardrails\n` +
+          `  multi-agent  session identity, warm-affinity queue, hooks, guard, and MCP\n` +
+          `  traps        common Android/ADB/multi-agent failure modes and how atc fixes them\n`,
+      );
+      return 0;
+    }
     process.stdout.write(
       `Android Traffic Control (atc)\n\n` +
         `Usage:\n` +
+        `  atc guide [workflow|profiles|snapshots|multi-agent|traps] [--json]\n` +
         `  atc claim [--type <type>] [--api <spec>] [--play|--no-play] [--snapshot-load <name>] [--ttl <sec>] [--wait <sec>]\n` +
         `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
         `  atc renew [<target>] [--ttl <sec>]\n` +
@@ -4086,6 +4106,39 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
   }
 
   switch (parsed.subcommand) {
+    case "guide": {
+      const unknownFlagErr = validateCommandFlags(parsed.flags, GUIDE_ALLOWED_FLAGS, "guide");
+      if (unknownFlagErr) {
+        process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
+      if (
+        parsed.positionals.length > 1 ||
+        (parsed.positionals.length > 0 && parsed.flags.topic !== undefined)
+      ) {
+        const extra =
+          parsed.positionals.length > 1 ? parsed.positionals[1] : parsed.positionals[0];
+        process.stderr.write(`[atc] Unexpected argument "${extra}" for "atc guide".\n`);
+        return 1;
+      }
+      const topicArg =
+        parsed.positionals[0] ||
+        (typeof parsed.flags.topic === "string" ? parsed.flags.topic : "workflow");
+      const res = cmdGuide(topicArg);
+      if (res.exitCode !== 0) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+        return res.exitCode;
+      }
+      if (parsed.flags.json) {
+        process.stdout.write(
+          JSON.stringify({ topic: res.topic, topics: res.topics, text: res.text }, null, 2) + "\n",
+        );
+      } else {
+        process.stdout.write(res.text.endsWith("\n") ? res.text : res.text + "\n");
+      }
+      return 0;
+    }
+
     case "claim": {
       if (parsed.positionals.length > 0) {
         process.stderr.write(

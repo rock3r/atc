@@ -1,5 +1,6 @@
 import readline from "node:readline";
 import { cmdClaim, cmdFree, cmdRenew, cmdSnapshot, cmdStatus } from "./cli.mjs";
+import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
 
 export const MCP_TOOLS = [
   {
@@ -86,6 +87,21 @@ export const MCP_TOOLS = [
         api: { type: "string" },
         services: { type: "string" },
         play: { type: "boolean" },
+      },
+    },
+  },
+  {
+    name: "atc_guide",
+    description:
+      "Read built-in Android Traffic Control (atc) guides on workflow, profile matching, snapshots, multi-agent coordination, and troubleshooting traps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          enum: [...GUIDE_TOPICS],
+          description: "Guide topic: workflow (default), profiles, snapshots, multi-agent, or traps",
+        },
       },
     },
   },
@@ -191,6 +207,8 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
       res = cmdSnapshot(stateDir, args.action, args.name || null, args, callOptions);
     } else if (toolName === "atc_status") {
       res = cmdStatus(stateDir, args, callOptions);
+    } else if (toolName === "atc_guide") {
+      res = cmdGuide(args.topic || "workflow");
     } else {
       return {
         jsonrpc: "2.0",

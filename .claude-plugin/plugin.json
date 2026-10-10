@@ -1,8 +1,23 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "atc",
+  "displayName": "Android Traffic Control",
   "version": "0.1.0",
-  "description": "Android Traffic Control — multi-agent Android emulator and device coordinator",
+  "description": "Coordinate exclusive Android emulator (AVD) and physical device leases across concurrent coding agents with the atc CLI, PreToolUse/SessionEnd hooks, and stdio MCP server.",
+  "author": {
+    "name": "Sebastiano Poggi"
+  },
+  "homepage": "https://specs.sebastiano.dev/atc/",
+  "repository": "https://github.com/rock3r/atc",
   "license": "Apache-2.0",
+  "keywords": [
+    "android",
+    "emulator",
+    "avd",
+    "adb",
+    "testing",
+    "multi-agent"
+  ],
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json"
 }

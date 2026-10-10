@@ -58,6 +58,7 @@ import {
   runCommandSync,
 } from "../src/spawn.mjs";
 import {
+  GUIDE_TOPICS,
   cmdClaim,
   cmdFree,
   cmdRenew,
@@ -66,6 +67,7 @@ import {
   cmdStatus,
   cmdConfig,
   cmdGuard,
+  cmdGuide,
   parseCliArgs,
   runCli,
   selectCandidateUnderLock,
@@ -6975,4 +6977,93 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
     fs.rmSync(avdHome, { recursive: true, force: true });
   }
 });
+
+test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_guide, and multi-host plugin packaging", async () => {
+  const dir = makeTempStateDir();
+  try {
+    // 1. Default topic is workflow, and all 5 canonical topics load cleanly
+    assert.deepEqual(GUIDE_TOPICS, ["workflow", "profiles", "snapshots", "multi-agent", "traps"]);
+    const defaultGuide = cmdGuide();
+    assert.equal(defaultGuide.exitCode, 0);
+    assert.equal(defaultGuide.topic, "workflow");
+    assert.match(defaultGuide.text, /# atc workflow guide/);
+
+    for (const topic of GUIDE_TOPICS) {
+      const res = cmdGuide(topic);
+      assert.equal(res.exitCode, 0);
+      assert.equal(res.topic, topic);
+      assert.deepEqual(res.topics, GUIDE_TOPICS);
+      assert.ok(res.text.length > 200, `Expected non-empty markdown for topic ${topic}`);
+    }
+
+    // 2. Convenient aliases resolve to canonical topics
+    assert.equal(cmdGuide("devices").topic, "profiles");
+    assert.equal(cmdGuide("snapshot").topic, "snapshots");
+    assert.equal(cmdGuide("queue").topic, "multi-agent");
+    assert.equal(cmdGuide("troubleshooting").topic, "traps");
+
+    // 3. Unknown guide topic returns exitCode 1 with actionable message
+    const badGuide = cmdGuide("nonexistent-topic");
+    assert.equal(badGuide.exitCode, 1);
+    assert.match(badGuide.error, /Unknown guide "nonexistent-topic": choose one of workflow, profiles, snapshots, multi-agent, traps/);
+
+    // 4. CLI runCli guide and help guide
+    const helpGuideExit = await runCli(["help", "guide"], { ATC_STATE_DIR: dir });
+    assert.equal(helpGuideExit, 0);
+    const guideJsonExit = await runCli(["guide", "traps", "--json"], { ATC_STATE_DIR: dir });
+    assert.equal(guideJsonExit, 0);
+    const guideExtraArgExit = await runCli(["guide", "workflow", "extra"], { ATC_STATE_DIR: dir });
+    assert.equal(guideExtraArgExit, 1);
+    const guideUnknownFlagExit = await runCli(["guide", "--bogus"], { ATC_STATE_DIR: dir });
+    assert.equal(guideUnknownFlagExit, 1);
+
+    // 5. MCP atc_guide tool is advertised in tools/list and callable via tools/call
+    const listResp = handleMcpRequest(dir, { jsonrpc: "2.0", id: 10, method: "tools/list", params: {} });
+    assert.ok(listResp.result.tools.some((t) => t.name === "atc_guide"));
+    const mcpGuideResp = handleMcpRequest(dir, {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "atc_guide", arguments: { topic: "profiles" } },
+    });
+    assert.equal(mcpGuideResp.result.isError, false);
+    const mcpGuidePayload = JSON.parse(mcpGuideResp.result.content[0].text);
+    assert.equal(mcpGuidePayload.exitCode, 0);
+    assert.equal(mcpGuidePayload.topic, "profiles");
+    assert.match(mcpGuidePayload.text, /Three-tier fleet discovery/);
+
+    // 6. Verify skill, user guide, and plugin manifests exist and are valid
+    const rootDir = new URL("../", import.meta.url);
+    const skillText = fs.readFileSync(new URL("skills/atc/SKILL.md", rootDir), "utf8");
+    assert.match(skillText, /atc guide/);
+    const installRefText = fs.readFileSync(new URL("skills/atc/references/install.md", rootDir), "utf8");
+    assert.match(installRefText, /npm install -g android-traffic-control/);
+    const userGuideText = fs.readFileSync(new URL("docs/user-guide.md", rootDir), "utf8");
+    assert.match(userGuideText, /# `atc` user guide/);
+    assert.match(userGuideText, /atc guide/);
+
+    const agentPlugin = JSON.parse(fs.readFileSync(new URL("plugin.json", rootDir), "utf8"));
+    assert.equal(agentPlugin.name, "atc");
+    assert.equal(agentPlugin.skills, "./skills/");
+    assert.equal(agentPlugin.hooks, "./hooks/hooks.json");
+
+    const claudePlugin = JSON.parse(fs.readFileSync(new URL(".claude-plugin/plugin.json", rootDir), "utf8"));
+    assert.equal(claudePlugin.name, "atc");
+    assert.equal(claudePlugin.skills, "./skills/");
+
+    const marketplace = JSON.parse(fs.readFileSync(new URL(".claude-plugin/marketplace.json", rootDir), "utf8"));
+    assert.equal(marketplace.name, "atc");
+    assert.ok(Array.isArray(marketplace.plugins) && marketplace.plugins[0].name === "atc");
+
+    const codexPlugin = JSON.parse(fs.readFileSync(new URL(".codex-plugin/plugin.json", rootDir), "utf8"));
+    assert.equal(codexPlugin.name, "atc");
+    assert.equal(codexPlugin.mcpServers, "./.mcp.json");
+
+    const mcpManifest = JSON.parse(fs.readFileSync(new URL(".mcp.json", rootDir), "utf8"));
+    assert.equal(mcpManifest.mcpServers.atc.command, "atc");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 

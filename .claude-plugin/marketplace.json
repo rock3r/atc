@@ -1,13 +1,23 @@
 {
-  "name": "atc-marketplace",
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "atc",
   "owner": {
     "name": "Sebastiano Poggi"
   },
+  "description": "Android Traffic Control for coding agents: exclusive Android emulator and physical device leases, warm-affinity queueing, and multi-agent guardrails.",
   "plugins": [
     {
       "name": "atc",
       "source": "./",
-      "description": "Android Traffic Control — multi-agent Android emulator and device coordinator"
+      "description": "Coordinate exclusive Android emulator (AVD) and physical device leases across concurrent coding agents with the atc CLI, hooks, and MCP server.",
+      "category": "Development",
+      "tags": [
+        "android",
+        "emulator",
+        "adb",
+        "testing",
+        "multi-agent"
+      ]
     }
   ]
 }

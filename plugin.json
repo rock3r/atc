@@ -1,8 +1,48 @@
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "atc",
   "version": "0.1.0",
-  "description": "Android Traffic Control — multi-agent Android emulator and device coordinator",
+  "description": "Coordinate exclusive Android emulator (AVD) and physical device leases across concurrent coding agents with the atc CLI, PreToolUse/SessionEnd hooks, and stdio MCP server.",
+  "author": {
+    "name": "Sebastiano Poggi"
+  },
+  "homepage": "https://specs.sebastiano.dev/atc/",
+  "repository": "https://github.com/rock3r/atc",
   "license": "Apache-2.0",
+  "keywords": [
+    "android",
+    "emulator",
+    "avd",
+    "adb",
+    "testing",
+    "multi-agent"
+  ],
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json"
+  "hooks": "./hooks/hooks.json",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Android Traffic Control",
+        "shortDescription": "Exclusive Android emulator & device leases",
+        "longDescription": "Coordinate exclusive Android Virtual Device (AVD) and physical USB/Wi-Fi device leases across concurrent coding agents with profile matching, QEMU snapshots, bounded-window warm-affinity queueing, host RAM/disk guardrails, and scoped atc exec heartbeats.",
+        "developerName": "Sebastiano Poggi",
+        "category": "Developer Tools",
+        "websiteURL": "https://specs.sebastiano.dev/atc/",
+        "supportURL": "https://github.com/rock3r/atc/issues",
+        "privacyPolicyURL": "https://github.com/rock3r/atc/blob/main/privacy.md",
+        "capabilities": [
+          "Claim and release exclusive Android emulator or device leases",
+          "Run adb, Gradle connectedCheck, and android CLI commands with lease heartbeats",
+          "Save, restore, and reset QEMU emulator snapshots",
+          "Enforce multi-agent guardrails and warm-affinity queueing"
+        ],
+        "composerIcon": "./assets/icon.svg",
+        "logo": "./assets/logo.svg",
+        "defaultPrompt": [
+          "Claim an API 36 phone emulator with Play Store and run connectedDebugAndroidTest.",
+          "Check available Android emulators and active leases with atc status."
+        ]
+      }
+    }
+  }
 }

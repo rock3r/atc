@@ -1,26 +1,39 @@
 ---
 name: atc
-description: Coordinate shared Android emulator and physical device leases across concurrent coding agents using Android Traffic Control (atc). Use before running adb, gradle connectedCheck, or android emulator commands.
+description: Coordinate exclusive Android emulator (AVD) and physical USB/Wi-Fi device leases across concurrent coding agents with the `atc` CLI — profile-based claims, QEMU snapshots, bounded-window warm-affinity queueing, and `atc exec` lease heartbeats. Use before running `adb`, `./gradlew connected*`, `android layout`, or any Android device/emulator command.
+license: Apache-2.0
+compatibility: Needs Node.js >= 20 on macOS, Linux, or Windows, and the Android SDK (`adb`, `emulator`, and/or the official `android` CLI) for live fleet discovery.
+metadata:
+  version: "0.1.0"
+  author: "Sebastiano Poggi"
 ---
 
 # Android Traffic Control (`atc`)
 
-Always coordinate Android emulator and physical device access through `atc` so concurrent agent sessions do not collide on the same `ANDROID_SERIAL`, corrupt snapshots, or exhaust host RAM.
+The `atc` CLI coordinates Android emulators and physical test devices and carries its own built-in guides. This skill gets you started.
 
-## Golden Rules
-
-1. **Never run `adb` or `emulator` without an active `atc` lease.**
-2. **Use `atc exec` for test runs or one-off commands** — it automatically sets `ANDROID_SERIAL=<serial>`, injects `--device=<serial>` for `android` CLI commands, and renews the lease heartbeat in the background every 15 seconds while the command runs (install globally via `npm install -g android-traffic-control` or invoke via `npx --package android-traffic-control atc ...`):
+1. Run `atc status`.
+   - `atc: command not found`: ask the user, then install it as [references/install.md](references/install.md) says (`npm install -g android-traffic-control`).
+   - Check `Host Capacity` (`slots: X/Y used`, available RAM, free disk), `Running` devices, `Offline` AVDs, and active `Leases` / `Queue`.
+2. Run `atc guide` and follow it. It covers the claim-exec-free workflow, rules, and a done checklist.
+   - Read `atc guide profiles` when choosing `--type`, `--api`, `--play`/`--no-play`, or claiming a physical USB/Wi-Fi phone (`--serial <id>` / `--kind physical`).
+   - Read `atc guide snapshots` before restoring/saving QEMU snapshots (`--snapshot-load`, `atc snapshot`), wiping data (`--wipe-data`), or handling exit code `5` (`ERESOURCE_EXCEEDED`).
+   - Read `atc guide multi-agent` when waiting in the queue (`--wait`), passing `--session <id>`, or using `atc mcp`.
+   - Read `atc guide traps` when diagnosing `more than one device/emulator`, shell loop variable expansion, or stale `.avd/*.lock` files.
+3. Claim a device before running any Android command:
    ```bash
-   atc exec --session builder-1 -- ./gradlew connectedDebugAndroidTest
-   atc exec --session builder-1 -- adb shell am start -n com.example/.MainActivity
+   atc claim --type phone --api ">=35" --play --wait 300
    ```
-3. **Or claim explicitly when running multiple interactive steps:**
+   Never start, boot, stop, or wipe an emulator directly (`emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`). Default claims target emulators (`--kind emulator`) so you never hijack a developer's personal USB phone unless explicitly asked.
+4. Run every device or instrumentation command through `atc exec`:
    ```bash
-   atc claim --session builder-1 --api 35 --type phone --json
+   atc exec -- adb shell getprop ro.product.model
+   atc exec -- android layout --pretty
+   atc exec -- ./gradlew connectedDebugAndroidTest
    ```
-   When finished, release the lease immediately:
+   `atc exec` injects `ANDROID_SERIAL=<serial>` and `--device=<serial>`, tracks the worker process group, and renews the lease every 15 seconds while the command runs.
+5. Free the lease as soon as your task finishes:
    ```bash
-   atc free --session builder-1
+   atc free
    ```
-4. **Never start, boot, kill, or wipe an emulator directly** (`emulator -avd ...`, `adb emu kill`, `android emulator start`). Let `atc claim` and `atc free --stop` manage device lifecycle and clean snapshots (`atc-clean-base`).
+   Leaving the emulator warm lets the next queued agent claim it in under 20 ms (`Tier 0`). Pass `atc free --stop` only when shutting down a specialized cold-booted AVD that other sessions will not reuse.
