@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Worker } from "node:worker_threads";
 
 import {
   acquireLock,
@@ -4252,7 +4253,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
   }
 });
 
-test("regression: Astra review hardening (rollback stopping state, stale lock breaker serialization, auto-create baseline isolation, Windows shutdown wait, and ADB post-subcommand -s)", () => {
+test("regression: Astra review hardening (rollback stopping state, stale lock breaker serialization, auto-create baseline isolation, Windows shutdown wait, and ADB post-subcommand -s)", async () => {
   const dir = makeTempStateDir();
   const avdHome = makeTempStateDir();
   try {
@@ -4964,6 +4965,118 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         assert.equal(hbSyncClaim.lease?.serial, "emulator-5578");
       } finally {
         fs.rmSync(hbSyncDir, { recursive: true, force: true });
+      }
+
+      // 14. Ownerless lock directory containing an abandoned owner.json.tmp.* file is safely recovered
+      const abandonedTmpDir = makeTempStateDir();
+      try {
+        const lockDirPath = path.join(abandonedTmpDir, "atc.lock");
+        fs.mkdirSync(lockDirPath, { recursive: true, mode: 0o700 });
+        const abandonedTmpFile = path.join(
+          lockDirPath,
+          `owner.json.tmp.${process.pid}.abandoned-nonce`,
+        );
+        fs.writeFileSync(abandonedTmpFile, '{"pid":99999999,"nonce":"partial"', "utf8");
+        const pastSec = Math.floor((Date.now() - 10_000) / 1000);
+        fs.utimesSync(abandonedTmpFile, pastSec, pastSec);
+        fs.utimesSync(lockDirPath, pastSec, pastSec);
+
+        const recoveredFromTmp = acquireLock(abandonedTmpDir, 3500);
+        assert.ok(recoveredFromTmp.nonce);
+        assert.equal(verifyLockOwnership(recoveredFromTmp), true);
+        assert.equal(fs.existsSync(abandonedTmpFile), false);
+        releaseLock(recoveredFromTmp);
+      } finally {
+        fs.rmSync(abandonedTmpDir, { recursive: true, force: true });
+      }
+
+      // 15. Concurrent stale-lock breakers cannot remove a newly acquired lock
+      const raceLockDir = makeTempStateDir();
+      try {
+        const lockModUrl = new URL("../src/lock.mjs", import.meta.url).href;
+        for (let round = 0; round < 3; round++) {
+          const staleLockPath = path.join(raceLockDir, "atc.lock");
+          fs.mkdirSync(staleLockPath, { recursive: true, mode: 0o700 });
+          fs.writeFileSync(
+            path.join(staleLockPath, "owner.json"),
+            JSON.stringify({
+              pid: 99999999,
+              createdAtMs: Date.now() - 60_000,
+              staleAfterMs: 10_000,
+              nonce: `stale-round-${round}`,
+            }),
+            "utf8",
+          );
+
+          const workerCount = 5;
+          const sab = new SharedArrayBuffer(16);
+          const syncView = new Int32Array(sab);
+          // syncView[0] = ready count, syncView[1] = go flag, syncView[2] = active holders, syncView[3] = max concurrent holders
+          const workerCode = `
+            import { workerData, parentPort } from "node:worker_threads";
+            const { acquireLock, verifyLockOwnership, releaseLock, sleepSync } = await import(workerData.lockModUrl);
+            const view = new Int32Array(workerData.sab);
+            Atomics.add(view, 0, 1);
+            Atomics.notify(view, 0);
+            while (Atomics.load(view, 1) === 0) {
+              Atomics.wait(view, 1, 0, 50);
+            }
+            const handle = acquireLock(workerData.stateDir, 6000);
+            const activeNow = Atomics.add(view, 2, 1) + 1;
+            let prevMax = Atomics.load(view, 3);
+            while (activeNow > prevMax) {
+              Atomics.compareExchange(view, 3, prevMax, activeNow);
+              prevMax = Atomics.load(view, 3);
+            }
+            const ownedStart = verifyLockOwnership(handle);
+            sleepSync(60);
+            const ownedEnd = verifyLockOwnership(handle);
+            Atomics.sub(view, 2, 1);
+            releaseLock(handle);
+            parentPort.postMessage({ ownedStart, ownedEnd, nonce: handle.nonce });
+          `;
+
+          const workers = [];
+          const resultsPromise = Promise.all(
+            Array.from({ length: workerCount }, () => {
+              return new Promise((resolve, reject) => {
+                const w = new Worker(workerCode, {
+                  eval: true,
+                  workerData: {
+                    lockModUrl,
+                    stateDir: raceLockDir,
+                    sab,
+                  },
+                });
+                workers.push(w);
+                w.once("message", resolve);
+                w.once("error", reject);
+                w.once("exit", (code) => {
+                  if (code !== 0) {
+                    reject(new Error(`Lock contender worker exited with code ${code}`));
+                  }
+                });
+              });
+            }),
+          );
+
+          while (Atomics.load(syncView, 0) < workerCount) {
+            Atomics.wait(syncView, 0, Atomics.load(syncView, 0), 20);
+          }
+          Atomics.store(syncView, 1, 1);
+          Atomics.notify(syncView, 1, workerCount);
+
+          const workerResults = await resultsPromise;
+          assert.equal(workerResults.length, workerCount);
+          assert.equal(Atomics.load(syncView, 3), 1, "At most 1 contender may hold the lock at a time");
+          for (const r of workerResults) {
+            assert.equal(r.ownedStart, true);
+            assert.equal(r.ownedEnd, true);
+            assert.notEqual(r.nonce, `stale-round-${round}`);
+          }
+        }
+      } finally {
+        fs.rmSync(raceLockDir, { recursive: true, force: true });
       }
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
