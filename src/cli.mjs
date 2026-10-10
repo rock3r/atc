@@ -436,7 +436,8 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
     let hasLockFiles = false;
     if (avd && avdHome) {
       try {
-        const avdDir = path.join(avdHome, `${avd}.avd`);
+        const meta = readLocalAvdMetadata(avd, avdHome);
+        const avdDir = meta.avdPath || path.join(avdHome, `${avd}.avd`);
         if (fs.existsSync(avdDir)) {
           hasLockFiles = fs
             .readdirSync(avdDir)
@@ -1683,6 +1684,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         },
         bootTimeoutMs || 180_000,
         "atc.create.lock",
+        bootTimeoutMs || 180_000,
       );
     }
 

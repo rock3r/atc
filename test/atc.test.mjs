@@ -4336,6 +4336,29 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         /Lock ownership nonce lost before state\.json commit/,
       );
       fs.rmSync(lockInfo.lockDir, { recursive: true, force: true });
+      // Malformed owner.json is recovered after MISSING_OWNER_STALE_MS
+      fs.mkdirSync(path.join(lockTestDir, "atc.lock"), { recursive: true });
+      fs.writeFileSync(path.join(lockTestDir, "atc.lock", "owner.json"), "{corrupt-json");
+      const recoveredLock = acquireLock(lockTestDir, 3500);
+      assert.ok(recoveredLock.nonce);
+      releaseLock(recoveredLock);
+
+      // Extended staleAfterMs (used by atc.create.lock) prevents breaking a live owner's lock after 10s
+      fs.mkdirSync(path.join(lockTestDir, "atc.create.lock"), { recursive: true });
+      fs.writeFileSync(
+        path.join(lockTestDir, "atc.create.lock", "owner.json"),
+        JSON.stringify({
+          pid: process.pid,
+          createdAtMs: Date.now() - 25_000,
+          staleAfterMs: 180_000,
+          nonce: "live-long-create",
+        }),
+      );
+      assert.throws(
+        () => acquireLock(lockTestDir, 150, "atc.create.lock", 180_000),
+        /Timed out waiting/,
+      );
+      fs.rmSync(path.join(lockTestDir, "atc.create.lock"), { recursive: true, force: true });
     } finally {
       fs.rmSync(lockTestDir, { recursive: true, force: true });
     }
@@ -4393,11 +4416,16 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       fs.rmSync(createIsoDir, { recursive: true, force: true });
     }
 
-    // 4. Windows adb emu kill waits for emulator to go offline and release .lock files
+    // 4. Windows adb emu kill waits for emulator to go offline and release .lock files (including relocated AVDs via .ini path=)
     const winShutdownDir = makeTempStateDir();
+    const relocatedRoot = makeTempStateDir();
     try {
-      const winAvdDir = path.join(avdHome, "Pixel_Win_API_35.avd");
+      const winAvdDir = path.join(relocatedRoot, "Custom_Relocated_Win.avd");
       fs.mkdirSync(winAvdDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(avdHome, "Pixel_Win_API_35.ini"),
+        `avd.ini.encoding=UTF-8\npath=${winAvdDir}\ntarget=android-35\n`,
+      );
       const lockFile = path.join(winAvdDir, "hardware-qemu.ini.lock");
       fs.writeFileSync(lockFile, "locked");
 
@@ -4460,6 +4488,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       assert.ok(adbPollCount >= 2);
     } finally {
       fs.rmSync(winShutdownDir, { recursive: true, force: true });
+      fs.rmSync(relocatedRoot, { recursive: true, force: true });
     }
 
     // 5. ADB payload arguments (-s after subcommand) are not mistaken for device selectors
