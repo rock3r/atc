@@ -10,6 +10,7 @@ import {
   acquireLock,
   clearKnownWindowsTreeDescendants,
   getKnownWindowsTreeDescendants,
+  getKnownWindowsTreePids,
   hasAliveProcessInGroup,
   isProcessGroupAlive,
   killProcessGroupTree,
@@ -23,6 +24,8 @@ import {
   writeFileAtomic,
 } from "../src/lock.mjs";
 import {
+  addLeaseWorker,
+  archiveWindowsProcessGroupGeneration,
   avdHasRuntimeLockFiles,
   offlineAvdHasRuntimeLockFiles,
   createDefaultState,
@@ -38,6 +41,7 @@ import {
   canJumpAhead,
   isTicketStarvationProtected,
   resolveSessionIdentity,
+  syncLeaseWorkers,
   withStateTransaction,
 } from "../src/state.mjs";
 import {
@@ -8279,6 +8283,110 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       readarrayDefaultRedir.rewrittenCommand,
       /do __atc_arr_MAPFILE_0="\$\{MAPFILE\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_MAPFILE_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
     );
+
+    // 1o. Windows process-group generation archiving isolates reused leader PID across worker generations
+    {
+      const genLeaderPgid = 820001;
+      const oldGenChildPid = 820002;
+      const newGenChildPid = 820003;
+      const gen1Creation = "20261010231000.000000+000";
+      const gen1ChildCreation = "20261010231001.000000+000";
+      const gen2Creation = "20261010232000.000000+000";
+      const gen2ChildCreation = "20261010232001.000000+000";
+      const gen1ArchiveKey = `${genLeaderPgid}@${gen1Creation}`;
+      clearKnownWindowsTreeDescendants(genLeaderPgid);
+      clearKnownWindowsTreeDescendants(gen1ArchiveKey);
+      try {
+        const genLease = {
+          leaseId: "lease_win_gen",
+          deviceKey: "avd:Pixel_Gen",
+          workerPids: [genLeaderPgid],
+          workerPid: genLeaderPgid,
+          workerPgids: [genLeaderPgid],
+          workerDescendants: {
+            [String(genLeaderPgid)]: [
+              { pid: genLeaderPgid, creationDate: gen1Creation, alive: false },
+              { pid: oldGenChildPid, creationDate: gen1ChildCreation, alive: true },
+            ],
+          },
+        };
+        seedWindowsKnownDescendants(genLease.workerDescendants);
+
+        // New worker spawns reusing numeric PID 820001 with gen2Creation while oldGenChildPid (820002) is still running
+        const archivedKey = archiveWindowsProcessGroupGeneration(genLeaderPgid);
+        assert.equal(archivedKey, gen1ArchiveKey);
+
+        const gen2Snapshot = [
+          { ProcessId: genLeaderPgid, ParentProcessId: 4000, CreationDate: gen2Creation },
+          { ProcessId: newGenChildPid, ParentProcessId: genLeaderPgid, CreationDate: gen2ChildCreation },
+          { ProcessId: oldGenChildPid, ParentProcessId: 1, CreationDate: gen1ChildCreation },
+        ];
+        queryWindowsProcessGroups(
+          [gen1ArchiveKey, genLeaderPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify(gen2Snapshot),
+            stderr: "",
+          }),
+          { knownDescendants: genLease.workerDescendants },
+        );
+
+        addLeaseWorker(
+          genLease,
+          genLeaderPgid,
+          (pid) => [genLeaderPgid, oldGenChildPid, newGenChildPid].includes(pid),
+          { isProcessGroup: true, freshGeneration: true },
+        );
+
+        assert.ok(
+          genLease.workerPgids.includes(gen1ArchiveKey) &&
+            genLease.workerPgids.includes(genLeaderPgid),
+          `Expected lease.workerPgids to track both archived ${gen1ArchiveKey} and current ${genLeaderPgid}, got ${JSON.stringify(genLease.workerPgids)}`,
+        );
+        assert.deepEqual(
+          getKnownWindowsTreeDescendants(genLeaderPgid).map((e) => e.pid).sort((a, b) => a - b),
+          [genLeaderPgid, newGenChildPid],
+          "Current generation tree must contain new root and new child, not old generation descendant",
+        );
+        assert.deepEqual(
+          getKnownWindowsTreePids(gen1ArchiveKey, { liveOnly: true }),
+          [oldGenChildPid],
+          "Archived generation tree must retain only the surviving old generation descendant",
+        );
+
+        // Signal forwarding / cleanup for the new worker (numeric genLeaderPgid) terminates only gen2 and spares oldGenChildPid
+        const killedGen2Pids = [];
+        killProcessGroupTree(genLeaderPgid, "SIGTERM", {
+          platform: "win32",
+          runner: (cmd, args) => {
+            if (cmd === "powershell.exe") {
+              return {
+                status: 0,
+                stdout: JSON.stringify(gen2Snapshot),
+                stderr: "",
+              };
+            }
+            if (cmd === "taskkill") {
+              for (let i = 0; i < args.length; i += 1) {
+                if (args[i] === "/PID") {
+                  killedGen2Pids.push(Number(args[i + 1]));
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        });
+        assert.deepEqual(
+          killedGen2Pids.sort((a, b) => a - b),
+          [genLeaderPgid, newGenChildPid],
+          "Terminating new worker generation must kill new root and new child without killing old generation descendant",
+        );
+      } finally {
+        clearKnownWindowsTreeDescendants(genLeaderPgid);
+        clearKnownWindowsTreeDescendants(gen1ArchiveKey);
+      }
+    }
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

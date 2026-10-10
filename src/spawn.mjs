@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  archiveWindowsProcessGroupGeneration,
   hasAliveProcessInGroup,
   isProcessGroupAlive,
   killProcessGroupTree,
@@ -668,9 +669,12 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
     const childPid = child.pid || null;
+    if (childPid && (options.platform || process.platform) === "win32") {
+      archiveWindowsProcessGroupGeneration(childPid);
+    }
     if (childPid && typeof options.onChildSpawn === "function") {
       try {
-        options.onChildSpawn(childPid, { isProcessGroup: true });
+        options.onChildSpawn(childPid, { isProcessGroup: true, freshGeneration: true });
       } catch {
         // Best-effort worker registration
       }

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  archiveWindowsProcessGroupGeneration,
   canSweepBreakClaimDir,
   clearKnownWindowsTreeDescendants,
   getKnownWindowsTreeDescendants,
@@ -24,6 +25,7 @@ import {
 } from "./lock.mjs";
 
 export {
+  archiveWindowsProcessGroupGeneration,
   clearKnownWindowsTreeDescendants,
   getKnownWindowsTreeDescendants,
   getKnownWindowsTreePids,
@@ -391,8 +393,83 @@ export function sweepOrphanFiles(stateDir, now = Date.now()) {
   }
 }
 
+function isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck = isPidAlive) {
+  if (typeof pgKey === "string" && pgKey.includes("@")) {
+    return hasAliveProcessInGroup(pgKey.trim(), {
+      allowSubprocess: false,
+      knownDescendants: lease?.workerDescendants,
+      livenessCheck,
+    });
+  }
+  const pid = Number(pgKey);
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  const hasWindowsDescendantEntry = Boolean(lease?.workerDescendants?.[String(pid)]);
+  return livenessCheck === isPidAlive || hasWindowsDescendantEntry
+    ? hasAliveProcessInGroup(pid, {
+        allowSubprocess: false,
+        knownDescendants: lease?.workerDescendants,
+        livenessCheck,
+      })
+    : livenessCheck(pid) ||
+        hasAliveProcessInGroup(pid, {
+          allowSubprocess: false,
+          knownDescendants: lease?.workerDescendants,
+          livenessCheck,
+        });
+}
+
+function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
+  if (!lease?.workerDescendants || typeof lease.workerDescendants !== "object") {
+    if (freshPid) {
+      archiveWindowsProcessGroupGeneration(freshPid);
+    }
+    return;
+  }
+  for (const [key, prevEntries] of Object.entries({ ...lease.workerDescendants })) {
+    if (key.includes("@") || !Array.isArray(prevEntries) || prevEntries.length === 0) {
+      continue;
+    }
+    const numericPid = Number(key);
+    if (!Number.isInteger(numericPid) || numericPid <= 1) continue;
+    const prevRoot = prevEntries.find(
+      (e) => e && typeof e === "object" && Number(e.pid ?? e.ProcessId) === numericPid,
+    );
+    const prevRootCreation =
+      prevRoot?.creationDate && prevRoot.creationDate !== "__exited__"
+        ? String(prevRoot.creationDate)
+        : null;
+    if (!prevRootCreation) continue;
+    const archiveKey = `${numericPid}@${prevRootCreation}`;
+    const archivedKnown = getKnownWindowsTreeDescendants(archiveKey);
+    const curKnown = getKnownWindowsTreeDescendants(numericPid);
+    const curRoot = curKnown.find((e) => Number(e?.pid) === numericPid);
+    const curRootCreation =
+      curRoot?.creationDate && curRoot.creationDate !== "__exited__"
+        ? String(curRoot.creationDate)
+        : null;
+    if (freshPid === numericPid && curRootCreation === prevRootCreation) {
+      archiveWindowsProcessGroupGeneration(numericPid);
+    }
+    const isNewGeneration =
+      archivedKnown.length > 0 ||
+      (curRootCreation && curRootCreation !== prevRootCreation) ||
+      freshPid === numericPid;
+    if (isNewGeneration) {
+      lease.workerDescendants[archiveKey] = prevEntries;
+      delete lease.workerDescendants[key];
+      seedWindowsKnownDescendants(archiveKey, prevEntries);
+      const pgids = Array.isArray(lease.workerPgids) ? [...lease.workerPgids] : [];
+      if (!pgids.includes(archiveKey)) {
+        pgids.push(archiveKey);
+      }
+      lease.workerPgids = pgids;
+    }
+  }
+}
+
 export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
   if (!lease || typeof lease !== "object") return [];
+  reconcileLeaseWindowsGenerations(lease);
   if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
     seedWindowsKnownDescendants(lease.workerDescendants);
   }
@@ -403,32 +480,28 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
   if (lease.workerPid !== null && lease.workerPid !== undefined) {
     raw.push(lease.workerPid);
   }
-  const pgidSet = new Set(
-    Array.isArray(lease.workerPgids)
-      ? lease.workerPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
-      : [],
-  );
+  const pgidEntries = Array.isArray(lease.workerPgids) ? lease.workerPgids : [];
+  for (const pgKey of pgidEntries) {
+    const numPid = Number(String(pgKey).split("@")[0]);
+    if (Number.isInteger(numPid) && numPid > 1) {
+      raw.push(numPid);
+    }
+  }
   const seen = new Set();
   const alive = [];
   for (const val of raw) {
     const pid = Number(val);
     if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
     seen.add(pid);
-    const hasWindowsDescendantEntry = Boolean(lease.workerDescendants?.[String(pid)]);
-    const isAlive = pgidSet.has(pid)
-      ? livenessCheck === isPidAlive || hasWindowsDescendantEntry
-        ? hasAliveProcessInGroup(pid, {
-            allowSubprocess: false,
-            knownDescendants: lease.workerDescendants,
-            livenessCheck,
-          })
-        : livenessCheck(pid) ||
-          hasAliveProcessInGroup(pid, {
-            allowSubprocess: false,
-            knownDescendants: lease.workerDescendants,
-            livenessCheck,
-          })
-      : livenessCheck(pid);
+    const matchingPgids = pgidEntries.filter(
+      (p) => Number(String(p).split("@")[0]) === pid,
+    );
+    const isAlive =
+      matchingPgids.length > 0
+        ? matchingPgids.some((pgKey) =>
+            isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck),
+          )
+        : livenessCheck(pid);
     if (isAlive) {
       alive.push(pid);
     }
@@ -448,13 +521,15 @@ function syncLeaseWindowsDescendants(lease) {
       ? lease.workerDescendants
       : {};
   for (const rawPgid of lease.workerPgids) {
-    const pgid = Number(rawPgid);
-    if (!Number.isInteger(pgid) || pgid <= 1) continue;
-    const known = getKnownWindowsTreeDescendants(pgid);
+    const isQualified = typeof rawPgid === "string" && rawPgid.includes("@");
+    const keyStr = isQualified ? rawPgid.trim() : String(Number(rawPgid));
+    const numPid = Number(keyStr.split("@")[0]);
+    if (!Number.isInteger(numPid) || numPid <= 1) continue;
+    const known = getKnownWindowsTreeDescendants(isQualified ? keyStr : numPid);
     if (known.length > 0) {
-      nextDesc[String(pgid)] = known;
-    } else if (Array.isArray(prevDesc[String(pgid)]) && prevDesc[String(pgid)].length > 0) {
-      nextDesc[String(pgid)] = prevDesc[String(pgid)];
+      nextDesc[keyStr] = known;
+    } else if (Array.isArray(prevDesc[keyStr]) && prevDesc[keyStr].length > 0) {
+      nextDesc[keyStr] = prevDesc[keyStr];
     }
   }
   if (Object.keys(nextDesc).length > 0) {
@@ -468,10 +543,9 @@ export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   lease.workerPids = alive;
   if (Array.isArray(lease.workerPgids)) {
-    const aliveSet = new Set(alive);
     lease.workerPgids = lease.workerPgids
-      .map(Number)
-      .filter((p) => aliveSet.has(p));
+      .map((p) => (typeof p === "string" && p.includes("@") ? p.trim() : Number(p)))
+      .filter((pgKey) => isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck));
     if (lease.workerPgids.length === 0) {
       delete lease.workerPgids;
     }
@@ -482,8 +556,14 @@ export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
 }
 
 export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options = {}) {
-  const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   const numericPid = Number(pid);
+  if (options.isProcessGroup && Number.isInteger(numericPid) && numericPid > 1) {
+    reconcileLeaseWindowsGenerations(
+      lease,
+      options.freshGeneration ? numericPid : null,
+    );
+  }
+  const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   if (Number.isInteger(numericPid) && numericPid > 0 && !alive.includes(numericPid)) {
     alive.push(numericPid);
   }
@@ -504,21 +584,37 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
 }
 
 export function removeLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
-  const numericPid = Number(pid);
+  const isQualified = typeof pid === "string" && pid.includes("@");
+  const keyStr = isQualified ? pid.trim() : null;
+  const numericPid = Number(isQualified ? keyStr.split("@")[0] : pid);
   if (Array.isArray(lease.workerPgids)) {
-    lease.workerPgids = lease.workerPgids.filter((p) => Number(p) !== numericPid);
+    lease.workerPgids = lease.workerPgids.filter((p) => {
+      if (isQualified) {
+        return String(p).trim() !== keyStr;
+      }
+      if (typeof p === "string" && p.includes("@")) {
+        return true;
+      }
+      return Number(p) !== numericPid;
+    });
     if (lease.workerPgids.length === 0) {
       delete lease.workerPgids;
     }
   }
-  clearKnownWindowsTreeDescendants(numericPid);
+  clearKnownWindowsTreeDescendants(isQualified ? keyStr : numericPid);
   if (lease?.workerDescendants && typeof lease.workerDescendants === "object") {
-    delete lease.workerDescendants[String(numericPid)];
+    delete lease.workerDescendants[isQualified ? keyStr : String(numericPid)];
     if (Object.keys(lease.workerDescendants).length === 0) {
       delete lease.workerDescendants;
     }
   }
-  const alive = getLiveLeaseWorkerPids(lease, livenessCheck).filter((p) => p !== numericPid);
+  if (Array.isArray(lease?.workerPids)) {
+    lease.workerPids = lease.workerPids.filter((p) => Number(p) !== numericPid);
+  }
+  if (Number(lease?.workerPid) === numericPid) {
+    lease.workerPid = null;
+  }
+  const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   lease.workerPids = alive;
   syncLeaseWindowsDescendants(lease);
   lease.workerPid = alive[0] ?? null;
@@ -1135,44 +1231,90 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     getAncestorPids(options.ppid ?? process.ppid);
   }
   let pgidSnapshot = null;
-  const terminatedSet = new Set(
-    Array.isArray(options.terminatedPgids)
-      ? options.terminatedPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
+  const terminatedSet = new Set();
+  if (Array.isArray(options.terminatedPgids)) {
+    for (const p of options.terminatedPgids) {
+      if (typeof p === "string" && p.includes("@")) {
+        const trimmed = p.trim();
+        const num = Number(trimmed.split("@")[0]);
+        if (Number.isInteger(num) && num > 1) {
+          terminatedSet.add(trimmed);
+        }
+      } else {
+        const num = Number(p);
+        if (Number.isInteger(num) && num > 1) {
+          terminatedSet.add(num);
+        }
+      }
+    }
+  }
+  const isTerminatedKey = (rawKey) => {
+    if (typeof rawKey === "string" && rawKey.includes("@")) {
+      return terminatedSet.has(rawKey.trim());
+    }
+    return terminatedSet.has(Number(rawKey));
+  };
+  const freshGenerationSet = new Set(
+    Array.isArray(options.freshGenerationPgids)
+      ? options.freshGenerationPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
       : [],
   );
+  for (const freshPid of freshGenerationSet) {
+    archiveWindowsProcessGroupGeneration(freshPid);
+  }
   try {
     const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
+    const pgids = [];
+    const knownDescendants = {};
     if (preRaw) {
       const preParsed = JSON.parse(preRaw);
-      const pgids = [];
-      const knownDescendants = {};
       for (const lease of Object.values(preParsed?.leases || {})) {
         if (!lease || typeof lease !== "object") continue;
         if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
           for (const [k, v] of Object.entries(lease.workerDescendants)) {
-            if (!terminatedSet.has(Number(k))) {
-              knownDescendants[k] = v;
+            if (isTerminatedKey(k)) continue;
+            if (!k.includes("@") && freshGenerationSet.has(Number(k)) && Array.isArray(v)) {
+              const numPid = Number(k);
+              const prevRoot = v.find(
+                (e) => e && typeof e === "object" && Number(e.pid ?? e.ProcessId) === numPid,
+              );
+              const prevRootCreation =
+                prevRoot?.creationDate && prevRoot.creationDate !== "__exited__"
+                  ? String(prevRoot.creationDate)
+                  : null;
+              if (prevRootCreation) {
+                const archiveKey = `${numPid}@${prevRootCreation}`;
+                knownDescendants[archiveKey] = v;
+                pgids.push(archiveKey);
+                continue;
+              }
             }
+            knownDescendants[k] = v;
           }
         }
         if (Array.isArray(lease.workerPgids)) {
           for (const p of lease.workerPgids) {
-            if (!terminatedSet.has(Number(p))) {
+            if (!isTerminatedKey(p)) {
               pgids.push(p);
             }
           }
         }
       }
-      if (Object.keys(knownDescendants).length > 0) {
-        seedWindowsKnownDescendants(knownDescendants);
+    }
+    for (const freshPid of freshGenerationSet) {
+      if (!isTerminatedKey(freshPid)) {
+        pgids.push(freshPid);
       }
-      if (pgids.length > 0) {
-        pgidSnapshot = snapshotProcessGroupsOutsideLock(pgids, {
-          knownDescendants,
-          spawnSyncFn: options.spawnSyncFn || options.runner,
-          platform: options.platform,
-        });
-      }
+    }
+    if (Object.keys(knownDescendants).length > 0) {
+      seedWindowsKnownDescendants(knownDescendants);
+    }
+    if (pgids.length > 0) {
+      pgidSnapshot = snapshotProcessGroupsOutsideLock(pgids, {
+        knownDescendants,
+        spawnSyncFn: options.spawnSyncFn || options.runner,
+        platform: options.platform,
+      });
     }
   } catch {
     // Ignore pre-lock snapshot parse errors

@@ -30,6 +30,7 @@ import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spaw
 import {
   DEFAULT_CONFIG,
   addLeaseWorker,
+  archiveWindowsProcessGroupGeneration,
   avdHasRuntimeLockFiles,
   canJumpAhead,
   computeEffectiveMaxEmulators,
@@ -57,10 +58,13 @@ export const ATC_VERSION = "1.0.0";
 export { GUIDE_TOPICS, cmdGuide };
 
 function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {
-  const num = Number(pgid);
+  const isQualified = typeof pgid === "string" && pgid.includes("@");
+  const keyStr = isQualified ? pgid.trim() : null;
+  const num = Number(isQualified ? keyStr.split("@")[0] : pgid);
   if (!Number.isInteger(num) || num <= 1) return false;
   if (num === options.callerWorkerPid) return false;
-  const descEntries = lease?.workerDescendants?.[String(num)];
+  const descKey = isQualified ? keyStr : String(num);
+  const descEntries = lease?.workerDescendants?.[descKey];
   if (Array.isArray(descEntries)) {
     const rootEntry = descEntries.find(
       (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === num,
@@ -78,16 +82,17 @@ function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, optio
   }
   const effectivePlatform = options.platform || process.platform;
   if (effectivePlatform === "win32") {
+    const targetKey = isQualified ? keyStr : num;
     const qRes = queryWindowsProcessGroups(
-      [num],
+      [targetKey],
       options.spawnSyncFn || options.runner,
       {
         knownDescendants: lease?.workerDescendants,
         triState: true,
       },
     );
-    if (qRes.refreshed && qRes.get(num) !== null) {
-      return getKnownWindowsTreePids(num, { liveOnly: true }).includes(num);
+    if (qRes.refreshed && qRes.get(targetKey) !== null) {
+      return getKnownWindowsTreePids(targetKey, { liveOnly: true }).includes(num);
     }
   }
   return true;
@@ -2844,7 +2849,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       }
       for (const l of preMatches) {
         if (!Array.isArray(l.workerPgids) || l.workerPgids.length === 0) continue;
-        const pgidSet = new Set(l.workerPgids.map(Number));
+        const pgidSet = new Set(
+          l.workerPgids.map((p) => Number(String(p).split("@")[0])),
+        );
         const hasLiveWrapperPid = (l.workerPids || []).some((p) => {
           const num = Number(p);
           return num !== options.callerWorkerPid && !pgidSet.has(num) && preLiveness(num);
@@ -3862,18 +3869,12 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   };
 
   let spawnedChildPid = null;
-  const onChildSpawn = (childPid, { isProcessGroup } = {}) => {
+  const onChildSpawn = (childPid, { isProcessGroup, freshGeneration } = {}) => {
     spawnedChildPid = childPid;
     try {
-      if (
-        isProcessGroup &&
-        !options.livenessCheck &&
-        (options.platform || process.platform) === "win32"
-      ) {
-        snapshotProcessGroupsOutsideLock([childPid], {
-          spawnSyncFn: options.spawnSyncFn,
-          platform: options.platform,
-        });
+      const isWin = (options.platform || process.platform) === "win32";
+      if (isProcessGroup && isWin) {
+        archiveWindowsProcessGroupGeneration(childPid);
       }
       withStateTransaction(
         stateDir,
@@ -3886,12 +3887,17 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
             addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
               isProcessGroup: Boolean(isProcessGroup),
+              freshGeneration: Boolean(freshGeneration ?? true),
             });
             return { mutated: true };
           }
           return { mutated: false };
         },
-        options,
+        {
+          ...options,
+          freshGenerationPgids:
+            isProcessGroup && isWin && !options.livenessCheck ? [childPid] : undefined,
+        },
       );
     } catch {
       // Best-effort child PID registration
@@ -4153,7 +4159,9 @@ export function cmdGc(stateDir, options = {}) {
     for (const lease of Object.values(preState.leases || {})) {
       if (!lease || typeof lease !== "object") continue;
       if (!Array.isArray(lease.workerPgids) || lease.workerPgids.length === 0) continue;
-      const pgidSet = new Set(lease.workerPgids.map(Number));
+      const pgidSet = new Set(
+        lease.workerPgids.map((p) => Number(String(p).split("@")[0])),
+      );
       const hasLiveWrapperPid = (lease.workerPids || []).some((p) => {
         const num = Number(p);
         return !pgidSet.has(num) && preLiveness(num);
