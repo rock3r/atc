@@ -8910,7 +8910,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       /^for x in a b ; do echo `x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'` ; done$/,
     );
 
-    // 3q. Extended-glob alternation (`@(foo|bar)`) is not split as a pipeline and uses `bash -c`
+    // 3q. Extended-glob alternation (`@(foo|bar)`) is not split as a pipeline and uses `bash -O extglob -c`, whereas arithmetic `$((a*(b+1)))` stays on `sh -c`
     const extglobLoopRedir = evaluateCommandGuard(
       'for x in 1; do adb shell echo @(foo|bar) > /tmp/out.txt; done',
       {
@@ -8922,12 +8922,40 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(extglobLoopRedir.allowed, true);
     assert.match(
       extglobLoopRedir.rewrittenCommand,
-      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
+      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
     );
 
-    // 3r. Positional parameters ($1, $@) inside functions or after `set --` are forwarded into rewritten shells and not clobbered by array transport
+    const arithMultLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo $((x*(x+1))) > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(arithMultLoopRedir.allowed, true);
+    assert.match(
+      arithMultLoopRedir.rewrittenCommand,
+      /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x\*\(x\+1\)\)\) > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3r. Positional parameters ($0, $1, $@, ${!#}) inside functions or after `set --` are forwarded into rewritten shells and not clobbered by array transport
+    const funcZeroParamLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo "$0" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(funcZeroParamLoopRedir.allowed, true);
+    assert.match(
+      funcZeroParamLoopRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$0" > \/tmp\/out\.txt' "\$0" ; done$/,
+    );
+
     const funcPositionalLoopRedir = evaluateCommandGuard(
-      'f() { for x in 1; do adb shell echo "$1" > /tmp/out.txt; done; }; f expected',
+      'f() { for x in 1; do adb shell echo "$1" "${!#}" > /tmp/out.txt; done; }; f expected',
       {
         sessionId: "loop-sess",
         activeLeases,
@@ -8937,11 +8965,11 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(funcPositionalLoopRedir.allowed, true);
     assert.match(
       funcPositionalLoopRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$1" > \/tmp\/out\.txt' sh "\$@" ; done ; \} ; f expected$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo "\$1" "\$\{!#\}" > \/tmp\/out\.txt' bash "\$@" ; done ; \} ; f expected$/,
     );
 
     const funcArrayAndPositionalLoopRedir = evaluateCommandGuard(
-      'f() { while read -ra parts; do adb shell echo "$1" "${parts[@]}" > /tmp/out.txt; done < rows.txt; }; f expected',
+      'f() { while read -ra parts; do adb shell echo "$0" "$1" "${X:-${parts[@]}}" > /tmp/out.txt; done < rows.txt; }; f expected',
       {
         sessionId: "loop-sess",
         activeLeases,
@@ -8951,7 +8979,36 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(funcArrayAndPositionalLoopRedir.allowed, true);
     assert.match(
       funcArrayAndPositionalLoopRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$1" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$0" "\$1" "\$\{X:-\$\{__atc_arr_at_0\[@\]\}\}" > \/tmp\/out\.txt' "\$0" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
+    );
+
+    // 3s. Array alias names do not collide when distinct array/subscript pairs flatten to the same prefix (${a_b[c]} vs ${a[b_c]}) or with reserved __atc_arr_at_<idx> (${at[0]})
+    const collidingArrayAliasesRedir = evaluateCommandGuard(
+      'while read -ra a_b && read -ra a && read -ra at; do adb shell echo "${a_b[c]}" "${a[b_c]}" "${at[0]}" "${a[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(collidingArrayAliasesRedir.allowed, true);
+    assert.match(
+      collidingArrayAliasesRedir.rewrittenCommand,
+      /do __atc_arr_a_b_c="\$\{a_b\[c\]\}" __atc_arr_a_b_c_0="\$\{a\[b_c\]\}" __atc_arr_at_0_1="\$\{at\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$\{__atc_arr_a_b_c\}" "\$\{__atc_arr_a_b_c_0\}" "\$\{__atc_arr_at_0_1\}" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#a\[@\]\}" "\$\{a\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    const prefixSubstrLoopRedir = evaluateCommandGuard(
+      'for prefix_var in 1; do adb shell echo "${!pre@}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(prefixSubstrLoopRedir.allowed, true);
+    assert.match(
+      prefixSubstrLoopRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!pre@\}" "--" ; done$/,
     );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);

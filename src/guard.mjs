@@ -348,17 +348,18 @@ function isExtglobOpen(str, i, curStage = "") {
   if (ch !== "@" && ch !== "*" && ch !== "+" && ch !== "?" && ch !== "!") {
     return false;
   }
-  if (ch === "!") {
-    const strippedCur = String(curStage || "")
-      .replace(LEADING_CONTROL_PREFIX_RE, "")
-      .trim();
-    const inCaseHeader = /(?:^|\s)case\s+\S+\s+in(?:\s|$)/.test(
-      String(curStage || ""),
-    );
-    if (!strippedCur && !inCaseHeader) {
-      return false;
-    }
-  }
+  const strippedCur =
+    ch === "!"
+      ? String(curStage || "")
+          .replace(LEADING_CONTROL_PREFIX_RE, "")
+          .trim()
+      : "";
+  const inCaseHeader =
+    ch === "!"
+      ? /(?:^|\s)case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in(?:\s|$)/.test(
+          String(curStage || ""),
+        )
+      : false;
   let depth = 1;
   let qSingle = false;
   let qDouble = false;
@@ -381,7 +382,16 @@ function isExtglobOpen(str, i, curStage = "") {
       if (c === "(") depth++;
       else if (c === ")") {
         depth--;
-        if (depth === 0) return true;
+        if (depth === 0) {
+          if (ch === "!" && !strippedCur && !inCaseHeader) {
+            const isCaseArmPattern =
+              /^\s*(?:\|\s*(?:[!?+*@]\([^()]*\)|[^;\n)])*)*\)/.test(
+                str.slice(j + 1),
+              );
+            if (!isCaseArmPattern) return false;
+          }
+          return true;
+        }
       }
     }
   }
@@ -413,19 +423,21 @@ function splitOutsideQuotes(str, sepType) {
       continue;
     }
     if (!inSingle && !inDouble) {
-      if (ch === "(" && str[i + 1] === "(") {
-        arithDepth++;
+      if (arithDepth === 0 && ch === "$" && str[i + 1] === "(" && str[i + 2] === "(") {
+        arithDepth = 2;
+        cur += "$((";
+        i += 2;
+        continue;
+      }
+      if (arithDepth === 0 && ch === "(" && str[i + 1] === "(") {
+        arithDepth = 2;
         cur += "((";
         i++;
         continue;
       }
-      if (arithDepth > 0 && ch === ")" && str[i + 1] === ")") {
-        arithDepth--;
-        cur += "))";
-        i++;
-        continue;
-      }
       if (arithDepth > 0) {
+        if (ch === "(") arithDepth++;
+        else if (ch === ")") arithDepth--;
         cur += ch;
         continue;
       }
@@ -2360,6 +2372,8 @@ function stageRequiresBashShell(cmdBody) {
   const s = String(cmdBody || "");
   let inSingle = false;
   let inDouble = false;
+  let arithDepth = 0;
+  const subStack = [];
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === "\\" && !inSingle && i + 1 < s.length) {
@@ -2373,6 +2387,43 @@ function stageRequiresBashShell(cmdBody) {
     if (ch === '"' && !inSingle) {
       inDouble = !inDouble;
       continue;
+    }
+    if (!inSingle && ch === "$" && s[i + 1] === "[") {
+      return true;
+    }
+    if (!inSingle && !inDouble && arithDepth === 0 && ch === "$" && s[i + 1] === "(" && s[i + 2] === "(") {
+      arithDepth = 2;
+      i += 2;
+      continue;
+    }
+    if (!inSingle && ch === "$" && s[i + 1] === "(" && s[i + 2] !== "(") {
+      subStack.push(inDouble);
+      inDouble = false;
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && arithDepth > 0) {
+      if (ch === "(") {
+        arithDepth++;
+        continue;
+      }
+      if (ch === ")") {
+        arithDepth--;
+        continue;
+      }
+    }
+    if (!inSingle && !inDouble && subStack.length > 0) {
+      if (ch === "(") {
+        subStack.push(null);
+        continue;
+      }
+      if (ch === ")") {
+        const popped = subStack.pop();
+        if (typeof popped === "boolean") {
+          inDouble = popped;
+        }
+        continue;
+      }
     }
     if (inSingle) continue;
     if (!inDouble && ch === "$" && (s[i + 1] === "'" || s[i + 1] === '"')) {
@@ -2395,7 +2446,7 @@ function stageRequiresBashShell(cmdBody) {
         if (
           inner.startsWith("!") ||
           /\[[^\]]+\]/.test(inner) ||
-          /^(?:[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*|[@*])(?:\/|\^|,|@[A-Za-z]|:(?![-=?+]))/.test(
+          /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])(?:\/|\^|,|@[A-Za-z]|:(?![-=?+]))/.test(
             inner,
           )
         ) {
@@ -2407,7 +2458,7 @@ function stageRequiresBashShell(cmdBody) {
       if ((ch === "<" || ch === ">") && s[i + 1] === "(") {
         return true;
       }
-      if (isExtglobOpen(s, i, s.slice(0, i))) {
+      if (arithDepth === 0 && isExtglobOpen(s, i, s.slice(0, i))) {
         return true;
       }
       if (ch === "<" && s[i + 1] === "<" && s[i + 2] === "<") {
@@ -2447,6 +2498,148 @@ function stageRequiresBashShell(cmdBody) {
         }
         if (validBrace && j < s.length && s[j] === "}" && (hasComma || hasDotDot)) {
           return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function stageUsesExtglob(cmdBody) {
+  const s = String(cmdBody || "");
+  let inSingle = false;
+  let inDouble = false;
+  let arithDepth = 0;
+  let bracketArithDepth = 0;
+  const subStack = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && !inSingle && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      if (ch === "$" && s[i + 1] === "[") {
+        bracketArithDepth++;
+        i++;
+        continue;
+      }
+      if (bracketArithDepth > 0) {
+        if (ch === "[") bracketArithDepth++;
+        else if (ch === "]") bracketArithDepth--;
+        continue;
+      }
+      if (arithDepth === 0 && ch === "$" && s[i + 1] === "(" && s[i + 2] === "(") {
+        arithDepth = 2;
+        i += 2;
+        continue;
+      }
+      if (arithDepth === 0 && ch === "(" && s[i + 1] === "(") {
+        arithDepth = 2;
+        i++;
+        continue;
+      }
+      if (arithDepth > 0) {
+        if (ch === "(") arithDepth++;
+        else if (ch === ")") arithDepth--;
+        continue;
+      }
+    }
+    if (!inSingle && ch === "$" && s[i + 1] === "(" && s[i + 2] !== "(") {
+      subStack.push(inDouble);
+      inDouble = false;
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && subStack.length > 0) {
+      if (ch === "(") {
+        subStack.push(null);
+        continue;
+      }
+      if (ch === ")") {
+        const popped = subStack.pop();
+        if (typeof popped === "boolean") {
+          inDouble = popped;
+        }
+        continue;
+      }
+    }
+    if (!inSingle && !inDouble && isExtglobOpen(s, i, s.slice(0, i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stageReferencesZeroParam(cmdBody) {
+  const s = String(cmdBody || "");
+  let inSingle = false;
+  let inDouble = false;
+  const subStack = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && !inSingle && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && ch === "$" && s[i + 1] === "(" && s[i + 2] !== "(") {
+      subStack.push(inDouble);
+      inDouble = false;
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && subStack.length > 0) {
+      if (ch === "(") {
+        subStack.push(null);
+        continue;
+      }
+      if (ch === ")") {
+        const popped = subStack.pop();
+        if (typeof popped === "boolean") {
+          inDouble = popped;
+        }
+        continue;
+      }
+    }
+    if (inSingle) continue;
+    if (ch === "$") {
+      const next = s[i + 1] || "";
+      if (next === "0") {
+        return true;
+      }
+      if (next === "{") {
+        let j = i + 2;
+        let depth = 1;
+        while (j < s.length && depth > 0) {
+          if (s[j] === "\\" && j + 1 < s.length) {
+            j += 2;
+            continue;
+          }
+          if (s[j] === "{") depth++;
+          else if (s[j] === "}") depth--;
+          j++;
+        }
+        if (depth === 0) {
+          const inner = s.slice(i + 2, j - 1);
+          if (/^[#!]*0+(?:$|[^A-Za-z0-9_\[])/.test(inner)) {
+            return true;
+          }
         }
       }
     }
@@ -2513,7 +2706,7 @@ function stageReferencesPositionalParams(cmdBody) {
         if (depth === 0) {
           const inner = s.slice(i + 2, j - 1);
           if (
-            /^[@*#]$|^[#!]*[1-9][0-9]*(?:$|[^A-Za-z0-9_\[])|^[#!]+[@*](?:$|[^A-Za-z0-9_\[])|^[@*](?:$|[^A-Za-z0-9_\[])/.test(
+            /^[#!]*[@*#]$|^[#!]*0*[1-9][0-9]*(?:$|[^A-Za-z0-9_\[])|^[#!]+[@*](?:$|[^A-Za-z0-9_\[])|^[@*](?:$|[^A-Za-z0-9_\[])/.test(
               inner,
             )
           ) {
@@ -2590,16 +2783,22 @@ function rewriteCompoundCommand(
         continue;
       }
       if (!inBacktick) {
-        if (!inDouble && ch === "(" && command[i + 1] === "(") {
-          arithDepth++;
+        if (!inDouble && arithDepth === 0 && ch === "$" && command[i + 1] === "(" && command[i + 2] === "(") {
+          arithDepth = 2;
+          cur += "$((";
+          i += 2;
+          continue;
+        }
+        if (!inDouble && arithDepth === 0 && ch === "(" && command[i + 1] === "(") {
+          arithDepth = 2;
           cur += "((";
           i++;
           continue;
         }
-        if (!inDouble && arithDepth > 0 && ch === ")" && command[i + 1] === ")") {
-          arithDepth--;
-          cur += "))";
-          i++;
+        if (!inDouble && arithDepth > 0) {
+          if (ch === "(") arithDepth++;
+          else if (ch === ")") arithDepth--;
+          cur += ch;
           continue;
         }
         if (
@@ -2822,6 +3021,29 @@ function rewriteCompoundCommand(
           ),
         );
         const arrayEnvEntries = new Map();
+        const exprToAlias = new Map();
+        let aliasSeq = 0;
+        const allocateEnvAlias = (expr, preferred) => {
+          const existing = exprToAlias.get(expr);
+          if (existing) return existing;
+          let candidate = preferred;
+          while (
+            /^__atc_arr_at_\d+$/.test(candidate) ||
+            (arrayEnvEntries.has(candidate) && arrayEnvEntries.get(candidate) !== expr)
+          ) {
+            candidate = `${preferred}_${aliasSeq++}`;
+          }
+          exprToAlias.set(expr, candidate);
+          arrayEnvEntries.set(candidate, expr);
+          return candidate;
+        };
+        const hasDynamicPrefixMatch = (prefix) => {
+          if (dynamicVarNames.has(prefix)) return true;
+          for (const k of dynamicVarNames) {
+            if (k.startsWith(prefix)) return true;
+          }
+          return false;
+        };
         const atArrayExprs = [];
         if (dynamicVarNames.size > 0 && cmdBody.includes("$")) {
           const atExprMap = new Map();
@@ -2912,11 +3134,20 @@ function rewriteCompoundCommand(
                       }
                     }
                   }
-                } else {
-                  const scalarModMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)(.*)$/s);
+                  i = closeIdx;
+                  continue;
+                }
+                const scalarModMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)(.*)$/s);
+                const isPrefixMatch =
+                  scalarModMatch &&
+                  scalarModMatch[1] === "!" &&
+                  (scalarModMatch[3] === "@" || scalarModMatch[3] === "*") &&
+                  hasDynamicPrefixMatch(scalarModMatch[2]);
+                if (
+                  scalarModMatch &&
+                  (dynamicVarNames.has(scalarModMatch[2]) || isPrefixMatch)
+                ) {
                   if (
-                    scalarModMatch &&
-                    dynamicVarNames.has(scalarModMatch[2]) &&
                     scalarModMatch[1] === "!" &&
                     (scalarModMatch[3] === "@" || (scalarModMatch[3] === "*" && !scanInDouble))
                   ) {
@@ -2947,8 +3178,11 @@ function rewriteCompoundCommand(
                       }
                     }
                   }
+                  if (scalarModMatch[1] !== "" || scalarModMatch[3] !== "") {
+                    i = closeIdx;
+                    continue;
+                  }
                 }
-                i = closeIdx;
               }
             }
           }
@@ -2957,9 +3191,7 @@ function rewriteCompoundCommand(
           let arrInSingle = false;
           let arrInDouble = false;
           const arrSubStack = [];
-          let aliasSeq = 0;
           let hasUnquotedAlias = false;
-          const exprToAlias = new Map();
           for (let i = 0; i < cmdBody.length; i++) {
             const ch = cmdBody[i];
             if (ch === "\\" && !arrInSingle && i + 1 < cmdBody.length) {
@@ -3027,35 +3259,42 @@ function rewriteCompoundCommand(
                   if (isPositionalArray) {
                     const baseKey = `${prefixOp}${arrName}[@]`;
                     const entry = atExprMap.get(baseKey);
-                    rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${subscript}]${modifier}}`;
-                    i = closeIdx;
-                    continue;
+                    if (entry) {
+                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${subscript}]${modifier}}`;
+                      i = closeIdx;
+                      continue;
+                    }
                   }
                   if (!arrInDouble && prefixOp !== "#") {
                     hasUnquotedAlias = true;
                   }
-                  let aliasName = exprToAlias.get(inner);
-                  if (!aliasName) {
-                    if (prefixOp === "#" && (subscript === "@" || subscript === "*")) {
-                      aliasName = `__atc_arr_${arrName}_len`;
-                    } else if (prefixOp === "!" && !modifier && subscript === "*") {
-                      aliasName = `__atc_arr_${arrName}_keys`;
-                    } else if (!prefixOp && !modifier && subscript === "*") {
-                      aliasName = `__atc_arr_${arrName}_all`;
-                    } else if (!prefixOp && !modifier && /^[A-Za-z0-9_]+$/.test(subscript)) {
-                      aliasName = `__atc_arr_${arrName}_${subscript}`;
-                    } else {
-                      aliasName = `__atc_arr_${arrName}_${aliasSeq++}`;
-                    }
-                    exprToAlias.set(inner, aliasName);
+                  let preferredAlias;
+                  if (prefixOp === "#" && (subscript === "@" || subscript === "*")) {
+                    preferredAlias = `__atc_arr_${arrName}_len`;
+                  } else if (prefixOp === "!" && !modifier && subscript === "*") {
+                    preferredAlias = `__atc_arr_${arrName}_keys`;
+                  } else if (!prefixOp && !modifier && subscript === "*") {
+                    preferredAlias = `__atc_arr_${arrName}_all`;
+                  } else if (!prefixOp && !modifier && /^[A-Za-z0-9_]+$/.test(subscript)) {
+                    preferredAlias = `__atc_arr_${arrName}_${subscript}`;
+                  } else {
+                    preferredAlias = `__atc_arr_${arrName}_${aliasSeq++}`;
                   }
-                  arrayEnvEntries.set(aliasName, inner);
+                  const aliasName = allocateEnvAlias(inner, preferredAlias);
                   rewrittenArrBody += `\${${aliasName}}`;
                   i = closeIdx;
                   continue;
                 }
                 const scalarModMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)(.*)$/s);
-                if (scalarModMatch && dynamicVarNames.has(scalarModMatch[2])) {
+                const isPrefixMatch =
+                  scalarModMatch &&
+                  scalarModMatch[1] === "!" &&
+                  (scalarModMatch[3] === "@" || scalarModMatch[3] === "*") &&
+                  hasDynamicPrefixMatch(scalarModMatch[2]);
+                if (
+                  scalarModMatch &&
+                  (dynamicVarNames.has(scalarModMatch[2]) || isPrefixMatch)
+                ) {
                   if (scalarModMatch[1] !== "" || scalarModMatch[3] !== "") {
                     const [, prefixOp, varName, modifier] = scalarModMatch;
                     const isPositionalPrefix =
@@ -3064,22 +3303,20 @@ function rewriteCompoundCommand(
                     if (isPositionalPrefix) {
                       const baseKey = `${prefixOp}${varName}@`;
                       const entry = atExprMap.get(baseKey);
-                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
-                      i = closeIdx;
-                      continue;
+                      if (entry) {
+                        rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
+                        i = closeIdx;
+                        continue;
+                      }
                     }
                     if (!arrInDouble && prefixOp !== "#") {
                       hasUnquotedAlias = true;
                     }
-                    let aliasName = exprToAlias.get(inner);
-                    if (!aliasName) {
-                      aliasName =
-                        prefixOp === "#" && !modifier
-                          ? `__atc_var_${varName}_len`
-                          : `__atc_var_${varName}_${aliasSeq++}`;
-                      exprToAlias.set(inner, aliasName);
-                    }
-                    arrayEnvEntries.set(aliasName, inner);
+                    const preferredAlias =
+                      prefixOp === "#" && !modifier
+                        ? `__atc_var_${varName}_len`
+                        : `__atc_var_${varName}_${aliasSeq++}`;
+                    const aliasName = allocateEnvAlias(inner, preferredAlias);
                     rewrittenArrBody += `\${${aliasName}}`;
                     i = closeIdx;
                     continue;
@@ -3161,11 +3398,11 @@ function rewriteCompoundCommand(
                   /(?<![${A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]/g,
                   (full, arrName, subscript) => {
                     if (!dynamicVarNames.has(arrName)) return full;
-                    const aliasName = /^[A-Za-z0-9_]+$/.test(subscript)
+                    const expr = `${arrName}[${subscript}]`;
+                    const preferredAlias = /^[A-Za-z0-9_]+$/.test(subscript)
                       ? `__atc_arr_${arrName}_${subscript}`
                       : `__atc_arr_${arrName}_arith_${arithAliasSeq++}`;
-                    arrayEnvEntries.set(aliasName, `${arrName}[${subscript}]`);
-                    return aliasName;
+                    return allocateEnvAlias(expr, preferredAlias);
                   },
                 );
                 for (const idMatch of rewrittenArithInner.matchAll(
@@ -3189,6 +3426,8 @@ function rewriteCompoundCommand(
           }
           cmdBody = arithRewritten;
         }
+        const usesExtglob = stageUsesExtglob(cmdBody);
+        const hasZeroParam = stageReferencesZeroParam(cmdBody);
         const hasPositionalParams = stageReferencesPositionalParams(cmdBody);
         const hasUnquotedAlias = Boolean(arrayEnvEntries.hasUnquotedAlias);
         const arrayEnvAssigns = Array.from(arrayEnvEntries.entries())
@@ -3230,16 +3469,23 @@ function rewriteCompoundCommand(
               )
               .join(" ") +
             (hasPositionalParams ? ' "$@"' : "");
-          return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- bash -c ${escaped} bash ${trailingArrays}${suffix}`;
+          const bashExec = usesExtglob ? "bash -O extglob" : "bash";
+          const zeroArg = hasZeroParam ? '"$0"' : "bash";
+          return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
         }
         const shIfsEnv = hasUnquotedAlias ? '__atc_ifs_set="${IFS+1}" __atc_ifs="${IFS-}" ' : "";
         const shIfsPrelude = hasUnquotedAlias
           ? 'if [ -n "$__atc_ifs_set" ]; then IFS=$__atc_ifs; else unset IFS; fi; '
           : "";
-        const targetShell = stageRequiresBashShell(cmdBody) ? "bash" : "sh";
+        const targetShell = usesExtglob || stageRequiresBashShell(cmdBody) ? "bash" : "sh";
+        const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
         const escaped = `'${String(shIfsPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
-        const trailingAtArgs = hasPositionalParams ? ` ${targetShell} "$@"` : "";
-        return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${targetShell} -c ${escaped}${trailingAtArgs}${suffix}`;
+        const trailingAtArgs = hasPositionalParams
+          ? ` ${hasZeroParam ? '"$0"' : targetShell} "$@"`
+          : hasZeroParam
+            ? ' "$0"'
+            : "";
+        return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =
