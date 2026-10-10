@@ -2253,6 +2253,45 @@ function extractStageLoopVariables(stageText) {
         vars.add(pm[1]);
       }
     }
+  } else if (idx < tokens.length && tokens[idx] === "getopts") {
+    idx++;
+    vars.add("OPTARG");
+    vars.add("OPTIND");
+    let optionsEnded = false;
+    const positional = [];
+    while (idx < tokens.length) {
+      const tok = tokens[idx++];
+      if (
+        tok === "<" ||
+        tok === "<<" ||
+        tok === "<<<" ||
+        tok === ">" ||
+        tok === ">>" ||
+        tok === "<&" ||
+        tok === ">&" ||
+        tok === "<>" ||
+        tok === "&>" ||
+        tok === "&>>"
+      ) {
+        if (idx < tokens.length) idx++;
+        continue;
+      }
+      if (/^[0-9]*[<>]/.test(tok) || tok.startsWith("&>") || tok.startsWith("&>>")) {
+        continue;
+      }
+      if (!optionsEnded && tok === "--") {
+        optionsEnded = true;
+        continue;
+      }
+      optionsEnded = true;
+      positional.push(tok);
+    }
+    if (positional.length >= 2) {
+      const dest = positional[1].replace(/^['"]|['"]$/g, "").replace(/\[.*$/, "");
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(dest)) {
+        vars.add(dest);
+      }
+    }
   }
 
   for (const tok of tokens) {
@@ -2265,6 +2304,99 @@ function extractStageLoopVariables(stageText) {
   }
 
   return Array.from(vars);
+}
+
+function stageRequiresBashShell(cmdBody) {
+  const s = String(cmdBody || "");
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && !inSingle && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (inSingle) continue;
+    if (!inDouble && ch === "$" && (s[i + 1] === "'" || s[i + 1] === '"')) {
+      return true;
+    }
+    if (ch === "$" && s[i + 1] === "{") {
+      let j = i + 2;
+      let depth = 1;
+      while (j < s.length && depth > 0) {
+        if (s[j] === "\\" && j + 1 < s.length) {
+          j += 2;
+          continue;
+        }
+        if (s[j] === "{") depth++;
+        else if (s[j] === "}") depth--;
+        j++;
+      }
+      if (depth === 0) {
+        const inner = s.slice(i + 2, j - 1);
+        if (
+          inner.startsWith("!") ||
+          /\[[^\]]+\]/.test(inner) ||
+          /^[A-Za-z_][A-Za-z0-9_]*(?:\/|\^|,|@[A-Za-z]|:(?![-=?+]))/.test(inner)
+        ) {
+          return true;
+        }
+      }
+    }
+    if (!inDouble) {
+      if ((ch === "<" || ch === ">") && s[i + 1] === "(") {
+        return true;
+      }
+      if (ch === "<" && s[i + 1] === "<" && s[i + 2] === "<") {
+        return true;
+      }
+      if (ch === "&" && s[i + 1] === ">") {
+        return true;
+      }
+      if (
+        ch === "[" &&
+        s[i + 1] === "[" &&
+        (i === 0 || /[\s;(|&]/.test(s[i - 1])) &&
+        /\s/.test(s[i + 2] || "")
+      ) {
+        return true;
+      }
+      if (
+        ch === "(" &&
+        s[i + 1] === "(" &&
+        (i === 0 || /[\s;(|&!]/.test(s[i - 1]))
+      ) {
+        return true;
+      }
+      if (ch === "{" && (i === 0 || s[i - 1] !== "$")) {
+        let j = i + 1;
+        let hasComma = false;
+        let hasDotDot = false;
+        let validBrace = j < s.length;
+        while (j < s.length && s[j] !== "}") {
+          if (/\s|['"`$(){};&|<>]/.test(s[j])) {
+            validBrace = false;
+            break;
+          }
+          if (s[j] === ",") hasComma = true;
+          if (s[j] === "." && s[j + 1] === ".") hasDotDot = true;
+          j++;
+        }
+        if (validBrace && j < s.length && s[j] === "}" && (hasComma || hasDotDot)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, platform = "win32" }) {
@@ -2916,13 +3048,14 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         const shIfsPrelude = hasUnquotedAlias
           ? 'if [ -n "$__atc_ifs_set" ]; then IFS=$__atc_ifs; else unset IFS; fi; '
           : "";
+        const targetShell = stageRequiresBashShell(cmdBody) ? "bash" : "sh";
         const escaped = `'${String(shIfsPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
         const trailingAtArgs = singleAtExpr
           ? atArrayExprs[0].quoted
-            ? ` sh "\${${atArrayExprs[0].inner}}"`
-            : ` sh \${${atArrayExprs[0].inner}}`
+            ? ` ${targetShell} "\${${atArrayExprs[0].inner}}"`
+            : ` ${targetShell} \${${atArrayExprs[0].inner}}`
           : "";
-        return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${trailingAtArgs}${suffix}`;
+        return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${targetShell} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =

@@ -417,6 +417,45 @@ export function getKnownWindowsTreeDescendants(pgid) {
   return out;
 }
 
+function resolveWindowsPgidKey(parsedPgid, knownDescendants) {
+  if (!parsedPgid) return null;
+  if (parsedPgid.rootCreation || !knownDescendants || typeof knownDescendants !== "object") {
+    return parsedPgid.key;
+  }
+  const pgid = parsedPgid.pid;
+  const entries = Array.isArray(knownDescendants)
+    ? knownDescendants
+    : knownDescendants[String(pgid)];
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return parsedPgid.key;
+  }
+  const rootItem = entries.find(
+    (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === pgid,
+  );
+  const expectedCreation = rootItem
+    ? normalizeCreationToken(
+        rootItem.creationDate ?? rootItem.CreationDate ?? rootItem.startToken ?? null,
+      )
+    : null;
+  if (!expectedCreation || expectedCreation === "__exited__") {
+    return parsedPgid.key;
+  }
+  const archiveKey = `${pgid}@${expectedCreation}`;
+  if (winKnownTreeDescendants.has(archiveKey)) {
+    return archiveKey;
+  }
+  const existingBare = winKnownTreeDescendants.get(pgid);
+  const existingRootCreation = existingBare?.get(pgid)?.creationDate ?? null;
+  if (
+    existingRootCreation &&
+    existingRootCreation !== "__exited__" &&
+    existingRootCreation !== expectedCreation
+  ) {
+    return archiveKey;
+  }
+  return parsedPgid.key;
+}
+
 export function isProcessGroupAlive(
   pgidOrLease,
   secondArg = {},
@@ -460,15 +499,16 @@ export function isProcessGroupAlive(
   if (!parsedPgid) {
     return false;
   }
-  const { key: pgidKey, pid: pgid } = parsedPgid;
+  const { pid: pgid } = parsedPgid;
   const effectiveKnown = knownDescendants || lease?.workerDescendants || null;
   if (effectiveKnown) {
     if (Array.isArray(effectiveKnown)) {
-      seedWindowsKnownDescendants(pgidKey, effectiveKnown);
+      seedWindowsKnownDescendants(parsedPgid.key, effectiveKnown);
     } else {
       seedWindowsKnownDescendants(effectiveKnown);
     }
   }
+  const pgidKey = resolveWindowsPgidKey(parsedPgid, effectiveKnown);
   if (platform === "win32" || winKnownTreeDescendants.has(pgidKey)) {
     if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgidKey)) {
       return activePgidLivenessSnapshot.get(pgidKey);
@@ -620,7 +660,6 @@ export function killProcessGroupTree(
 
   const parsedPgid = parseWindowsPgidKey(pgidOrLease);
   const childPid = parsedPgid ? parsedPgid.pid : Number(pgidOrLease);
-  const childKey = parsedPgid ? parsedPgid.key : childPid;
   if (!Number.isInteger(childPid) || childPid <= 0) {
     return withTerminatedPgids([], []);
   }
@@ -628,11 +667,14 @@ export function killProcessGroupTree(
   if (platform === "win32") {
     if (knownDescendants) {
       if (Array.isArray(knownDescendants)) {
-        seedWindowsKnownDescendants(childKey, knownDescendants);
+        seedWindowsKnownDescendants(parsedPgid ? parsedPgid.key : childPid, knownDescendants);
       } else {
         seedWindowsKnownDescendants(knownDescendants);
       }
     }
+    const childKey = parsedPgid
+      ? resolveWindowsPgidKey(parsedPgid, knownDescendants)
+      : childPid;
     let refreshedAlive = null;
     if (options.refresh !== false) {
       refreshedAlive = queryWindowsProcessGroups([childKey], spawnSyncFn, {

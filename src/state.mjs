@@ -458,7 +458,11 @@ function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
       lease.workerDescendants[archiveKey] = prevEntries;
       delete lease.workerDescendants[key];
       seedWindowsKnownDescendants(archiveKey, prevEntries);
-      const pgids = Array.isArray(lease.workerPgids) ? [...lease.workerPgids] : [];
+      const pgids = Array.isArray(lease.workerPgids)
+        ? lease.workerPgids.filter(
+            (p) => (typeof p === "string" && p.includes("@")) || Number(p) !== numericPid,
+          )
+        : [];
       if (!pgids.includes(archiveKey)) {
         pgids.push(archiveKey);
       }
@@ -568,7 +572,15 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
     alive.push(numericPid);
   }
   if (options.isProcessGroup && Number.isInteger(numericPid) && numericPid > 1) {
-    const pgids = Array.isArray(lease.workerPgids) ? [...lease.workerPgids] : [];
+    const pgids = Array.isArray(lease.workerPgids)
+      ? lease.workerPgids
+          .map((p) => (typeof p === "string" && p.includes("@") ? p.trim() : Number(p)))
+          .filter(
+            (pgKey) =>
+              pgKey === numericPid ||
+              isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck),
+          )
+      : [];
     if (!pgids.includes(numericPid)) {
       pgids.push(numericPid);
     }

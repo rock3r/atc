@@ -8416,6 +8416,148 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       printfVArrayLoopRedir.rewrittenCommand,
       /__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt' ; done$/,
     );
+
+    // 1p. Cross-lease reused Windows leader PID disassociates bare PGID from the previous lease
+    {
+      const crossLeaderPgid = 830001;
+      const oldLeaseChildPid = 830002;
+      const newLeaseChildPid = 830003;
+      const genACreation = "20261010233000.000000+000";
+      const genAChildCreation = "20261010233001.000000+000";
+      const genBCreation = "20261010234000.000000+000";
+      const genBChildCreation = "20261010234001.000000+000";
+      const genAArchiveKey = `${crossLeaderPgid}@${genACreation}`;
+      clearKnownWindowsTreeDescendants(crossLeaderPgid);
+      clearKnownWindowsTreeDescendants(genAArchiveKey);
+      try {
+        const leaseA = {
+          leaseId: "lease_win_cross_a",
+          deviceKey: "avd:Pixel_Cross_A",
+          workerPids: [crossLeaderPgid],
+          workerPid: crossLeaderPgid,
+          workerPgids: [crossLeaderPgid],
+          workerDescendants: {
+            [String(crossLeaderPgid)]: [
+              { pid: crossLeaderPgid, creationDate: genACreation, alive: false },
+              { pid: oldLeaseChildPid, creationDate: genAChildCreation, alive: true },
+            ],
+          },
+        };
+        const leaseB = {
+          leaseId: "lease_win_cross_b",
+          deviceKey: "avd:Pixel_Cross_B",
+          workerPids: [],
+          workerPid: null,
+        };
+        seedWindowsKnownDescendants(leaseA.workerDescendants);
+        archiveWindowsProcessGroupGeneration(crossLeaderPgid);
+
+        const crossSnapshot = [
+          { ProcessId: crossLeaderPgid, ParentProcessId: 4000, CreationDate: genBCreation },
+          { ProcessId: newLeaseChildPid, ParentProcessId: crossLeaderPgid, CreationDate: genBChildCreation },
+          { ProcessId: oldLeaseChildPid, ParentProcessId: 1, CreationDate: genAChildCreation },
+        ];
+        queryWindowsProcessGroups(
+          [genAArchiveKey, crossLeaderPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify(crossSnapshot),
+            stderr: "",
+          }),
+          { knownDescendants: leaseA.workerDescendants },
+        );
+
+        const liveCheck = (pid) =>
+          [crossLeaderPgid, oldLeaseChildPid, newLeaseChildPid].includes(pid);
+        syncLeaseWorkers(leaseA, liveCheck);
+        addLeaseWorker(leaseB, crossLeaderPgid, liveCheck, {
+          isProcessGroup: true,
+          freshGeneration: true,
+        });
+
+        assert.deepEqual(
+          leaseA.workerPgids,
+          [genAArchiveKey],
+          "Previous lease must replace bare PGID with archived generation key and not retain bare PGID owned by new lease",
+        );
+        assert.deepEqual(
+          leaseB.workerPgids,
+          [crossLeaderPgid],
+          "New lease must own the bare numeric PGID for the current generation",
+        );
+
+        const killedLeaseAPids = [];
+        killProcessGroupTree(leaseA, "SIGKILL", {
+          platform: "win32",
+          runner: (cmd, args) => {
+            if (cmd === "powershell.exe") {
+              return { status: 0, stdout: JSON.stringify(crossSnapshot), stderr: "" };
+            }
+            if (cmd === "taskkill") {
+              for (let i = 0; i < args.length; i += 1) {
+                if (args[i] === "/PID") {
+                  killedLeaseAPids.push(Number(args[i + 1]));
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        });
+        assert.deepEqual(
+          killedLeaseAPids,
+          [oldLeaseChildPid],
+          "Killing previous lease must only terminate its archived generation descendant and spare new lease worker",
+        );
+      } finally {
+        clearKnownWindowsTreeDescendants(crossLeaderPgid);
+        clearKnownWindowsTreeDescendants(genAArchiveKey);
+      }
+    }
+
+    // 3n. `getopts` loop variable and `OPTARG` are tracked and forwarded
+    const getoptsLoopRedir = evaluateCommandGuard(
+      'while getopts "s:" opt; do adb shell echo "$opt:$OPTARG" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(getoptsLoopRedir.allowed, true);
+    assert.match(
+      getoptsLoopRedir.rewrittenCommand,
+      /OPTARG="\$OPTARG" opt="\$opt" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$opt:\$OPTARG" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3o. Redirected loop stages using Bash syntax (brace expansion, process substitution) preserve `bash -c`
+    const bashBraceLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo {a,b} > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bashBraceLoopRedir.allowed, true);
+    assert.match(
+      bashBraceLoopRedir.rewrittenCommand,
+      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo \{a,b\} > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const bashProcSubLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell cat <(printf foo) > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bashProcSubLoopRedir.allowed, true);
+    assert.match(
+      bashProcSubLoopRedir.rewrittenCommand,
+      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell cat <\(printf foo\) > \/tmp\/out\.txt' ; done$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
