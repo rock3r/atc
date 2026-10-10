@@ -5947,7 +5947,8 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
     }
 
     // 5. Finding #5: cmdExec tracks child process group and waits for backgrounded subchildren
-    if (process.platform !== "win32") {
+    // 5. Finding #5: spawnWithHeartbeat and lease worker liveness track child process group (POSIX and Windows)
+    {
       const execDir = makeTempStateDir();
       try {
         withStateTransaction(execDir, (s, { now }) => {
@@ -6742,6 +6743,88 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         } finally {
           fs.rmSync(winCustomSdkDir, { recursive: true, force: true });
         }
+
+        // Astra #24 Finding 2: Rekeying a lease from serial:<serial> to avd:<name> during atc exec still executes deferred free cleanup
+        withStateTransaction(r21Dir, (s, { now }) => {
+          s.leases = {
+            "serial:emulator-5576": {
+              leaseId: "lease_rekey_defer",
+              deviceKey: "serial:emulator-5576",
+              kind: "emulator",
+              avd: null,
+              serial: "emulator-5576",
+              profile: { apiLevel: "android-35", deviceType: "phone" },
+              sessionId: "rekey-defer-sess",
+              anchorPid: process.pid,
+              state: "active",
+              claimedAtMs: now - 5_000,
+              activatedAtMs: now - 4_000,
+              renewedAtMs: now,
+              expiresAtMs: now + 60_000,
+            },
+          };
+          return { mutated: true };
+        });
+        let rekeyStopCalled = false;
+        const rekeyExecRes = await cmdExec(
+          r21Dir,
+          [
+            process.execPath,
+            "-e",
+            `
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const statePath = path.join(process.argv[1], "state.json");
+            const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
+            const old = st.leases["serial:emulator-5576"];
+            if (old) {
+              delete st.leases["serial:emulator-5576"];
+              old.avd = "Pixel_Rekeyed";
+              old.deviceKey = "avd:Pixel_Rekeyed";
+              old.releaseOnWorkerExit = true;
+              old.pendingStop = true;
+              st.leases["avd:Pixel_Rekeyed"] = old;
+              fs.writeFileSync(statePath, JSON.stringify(st, null, 2));
+            }
+            `,
+            r21Dir,
+          ],
+          { session: "rekey-defer-sess" },
+          {
+            platform: "linux",
+            runner: (cmd, args) => {
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                rekeyStopCalled = true;
+                return { status: 0, stdout: "Stopped\n", stderr: "" };
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            },
+          },
+        );
+        assert.equal(rekeyExecRes.exitCode, 0);
+        assert.equal(rekeyStopCalled, true, "Deferred stop must execute even after lease is rekeyed");
+        assert.equal(readState(r21Dir).leases["avd:Pixel_Rekeyed"], undefined);
+
+        // Astra #24 Finding 3: Shell builtin wrapper `command adb ...` is wrapped in `sh -c` on POSIX and unwrapped in buildChildInvocation
+        const builtinCmdGuard = evaluateCommandGuard("command adb shell getprop", {
+          sessionId: "builtin-sess",
+          activeLeases: [{ leaseId: "lease_builtin", serial: "emulator-5554" }],
+          platform: "linux",
+        });
+        assert.equal(builtinCmdGuard.allowed, true);
+        assert.equal(
+          builtinCmdGuard.rewrittenCommand,
+          "ATC_SESSION_ID=builtin-sess atc exec --serial emulator-5554 -- sh -c 'command adb shell getprop'",
+        );
+        const unwrappedInv = buildChildInvocation(
+          "command",
+          ["--", "android", "run", "com.example.app"],
+          { leaseId: "lease_builtin", serial: "emulator-5554", avd: "Pixel_8_API_35" },
+          "builtin-sess",
+          {},
+        );
+        assert.equal(unwrappedInv.cmd, "android");
+        assert.ok(unwrappedInv.args.includes("--device=emulator-5554"));
       } finally {
         fs.rmSync(r21Dir, { recursive: true, force: true });
       }

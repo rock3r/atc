@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isProcessGroupAlive, sleepSync } from "./lock.mjs";
+import { getKnownWindowsTreePids, isProcessGroupAlive, sleepSync } from "./lock.mjs";
 
 const SAFE_TOKEN_REGEX = /^[A-Za-z0-9._:/@=-]+$/;
 
@@ -367,6 +367,43 @@ function findAndroidSubcommand(args) {
 }
 
 export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
+  let effectiveCmd = cmd;
+  let effectiveArgs = [...args];
+  let useDefaultStandardPath = false;
+  while (
+    path.basename(effectiveCmd, path.extname(effectiveCmd)).toLowerCase() === "command"
+  ) {
+    let idx = 0;
+    let queryMode = false;
+    while (idx < effectiveArgs.length) {
+      const a = String(effectiveArgs[idx]);
+      if (a === "--") {
+        idx++;
+        break;
+      }
+      if (a === "-p") {
+        useDefaultStandardPath = true;
+        idx++;
+        continue;
+      }
+      if (a.startsWith("-") && /[vV]/.test(a)) {
+        queryMode = true;
+        break;
+      }
+      if (a.startsWith("-")) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+    if (queryMode || idx >= effectiveArgs.length) {
+      break;
+    }
+    effectiveCmd = String(effectiveArgs[idx]);
+    effectiveArgs = effectiveArgs.slice(idx + 1);
+  }
+  cmd = effectiveCmd;
+  args = effectiveArgs;
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
   const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
   if (base === "emulator") {
@@ -538,6 +575,9 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   }
   const env = {
     ...baseEnv,
+    ...(useDefaultStandardPath && process.platform !== "win32"
+      ? { PATH: "/usr/bin:/bin" }
+      : {}),
     ANDROID_SERIAL: lease.serial,
     ATC_LEASE_ID: lease.leaseId,
     ATC_SESSION_ID: sessionId,
@@ -568,8 +608,15 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
 function terminateChildTree(childPid, signal = "SIGTERM") {
   if (!Number.isInteger(childPid) || childPid <= 0) return;
   if (process.platform === "win32") {
+    const pids = Array.from(new Set([childPid, ...getKnownWindowsTreePids(childPid)]));
+    const pidArgs = [];
+    for (const p of pids) {
+      if (Number.isInteger(p) && p > 0) {
+        pidArgs.push("/PID", String(p));
+      }
+    }
     try {
-      spawnSync("taskkill", ["/T", "/F", "/PID", String(childPid)], {
+      spawnSync("taskkill", ["/T", "/F", ...pidArgs], {
         stdio: "ignore",
         timeout: 3000,
         windowsHide: true,
@@ -596,11 +643,11 @@ function terminateChildTree(childPid, signal = "SIGTERM") {
 
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
   const invocation = buildChildInvocation(cmd, args, lease, sessionId, options.env);
-  const useProcessGroup = process.platform !== "win32";
+  const detachChild = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
     stdio: options.stdio || "inherit",
     env: invocation.env,
-    detached: useProcessGroup,
+    detached: detachChild,
   });
 
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
@@ -609,7 +656,7 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     const childPid = child.pid || null;
     if (childPid && typeof options.onChildSpawn === "function") {
       try {
-        options.onChildSpawn(childPid, { isProcessGroup: useProcessGroup });
+        options.onChildSpawn(childPid, { isProcessGroup: true });
       } catch {
         // Best-effort worker registration
       }
@@ -639,7 +686,7 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
         }
         if (childPid) {
           terminateChildTree(childPid, sig);
-          if (!killEscalationTimer && useProcessGroup) {
+          if (!killEscalationTimer) {
             killEscalationTimer = setTimeout(() => {
               if (isProcessGroupAlive(childPid)) {
                 terminateChildTree(childPid, "SIGKILL");
@@ -697,7 +744,7 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
         resolve(1);
       };
 
-      if (useProcessGroup && childPid && isProcessGroupAlive(childPid)) {
+      if (childPid && isProcessGroupAlive(childPid)) {
         if (effectiveSignal) {
           terminateChildTree(childPid, "SIGTERM");
           const killDeadline = Date.now() + 500;
@@ -714,6 +761,7 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
           finishClose();
           return;
         }
+        const pollMs = process.platform === "win32" ? 200 : 50;
         const waitGroupTimer = setInterval(() => {
           if (wrapperSignal) {
             terminateChildTree(childPid, wrapperSignal);
@@ -722,7 +770,7 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
             clearInterval(waitGroupTimer);
             finishClose();
           }
-        }, 50);
+        }, pollMs);
         return;
       }
 

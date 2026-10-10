@@ -546,16 +546,25 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
     }
   }
 
+  const markerRetentionMs = Math.max(maxTtlMs, 3_600_000);
   if (state.stoppedDevices && typeof state.stoppedDevices === "object") {
     for (const [k, entry] of Object.entries(state.stoppedDevices)) {
-      if (!entry || typeof entry.stoppedAtMs !== "number" || now - entry.stoppedAtMs > 120_000) {
+      if (
+        !entry ||
+        typeof entry.stoppedAtMs !== "number" ||
+        now - entry.stoppedAtMs > markerRetentionMs
+      ) {
         delete state.stoppedDevices[k];
       }
     }
   }
   if (state.bootedDevices && typeof state.bootedDevices === "object") {
     for (const [k, entry] of Object.entries(state.bootedDevices)) {
-      if (!entry || typeof entry.bootedAtMs !== "number" || now - entry.bootedAtMs > 120_000) {
+      if (
+        !entry ||
+        typeof entry.bootedAtMs !== "number" ||
+        now - entry.bootedAtMs > markerRetentionMs
+      ) {
         delete state.bootedDevices[k];
       }
     }
@@ -934,7 +943,7 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     getAncestorPids(options.ppid ?? process.ppid);
   }
   let pgidSnapshot = null;
-  if (!options.livenessCheck && process.platform !== "win32") {
+  if (!options.livenessCheck) {
     try {
       const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
       if (preRaw) {

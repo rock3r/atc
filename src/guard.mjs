@@ -37,6 +37,24 @@ const SHELL_WRAPPERS = new Set([
   "source",
   ".",
 ]);
+const SHELL_BUILTIN_WRAPPERS = new Set([
+  "command",
+  "builtin",
+  "eval",
+  "source",
+  ".",
+  "time",
+  "exec",
+]);
+
+function requiresShellExecution(cmdStr) {
+  const firstTok = tokenizeSegment(cmdStr)[0] || "";
+  return (
+    firstTok.includes("=") ||
+    SHELL_BUILTIN_WRAPPERS.has(firstTok.toLowerCase())
+  );
+}
+
 const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "echo",
   "printf",
@@ -2110,7 +2128,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
         const isSimpleStage =
-          !/[<>|&;`$()\r\n]/.test(cmdBody) && !tokenizeSegment(cmdBody)[0]?.includes("=");
+          !/[<>|&;`$()\r\n]/.test(cmdBody) && !requiresShellExecution(cmdBody);
         if (isSimpleStage) {
           return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
@@ -2268,7 +2286,7 @@ export function evaluateCommandGuard(
       segments.length === 1 &&
       !needsAtcRewrite &&
       !/[<>|&;`$()\r\n]/.test(command) &&
-      !tokenizeSegment(command)[0]?.includes("=");
+      !requiresShellExecution(command);
     if (isWin) {
       rewrittenCommand = rewriteCompoundCommand(command, {
         sessionId,

@@ -286,12 +286,24 @@ function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
   return Math.max(10, Math.min(max, Math.round(n)));
 }
 
+function findLeaseEntry(state, deviceKey, leaseId) {
+  if (deviceKey && state.leases?.[deviceKey]?.leaseId === leaseId) {
+    return { key: deviceKey, lease: state.leases[deviceKey] };
+  }
+  for (const [k, l] of Object.entries(state.leases || {})) {
+    if (l && l.leaseId === leaseId) {
+      return { key: k, lease: l };
+    }
+  }
+  return { key: null, lease: null };
+}
+
 function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, onBeforeRelease = null) {
   const livenessCheck = options.livenessCheck || isPidAlive;
   const check = withStateTransaction(
     stateDir,
     (state, { now }) => {
-      const cur = state.leases[deviceKey];
+      const { key: resolvedKey, lease: cur } = findLeaseEntry(state, deviceKey, leaseId);
       if (
         !cur ||
         cur.leaseId !== leaseId ||
@@ -320,7 +332,7 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
         );
       if (needsRelease) {
         if (!hasPendingCleanup) {
-          delete state.leases[deviceKey];
+          delete state.leases[resolvedKey];
           return { mutated: true, value: { lease: { ...cur }, deferredFree: false } };
         }
         // Keep process.pid registered until cmdFree transitions the lease to "stopping"
@@ -350,7 +362,7 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
     withStateTransaction(
       stateDir,
       (state, { now }) => {
-        const cur = state.leases[deviceKey];
+        const { lease: cur } = findLeaseEntry(state, deviceKey, leaseId);
         if (cur && cur.leaseId === leaseId) {
           removeLeaseWorker(cur, process.pid, livenessCheck);
           if (freeRes.exitCode !== 0) {
@@ -1057,8 +1069,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             l.awaitOfflineReconcile &&
             (l.stoppingEpoch || 0) > invEpoch,
         );
+        const epochAdvanced = (state.fleetEpoch || 0) > invEpoch;
         if (
-          (staleRunning.length > 0 || staleBooted.length > 0 || staleStopping) &&
+          (epochAdvanced ||
+            staleRunning.length > 0 ||
+            staleBooted.length > 0 ||
+            staleStopping) &&
           !options.inventory
         ) {
           return {
@@ -1522,7 +1538,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           const owned = withStateTransaction(
             stateDir,
             (state) => {
-              const cur = state.leases[txOutcome.lease.deviceKey];
+              const { lease: cur } = findLeaseEntry(
+                state,
+                txOutcome.lease.deviceKey,
+                txOutcome.lease.leaseId,
+              );
               return {
                 mutated: false,
                 value: Boolean(
@@ -2905,7 +2925,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         let mutated = false;
         let currentItemActive = false;
         for (const rem of stoppingItems) {
-          const cur = state.leases[rem.lease.deviceKey];
+          const { lease: cur } = findLeaseEntry(
+            state,
+            rem.lease.deviceKey,
+            rem.lease.leaseId,
+          );
           if (
             cur &&
             cur.leaseId === rem.lease.leaseId &&
@@ -3055,7 +3079,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       withStateTransaction(
         stateDir,
         (state, { now }) => {
-          const cur = state.leases[lease.deviceKey];
+          const { key: resolvedKey, lease: cur } = findLeaseEntry(
+            state,
+            lease.deviceKey,
+            lease.leaseId,
+          );
           if (cur && cur.leaseId === lease.leaseId) {
             if (lease.avd && !cur.avd) {
               cur.avd = lease.avd;
@@ -3087,7 +3115,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               if (doStop) {
                 recordDeviceStoppedInState(state, cur, now);
               }
-              delete state.leases[lease.deviceKey];
+              delete state.leases[resolvedKey];
             }
             return { mutated: true };
           }
@@ -3433,12 +3461,16 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     };
   }
 
-  if (effectiveAction === "load") {
+      if ( effectiveAction === "load") {
     try {
       const stillOwnedBeforeWait = withStateTransaction(
         stateDir,
         (state) => {
-          const cur = state.leases[leaseCheck.lease.deviceKey];
+          const { lease: cur } = findLeaseEntry(
+            state,
+            leaseCheck.lease.deviceKey,
+            leaseCheck.lease.leaseId,
+          );
           return {
             mutated: false,
             value: Boolean(
@@ -3591,7 +3623,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const heartbeatIntervalMs = Math.min(60_000, Math.max(1000, Math.floor(check.ttlMs / 3)));
   const onHeartbeat = () => {
     withStateTransaction(stateDir, (state, { now }) => {
-      const cur = state.leases[check.lease.deviceKey];
+      const { lease: cur } = findLeaseEntry(
+        state,
+        check.lease.deviceKey,
+        check.lease.leaseId,
+      );
       if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
         cur.renewedAtMs = now;
         cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
@@ -3608,7 +3644,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       withStateTransaction(
         stateDir,
         (state) => {
-          const cur = state.leases[check.lease.deviceKey];
+          const { lease: cur } = findLeaseEntry(
+            state,
+            check.lease.deviceKey,
+            check.lease.leaseId,
+          );
           if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
             addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
               isProcessGroup: Boolean(isProcessGroup),

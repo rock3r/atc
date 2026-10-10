@@ -25,10 +25,102 @@ export function isPidAlive(pid) {
 }
 
 let activePgidLivenessSnapshot = null;
+const winKnownTreeDescendants = new Map();
+
+function queryWindowsProcessGroups(pgids) {
+  const result = new Map();
+  for (const pgid of pgids) {
+    result.set(pgid, false);
+  }
+  try {
+    const psCmd =
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress";
+    const res = spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", psCmd],
+      { encoding: "utf8", timeout: 2500, windowsHide: true },
+    );
+    if (res && res.status === 0 && res.stdout) {
+      const parsed = JSON.parse(res.stdout.trim());
+      const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+      const alivePids = new Set();
+      const childrenByParent = new Map();
+      for (const r of rows) {
+        const pid = Number(r?.ProcessId);
+        const ppid = Number(r?.ParentProcessId);
+        if (Number.isInteger(pid) && pid > 0) {
+          alivePids.add(pid);
+          if (Number.isInteger(ppid) && ppid > 0) {
+            let list = childrenByParent.get(ppid);
+            if (!list) {
+              list = [];
+              childrenByParent.set(ppid, list);
+            }
+            list.push(pid);
+          }
+        }
+      }
+      for (const pgid of pgids) {
+        const prevKnown = winKnownTreeDescendants.get(pgid) || new Set();
+        const queue = [pgid, ...prevKnown];
+        const visited = new Set(queue);
+        const liveMembers = new Set();
+        if (alivePids.has(pgid)) {
+          liveMembers.add(pgid);
+        }
+        for (const k of prevKnown) {
+          if (alivePids.has(k)) {
+            liveMembers.add(k);
+          }
+        }
+        while (queue.length > 0) {
+          const cur = queue.shift();
+          const kids = childrenByParent.get(cur) || [];
+          for (const kid of kids) {
+            if (alivePids.has(kid)) {
+              liveMembers.add(kid);
+            }
+            if (!visited.has(kid)) {
+              visited.add(kid);
+              queue.push(kid);
+            }
+          }
+        }
+        if (liveMembers.size > 0) {
+          winKnownTreeDescendants.set(pgid, liveMembers);
+          result.set(pgid, true);
+        } else {
+          winKnownTreeDescendants.delete(pgid);
+          result.set(pgid, false);
+        }
+      }
+    }
+  } catch {
+    // Ignore PowerShell query errors
+  }
+  return result;
+}
+
+export function getKnownWindowsTreePids(pgid) {
+  const known = winKnownTreeDescendants.get(Number(pgid));
+  return known ? Array.from(known) : [];
+}
 
 export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
-  if (process.platform === "win32" || !Number.isInteger(pgid) || pgid <= 1) {
+  if (!Number.isInteger(pgid) || pgid <= 1) {
     return false;
+  }
+  if (process.platform === "win32") {
+    if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgid)) {
+      return activePgidLivenessSnapshot.get(pgid);
+    }
+    if (isPidAlive(pgid)) {
+      return true;
+    }
+    if (!allowSubprocess) {
+      return false;
+    }
+    return Boolean(queryWindowsProcessGroups([pgid]).get(pgid));
   }
   try {
     process.kill(-pgid, 0);
@@ -98,7 +190,27 @@ export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
 
 export function snapshotProcessGroupsOutsideLock(pgids) {
   const snapshot = new Map();
-  if (process.platform === "win32" || !Array.isArray(pgids) || pgids.length === 0) {
+  if (!Array.isArray(pgids) || pgids.length === 0) {
+    return snapshot;
+  }
+  if (process.platform === "win32") {
+    const exitedCandidates = [];
+    for (const raw of pgids) {
+      const pgid = Number(raw);
+      if (!Number.isInteger(pgid) || pgid <= 1 || snapshot.has(pgid)) continue;
+      if (isPidAlive(pgid)) {
+        snapshot.set(pgid, true);
+      } else {
+        exitedCandidates.push(pgid);
+        snapshot.set(pgid, false);
+      }
+    }
+    if (exitedCandidates.length > 0) {
+      const winRes = queryWindowsProcessGroups(exitedCandidates);
+      for (const [pgid, alive] of winRes.entries()) {
+        snapshot.set(pgid, alive);
+      }
+    }
     return snapshot;
   }
   const candidates = [];
