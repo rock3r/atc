@@ -2540,6 +2540,39 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           assert.equal(avdPrefixList[0].avd, "AVD_Pixel_9");
           assert.equal(avdPrefixList[0].online, true);
           assert.equal(avdPrefixList[0].serial, "emulator-5558");
+
+          // 6. starting/stopping transition reservations with a future deadlineMs are retained until deadlineMs expires even if workerPid is dead
+          const orphanTransState = createDefaultState();
+          const tTrans = 1_700_000_000_000;
+          orphanTransState.leases["avd:Pixel_8_API_35"] = {
+            leaseId: "lease-orphan-starting",
+            deviceKey: "avd:Pixel_8_API_35",
+            avd: "Pixel_8_API_35",
+            kind: "emulator",
+            state: "starting",
+            sessionId: "sess-orphan",
+            workerPid: 99999999,
+            claimedAtMs: tTrans,
+            deadlineMs: tTrans + 60_000,
+          };
+          const prunedBeforeDeadline = runGarbageCollection(
+            orphanTransState,
+            null,
+            tTrans + 10_000,
+            () => false,
+          );
+          assert.equal(prunedBeforeDeadline.leases.length, 0);
+          assert.ok(orphanTransState.leases["avd:Pixel_8_API_35"]);
+
+          const prunedAfterDeadline = runGarbageCollection(
+            orphanTransState,
+            null,
+            tTrans + 60_000,
+            () => false,
+          );
+          assert.equal(prunedAfterDeadline.leases.length, 1);
+          assert.equal(prunedAfterDeadline.leases[0].reason, "deadline_exceeded");
+          assert.equal(orphanTransState.leases["avd:Pixel_8_API_35"], undefined);
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }

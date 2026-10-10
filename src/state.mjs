@@ -398,14 +398,15 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       }
     } else if (lease.state === "starting" || lease.state === "stopping") {
       const deadWorker = !lease.workerPid || !livenessCheck(lease.workerPid);
+      const hasDeadline = typeof lease.deadlineMs === "number" && Number.isFinite(lease.deadlineMs);
       const pastDeadline =
-        (typeof lease.deadlineMs === "number" && now >= lease.deadlineMs) ||
+        (hasDeadline && now >= lease.deadlineMs) ||
         (typeof lease.claimedAtMs === "number" && now < lease.claimedAtMs);
-      if (deadWorker || pastDeadline) {
+      if (pastDeadline || (deadWorker && !hasDeadline)) {
         pruned.leases.push({
           deviceKey,
           leaseId: lease.leaseId,
-          reason: deadWorker ? "dead_worker" : "deadline_exceeded",
+          reason: pastDeadline ? "deadline_exceeded" : "dead_worker",
         });
         delete state.leases[deviceKey];
       }
