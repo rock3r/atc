@@ -5164,6 +5164,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
                 Atomics.wait(view, 0, 0, 20);
               }
               const handleB = acquireLock(workerData.stateDir, 6000);
+              const acquiredAtMs = Date.now();
               const activeNow = Atomics.add(view, 1, 1) + 1;
               let prevMax = Atomics.load(view, 2);
               while (activeNow > prevMax) {
@@ -5175,7 +5176,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
               const ownedEnd = verifyLockOwnership(handleB);
               Atomics.sub(view, 1, 1);
               releaseLock(handleB);
-              parentPort.postMessage({ ownedStart, ownedEnd, acquiredAtMs: Date.now() });
+              parentPort.postMessage({ ownedStart, ownedEnd, acquiredAtMs });
             })
             .catch((err) => {
               throw err;
@@ -5201,6 +5202,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         });
 
         let pausedBeforeRename = false;
+        let pauseEndedAtMs = 0;
         const handleA = acquireLock(pausedBreakerDir, 6000, "atc.lock", 10_000, {
           beforeBreakRename: () => {
             pausedBeforeRename = true;
@@ -5208,6 +5210,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             Atomics.notify(pauseView, 0, 1);
             // Pause longer than MISSING_OWNER_STALE_MS (2000ms) right before renameSync
             sleepSync(2200);
+            pauseEndedAtMs = Date.now();
           },
         });
         assert.equal(pausedBeforeRename, true);
@@ -5220,7 +5223,6 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         assert.equal(verifyLockOwnership(handleA), true);
         sleepSync(50);
         assert.equal(verifyLockOwnership(handleA), true);
-        const releasedAAtMs = Date.now();
         Atomics.sub(pauseView, 1, 1);
         releaseLock(handleA);
 
@@ -5229,8 +5231,8 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         assert.equal(resB.ownedEnd, true);
         assert.equal(Atomics.load(pauseView, 2), 1);
         assert.ok(
-          resB.acquiredAtMs >= releasedAAtMs,
-          "Worker B must not acquire the lock before paused Breaker A releases it",
+          resB.acquiredAtMs >= pauseEndedAtMs,
+          "Worker B must not break or acquire the lock while Breaker A is paused before renameSync",
         );
       } finally {
         fs.rmSync(pausedBreakerDir, { recursive: true, force: true });
@@ -5282,6 +5284,42 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             "darwin",
           );
           assert.equal(resolvedEmptyEntryAdb.executable, "adb");
+
+          // Empty PATH="" checks child cwd before SDK fallback
+          const resolvedEmptyPathWithCwdAdb = resolveExecutable(
+            "adb",
+            { PATH: "", HOME: fakeHome },
+            relToolsDir,
+            "darwin",
+          );
+          assert.equal(resolvedEmptyPathWithCwdAdb.executable, "adb");
+
+          const resolvedEmptyPathNoCwdAdb = resolveExecutable(
+            "adb",
+            { PATH: "", HOME: fakeHome },
+            childCwd,
+            "darwin",
+          );
+          assert.equal(resolvedEmptyPathNoCwdAdb.executable, execAdb);
+
+          // Unset PATH searches POSIX default path (/usr/bin:/bin) before SDK fallback
+          const resolvedUnsetPathWithDefaultHit = resolveExecutable(
+            "adb",
+            { HOME: fakeHome },
+            childCwd,
+            "darwin",
+            `${relToolsDir}:/bin`,
+          );
+          assert.equal(resolvedUnsetPathWithDefaultHit.executable, "adb");
+
+          const resolvedUnsetPathFallback = resolveExecutable(
+            "adb",
+            { HOME: fakeHome },
+            childCwd,
+            "darwin",
+            localBin,
+          );
+          assert.equal(resolvedUnsetPathFallback.executable, execAdb);
         } finally {
           fs.rmSync(fakeHome, { recursive: true, force: true });
         }

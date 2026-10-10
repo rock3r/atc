@@ -22,6 +22,7 @@ export function resolveExecutable(
   env = process.env,
   cwd = process.cwd(),
   platform = process.platform,
+  defaultPosixPath = "/usr/bin:/bin",
 ) {
   if (!command || typeof command !== "string") {
     throw new Error("Command must be a non-empty string");
@@ -32,8 +33,9 @@ export function resolveExecutable(
       !command.includes("/")
     ) {
       const rawPath = env.PATH;
-      const posixPathDirs =
-        typeof rawPath === "string" && rawPath.length > 0 ? rawPath.split(":") : [];
+      const effectivePath =
+        typeof rawPath === "string" ? rawPath : defaultPosixPath;
+      const posixPathDirs = effectivePath.split(":");
       const inPath = posixPathDirs.some((dir) =>
         isPosixExecutableFile(path.resolve(cwd, dir || ".", command)),
       );
