@@ -112,10 +112,73 @@ const READ_ONLY_ADB_SUBCOMMANDS = new Set([
   "--help",
 ]);
 
+const TOOL_NAMES = ["android", "adb", "emulator", "gradlew", "gradle", "atc"];
+
+function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") {
+  const tokens = tokenizeSegment(
+    String(expandedInner || "")
+      .trimStart()
+      .replace(LEADING_CONTROL_PREFIX_RE, ""),
+  );
+  const cmd = tokens[0] ? path.basename(tokens[0], path.extname(tokens[0])).toLowerCase() : "";
+  const args = tokens.slice(1);
+
+  if (cmd === "echo") {
+    let idx = 0;
+    while (idx < args.length && /^-[neE]+$/.test(args[idx])) {
+      idx++;
+    }
+    return args.slice(idx).join(" ");
+  }
+
+  if (cmd === "printf") {
+    let idx = 0;
+    if (args[idx] === "--") idx++;
+    if (args[idx] === "-v") {
+      return "";
+    }
+    const fmt = args[idx] ?? "";
+    const fmtArgs = args.slice(idx + 1);
+    if (fmtArgs.length === 0) {
+      return fmt;
+    }
+    let argIdx = 0;
+    return fmt.replace(/%[sb]/g, () => (argIdx < fmtArgs.length ? fmtArgs[argIdx++] : ""));
+  }
+
+  if (
+    (cmd === "command" && (args[0] === "-v" || args[0] === "-V")) ||
+    cmd === "which" ||
+    cmd === "type"
+  ) {
+    const tokenMatch = String(expandedInner).match(FAST_PATH_REGEX);
+    if (tokenMatch) return tokenMatch[1];
+  }
+
+  if (prefixWord || suffixWord) {
+    const pLow = prefixWord.toLowerCase();
+    const sLow = suffixWord.toLowerCase();
+    for (const tool of TOOL_NAMES) {
+      if (
+        tool.startsWith(pLow) &&
+        tool.endsWith(sLow) &&
+        pLow.length + sLow.length <= tool.length
+      ) {
+        return tool.slice(pLow.length, tool.length - sLow.length);
+      }
+    }
+  }
+
+  return "__atc_cmd_sub__";
+}
+
 function matchesAndroidOrAtcText(str, inheritedVars = {}) {
   if (!str || typeof str !== "string") return false;
   if (FAST_PATH_REGEX.test(str)) return true;
-  const normalizedVars = str.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const subExpanded =
+    str.includes("$") || str.includes("`") ? extractCommandSubstitutions(str, []) : str;
+  if (FAST_PATH_REGEX.test(subExpanded)) return true;
+  const normalizedVars = subExpanded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
   const collapsed = normalizedVars.replace(/\\(.)/g, "$1").replace(/["']/g, "");
   if (FAST_PATH_REGEX.test(collapsed)) return true;
   if (collapsed.includes("$")) {
@@ -257,12 +320,13 @@ function extractCommandSubstitutions(str, innerSubstitutions) {
         const rawInner = str.slice(i + 2, j - 1);
         const expandedInner = extractCommandSubstitutions(rawInner, innerSubstitutions);
         innerSubstitutions.push(expandedInner);
-        if (classifySegment(expandedInner).kind === "ignore") {
-          const tokenMatch = String(expandedInner).match(FAST_PATH_REGEX);
-          out += tokenMatch ? tokenMatch[1] : "";
-        } else {
-          out += "__atc_cmd_sub__";
-        }
+        const prefixMatch = out.match(/([A-Za-z0-9_.-]+)$/);
+        const suffixMatch = str.slice(j).match(/^([A-Za-z0-9_.-]+)/);
+        out += resolveStaticSubValue(
+          expandedInner,
+          prefixMatch ? prefixMatch[1] : "",
+          suffixMatch ? suffixMatch[1] : "",
+        );
         i = j - 1;
         continue;
       }
@@ -280,12 +344,13 @@ function extractCommandSubstitutions(str, innerSubstitutions) {
         const rawInner = str.slice(i + 1, j);
         const expandedInner = extractCommandSubstitutions(rawInner, innerSubstitutions);
         innerSubstitutions.push(expandedInner);
-        if (classifySegment(expandedInner).kind === "ignore") {
-          const tokenMatch = String(expandedInner).match(FAST_PATH_REGEX);
-          out += tokenMatch ? tokenMatch[1] : "";
-        } else {
-          out += "__atc_cmd_sub__";
-        }
+        const prefixMatch = out.match(/([A-Za-z0-9_.-]+)$/);
+        const suffixMatch = str.slice(j + 1).match(/^([A-Za-z0-9_.-]+)/);
+        out += resolveStaticSubValue(
+          expandedInner,
+          prefixMatch ? prefixMatch[1] : "",
+          suffixMatch ? suffixMatch[1] : "",
+        );
         i = j;
         continue;
       }
@@ -413,9 +478,16 @@ export function expandVariables(str, vars = {}) {
 }
 
 export function parseSegment(segment, inheritedVars = {}) {
-  const strippedSegment = String(segment || "")
+  const rawStripped = String(segment || "")
     .trimStart()
     .replace(LEADING_CONTROL_PREFIX_RE, "");
+  const strippedSegment =
+    rawStripped.includes("$(") ||
+    rawStripped.includes("<(") ||
+    rawStripped.includes(">(") ||
+    rawStripped.includes("`")
+      ? extractCommandSubstitutions(rawStripped, [])
+      : rawStripped;
   const tokens = tokenizeSegment(strippedSegment);
   let baseVars = { ...inheritedVars };
   const envVars = {};

@@ -3983,6 +3983,41 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 fs.rmSync(evilWorkDir, { recursive: true, force: true });
               }
             }
+
+            // 48. Command-substitution executable assembly (`$(printf ad)b`, `$(printf emul)ator`) is caught by fast-path and guard
+            const subPrintfKill = evaluateCommandGuard("$(printf ad)b kill-server", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(subPrintfKill.allowed, false);
+            assert.match(subPrintfKill.reason, /adb kill-server/);
+
+            const subPrintfEmu = evaluateCommandGuard("$(printf emul)ator -avd Evil", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(subPrintfEmu.allowed, false);
+            assert.match(subPrintfEmu.reason, /Direct emulator launch is disabled/);
+
+            const subPrintfAssignKill = evaluateCommandGuard("x=$(printf ad); ${x}b kill-server", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(subPrintfAssignKill.allowed, false);
+            assert.match(subPrintfAssignKill.reason, /adb kill-server/);
+
+            const subPrintfDeviceRewrite = evaluateCommandGuard("$(printf ad)b shell getprop", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              runningCount: 1,
+              platform: "darwin",
+            });
+            assert.equal(subPrintfDeviceRewrite.allowed, true);
+            assert.equal(subPrintfDeviceRewrite.fastPath, false);
+            assert.equal(
+              subPrintfDeviceRewrite.rewrittenCommand,
+              "ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c '$(printf ad)b shell getprop'",
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

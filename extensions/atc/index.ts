@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|atc)\b/i;
+const TOOL_NAMES = ["android", "adb", "emulator", "gradlew", "gradle", "atc"];
 
 function expandVariables(str: string, vars: Record<string, string> = {}): string {
   if (!str || Object.keys(vars).length === 0) return str;
@@ -16,10 +17,167 @@ function expandVariables(str: string, vars: Record<string, string> = {}): string
   );
 }
 
+function resolveStaticSubValue(expandedInner: string, prefixWord = "", suffixWord = ""): string {
+  const cleaned = String(expandedInner || "")
+    .replace(/\\(.)/g, "$1")
+    .replace(/["']/g, "")
+    .trim();
+  const tokens = cleaned ? cleaned.split(/\s+/) : [];
+  const cmd = tokens[0] ? path.basename(tokens[0], path.extname(tokens[0])).toLowerCase() : "";
+  const args = tokens.slice(1);
+
+  if (cmd === "echo") {
+    let idx = 0;
+    while (idx < args.length && /^-[neE]+$/.test(args[idx])) {
+      idx++;
+    }
+    return args.slice(idx).join(" ");
+  }
+
+  if (cmd === "printf") {
+    let idx = 0;
+    if (args[idx] === "--") idx++;
+    if (args[idx] === "-v") return "";
+    const fmt = args[idx] ?? "";
+    const fmtArgs = args.slice(idx + 1);
+    if (fmtArgs.length === 0) return fmt;
+    let argIdx = 0;
+    return fmt.replace(/%[sb]/g, () => (argIdx < fmtArgs.length ? fmtArgs[argIdx++] : ""));
+  }
+
+  if (
+    (cmd === "command" && (args[0] === "-v" || args[0] === "-V")) ||
+    cmd === "which" ||
+    cmd === "type"
+  ) {
+    const tokenMatch = String(expandedInner).match(FAST_PATH_REGEX);
+    if (tokenMatch) return tokenMatch[1];
+  }
+
+  if (prefixWord || suffixWord) {
+    const pLow = prefixWord.toLowerCase();
+    const sLow = suffixWord.toLowerCase();
+    for (const tool of TOOL_NAMES) {
+      if (
+        tool.startsWith(pLow) &&
+        tool.endsWith(sLow) &&
+        pLow.length + sLow.length <= tool.length
+      ) {
+        return tool.slice(pLow.length, tool.length - sLow.length);
+      }
+    }
+  }
+
+  return "__atc_cmd_sub__";
+}
+
+function expandCommandSubstitutionsForFastPath(
+  str: string,
+  subCollector: string[] = []
+): string {
+  let out = "";
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === "\\" && !inSingle && i + 1 < str.length) {
+      out += ch + str[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+    if (
+      !inSingle &&
+      (ch === "$" || ch === "<" || ch === ">") &&
+      str[i + 1] === "(" &&
+      str[i + 2] !== "("
+    ) {
+      let depth = 1;
+      let j = i + 2;
+      let subSingle = false;
+      let subDouble = false;
+      while (j < str.length && depth > 0) {
+        const c = str[j];
+        if (c === "\\" && !subSingle && j + 1 < str.length) {
+          j += 2;
+          continue;
+        }
+        if (c === "'" && !subDouble) {
+          subSingle = !subSingle;
+        } else if (c === '"' && !subSingle) {
+          subDouble = !subDouble;
+        } else if (!subSingle && !subDouble) {
+          if (c === "(") depth++;
+          else if (c === ")") depth--;
+        }
+        j++;
+      }
+      if (depth === 0) {
+        const rawInner = str.slice(i + 2, j - 1);
+        const expandedInner = expandCommandSubstitutionsForFastPath(rawInner, subCollector);
+        subCollector.push(expandedInner);
+        const prefixMatch = out.match(/([A-Za-z0-9_.-]+)$/);
+        const suffixMatch = str.slice(j).match(/^([A-Za-z0-9_.-]+)/);
+        out += resolveStaticSubValue(
+          expandedInner,
+          prefixMatch ? prefixMatch[1] : "",
+          suffixMatch ? suffixMatch[1] : ""
+        );
+        i = j - 1;
+        continue;
+      }
+    }
+    if (!inSingle && ch === "`") {
+      let j = i + 1;
+      while (j < str.length && str[j] !== "`") {
+        if (str[j] === "\\" && j + 1 < str.length) {
+          j += 2;
+          continue;
+        }
+        j++;
+      }
+      if (j < str.length && str[j] === "`") {
+        const rawInner = str.slice(i + 1, j);
+        const expandedInner = expandCommandSubstitutionsForFastPath(rawInner, subCollector);
+        subCollector.push(expandedInner);
+        const prefixMatch = out.match(/([A-Za-z0-9_.-]+)$/);
+        const suffixMatch = str.slice(j + 1).match(/^([A-Za-z0-9_.-]+)/);
+        out += resolveStaticSubValue(
+          expandedInner,
+          prefixMatch ? prefixMatch[1] : "",
+          suffixMatch ? suffixMatch[1] : ""
+        );
+        i = j;
+        continue;
+      }
+    }
+    out += ch;
+  }
+
+  return out;
+}
+
 export function hasAndroidOrAtcTokens(command: string): boolean {
   if (!command || typeof command !== "string") return false;
   if (FAST_PATH_REGEX.test(command)) return true;
-  const normalizedVars = command.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const subParts: string[] = [];
+  const subExpanded =
+    command.includes("$") || command.includes("`")
+      ? expandCommandSubstitutionsForFastPath(command, subParts)
+      : command;
+  const combined = subParts.length > 0 ? `${subExpanded} ; ${subParts.join(" ; ")}` : subExpanded;
+  if (FAST_PATH_REGEX.test(combined)) return true;
+  const normalizedVars = combined.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
   const collapsed = normalizedVars.replace(/\\(.)/g, "$1").replace(/["']/g, "");
   if (FAST_PATH_REGEX.test(collapsed)) return true;
   if (collapsed.includes("$")) {
