@@ -8943,7 +8943,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(extglobLoopRedir.allowed, true);
     assert.match(
       extglobLoopRedir.rewrittenCommand,
-      /__atc_flags="\$-\" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; eval "\$__atc_shopts" 2>\/dev\/null; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
+      /__atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
     );
 
     const arithMultLoopRedir = evaluateCommandGuard(
@@ -9209,7 +9209,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(noglobExplicitLoopRedir.allowed, true);
     assert.match(
       noglobExplicitLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+      /do __atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
     );
 
     const noglobCallerGlobLoopRedir = evaluateCommandGuard(
@@ -9223,7 +9223,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(noglobCallerGlobLoopRedir.allowed, true);
     assert.match(
       noglobCallerGlobLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+      /do __atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
     );
 
     const noglobOptionLoopRedir = evaluateCommandGuard(
@@ -9254,7 +9254,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell rm -rf "\$MISSING" > \/tmp\/out\.txt' ; done$/,
     );
 
-    // Concurrent lease renewal between cmdGc unlocked read and lock revalidation prevents killing active detached group
+    // Concurrent lease renewal between cmdGc unlocked read (or after gcReapingAtMs marker while powershell runs) and beforeKill recheck prevents killing active detached group
     const concurrentRenewPgid = 890001;
     clearKnownWindowsTreeDescendants(concurrentRenewPgid);
     try {
@@ -9284,33 +9284,36 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         expiresAtMs: now - 10_000,
       };
       withLock(dir, (h) => commitState(dir, gcRaceState, h));
-      let simulatedConcurrentRenew = false;
       const raceKilledPids = [];
+      let renewDuringReap = null;
+      const winPsOutput = JSON.stringify([
+        {
+          ProcessId: 890002,
+          ParentProcessId: concurrentRenewPgid,
+          CreationDate: "20261011000001.000000+000",
+        },
+      ]);
       const gcRaceRes = cmdGc(dir, {
         platform: "win32",
         now,
-        livenessCheck: (pid) => {
-          if (pid === process.pid && !simulatedConcurrentRenew) {
-            simulatedConcurrentRenew = true;
-            // Simulate a concurrent renewal landing after cmdGc's unlocked readState but before its locked revalidation
-            withLock(dir, (h) => {
-              const s = readState(dir, { lockHandle: h });
-              if (s.leases["serial:emulator-5578"]) {
-                s.leases["serial:emulator-5578"].renewedAtMs = now;
-                s.leases["serial:emulator-5578"].expiresAtMs = now + 300_000;
-                commitState(dir, s, h);
-              }
-            });
-          }
-          return pid === process.pid || pid === 890002;
-        },
+        livenessCheck: (pid) => pid === process.pid || pid === 890002,
         runner: (cmd, args) => {
           if (cmd === "powershell.exe") {
+            // Simulate cmdRenew landing AFTER cmdGc set gcReapingAtMs under lock, while powershell.exe is running outside the lock
+            renewDuringReap = cmdRenew(
+              dir,
+              "lease_gc_race_renew",
+              { session: "gc-race-sess", ttl: 300 },
+              {
+                platform: "win32",
+                now,
+                livenessCheck: (pid) => pid === process.pid || pid === 890002,
+                runner: () => ({ status: 0, stdout: winPsOutput, stderr: "" }),
+              },
+            );
             return {
               status: 0,
-              stdout: JSON.stringify([
-                { ProcessId: 890002, ParentProcessId: concurrentRenewPgid, CreationDate: "20261011000001.000000+000" },
-              ]),
+              stdout: winPsOutput,
               stderr: "",
             };
           }
@@ -9321,11 +9324,12 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
           return { status: 0, stdout: "", stderr: "" };
         },
       });
+      assert.equal(renewDuringReap?.exitCode, 0);
       assert.equal(gcRaceRes.exitCode, 0);
       assert.deepEqual(
         raceKilledPids,
         [],
-        "cmdGc must not kill detached descendants when lease was concurrently renewed before lock revalidation",
+        "cmdGc beforeKill recheck must not kill detached descendants when lease was renewed after gcReapingAtMs was set",
       );
       assert.ok(
         readState(dir).leases["serial:emulator-5578"],
@@ -9344,6 +9348,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       const noglobExecDir = makeTempStateDir();
       try {
         fs.writeFileSync(path.join(noglobExecDir, "sample.apk"), "dummy", "utf8");
+        fs.writeFileSync(path.join(noglobExecDir, "skip.apk"), "dummy", "utf8");
         const stubBinDir = path.join(noglobExecDir, "bin");
         fs.mkdirSync(stubBinDir, { recursive: true });
         fs.writeFileSync(
@@ -9374,7 +9379,54 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         });
         assert.equal(execRes.status, 0, execRes.stderr);
         assert.equal(fs.readFileSync(outWithNoglob, "utf8").trim(), "install *.apk");
-        assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk");
+        assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk skip.apk");
+
+        const outGlobignore = path.join(noglobExecDir, "out-globignore.txt");
+        const rewrittenGlobignoreExec = evaluateCommandGuard(
+          `GLOBIGNORE=skip.apk; for x in 1; do adb install *.apk > "${outGlobignore}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenGlobignoreExec.allowed, true);
+        const globignoreRes = spawnSync("bash", ["-c", rewrittenGlobignoreExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(globignoreRes.status, 0, globignoreRes.stderr);
+        assert.equal(
+          fs.readFileSync(outGlobignore, "utf8").trim(),
+          "install sample.apk",
+          "GLOBIGNORE must be forwarded into wrapped glob stage to exclude matching filenames",
+        );
+
+        const outRandom = path.join(noglobExecDir, "out-random.txt");
+        const expectedRandomRes = spawnSync("bash", ["-c", 'RANDOM=42; printf "%s" "$RANDOM"'], {
+          encoding: "utf8",
+        });
+        const rewrittenRandomExec = evaluateCommandGuard(
+          `RANDOM=42; for x in 1; do adb shell echo "$RANDOM" > "${outRandom}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenRandomExec.allowed, true);
+        const randomRes = spawnSync("bash", ["-c", rewrittenRandomExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(randomRes.status, 0, randomRes.stderr);
+        assert.equal(
+          fs.readFileSync(outRandom, "utf8").trim(),
+          `shell echo ${expectedRandomRes.stdout.trim()}`,
+          "Bash special variable $RANDOM must be preserved across wrapped stage",
+        );
 
         const outNullglob = path.join(noglobExecDir, "out-nullglob.txt");
         const rewrittenNullglobExec = evaluateCommandGuard(

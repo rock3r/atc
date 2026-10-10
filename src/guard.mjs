@@ -2368,7 +2368,123 @@ function extractStageLoopVariables(stageText) {
   return Array.from(vars);
 }
 
+const BASH_SPECIAL_VAR_RE =
+  /^(?:RANDOM|SRANDOM|SECONDS|EPOCHSECONDS|EPOCHREALTIME|LINENO|BASH|BASHOPTS|BASHPID|BASH_[A-Z0-9_]+|UID|EUID|GROUPS|HOSTNAME|HOSTTYPE|OSTYPE|MACHTYPE|SHELLOPTS|SHLVL|PPID|DIRSTACK|FUNCNAME|HISTCMD|MAPFILE|PIPESTATUS|COMP_[A-Z0-9_]+)$/;
+
+const BASH_DYNAMIC_SPECIAL_VARS = new Set([
+  "RANDOM",
+  "SRANDOM",
+  "SECONDS",
+  "LINENO",
+  "EPOCHSECONDS",
+  "EPOCHREALTIME",
+  "BASHPID",
+  "BASH_SUBSHELL",
+  "SHLVL",
+  "HISTCMD",
+  "GLOBIGNORE",
+]);
+
+function extractReferencedBashSpecialVars(cmdBody) {
+  const s = String(cmdBody || "");
+  const vars = new Set();
+  const counts = new Map();
+  const assigned = new Set();
+  const recordRef = (name) => {
+    if (BASH_SPECIAL_VAR_RE.test(name)) {
+      vars.add(name);
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
+  };
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && !inSingle && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (inSingle) continue;
+    if (!inDouble && (i === 0 || /[\s;(]/.test(s[i - 1]))) {
+      const assignMatch = s.slice(i).match(/^([A-Za-z_][A-Za-z0-9_]*)\+?=/);
+      if (assignMatch && BASH_SPECIAL_VAR_RE.test(assignMatch[1])) {
+        assigned.add(assignMatch[1]);
+      }
+    }
+    const isDollarArith = ch === "$" && s[i + 1] === "(" && s[i + 2] === "(";
+    const isBareArith = !inDouble && ch === "(" && s[i + 1] === "(";
+    const isBracketArith = ch === "$" && s[i + 1] === "[";
+    if (isDollarArith || isBareArith || isBracketArith) {
+      const openLen = isDollarArith ? 3 : 2;
+      let depth = isBracketArith ? 1 : 2;
+      let j = i + openLen;
+      for (; j < s.length; j++) {
+        if (isBracketArith) {
+          if (s[j] === "[") depth++;
+          else if (s[j] === "]" && --depth === 0) break;
+        } else {
+          if (s[j] === "(") depth++;
+          else if (s[j] === ")" && --depth === 0) break;
+        }
+      }
+      if (j < s.length) {
+        const arithInner = s.slice(i + openLen, isBracketArith ? j : j - 1);
+        for (const m of arithInner.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+          recordRef(m[1]);
+        }
+        i = j;
+        continue;
+      }
+    }
+    if (ch === "$") {
+      const next = s[i + 1] || "";
+      if (/^[A-Za-z_]$/.test(next)) {
+        const idMatch = s.slice(i + 1).match(/^([A-Za-z_][A-Za-z0-9_]*)/);
+        if (idMatch) {
+          recordRef(idMatch[1]);
+          i += idMatch[1].length;
+          continue;
+        }
+      }
+      if (next === "{") {
+        let j = i + 2;
+        let depth = 1;
+        while (j < s.length && depth > 0) {
+          if (s[j] === "\\" && j + 1 < s.length) {
+            j += 2;
+            continue;
+          }
+          if (s[j] === "{") depth++;
+          else if (s[j] === "}") depth--;
+          j++;
+        }
+        if (depth === 0) {
+          const inner = s.slice(i + 2, j - 1);
+          const varMatch = inner.match(/^[#!]*([A-Za-z_][A-Za-z0-9_]*)/);
+          if (varMatch) {
+            recordRef(varMatch[1]);
+          }
+          i = j - 1;
+          continue;
+        }
+      }
+    }
+  }
+  return { vars, counts, assigned };
+}
+
 function stageRequiresBashShell(cmdBody) {
+  if (extractReferencedBashSpecialVars(cmdBody).vars.size > 0) {
+    return true;
+  }
   const s = String(cmdBody || "");
   let inSingle = false;
   let inDouble = false;
@@ -3181,9 +3297,15 @@ function extractStageShellFlagsUpdate(stageText) {
         if (!a.startsWith("-") && a !== "ANDROID_SERIAL" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(a)) {
           unsetVars.push(a);
           nounset = true;
+          if (a === "GLOBIGNORE") {
+            globShopt = true;
+          }
         }
       }
     }
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed.envVars || {}, "GLOBIGNORE")) {
+    globShopt = true;
   }
   return { noglob, nounset, globShopt, unsetVars };
 }
@@ -3517,6 +3639,7 @@ function rewriteCompoundCommand(
           Object.entries(shellVars).filter(
             ([k, v]) =>
               !k.startsWith("__atc_") &&
+              !BASH_DYNAMIC_SPECIAL_VARS.has(k) &&
               typeof v === "string" &&
               !v.includes("__atc_cmd_sub__") &&
               /^[A-Za-z0-9._:/@=-]+$/.test(v),
@@ -3538,6 +3661,7 @@ function rewriteCompoundCommand(
           Object.keys(shellVars).filter(
             (k) =>
               !k.startsWith("__atc_") &&
+              !BASH_DYNAMIC_SPECIAL_VARS.has(k) &&
               /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) &&
               !Object.prototype.hasOwnProperty.call(staticShellVars, k),
           ),
@@ -3991,6 +4115,67 @@ function rewriteCompoundCommand(
           : "";
         const statusEnv = hasExitStatus ? '__atc_status="$?" ' : "";
         const statusPrelude = hasExitStatus ? '(exit "$__atc_status"); ' : "";
+        const specialBashRefs = extractReferencedBashSpecialVars(cmdBody);
+        const specialVarEnvParts = [];
+        const specialVarPreludeParts = [];
+        if (specialBashRefs.vars.has("RANDOM")) {
+          specialVarEnvParts.push('__atc_random="${RANDOM-}" ');
+          if (
+            (specialBashRefs.counts.get("RANDOM") || 0) === 1 &&
+            !specialBashRefs.assigned.has("RANDOM")
+          ) {
+            specialVarPreludeParts.push(
+              '[ -n "$__atc_random" ] && { unset RANDOM; RANDOM="$__atc_random"; }; ',
+            );
+          } else {
+            specialVarPreludeParts.push('[ -n "$__atc_random" ] && RANDOM="$__atc_random"; ');
+          }
+        }
+        if (specialBashRefs.vars.has("SRANDOM")) {
+          specialVarEnvParts.push('__atc_srandom="${SRANDOM-}" ');
+          if (
+            (specialBashRefs.counts.get("SRANDOM") || 0) === 1 &&
+            !specialBashRefs.assigned.has("SRANDOM")
+          ) {
+            specialVarPreludeParts.push(
+              '[ -n "$__atc_srandom" ] && { unset SRANDOM; SRANDOM="$__atc_srandom"; }; ',
+            );
+          }
+        }
+        if (specialBashRefs.vars.has("SECONDS")) {
+          specialVarEnvParts.push('__atc_seconds="${SECONDS-}" ');
+          specialVarPreludeParts.push('[ -n "$__atc_seconds" ] && SECONDS="$__atc_seconds"; ');
+        }
+        if (specialBashRefs.vars.has("LINENO")) {
+          specialVarEnvParts.push('__atc_lineno="${LINENO-}" ');
+          specialVarPreludeParts.push(
+            '[ -n "$__atc_lineno" ] && { unset LINENO; LINENO="$__atc_lineno"; }; ',
+          );
+        }
+        if (specialBashRefs.vars.has("BASHPID")) {
+          specialVarEnvParts.push('__atc_bashpid="${BASHPID-}" ');
+          specialVarPreludeParts.push(
+            '[ -n "$__atc_bashpid" ] && { unset BASHPID; BASHPID="$__atc_bashpid"; }; ',
+          );
+        }
+        if (specialBashRefs.vars.has("SHLVL")) {
+          specialVarEnvParts.push('__atc_shlvl="${SHLVL-}" ');
+          specialVarPreludeParts.push('[ -n "$__atc_shlvl" ] && SHLVL="$__atc_shlvl"; ');
+        }
+        if (specialBashRefs.vars.has("BASH_SUBSHELL")) {
+          specialVarEnvParts.push('__atc_bash_subshell="${BASH_SUBSHELL-}" ');
+          specialVarPreludeParts.push(
+            '[ -n "$__atc_bash_subshell" ] && { unset BASH_SUBSHELL; BASH_SUBSHELL="$__atc_bash_subshell"; }; ',
+          );
+        }
+        if (specialBashRefs.vars.has("HISTCMD")) {
+          specialVarEnvParts.push('__atc_histcmd="${HISTCMD-}" ');
+          specialVarPreludeParts.push(
+            '[ -n "$__atc_histcmd" ] && { unset HISTCMD; HISTCMD="$__atc_histcmd"; }; ',
+          );
+        }
+        const specialVarEnv = specialVarEnvParts.join("");
+        const specialVarPrelude = specialVarPreludeParts.join("");
         const needsOuterGlobShopts =
           usesExtglob ||
           Boolean(shellVars.__atc_shopt_glob_seen) ||
@@ -3999,10 +4184,10 @@ function rewriteCompoundCommand(
             includeVarExpansion: false,
           });
         const shoptsEnv = needsOuterGlobShopts
-          ? `__atc_shopts="$(shopt -p nullglob failglob dotglob nocaseglob${usesExtglob ? "" : " extglob"} 2>/dev/null; shopt -p globstar 2>/dev/null; shopt -p globasciiranges 2>/dev/null)" `
+          ? `__atc_globignore="\${GLOBIGNORE-}" __atc_shopts="\$(shopt -p nullglob failglob dotglob nocaseglob${usesExtglob ? "" : " extglob"} 2>/dev/null; shopt -p globstar 2>/dev/null; shopt -p globasciiranges 2>/dev/null)" `
           : "";
         const globShoptPrelude = needsOuterGlobShopts
-          ? 'eval "$__atc_shopts" 2>/dev/null; '
+          ? 'if [ -n "$__atc_globignore" ]; then GLOBIGNORE=$__atc_globignore; else unset GLOBIGNORE; fi; eval "$__atc_shopts" 2>/dev/null; '
           : "";
         if (atArrayExprs.length > 0) {
           const needsOuterIfs =
@@ -4023,6 +4208,7 @@ function rewriteCompoundCommand(
           const prelude =
             noglobPrelude +
             globShoptPrelude +
+            specialVarPrelude +
             ifsPrelude +
             atArrayExprs
               .map((entry) =>
@@ -4049,7 +4235,7 @@ function rewriteCompoundCommand(
             (hasPositionalParams ? ' "$@"' : "");
           const bashExec = usesExtglob ? "bash -O extglob" : "bash";
           const zeroArg = hasZeroParam ? '"$0"' : "bash";
-          return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
+          return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
         }
         const needsOuterNoglob =
           hasUnquotedAlias ||
@@ -4068,13 +4254,13 @@ function rewriteCompoundCommand(
         const targetShell =
           usesExtglob || needsOuterGlobShopts || stageRequiresBashShell(cmdBody) ? "bash" : "sh";
         const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
-        const escaped = `'${String(noglobPrelude + globShoptPrelude + shIfsPrelude + dynamicUnsetPrelude + nounsetPrelude + statusPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
+        const escaped = `'${String(noglobPrelude + globShoptPrelude + specialVarPrelude + shIfsPrelude + dynamicUnsetPrelude + nounsetPrelude + statusPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
         const trailingAtArgs = hasPositionalParams
           ? ` ${hasZeroParam ? '"$0"' : targetShell} "$@"`
           : hasZeroParam
             ? ' "$0"'
             : "";
-        return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
+        return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =

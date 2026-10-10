@@ -3443,7 +3443,20 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       };
     }
 
+    const killCommittedAgeMs =
+      typeof lease.gcKillCommittedAtMs === "number" &&
+      Number.isFinite(lease.gcKillCommittedAtMs)
+        ? now - lease.gcKillCommittedAtMs
+        : -1;
+    if (killCommittedAgeMs >= 0 && killCommittedAgeMs < 30_000) {
+      return {
+        mutated: false,
+        value: { exitCode: 3, error: "No matching active lease found to renew." },
+      };
+    }
+
     delete lease.gcReapingAtMs;
+    delete lease.gcKillCommittedAtMs;
     lease.renewedAtMs = now;
     lease.expiresAtMs =
       rawExplicitTtl !== undefined ? now + ttlMs : Math.max(lease.expiresAtMs || 0, now + ttlMs);
@@ -3885,6 +3898,16 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         check.lease.leaseId,
       );
       if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+        const killCommittedAgeMs =
+          typeof cur.gcKillCommittedAtMs === "number" &&
+          Number.isFinite(cur.gcKillCommittedAtMs)
+            ? now - cur.gcKillCommittedAtMs
+            : -1;
+        if (killCommittedAgeMs >= 0 && killCommittedAgeMs < 30_000) {
+          return { mutated: false };
+        }
+        delete cur.gcReapingAtMs;
+        delete cur.gcKillCommittedAtMs;
         syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
         cur.renewedAtMs = now;
         cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
@@ -4302,11 +4325,71 @@ export function cmdGc(stateDir, options = {}) {
         options,
       );
       for (const targetLease of confirmedKillTargets) {
+        const expectedTargetPgids = new Set(
+          (targetLease.workerPgids || []).map((p) => String(p).trim()),
+        );
         const killedRes = killProcessGroupTree(targetLease, "SIGKILL", {
           spawnSyncFn: options.spawnSyncFn || options.runner,
           platform: options.platform,
           livenessCheck: preLiveness,
           killFn: options.killFn,
+          beforeKill: () =>
+            withLock(
+              stateDir,
+              (lockHandle) => {
+                const lockedNow = options.now ?? Date.now();
+                const lockedState = readState(stateDir, { lockHandle });
+                const lockedCfg = lockedState.config || DEFAULT_CONFIG;
+                const lockedMaxTtlMs = (lockedCfg.maxTtlSec || 3600) * 1000;
+                const cur = lockedState.leases?.[targetLease.deviceKey];
+                if (
+                  !cur ||
+                  typeof cur !== "object" ||
+                  cur.leaseId !== targetLease.leaseId ||
+                  cur.gcReapingAtMs !== targetLease.gcReapingAtMs
+                ) {
+                  return false;
+                }
+                if (!Array.isArray(cur.workerPgids) || cur.workerPgids.length === 0) {
+                  return false;
+                }
+                const hasNewPgid = cur.workerPgids.some(
+                  (p) => !expectedTargetPgids.has(String(p).trim()),
+                );
+                if (hasNewPgid) return false;
+                const curPgidSet = new Set(
+                  cur.workerPgids.map((p) => Number(String(p).split("@")[0])),
+                );
+                const curLiveWrapper = (cur.workerPids || []).some((p) => {
+                  const num = Number(p);
+                  return !curPgidSet.has(num) && preLiveness(num);
+                });
+                if (curLiveWrapper) return false;
+                const curLastRenewedMs =
+                  typeof cur.renewedAtMs === "number" ? cur.renewedAtMs : cur.claimedAtMs;
+                const curExpired =
+                  lockedNow >= cur.expiresAtMs ||
+                  lockedNow < cur.claimedAtMs ||
+                  (typeof curLastRenewedMs === "number" &&
+                    lockedNow > curLastRenewedMs + lockedMaxTtlMs);
+                const curDeadAnchor =
+                  cur.anchorPid !== null &&
+                  cur.anchorPid !== undefined &&
+                  !preLiveness(cur.anchorPid);
+                if (!curExpired && !curDeadAnchor && !cur.releaseOnWorkerExit) {
+                  return false;
+                }
+                if (cur.gcKillCommittedAtMs !== lockedNow) {
+                  cur.gcKillCommittedAtMs = lockedNow;
+                  commitState(stateDir, lockedState, lockHandle);
+                }
+                return true;
+              },
+              options.lockTimeoutMs,
+              "atc.lock",
+              undefined,
+              options,
+            ),
         });
         if (Array.isArray(killedRes?.terminatedPgids)) {
           terminatedPgids.push(...killedRes.terminatedPgids);
@@ -4320,14 +4403,22 @@ export function cmdGc(stateDir, options = {}) {
     stateDir,
     (state, { now, pruned }) => {
       for (const lease of Object.values(state.leases || {})) {
-        if (lease && typeof lease === "object" && "gcReapingAtMs" in lease) {
+        if (lease && typeof lease === "object") {
           const matchedOwnTarget = confirmedKillTargets.some(
             (t) =>
               t.leaseId === lease.leaseId && t.gcReapingAtMs === lease.gcReapingAtMs,
           );
-          const ageMs = now - Number(lease.gcReapingAtMs);
-          if (matchedOwnTarget || !Number.isFinite(ageMs) || ageMs < 0 || ageMs >= 30_000) {
-            delete lease.gcReapingAtMs;
+          if ("gcReapingAtMs" in lease) {
+            const ageMs = now - Number(lease.gcReapingAtMs);
+            if (matchedOwnTarget || !Number.isFinite(ageMs) || ageMs < 0 || ageMs >= 30_000) {
+              delete lease.gcReapingAtMs;
+            }
+          }
+          if ("gcKillCommittedAtMs" in lease) {
+            const ageMs = now - Number(lease.gcKillCommittedAtMs);
+            if (matchedOwnTarget || !Number.isFinite(ageMs) || ageMs < 0 || ageMs >= 30_000) {
+              delete lease.gcKillCommittedAtMs;
+            }
           }
         }
       }

@@ -1058,6 +1058,12 @@ export function killProcessGroupTree(
       winKnownTreeDescendants.delete(childKey);
       return withTerminatedPgids([], [childKey]);
     }
+    if (
+      typeof options.beforeKill === "function" &&
+      !options.beforeKill(options.lease || pgidOrLease)
+    ) {
+      return withTerminatedPgids([], []);
+    }
     const pidArgs = [];
     for (const p of pidsToKill) {
       pidArgs.push("/PID", String(p));
@@ -1123,6 +1129,12 @@ export function killProcessGroupTree(
       return withTerminatedPgids([], []);
     }
   } else if (hasLeaseContext && livenessCheck(childPid)) {
+    return withTerminatedPgids([], []);
+  }
+  if (
+    typeof options.beforeKill === "function" &&
+    !options.beforeKill(options.lease || pgidOrLease)
+  ) {
     return withTerminatedPgids([], []);
   }
   let groupSignaled = false;
