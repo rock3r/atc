@@ -535,7 +535,14 @@ export function reconcileOfflineLeases(
       const workerAlive = Boolean(lease.workerPid && livenessCheck(lease.workerPid));
       const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
-      if (!workerAlive && emulatorListOk && adbDevicesOk && !avdOnline && !serialOnline) {
+      if (
+        !workerAlive &&
+        !lease.pendingFsLockCheck &&
+        emulatorListOk &&
+        adbDevicesOk &&
+        !avdOnline &&
+        !serialOnline
+      ) {
         delete state.leases[deviceKey];
         mutated = true;
       }

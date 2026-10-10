@@ -7,6 +7,7 @@ import {
   deterministicCreatedAvdId,
   discoverFleet,
   parseAdbDevicesOutput,
+  parseAndroidEmulatorListOutput,
   readFreeDiskMb,
   readHostResources,
   readLocalAvdMetadata,
@@ -15,7 +16,14 @@ import {
 } from "./android.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
-import { isPidAlive, randomNonce, resolveStateDir, sleepSync, withLock } from "./lock.mjs";
+import {
+  isPidAlive,
+  randomNonce,
+  renewLock,
+  resolveStateDir,
+  sleepSync,
+  withLock,
+} from "./lock.mjs";
 import { startMcpServer } from "./mcp.mjs";
 import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
@@ -427,17 +435,70 @@ function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
 function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const fleet = discoverFleet({ runner, avdHome });
-    const probesOk = Boolean(
-      fleet.probes?.adbDevicesOk && fleet.probes?.emulatorListOk,
+    const remainingForListMs = deadline - Date.now();
+    if (remainingForListMs <= 0) break;
+    const listRes = runner("android", ["emulator", "list", "--long"], {
+      timeoutMs: Math.min(4000, Math.max(500, remainingForListMs)),
+    });
+    const emulatorListOk = listRes.status === 0;
+    const listedAvds =
+      emulatorListOk && listRes.stdout
+        ? parseAndroidEmulatorListOutput(listRes.stdout)
+        : [];
+
+    const remainingForAdbMs = deadline - Date.now();
+    if (remainingForAdbMs <= 0) break;
+    const adbRes = runner("adb", ["devices"], {
+      timeoutMs: Math.min(4000, Math.max(500, remainingForAdbMs)),
+    });
+    const adbDevicesOk = adbRes.status === 0;
+    const adbDevices =
+      adbDevicesOk && adbRes.stdout ? parseAdbDevicesOutput(adbRes.stdout) : [];
+
+    const probesOk = Boolean(adbDevicesOk && emulatorListOk);
+    const avdStillOnline = Boolean(
+      avd &&
+        listedAvds.some(
+          (item) =>
+            item.online &&
+            (item.avd === avd || (serial && item.serial === serial)),
+        ),
     );
+    const serialStillOnline = Boolean(
+      serial && adbDevices.some((dev) => dev.serial === serial),
+    );
+    let unmappedOnlineEmulatorMatchesAvd = false;
+    if (avd && !avdStillOnline && !serialStillOnline && adbDevicesOk) {
+      const mappedSerials = new Set(
+        listedAvds.map((item) => item.serial).filter(Boolean),
+      );
+      for (const dev of adbDevices) {
+        if (dev.kind !== "emulator" || !dev.serial || mappedSerials.has(dev.serial)) {
+          continue;
+        }
+        const remMs = deadline - Date.now();
+        if (remMs <= 0) {
+          unmappedOnlineEmulatorMatchesAvd = true;
+          break;
+        }
+        const nameRes = runner("adb", ["-s", dev.serial, "emu", "avd", "name"], {
+          timeoutMs: Math.min(2000, Math.max(500, remMs)),
+        });
+        const avdId =
+          nameRes.status === 0 && nameRes.stdout
+            ? nameRes.stdout.split(/\r?\n/)[0].trim()
+            : "";
+        if (!avdId || avdId === "OK" || avdId === avd) {
+          unmappedOnlineEmulatorMatchesAvd = true;
+          break;
+        }
+      }
+    }
     const stillRunning =
       !probesOk ||
-      (fleet.running || []).some(
-        (d) =>
-          d.kind === "emulator" &&
-          ((serial && d.serial === serial) || (avd && d.avd === avd)),
-      );
+      avdStillOnline ||
+      serialStillOnline ||
+      unmappedOnlineEmulatorMatchesAvd;
     let hasLockFiles = false;
     if (avd && avdHome) {
       try {
@@ -452,7 +513,7 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
         hasLockFiles = true;
       }
     }
-    if (!stillRunning && !hasLockFiles) {
+    if (!stillRunning && !hasLockFiles && Date.now() <= deadline) {
       return true;
     }
     if (Date.now() + 250 >= deadline) break;
@@ -1533,11 +1594,20 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
 
     // 2. Auto-create missing AVD if Priority 4
     if (selection.createAvd) {
+      const createLockStaleMs = Math.max(600_000, (bootTimeoutMs || 180_000) * 3);
       withLock(
         stateDir,
-        () => {
+        (createLockHandle) => {
+          const refreshCreateLock = () => {
+            if (!renewLock(createLockHandle, createLockStaleMs)) {
+              throw new Error(
+                `AVD creation lock was lost before completing creation for ${candidate.profile.deviceName}.`,
+              );
+            }
+          };
           assertReservationStillOwned();
           const preCreateFleet = discoverFleet({ runner, avdHome });
+          refreshCreateLock();
           const preFleetAvds = new Set(
             [
               ...(preCreateFleet.offline || []),
@@ -1556,15 +1626,17 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           const createRes = runner(
             "android",
             ["emulator", "create", candidate.profile.deviceName],
-            { strictInternal: true },
+            { strictInternal: true, timeoutMs: bootTimeoutMs || 180_000 },
           );
           if (createRes.status !== 0) {
             throw new Error(
               `Failed to create AVD for profile ${candidate.profile.deviceName}: ${createRes.stderr || createRes.stdout}`,
             );
           }
+          refreshCreateLock();
 
           const postCreateFleet = discoverFleet({ runner, avdHome });
+          refreshCreateLock();
           const allPostAvds = [
             ...(postCreateFleet.offline || []),
             ...(postCreateFleet.running || []),
@@ -1689,7 +1761,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         },
         bootTimeoutMs || 180_000,
         "atc.create.lock",
-        bootTimeoutMs || 180_000,
+        createLockStaleMs,
       );
     }
 
@@ -2089,6 +2161,9 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               cur.state = "stopping";
               removeLeaseWorker(cur, process.pid, livenessCheck);
               cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
+              if (isWin) {
+                cur.pendingFsLockCheck = true;
+              }
               cur.deadlineMs = now + effectiveStopTimeoutMs;
             }
             return { mutated: true };

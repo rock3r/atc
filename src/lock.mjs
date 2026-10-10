@@ -327,6 +327,30 @@ export function verifyLockOwnership(lockHandle) {
   }
 }
 
+export function renewLock(lockHandle, staleAfterMs = STALE_LOCK_MS) {
+  if (!verifyLockOwnership(lockHandle)) return false;
+  const effectiveStaleMs =
+    typeof staleAfterMs === "number" && Number.isFinite(staleAfterMs) && staleAfterMs > 0
+      ? Math.max(STALE_LOCK_MS, staleAfterMs)
+      : STALE_LOCK_MS;
+  try {
+    const payload = JSON.stringify({
+      pid: process.pid,
+      createdAtMs: Date.now(),
+      staleAfterMs: effectiveStaleMs,
+      nonce: lockHandle.nonce,
+    });
+    writeFileAtomic(lockHandle.ownerPath, payload, randomNonce(), () => {
+      if (!verifyLockOwnership(lockHandle)) {
+        throw new Error("Lock ownership lost before renewal");
+      }
+    });
+    return verifyLockOwnership(lockHandle);
+  } catch {
+    return false;
+  }
+}
+
 export function releaseLock(lockHandle) {
   if (!lockHandle || !lockHandle.ownerPath) return;
   if (!verifyLockOwnership(lockHandle)) {

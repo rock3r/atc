@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   acquireLock,
   releaseLock,
+  renewLock,
   verifyLockOwnership,
   withLock,
   writeFileAtomic,
@@ -4601,6 +4602,56 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       assert.equal(heldLease.workerPid, null);
       assert.equal(heldLease.serial, "emulator-5568");
       assert.ok(heldLease.deadlineMs > Date.now());
+
+      // Windows rollback with pendingFsLockCheck is NOT cleared early by reconcileOfflineLeases
+      withStateTransaction(rollbackHoldDir, (s) => {
+        s.leases["avd:Pixel_Rollback_AVD"].pendingFsLockCheck = true;
+        return { mutated: true };
+      });
+      withStateTransaction(rollbackHoldDir, (s) => {
+        reconcileOfflineLeases(
+          s,
+          {
+            running: [],
+            offline: [{ deviceKey: "avd:Pixel_Rollback_AVD", kind: "emulator", avd: "Pixel_Rollback_AVD" }],
+            probes: { emulatorListOk: true, adbDevicesOk: true },
+          },
+          "other-sess",
+        );
+        return { mutated: true };
+      });
+      assert.ok(
+        readState(rollbackHoldDir).leases["avd:Pixel_Rollback_AVD"],
+        "Windows stopping lease with pendingFsLockCheck must remain held until deadline",
+      );
+
+      // Non-Windows stopping lease without pendingFsLockCheck IS cleared once confirmed offline
+      withStateTransaction(rollbackHoldDir, (s) => {
+        delete s.leases["avd:Pixel_Rollback_AVD"].pendingFsLockCheck;
+        reconcileOfflineLeases(
+          s,
+          {
+            running: [],
+            offline: [{ deviceKey: "avd:Pixel_Rollback_AVD", kind: "emulator", avd: "Pixel_Rollback_AVD" }],
+            probes: { emulatorListOk: true, adbDevicesOk: true },
+          },
+          "other-sess",
+        );
+        return { mutated: true };
+      });
+      assert.equal(
+        readState(rollbackHoldDir).leases["avd:Pixel_Rollback_AVD"],
+        undefined,
+      );
+
+      // 8. renewLock refreshes owner file timestamp while preserving nonce ownership
+      const renewHandle = acquireLock(rollbackHoldDir, 2000, "atc.create.lock", 15000);
+      try {
+        assert.equal(renewLock(renewHandle, 30000), true);
+        assert.equal(verifyLockOwnership(renewHandle), true);
+      } finally {
+        releaseLock(renewHandle);
+      }
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
     }
