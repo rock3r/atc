@@ -497,6 +497,23 @@ export function avdHasRuntimeLockFiles(avdId, avdHome) {
   }
 }
 
+export function anyAvdHasRuntimeLockFiles(avdHome) {
+  if (!avdHome || !fs.existsSync(avdHome)) return false;
+  try {
+    for (const entry of fs.readdirSync(avdHome)) {
+      if (entry.endsWith(".ini") || entry.endsWith(".avd")) {
+        const avdId = entry.slice(0, -4);
+        if (avdHasRuntimeLockFiles(avdId, avdHome)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 export function reconcileOfflineLeases(
   state,
   inventory,
@@ -576,11 +593,35 @@ export function reconcileOfflineLeases(
     if (lease.state === "stopping") {
       if (!lease.awaitOfflineReconcile) continue;
       if (lease.workerPid && livenessCheck(lease.workerPid)) continue;
+      const requiredFreshAfterMs = Math.max(
+        typeof lease.stoppingAtMs === "number" && Number.isFinite(lease.stoppingAtMs)
+          ? lease.stoppingAtMs
+          : 0,
+        typeof lease.reconcileAfterMs === "number" && Number.isFinite(lease.reconcileAfterMs)
+          ? lease.reconcileAfterMs
+          : 0,
+      );
       if (
-        typeof lease.reconcileAfterMs === "number" &&
-        Number.isFinite(lease.reconcileAfterMs) &&
-        now < lease.reconcileAfterMs
+        typeof lease.stoppingEpoch === "number" &&
+        typeof inventory.fleetEpoch === "number" &&
+        inventory.fleetEpoch < lease.stoppingEpoch
       ) {
+        continue;
+      }
+      const hasFreshEpoch =
+        typeof lease.stoppingEpoch === "number" &&
+        typeof inventory.fleetEpoch === "number" &&
+        inventory.fleetEpoch >= lease.stoppingEpoch;
+      const hasFreshTimestamp =
+        typeof inventory.discoveredAtMs === "number" &&
+        Number.isFinite(inventory.discoveredAtMs) &&
+        (hasFreshEpoch
+          ? inventory.discoveredAtMs >= requiredFreshAfterMs
+          : inventory.discoveredAtMs > requiredFreshAfterMs);
+      if (requiredFreshAfterMs > 0 && !hasFreshTimestamp) {
+        continue;
+      }
+      if (requiredFreshAfterMs > 0 && now < requiredFreshAfterMs) {
         continue;
       }
       if (!emulatorListOk || !adbDevicesOk) continue;
@@ -593,9 +634,11 @@ export function reconcileOfflineLeases(
       const offlineEntry = lease.avd
         ? (inventory.offline || []).find((d) => d.avd === lease.avd || d.deviceKey === deviceKey)
         : null;
-      const hasLocks =
-        Boolean(offlineEntry?.hasLockFiles) ||
-        Boolean(lease.avd && avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome));
+      const hasLocks = lease.avd
+        ? Boolean(offlineEntry?.hasLockFiles) ||
+          Boolean(avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))
+        : Boolean((inventory.offline || []).some((d) => d?.hasLockFiles)) ||
+          Boolean(avdHome && anyAvdHasRuntimeLockFiles(avdHome));
       if (hasLocks) continue;
       delete state.leases[deviceKey];
       mutated = true;

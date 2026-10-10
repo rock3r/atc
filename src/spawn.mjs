@@ -31,8 +31,12 @@ export function resolveExecutable(
       (command === "android" || command === "adb" || command === "emulator") &&
       !command.includes("/")
     ) {
-      const posixPathDirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
-      const inPath = posixPathDirs.some((dir) => isPosixExecutableFile(path.join(dir, command)));
+      const rawPath = env.PATH;
+      const posixPathDirs =
+        typeof rawPath === "string" && rawPath.length > 0 ? rawPath.split(":") : [];
+      const inPath = posixPathDirs.some((dir) =>
+        isPosixExecutableFile(path.resolve(cwd, dir || ".", command)),
+      );
       if (!inPath) {
         const home = env.HOME || os.homedir();
         const sdkRoot =

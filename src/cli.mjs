@@ -279,6 +279,17 @@ function clearDeviceStoppedInState(state, deviceInfo) {
   if (deviceInfo.serial) delete state.stoppedDevices[`serial:${deviceInfo.serial}`];
 }
 
+function markStoppingAwaitOfflineReconcile(state, targetLease, now, deadlineMs) {
+  if (!state || !targetLease) return;
+  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
+  targetLease.state = "stopping";
+  targetLease.awaitOfflineReconcile = true;
+  targetLease.stoppingAtMs = now;
+  targetLease.reconcileAfterMs = now;
+  targetLease.stoppingEpoch = state.fleetEpoch;
+  targetLease.deadlineMs = deadlineMs;
+}
+
 function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
   const def = cfg.defaultTtlSec ?? 600;
   const max = cfg.maxTtlSec ?? 3600;
@@ -946,7 +957,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
   const initialState = readState(stateDir);
   const initialCfg = initialState.config || DEFAULT_CONFIG;
   let inventoryEpoch = initialState.fleetEpoch || 0;
-  let inventory = options.inventory || discoverFleet({ runner, avdHome, cfg: initialCfg });
+  let discoveryStartedAtMs = Date.now();
+  let rawInventory = options.inventory || discoverFleet({ runner, avdHome, cfg: initialCfg });
+  let inventory = {
+    ...rawInventory,
+    discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+    fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+  };
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
 
@@ -967,7 +984,14 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           );
         };
         const staleRunning = (inventory.running || []).filter(isStoppedSinceInventory);
-        if (staleRunning.length > 0 && !options.inventory) {
+        const staleStopping = Object.values(state.leases || {}).some(
+          (l) =>
+            l &&
+            l.state === "stopping" &&
+            l.awaitOfflineReconcile &&
+            (l.stoppingEpoch || 0) > inventoryEpoch,
+        );
+        if ((staleRunning.length > 0 || staleStopping) && !options.inventory) {
           return {
             mutated: false,
             value: { status: "stale_inventory" },
@@ -1299,11 +1323,17 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     if (txOutcome.status === "stale_inventory") {
       const refreshedState = readState(stateDir);
       inventoryEpoch = refreshedState.fleetEpoch || 0;
-      inventory = discoverFleet({
+      discoveryStartedAtMs = Date.now();
+      rawInventory = discoverFleet({
         runner,
         avdHome,
         cfg: refreshedState.config || DEFAULT_CONFIG,
       });
+      inventory = {
+        ...rawInventory,
+        discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+        fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+      };
       continue;
     }
 
@@ -1494,7 +1524,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         const curState = readState(stateDir);
         const curCfg = curState.config || DEFAULT_CONFIG;
         inventoryEpoch = curState.fleetEpoch || 0;
-        inventory = options.inventory || discoverFleet({ runner, avdHome, cfg: curCfg });
+        discoveryStartedAtMs = Date.now();
+        rawInventory = options.inventory || discoverFleet({ runner, avdHome, cfg: curCfg });
+        inventory = {
+          ...rawInventory,
+          discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+          fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+        };
         break;
       }
     }
@@ -2078,12 +2114,15 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
 
         if (owned) {
           if (rebootStopWaitTimedOut) {
-            current.state = "stopping";
-            current.awaitOfflineReconcile = true;
             removeLeaseWorker(current, process.pid, livenessCheck);
             current.replacingAvd = null;
             current.serial = candidate.serial || current.serial || null;
-            current.deadlineMs = now + effectiveStopTimeoutMs;
+            markStoppingAwaitOfflineReconcile(
+              state,
+              current,
+              now,
+              now + effectiveStopTimeoutMs,
+            );
           } else if (previousLease && !shouldRelease) {
             state.leases[lease.deviceKey] = {
               ...previousLease,
@@ -2120,30 +2159,37 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             }
           }
         } else if (rebootStopWaitTimedOut && !current) {
-          state.leases[lease.deviceKey] = {
+          const recreated = {
             ...lease,
-            state: "stopping",
-            awaitOfflineReconcile: true,
             workerPid: null,
             workerPids: [],
             replacingAvd: null,
             serial: candidate.serial || lease.serial || null,
-            deadlineMs: now + effectiveStopTimeoutMs,
           };
+          markStoppingAwaitOfflineReconcile(
+            state,
+            recreated,
+            now,
+            now + effectiveStopTimeoutMs,
+          );
+          state.leases[lease.deviceKey] = recreated;
         }
         if (selection.victim) {
           const vCurrent = state.leases[selection.victim.deviceKey];
           if (vCurrent && vCurrent.leaseId === victimLeaseId) {
             if (victimStopWaitTimedOut) {
-              vCurrent.state = "stopping";
-              vCurrent.awaitOfflineReconcile = true;
               removeLeaseWorker(vCurrent, process.pid, livenessCheck);
-              vCurrent.deadlineMs = now + effectiveStopTimeoutMs;
+              markStoppingAwaitOfflineReconcile(
+                state,
+                vCurrent,
+                now,
+                now + effectiveStopTimeoutMs,
+              );
             } else {
               delete state.leases[selection.victim.deviceKey];
             }
           } else if (victimStopWaitTimedOut && !vCurrent && victimLeaseId) {
-            state.leases[selection.victim.deviceKey] = {
+            const vRecreated = {
               leaseId: victimLeaseId,
               deviceKey: selection.victim.deviceKey,
               kind: "emulator",
@@ -2152,15 +2198,19 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               profile: selection.victim.profile,
               sessionId: lease.sessionId,
               anchorPid: lease.anchorPid ?? null,
-              state: "stopping",
-              awaitOfflineReconcile: true,
               workerPid: null,
               workerPids: [],
               replacingAvd: null,
               requiredRamMb: 0,
               claimedAtMs: now,
-              deadlineMs: now + effectiveStopTimeoutMs,
             };
+            markStoppingAwaitOfflineReconcile(
+              state,
+              vRecreated,
+              now,
+              now + effectiveStopTimeoutMs,
+            );
+            state.leases[selection.victim.deviceKey] = vRecreated;
           }
         }
         const otherLeaseOwnsDevice = Object.values(state.leases || {}).some(
@@ -2276,24 +2326,38 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 delete state.leases[lease.deviceKey];
               }
             } else if (cur && cur.leaseId === lease.leaseId) {
-              cur.state = "stopping";
-              if (isWin) {
-                cur.awaitOfflineReconcile = true;
-              }
               removeLeaseWorker(cur, process.pid, livenessCheck);
               cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
-              cur.deadlineMs = now + effectiveStopTimeoutMs;
+              if (isWin) {
+                markStoppingAwaitOfflineReconcile(
+                  state,
+                  cur,
+                  now,
+                  now + effectiveStopTimeoutMs,
+                );
+              } else {
+                cur.state = "stopping";
+                cur.deadlineMs = now + effectiveStopTimeoutMs;
+              }
             } else if (!cur) {
-              state.leases[lease.deviceKey] = {
+              const recreated = {
                 ...lease,
                 state: "stopping",
-                ...(isWin ? { awaitOfflineReconcile: true } : {}),
                 workerPid: null,
                 workerPids: [],
                 replacingAvd: null,
                 serial: cleanupSerial || resolvedSerial || lease.serial || null,
                 deadlineMs: now + effectiveStopTimeoutMs,
               };
+              if (isWin) {
+                markStoppingAwaitOfflineReconcile(
+                  state,
+                  recreated,
+                  now,
+                  now + effectiveStopTimeoutMs,
+                );
+              }
+              state.leases[lease.deviceKey] = recreated;
             }
             return { mutated: true };
           },
@@ -2671,9 +2735,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               const livenessCheck = options.livenessCheck || isPidAlive;
               removeLeaseWorker(cur, process.pid, livenessCheck);
               if (windowsStopWaitTimedOut) {
-                cur.state = "stopping";
-                cur.awaitOfflineReconcile = true;
-                cur.deadlineMs = now + stopTimeoutMs;
+                markStoppingAwaitOfflineReconcile(state, cur, now, now + stopTimeoutMs);
               } else {
                 cur.state = "active";
                 cur.releaseOnWorkerExit = false;
@@ -2698,14 +2760,13 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             return { mutated: true };
           }
           if (itemFailed && windowsStopWaitTimedOut && !cur) {
-            state.leases[lease.deviceKey] = {
+            const recreated = {
               ...lease,
-              state: "stopping",
-              awaitOfflineReconcile: true,
               workerPid: null,
               workerPids: [],
-              deadlineMs: now + stopTimeoutMs,
             };
+            markStoppingAwaitOfflineReconcile(state, recreated, now, now + stopTimeoutMs);
+            state.leases[lease.deviceKey] = recreated;
             return { mutated: true };
           }
           return { mutated: false };
@@ -3242,8 +3303,16 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   }
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
-  const cfg = readState(stateDir).config || DEFAULT_CONFIG;
-  const inventory = options.inventory || discoverFleet({ runner, avdHome, cfg });
+  const preState = readState(stateDir);
+  const cfg = preState.config || DEFAULT_CONFIG;
+  const inventoryEpoch = preState.fleetEpoch || 0;
+  const discoveryStartedAtMs = Date.now();
+  const rawInventory = options.inventory || discoverFleet({ runner, avdHome, cfg });
+  const inventory = {
+    ...rawInventory,
+    discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+    fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+  };
   const req = {
     kind: flags.kind || "any",
     deviceType: flags.type || null,

@@ -515,6 +515,7 @@ export function discoverFleet({
   cfg = DEFAULT_CONFIG,
   runner = runCommandSync,
 } = {}) {
+  const discoveredAtMs = Date.now();
   const host = readHostResources(avdHome);
   const knownAvds = new Map();
 
@@ -674,6 +675,7 @@ export function discoverFleet({
   return {
     host,
     avdHome,
+    discoveredAtMs,
     running,
     offline,
     creatable,

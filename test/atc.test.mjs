@@ -5258,6 +5258,30 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             "darwin",
           );
           assert.equal(resolvedPosixAdb.executable, execAdb);
+
+          // Relative and empty POSIX PATH entries are resolved against child cwd before falling back to SDK
+          const childCwd = path.join(fakeHome, "project");
+          const relToolsDir = path.join(childCwd, "tools");
+          fs.mkdirSync(relToolsDir, { recursive: true });
+          const relWrapperAdb = path.join(relToolsDir, "adb");
+          fs.writeFileSync(relWrapperAdb, "#!/bin/sh\n", "utf8");
+          fs.chmodSync(relWrapperAdb, 0o755);
+
+          const resolvedRelPathAdb = resolveExecutable(
+            "adb",
+            { PATH: `tools:${localBin}`, HOME: fakeHome },
+            childCwd,
+            "darwin",
+          );
+          assert.equal(resolvedRelPathAdb.executable, "adb");
+
+          const resolvedEmptyEntryAdb = resolveExecutable(
+            "adb",
+            { PATH: `:${localBin}`, HOME: fakeHome },
+            relToolsDir,
+            "darwin",
+          );
+          assert.equal(resolvedEmptyEntryAdb.executable, "adb");
         } finally {
           fs.rmSync(fakeHome, { recursive: true, force: true });
         }
@@ -5291,7 +5315,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         fs.rmSync(sweepClaimDir, { recursive: true, force: true });
       }
 
-      // 20. Windows stopping reservation with awaitOfflineReconcile is retained past deadlineMs until reconcileOfflineLeases confirms offline + no lock files
+      // 20. Windows stopping reservation with awaitOfflineReconcile is retained past deadlineMs and against pre-stopping stale discovery until fresh reconcileOfflineLeases confirms offline + no lock files
       const winReconcileDir = makeTempStateDir();
       try {
         const winAvdDir = path.join(avdHome, "Pixel_Win_Reconcile.avd");
@@ -5299,7 +5323,25 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         const qemuLockPath = path.join(winAvdDir, "hardware-qemu.ini.lock");
         fs.writeFileSync(qemuLockPath, "locked", "utf8");
 
+        // Stale discovery collected BEFORE the stopping transition
+        const stalePreStopInventory = {
+          avdHome,
+          discoveredAtMs: Date.now() - 5000,
+          fleetEpoch: 0,
+          running: [],
+          offline: [
+            {
+              deviceKey: "avd:Pixel_Win_Reconcile",
+              kind: "emulator",
+              avd: "Pixel_Win_Reconcile",
+              online: false,
+            },
+          ],
+          probes: { emulatorListOk: true, adbDevicesOk: true },
+        };
+
         withStateTransaction(winReconcileDir, (s, { now }) => {
+          s.fleetEpoch = 2;
           s.leases["avd:Pixel_Win_Reconcile"] = {
             leaseId: "lease_win_reconcile",
             deviceKey: "avd:Pixel_Win_Reconcile",
@@ -5308,6 +5350,9 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             serial: "emulator-5582",
             state: "stopping",
             awaitOfflineReconcile: true,
+            stoppingAtMs: now - 1000,
+            reconcileAfterMs: now - 1000,
+            stoppingEpoch: 2,
             workerPid: null,
             workerPids: [],
             sessionId: "win-reconcile-sess",
@@ -5327,6 +5372,8 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             s,
             {
               avdHome,
+              discoveredAtMs: now,
+              fleetEpoch: 2,
               running: [],
               offline: [
                 {
@@ -5348,13 +5395,25 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
           "Stopping reservation must remain held while hardware-qemu.ini.lock is present",
         );
 
-        // Once hardware-qemu.ini.lock is removed and emulator is offline, reconcileOfflineLeases clears it
+        // Remove lock file, then verify interleaved stale pre-stopping discovery STILL cannot clear the stopping reservation
         fs.rmSync(qemuLockPath, { force: true });
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          reconcileOfflineLeases(s, stalePreStopInventory, "other-sess", now);
+          return { mutated: true };
+        });
+        assert.ok(
+          readState(winReconcileDir).leases["avd:Pixel_Win_Reconcile"],
+          "Stale discovery collected before stoppingAtMs/stoppingEpoch must not clear stopping reservation",
+        );
+
+        // Once hardware-qemu.ini.lock is removed and fresh discovery confirms emulator is offline, reconcileOfflineLeases clears it
         withStateTransaction(winReconcileDir, (s, { now }) => {
           reconcileOfflineLeases(
             s,
             {
               avdHome,
+              discoveredAtMs: now + 10,
+              fleetEpoch: 2,
               running: [],
               offline: [
                 {
@@ -5367,7 +5426,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
               probes: { emulatorListOk: true, adbDevicesOk: true },
             },
             "other-sess",
-            now,
+            now + 10,
           );
           return { mutated: true };
         });
