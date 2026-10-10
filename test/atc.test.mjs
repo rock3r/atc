@@ -4602,11 +4602,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       assert.equal(heldLease.serial, "emulator-5568");
       assert.ok(heldLease.deadlineMs > Date.now());
 
-      // Windows rollback with pendingFsLockCheck is NOT cleared early by reconcileOfflineLeases
-      withStateTransaction(rollbackHoldDir, (s) => {
-        s.leases["avd:Pixel_Rollback_AVD"].pendingFsLockCheck = true;
-        return { mutated: true };
-      });
+      // Pre-boot/stale offline inventory in reconcileOfflineLeases or concurrent claim must NOT clear the stopping reservation before its deadline
       withStateTransaction(rollbackHoldDir, (s) => {
         reconcileOfflineLeases(
           s,
@@ -4621,27 +4617,43 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       });
       assert.ok(
         readState(rollbackHoldDir).leases["avd:Pixel_Rollback_AVD"],
-        "Windows stopping lease with pendingFsLockCheck must remain held until deadline",
+        "Stopping lease must remain held until deadline even when pre-boot offline inventory is reconciled",
       );
-
-      // Non-Windows stopping lease without pendingFsLockCheck IS cleared once confirmed offline
-      withStateTransaction(rollbackHoldDir, (s) => {
-        delete s.leases["avd:Pixel_Rollback_AVD"].pendingFsLockCheck;
-        reconcileOfflineLeases(
-          s,
-          {
+      const concurrentClaimWithStaleOfflineInventory = cmdClaim(
+        rollbackHoldDir,
+        {
+          session: "stale-inv-sess",
+          avd: "Pixel_Rollback_AVD",
+          wait: 0,
+          force: true,
+        },
+        {
+          platform: "darwin",
+          avdHome,
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
             running: [],
-            offline: [{ deviceKey: "avd:Pixel_Rollback_AVD", kind: "emulator", avd: "Pixel_Rollback_AVD" }],
-            probes: { emulatorListOk: true, adbDevicesOk: true },
+            offline: [
+              {
+                deviceKey: "avd:Pixel_Rollback_AVD",
+                kind: "emulator",
+                avd: "Pixel_Rollback_AVD",
+                serial: null,
+                online: false,
+                profile: { deviceType: "phone", apiLevel: "android-35" },
+              },
+            ],
+            creatable: [],
           },
-          "other-sess",
-        );
+        },
+      );
+      assert.notEqual(concurrentClaimWithStaleOfflineInventory.exitCode, 0);
+
+      // Clear stopping lease for subsequent test cases in rollbackHoldDir
+      withStateTransaction(rollbackHoldDir, (s) => {
+        delete s.leases["avd:Pixel_Rollback_AVD"];
         return { mutated: true };
       });
-      assert.equal(
-        readState(rollbackHoldDir).leases["avd:Pixel_Rollback_AVD"],
-        undefined,
-      );
 
       // 8. allowLivePidExpiry: false prevents breaking a lock held by a live PID even past staleLockMs
       const liveHandle = acquireLock(
@@ -4668,7 +4680,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         releaseLock(liveHandle);
       }
 
-      // 9. Windows cmdFree --stop timeout preserves "stopping" with pendingFsLockCheck
+      // 9. Windows cmdFree --stop timeout preserves "stopping" until deadline
       const winFreeClaim = cmdClaim(
         rollbackHoldDir,
         {
@@ -4728,7 +4740,6 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       const winFreeHeld = readState(rollbackHoldDir).leases["avd:Pixel_Rollback_AVD"];
       assert.ok(winFreeHeld);
       assert.equal(winFreeHeld.state, "stopping");
-      assert.equal(winFreeHeld.pendingFsLockCheck, true);
       assert.equal(winFreeHeld.workerPid, null);
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });

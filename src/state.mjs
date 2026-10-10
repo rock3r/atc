@@ -531,23 +531,6 @@ export function reconcileOfflineLeases(
         }
       }
     }
-    if (lease.state === "stopping" && lease.kind === "emulator") {
-      const workerAlive = Boolean(lease.workerPid && livenessCheck(lease.workerPid));
-      const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
-      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
-      if (
-        !workerAlive &&
-        !lease.pendingFsLockCheck &&
-        emulatorListOk &&
-        adbDevicesOk &&
-        !avdOnline &&
-        !serialOnline
-      ) {
-        delete state.leases[deviceKey];
-        mutated = true;
-      }
-      continue;
-    }
     if (lease.state !== "active") continue;
     if (lease.kind === "physical") {
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));

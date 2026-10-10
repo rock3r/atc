@@ -2150,9 +2150,6 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               cur.state = "stopping";
               removeLeaseWorker(cur, process.pid, livenessCheck);
               cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
-              if (isWin) {
-                cur.pendingFsLockCheck = true;
-              }
               cur.deadlineMs = now + effectiveStopTimeoutMs;
             }
             return { mutated: true };
@@ -2532,7 +2529,6 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               removeLeaseWorker(cur, process.pid, livenessCheck);
               if (windowsStopWaitTimedOut) {
                 cur.state = "stopping";
-                cur.pendingFsLockCheck = true;
                 cur.deadlineMs = now + stopTimeoutMs;
               } else {
                 cur.state = "active";
