@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   archiveWindowsProcessGroupGeneration,
+  getPosixProcessStartToken,
   hasAliveProcessInGroup,
   isProcessGroupAlive,
   killProcessGroupTree,
+  seedPosixPgidStartTokens,
   sleepSync,
 } from "./lock.mjs";
 
@@ -669,12 +671,25 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
     const childPid = child.pid || null;
-    if (childPid && (options.platform || process.platform) === "win32") {
+    const effectivePlatform = options.platform || process.platform;
+    let childStartToken = null;
+    if (childPid && effectivePlatform === "win32") {
       archiveWindowsProcessGroupGeneration(childPid);
+    } else if (childPid) {
+      childStartToken = getPosixProcessStartToken(childPid, {
+        platform: effectivePlatform,
+      });
+      if (childStartToken) {
+        seedPosixPgidStartTokens(childPid, childStartToken);
+      }
     }
     if (childPid && typeof options.onChildSpawn === "function") {
       try {
-        options.onChildSpawn(childPid, { isProcessGroup: true, freshGeneration: true });
+        options.onChildSpawn(childPid, {
+          isProcessGroup: true,
+          freshGeneration: true,
+          startToken: childStartToken,
+        });
       } catch {
         // Best-effort worker registration
       }

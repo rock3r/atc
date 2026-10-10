@@ -2399,7 +2399,17 @@ function stageRequiresBashShell(cmdBody) {
   return false;
 }
 
-function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, platform = "win32" }) {
+function rewriteCompoundCommand(
+  command,
+  {
+    sessionId,
+    anchorPid,
+    execSerial,
+    platform = "win32",
+    inheritedShellVars = null,
+    inheritedLoopDepth = 0,
+  },
+) {
   const rewriteOpts = { sessionId, anchorPid, execSerial, platform };
   const isWin = platform === "win32";
   const sessionFlag = sessionId
@@ -2559,10 +2569,13 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
     }
   }
 
-  const shellVars = {};
+  const shellVars =
+    inheritedShellVars && typeof inheritedShellVars === "object"
+      ? { ...inheritedShellVars }
+      : {};
   let pipeUpstreamArgs = [];
   let inPipeline = false;
-  let loopDepth = 0;
+  let loopDepth = Number.isInteger(inheritedLoopDepth) && inheritedLoopDepth > 0 ? inheritedLoopDepth : 0;
   return tokens
     .map((tok) => {
       if (tok.type !== "stage") {
@@ -2588,7 +2601,11 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       for (const lv of extractStageLoopVariables(trimmed)) {
         shellVars[lv] = "__atc_cmd_sub__";
       }
-      const subRewrite = rewriteStageCommandSubstitutions(trimmed, rewriteOpts);
+      const subRewrite = rewriteStageCommandSubstitutions(trimmed, {
+        ...rewriteOpts,
+        inheritedShellVars: shellVars,
+        inheritedLoopDepth: loopDepth,
+      });
       const stageForClassify = subRewrite.changed ? subRewrite.maskedStage : trimmed;
       const parsedStage = parseSegment(stageForClassify, shellVars);
       let classifyInput = stageForClassify;
@@ -2672,6 +2689,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           const atExprMap = new Map();
           let scanInSingle = false;
           let scanInDouble = false;
+          const scanSubStack = [];
           for (let i = 0; i < cmdBody.length; i++) {
             const ch = cmdBody[i];
             if (ch === "\\" && !scanInSingle && i + 1 < cmdBody.length) {
@@ -2685,6 +2703,25 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
             if (ch === '"' && !scanInSingle) {
               scanInDouble = !scanInDouble;
               continue;
+            }
+            if (!scanInSingle && ch === "$" && cmdBody[i + 1] === "(" && cmdBody[i + 2] !== "(") {
+              scanSubStack.push(scanInDouble);
+              scanInDouble = false;
+              i++;
+              continue;
+            }
+            if (!scanInSingle && !scanInDouble && scanSubStack.length > 0) {
+              if (ch === "(") {
+                scanSubStack.push(null);
+                continue;
+              }
+              if (ch === ")") {
+                const popped = scanSubStack.pop();
+                if (typeof popped === "boolean") {
+                  scanInDouble = popped;
+                }
+                continue;
+              }
             }
             if (!scanInSingle && ch === "$" && cmdBody[i + 1] === "{") {
               let closeIdx = -1;
@@ -2783,6 +2820,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           let rewrittenArrBody = "";
           let arrInSingle = false;
           let arrInDouble = false;
+          const arrSubStack = [];
           let aliasSeq = 0;
           let hasUnquotedAlias = false;
           const exprToAlias = new Map();
@@ -2802,6 +2840,28 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
               arrInDouble = !arrInDouble;
               rewrittenArrBody += ch;
               continue;
+            }
+            if (!arrInSingle && ch === "$" && cmdBody[i + 1] === "(" && cmdBody[i + 2] !== "(") {
+              arrSubStack.push(arrInDouble);
+              arrInDouble = false;
+              rewrittenArrBody += "$(";
+              i++;
+              continue;
+            }
+            if (!arrInSingle && !arrInDouble && arrSubStack.length > 0) {
+              if (ch === "(") {
+                arrSubStack.push(null);
+                rewrittenArrBody += ch;
+                continue;
+              }
+              if (ch === ")") {
+                const popped = arrSubStack.pop();
+                if (typeof popped === "boolean") {
+                  arrInDouble = popped;
+                }
+                rewrittenArrBody += ch;
+                continue;
+              }
             }
             if (!arrInSingle && ch === "$" && cmdBody[i + 1] === "{") {
               let closeIdx = -1;

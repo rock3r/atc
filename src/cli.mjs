@@ -35,7 +35,9 @@ import {
   canJumpAhead,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
+  getKnownPosixPgidStartToken,
   getKnownWindowsTreePids,
+  getPosixProcessStartToken,
   hasAliveProcessInGroup,
   isTicketStarvationProtected,
   killProcessGroupTree,
@@ -49,6 +51,7 @@ import {
   removeLeaseWorker,
   resolveSessionIdentity,
   resolveStableParentPid,
+  seedPosixPgidStartTokens,
   snapshotProcessGroupsOutsideLock,
   syncLeaseWorkers,
   withStateTransaction,
@@ -93,6 +96,22 @@ function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, optio
     );
     if (qRes.refreshed && qRes.get(targetKey) !== null) {
       return getKnownWindowsTreePids(targetKey, { liveOnly: true }).includes(num);
+    }
+    return true;
+  }
+  const expectedStartToken =
+    (isQualified ? keyStr.slice(keyStr.indexOf("@") + 1).trim() : null) ||
+    lease?.workerPgidStartTokens?.[String(num)] ||
+    getKnownPosixPgidStartToken(num) ||
+    null;
+  if (expectedStartToken) {
+    const actualStartToken = getPosixProcessStartToken(num, {
+      spawnSyncFn: options.spawnSyncFn || options.runner,
+      platform: effectivePlatform,
+      expectedToken: expectedStartToken,
+    });
+    if (actualStartToken !== null && actualStartToken !== expectedStartToken) {
+      return false;
     }
   }
   return true;
@@ -2863,6 +2882,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           const killedRes = killProcessGroupTree(l, "SIGKILL", {
             spawnSyncFn: options.spawnSyncFn || options.runner,
             platform: options.platform,
+            livenessCheck: preLiveness,
+            killFn: options.killFn,
           });
           if (Array.isArray(killedRes?.terminatedPgids)) {
             terminatedPgids.push(...killedRes.terminatedPgids);
@@ -3869,10 +3890,26 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   };
 
   let spawnedChildPid = null;
-  const onChildSpawn = (childPid, { isProcessGroup, freshGeneration } = {}) => {
+  let spawnedChildStartToken = null;
+  const onChildSpawn = (
+    childPid,
+    { isProcessGroup, freshGeneration, startToken } = {},
+  ) => {
     spawnedChildPid = childPid;
+    const effectivePlatform = options.platform || process.platform;
+    const isWin = effectivePlatform === "win32";
+    spawnedChildStartToken =
+      startToken ||
+      (!isWin && isProcessGroup && !options.livenessCheck
+        ? getPosixProcessStartToken(childPid, {
+            platform: effectivePlatform,
+            spawnSyncFn: options.spawnSyncFn || options.runner,
+          })
+        : null);
+    if (spawnedChildStartToken) {
+      seedPosixPgidStartTokens(childPid, spawnedChildStartToken);
+    }
     try {
-      const isWin = (options.platform || process.platform) === "win32";
       if (isProcessGroup && isWin) {
         archiveWindowsProcessGroupGeneration(childPid);
       }
@@ -3888,6 +3925,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
               isProcessGroup: Boolean(isProcessGroup),
               freshGeneration: Boolean(freshGeneration ?? true),
+              startToken: spawnedChildStartToken,
+              platform: effectivePlatform,
+              spawnSyncFn: options.spawnSyncFn || options.runner,
             });
             return { mutated: true };
           }
@@ -3927,6 +3967,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             allowSubprocess: true,
             spawnSyncFn: options.spawnSyncFn,
             platform: options.platform,
+            expectedStartToken: spawnedChildStartToken,
           });
         } catch {
           keepSpawnedChildGroup = false;
@@ -4184,6 +4225,8 @@ export function cmdGc(stateDir, options = {}) {
         const killedRes = killProcessGroupTree(lease, "SIGKILL", {
           spawnSyncFn: options.spawnSyncFn || options.runner,
           platform: options.platform,
+          livenessCheck: preLiveness,
+          killFn: options.killFn,
         });
         if (Array.isArray(killedRes?.terminatedPgids)) {
           terminatedPgids.push(...killedRes.terminatedPgids);

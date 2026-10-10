@@ -26,6 +26,7 @@ export function isPidAlive(pid) {
 
 let activePgidLivenessSnapshot = null;
 const winKnownTreeDescendants = new Map();
+const posixKnownPgidStartTokens = new Map();
 
 function normalizeCreationToken(raw) {
   if (raw === null || raw === undefined) return null;
@@ -62,6 +63,115 @@ function parseWindowsPgidKey(rawPgid) {
     return { key: pid, pid, rootCreation: null };
   }
   return null;
+}
+
+export function getPosixProcessStartToken(pid, options = {}) {
+  const numPid = Number(pid);
+  if (!Number.isInteger(numPid) || numPid <= 1) return null;
+  const platform = options.platform || process.platform;
+  if (platform === "win32") return null;
+  const expectedToken = normalizeCreationToken(options.expectedToken);
+  const preferPs = Boolean(expectedToken && !expectedToken.startsWith("proc:"));
+  if (platform === "linux" && !preferPs) {
+    try {
+      const stat = fs.readFileSync(`/proc/${numPid}/stat`, "utf8");
+      const closeParen = stat.lastIndexOf(")");
+      if (closeParen !== -1) {
+        const fields = stat.slice(closeParen + 1).trim().split(/\s+/);
+        if (fields.length > 19 && fields[19]) {
+          return `proc:${fields[19].trim()}`;
+        }
+      }
+    } catch {
+      // Fall back to ps below if /proc is unavailable or unreadable
+    }
+  }
+  if (options.allowSubprocess === false) {
+    return null;
+  }
+  const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+  try {
+    const res = spawnSyncFn("ps", ["-o", "lstart=", "-p", String(numPid)], {
+      encoding: "utf8",
+      timeout: 1500,
+    });
+    if (res && res.status === 0 && typeof res.stdout === "string") {
+      const token = res.stdout.trim().replace(/\s+/g, " ");
+      if (token.length > 0) {
+        return token;
+      }
+    }
+  } catch {
+    // Ignore ps failures
+  }
+  return null;
+}
+
+export function seedPosixPgidStartTokens(pgidOrMap, token = undefined) {
+  if (pgidOrMap && typeof pgidOrMap === "object" && !(pgidOrMap instanceof Set)) {
+    const iterable =
+      pgidOrMap instanceof Map ? pgidOrMap.entries() : Object.entries(pgidOrMap);
+    for (const [k, v] of iterable) {
+      seedPosixPgidStartTokens(k, v);
+    }
+    return;
+  }
+  const parsed = parseWindowsPgidKey(pgidOrMap);
+  if (!parsed) return;
+  const norm = normalizeCreationToken(token ?? parsed.rootCreation);
+  if (norm && norm !== "__exited__") {
+    posixKnownPgidStartTokens.set(parsed.pid, norm);
+  }
+}
+
+export function getKnownPosixPgidStartToken(pgid) {
+  const parsed = parseWindowsPgidKey(pgid);
+  if (!parsed) return null;
+  return posixKnownPgidStartTokens.get(parsed.pid) ?? parsed.rootCreation ?? null;
+}
+
+export function clearKnownPosixPgidStartTokens(pgid = null) {
+  if (pgid === null || pgid === undefined) {
+    posixKnownPgidStartTokens.clear();
+  } else {
+    const parsed = parseWindowsPgidKey(pgid);
+    if (parsed) {
+      posixKnownPgidStartTokens.delete(parsed.pid);
+    }
+  }
+}
+
+export function resolveExpectedPosixPgidStartToken(rawPgid, options = {}) {
+  const parsed = parseWindowsPgidKey(rawPgid);
+  if (!parsed) return null;
+  const pidStr = String(parsed.pid);
+  const direct =
+    normalizeCreationToken(options.startToken) ??
+    parsed.rootCreation ??
+    normalizeCreationToken(
+      options.pgidStartTokens?.[pidStr] ??
+        options.lease?.workerPgidStartTokens?.[pidStr] ??
+        null,
+    );
+  if (direct && direct !== "__exited__") {
+    return direct;
+  }
+  const descMap = options.knownDescendants ?? options.lease?.workerDescendants ?? null;
+  const descEntries = Array.isArray(descMap) ? descMap : descMap?.[pidStr];
+  if (Array.isArray(descEntries)) {
+    const rootEntry = descEntries.find(
+      (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === parsed.pid,
+    );
+    const rootToken = rootEntry
+      ? normalizeCreationToken(
+          rootEntry.startToken ?? rootEntry.creationDate ?? rootEntry.CreationDate ?? null,
+        )
+      : null;
+    if (rootToken && rootToken !== "__exited__") {
+      return rootToken;
+    }
+  }
+  return posixKnownPgidStartTokens.get(parsed.pid) ?? null;
 }
 
 export function deriveWindowsTreeGenerationToken(pgid, entriesOrMap) {
@@ -519,6 +629,9 @@ export function isProcessGroupAlive(
       isProcessGroupAlive(p, {
         allowSubprocess,
         knownDescendants: knownDescendants || targetLease.workerDescendants || null,
+        pgidStartTokens:
+          options.pgidStartTokens || targetLease.workerPgidStartTokens || null,
+        lease: targetLease,
         spawnSyncFn,
         platform,
         livenessCheck,
@@ -566,13 +679,45 @@ export function isProcessGroupAlive(
     }
     return false;
   }
-  try {
-    killFn(-pgid, 0);
-  } catch (err) {
-    if (!err || err.code !== "EPERM") return false;
+  if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgidKey)) {
+    return activePgidLivenessSnapshot.get(pgidKey);
   }
   if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgid)) {
     return activePgidLivenessSnapshot.get(pgid);
+  }
+  const hasCustomLiveness =
+    typeof livenessCheck === "function" && livenessCheck !== isPidAlive;
+  let groupExists = false;
+  try {
+    killFn(-pgid, 0);
+    groupExists = true;
+  } catch (err) {
+    if (err && err.code === "EPERM") {
+      groupExists = true;
+    }
+  }
+  if (!groupExists && !(hasCustomLiveness && livenessCheck(pgid))) {
+    return false;
+  }
+  const expectedStartToken = resolveExpectedPosixPgidStartToken(
+    pgidOrLease,
+    options,
+  );
+  if (expectedStartToken) {
+    const actualStartToken = getPosixProcessStartToken(pgid, {
+      spawnSyncFn,
+      platform,
+      expectedToken: expectedStartToken,
+      allowSubprocess,
+    });
+    if (actualStartToken !== null && actualStartToken !== expectedStartToken) {
+      return false;
+    }
+    if (!groupExists && hasCustomLiveness && livenessCheck(pgid)) {
+      return true;
+    }
+  } else if (!groupExists && hasCustomLiveness && livenessCheck(pgid)) {
+    return true;
   }
   if (platform === "linux") {
     try {
@@ -676,7 +821,10 @@ export function killProcessGroupTree(
     for (const p of pgids) {
       const sub = killProcessGroupTree(p, signal, {
         ...options,
+        lease,
         knownDescendants: knownDescendants || lease.workerDescendants || null,
+        pgidStartTokens:
+          options.pgidStartTokens || lease.workerPgidStartTokens || null,
       });
       killed.push(...sub);
       if (Array.isArray(sub.terminatedPgids)) {
@@ -768,6 +916,37 @@ export function killProcessGroupTree(
   }
 
   const killFn = options.killFn || process.kill.bind(process);
+  const livenessCheck = options.livenessCheck || isPidAlive;
+  if (options.pgidStartTokens && typeof options.pgidStartTokens === "object") {
+    seedPosixPgidStartTokens(options.pgidStartTokens);
+  }
+  if (
+    options.lease?.workerPgidStartTokens &&
+    typeof options.lease.workerPgidStartTokens === "object"
+  ) {
+    seedPosixPgidStartTokens(options.lease.workerPgidStartTokens);
+  }
+  const expectedStartToken = resolveExpectedPosixPgidStartToken(
+    pgidOrLease,
+    options,
+  );
+  const hasLeaseContext = Boolean(options.lease || options.requireLeaderToken);
+  if (expectedStartToken) {
+    const actualStartToken = getPosixProcessStartToken(childPid, {
+      spawnSyncFn,
+      platform,
+      expectedToken: expectedStartToken,
+    });
+    if (actualStartToken !== null && actualStartToken !== expectedStartToken) {
+      posixKnownPgidStartTokens.delete(childPid);
+      return withTerminatedPgids([], [parsedPgid ? parsedPgid.key : childPid]);
+    }
+    if (actualStartToken === null && livenessCheck(childPid)) {
+      return withTerminatedPgids([], []);
+    }
+  } else if (hasLeaseContext && livenessCheck(childPid)) {
+    return withTerminatedPgids([], []);
+  }
   let groupSignaled = false;
   let groupMissing = false;
   try {
@@ -777,15 +956,24 @@ export function killProcessGroupTree(
     groupMissing = Boolean(groupErr && groupErr.code === "ESRCH");
   }
   if (groupMissing) {
-    return withTerminatedPgids([], [childPid]);
+    return withTerminatedPgids([], [parsedPgid ? parsedPgid.key : childPid]);
   }
   if (
     !groupSignaled &&
-    isProcessGroupAlive(childPid, { allowSubprocess: true, spawnSyncFn, platform, killFn })
+    isProcessGroupAlive(childPid, {
+      allowSubprocess: true,
+      spawnSyncFn,
+      platform,
+      killFn,
+      expectedStartToken,
+    })
   ) {
     return withTerminatedPgids([], []);
   }
-  return withTerminatedPgids(groupSignaled ? [childPid] : [], [childPid]);
+  return withTerminatedPgids(
+    groupSignaled ? [childPid] : [],
+    [parsedPgid ? parsedPgid.key : childPid],
+  );
 }
 
 export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {
@@ -794,12 +982,16 @@ export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {
   const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
   const rawList = [];
   const mergedKnown = {};
+  const mergedTokens = {};
   if (options.knownDescendants && typeof options.knownDescendants === "object") {
     if (Array.isArray(options.knownDescendants)) {
       // Handled per-pgid below if single pgid
     } else {
       Object.assign(mergedKnown, options.knownDescendants);
     }
+  }
+  if (options.pgidStartTokens && typeof options.pgidStartTokens === "object") {
+    Object.assign(mergedTokens, options.pgidStartTokens);
   }
   if (Array.isArray(pgidsOrState)) {
     for (const item of pgidsOrState) {
@@ -809,6 +1001,12 @@ export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {
         }
         if (item.workerDescendants && typeof item.workerDescendants === "object") {
           Object.assign(mergedKnown, item.workerDescendants);
+        }
+        if (
+          item.workerPgidStartTokens &&
+          typeof item.workerPgidStartTokens === "object"
+        ) {
+          Object.assign(mergedTokens, item.workerPgidStartTokens);
         }
       } else {
         rawList.push(item);
@@ -825,6 +1023,12 @@ export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {
       }
       if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
         Object.assign(mergedKnown, lease.workerDescendants);
+      }
+      if (
+        lease.workerPgidStartTokens &&
+        typeof lease.workerPgidStartTokens === "object"
+      ) {
+        Object.assign(mergedTokens, lease.workerPgidStartTokens);
       }
     }
   }
@@ -867,22 +1071,70 @@ export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {
     }
     return snapshot;
   }
+  if (Object.keys(mergedTokens).length > 0) {
+    seedPosixPgidStartTokens(mergedTokens);
+  }
+  const killFn = options.killFn || process.kill.bind(process);
+  const hasCustomLiveness =
+    typeof options.livenessCheck === "function" &&
+    options.livenessCheck !== isPidAlive;
   const candidates = [];
   for (const raw of rawList) {
-    const pgid = Number(raw);
+    const parsed = parseWindowsPgidKey(raw);
+    if (!parsed) continue;
+    const pgid = parsed.pid;
     if (!Number.isInteger(pgid) || pgid <= 1 || snapshot.has(pgid)) continue;
+    let groupExists = false;
     try {
-      process.kill(-pgid, 0);
-      candidates.push(pgid);
-      snapshot.set(pgid, false);
+      killFn(-pgid, 0);
+      groupExists = true;
     } catch (err) {
       if (err && err.code === "EPERM") {
-        candidates.push(pgid);
-        snapshot.set(pgid, false);
-      } else {
-        snapshot.set(pgid, false);
+        groupExists = true;
       }
     }
+    const customAlive = !groupExists && hasCustomLiveness && options.livenessCheck(pgid);
+    if (!groupExists && !customAlive) {
+      snapshot.set(pgid, false);
+      if (parsed.key !== pgid) {
+        snapshot.set(parsed.key, false);
+      }
+      continue;
+    }
+    const expectedToken =
+      parsed.rootCreation ||
+      mergedTokens[String(pgid)] ||
+      posixKnownPgidStartTokens.get(pgid) ||
+      null;
+    if (expectedToken) {
+      const actualToken = getPosixProcessStartToken(pgid, {
+        spawnSyncFn,
+        platform,
+        expectedToken,
+      });
+      if (actualToken !== null && actualToken !== expectedToken) {
+        snapshot.set(pgid, false);
+        if (parsed.key !== pgid) {
+          snapshot.set(parsed.key, false);
+        }
+        continue;
+      }
+      if (customAlive) {
+        snapshot.set(pgid, true);
+        if (parsed.key !== pgid) {
+          snapshot.set(parsed.key, true);
+        }
+        continue;
+      }
+    } else if (customAlive) {
+      snapshot.set(pgid, true);
+      if (parsed.key !== pgid) {
+        snapshot.set(parsed.key, true);
+      }
+      continue;
+    }
+    candidates.push(pgid);
+    snapshot.set(pgid, false);
   }
   if (candidates.length === 0) {
     return snapshot;

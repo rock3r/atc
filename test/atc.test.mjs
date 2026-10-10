@@ -8,6 +8,7 @@ import { Worker } from "node:worker_threads";
 
 import {
   acquireLock,
+  clearKnownPosixPgidStartTokens,
   clearKnownWindowsTreeDescendants,
   getKnownWindowsTreeDescendants,
   getKnownWindowsTreePids,
@@ -8632,6 +8633,260 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         clearKnownWindowsTreeDescendants(expectedTombArchiveKey);
       }
     }
+
+    // 1r. POSIX `free --force` / `killProcessGroupTree` verifies group leader start token before signaling `-pgid`
+    {
+      const posixReusedPgid = 850001;
+      const posixUnverifiablePgid = 850002;
+      const posixVerifiedPgid = 850003;
+      const recordedToken = "Mon Oct 10 10:00:00 2026";
+      const reusedToken = "Mon Oct 10 10:05:00 2026";
+      clearKnownPosixPgidStartTokens(posixReusedPgid);
+      clearKnownPosixPgidStartTokens(posixUnverifiablePgid);
+      clearKnownPosixPgidStartTokens(posixVerifiedPgid);
+      try {
+        // Case A: Reused POSIX leader PID (mismatched start token) is NOT signaled by `free --force`, and stale PGID is pruned
+        withStateTransaction(dir, (state, { now }) => {
+          state.leases["avd:Pixel_Posix_Reused"] = {
+            leaseId: "lease_posix_reused",
+            deviceKey: "avd:Pixel_Posix_Reused",
+            avd: "Pixel_Posix_Reused",
+            serial: "emulator-5596",
+            kind: "emulator",
+            state: "active",
+            sessionId: "posix-reused-sess",
+            anchorPid: process.pid,
+            workerPid: posixReusedPgid,
+            workerPids: [posixReusedPgid],
+            workerPgids: [posixReusedPgid],
+            workerPgidStartTokens: {
+              [String(posixReusedPgid)]: recordedToken,
+            },
+            claimedAtMs: now - 5000,
+            renewedAtMs: now - 1000,
+            expiresAtMs: now + 60_000,
+          };
+          return { mutated: true };
+        });
+
+        const signaledReused = [];
+        const freeReusedRes = cmdFree(
+          dir,
+          "lease_posix_reused",
+          { session: "admin-sess", force: true },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixReusedPgid,
+            killFn: (targetPid, sig) => {
+              if (sig !== 0) {
+                signaledReused.push({ targetPid, sig });
+              }
+            },
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${reusedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixReusedPgid} S\n`, stderr: "" };
+            },
+          },
+        );
+        assert.equal(freeReusedRes.exitCode, 0);
+        assert.deepEqual(
+          signaledReused,
+          [],
+          "POSIX free --force must not signal -pgid when the leader PID start token mismatches (reused PID)",
+        );
+        assert.equal(
+          readState(dir).leases["avd:Pixel_Posix_Reused"],
+          undefined,
+          "Lease must be released after reused POSIX leader PID is pruned without signaling the unrelated process group",
+        );
+
+        // Case B: Live POSIX leader PID with missing/unverifiable start token fails closed without signaling `-pgid`
+        withStateTransaction(
+          dir,
+          (state, { now }) => {
+            state.leases["avd:Pixel_Posix_Unverifiable"] = {
+              leaseId: "lease_posix_unverifiable",
+              deviceKey: "avd:Pixel_Posix_Unverifiable",
+              avd: "Pixel_Posix_Unverifiable",
+              serial: "emulator-5597",
+              kind: "emulator",
+              state: "active",
+              sessionId: "posix-unverifiable-sess",
+              anchorPid: process.pid,
+              workerPid: posixUnverifiablePgid,
+              workerPids: [posixUnverifiablePgid],
+              workerPgids: [posixUnverifiablePgid],
+              workerPgidStartTokens: {
+                [String(posixUnverifiablePgid)]: recordedToken,
+              },
+              claimedAtMs: now - 5000,
+              renewedAtMs: now - 1000,
+              expiresAtMs: now + 60_000,
+            };
+            return { mutated: true };
+          },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixUnverifiablePgid,
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixUnverifiablePgid} S\n`, stderr: "" };
+            },
+          },
+        );
+
+        const signaledUnverifiable = [];
+        const freeUnverifiableRes = cmdFree(
+          dir,
+          "lease_posix_unverifiable",
+          { session: "admin-sess", force: true },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixUnverifiablePgid,
+            killFn: (targetPid, sig) => {
+              if (sig !== 0) {
+                signaledUnverifiable.push({ targetPid, sig });
+              }
+            },
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 1, stdout: "", stderr: "ps failed" };
+              }
+              return { status: 0, stdout: `${posixUnverifiablePgid} S\n`, stderr: "" };
+            },
+          },
+        );
+        assert.equal(
+          freeUnverifiableRes.exitCode,
+          3,
+          "POSIX free --force must retain the lease when a live leader PID's start token cannot be verified",
+        );
+        assert.deepEqual(
+          signaledUnverifiable,
+          [],
+          "POSIX free --force must not signal -pgid when start token lookup fails for a live leader PID",
+        );
+        withStateTransaction(dir, (state) => {
+          delete state.leases["avd:Pixel_Posix_Unverifiable"];
+          return { mutated: true };
+        });
+
+        // Case C: Verified POSIX leader PID (matching start token) IS signaled by `free --force` and lease is released
+        withStateTransaction(
+          dir,
+          (state, { now }) => {
+            state.leases["avd:Pixel_Posix_Verified"] = {
+              leaseId: "lease_posix_verified",
+              deviceKey: "avd:Pixel_Posix_Verified",
+              avd: "Pixel_Posix_Verified",
+              serial: "emulator-5598",
+              kind: "emulator",
+              state: "active",
+              sessionId: "posix-verified-sess",
+              anchorPid: process.pid,
+              workerPid: posixVerifiedPgid,
+              workerPids: [posixVerifiedPgid],
+              workerPgids: [posixVerifiedPgid],
+              workerPgidStartTokens: {
+                [String(posixVerifiedPgid)]: recordedToken,
+              },
+              claimedAtMs: now - 5000,
+              renewedAtMs: now - 1000,
+              expiresAtMs: now + 60_000,
+            };
+            return { mutated: true };
+          },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixVerifiedPgid,
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixVerifiedPgid} S\n`, stderr: "" };
+            },
+          },
+        );
+
+        const signaledVerified = [];
+        const freeVerifiedRes = cmdFree(
+          dir,
+          "lease_posix_verified",
+          { session: "admin-sess", force: true },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixVerifiedPgid,
+            killFn: (targetPid, sig) => {
+              if (sig !== 0) {
+                signaledVerified.push({ targetPid, sig });
+              }
+            },
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixVerifiedPgid} S\n`, stderr: "" };
+            },
+          },
+        );
+        assert.equal(freeVerifiedRes.exitCode, 0);
+        assert.deepEqual(signaledVerified, [
+          { targetPid: -posixVerifiedPgid, sig: "SIGKILL" },
+        ]);
+        assert.equal(readState(dir).leases["avd:Pixel_Posix_Verified"], undefined);
+      } finally {
+        clearKnownPosixPgidStartTokens(posixReusedPgid);
+        clearKnownPosixPgidStartTokens(posixUnverifiablePgid);
+        clearKnownPosixPgidStartTokens(posixVerifiedPgid);
+      }
+    }
+
+    // 3p. Loop variables (including `mapfile` arrays) are propagated into recursive `$(...)` and backtick command substitutions
+    const forCmdSubLoop = evaluateCommandGuard(
+      'while read -r x; do echo "$(adb shell echo "$x" > /tmp/out.txt)"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(forCmdSubLoop.allowed, true);
+    assert.match(
+      forCmdSubLoop.rewrittenCommand,
+      /^while read -r x ; do echo "\$\(x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'\)" ; done$/,
+    );
+
+    const mapfileCmdSubLoop = evaluateCommandGuard(
+      'while mapfile -t arr; do echo "$(adb shell echo "${arr[0]}" > /tmp/out.txt)"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(mapfileCmdSubLoop.allowed, true);
+    assert.match(
+      mapfileCmdSubLoop.rewrittenCommand,
+      /echo "\$\(__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt'\)" ; done$/,
+    );
+
+    const backtickCmdSubLoop = evaluateCommandGuard(
+      'for x in a b; do echo `adb shell echo "$x" > /tmp/out.txt`; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(backtickCmdSubLoop.allowed, true);
+    assert.match(
+      backtickCmdSubLoop.rewrittenCommand,
+      /^for x in a b ; do echo `x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'` ; done$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
