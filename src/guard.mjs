@@ -11,6 +11,15 @@ const TRANSPARENT_WRAPPERS = new Set([
   "nice",
   "time",
   "npx",
+  "then",
+  "else",
+  "do",
+  "if",
+  "elif",
+  "while",
+  "until",
+  "!",
+  "{",
 ]);
 const SHELL_WRAPPERS = new Set([
   "sh",
@@ -973,16 +982,29 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       const c = classifySegment(trimmed, shellVars);
       Object.assign(shellVars, c.parsed?.envVars || {});
       if (c.kind === "device_action" && execSerial) {
+        let prefix = "";
+        let cmdBody = trimmed;
+        const ctrlMatch = trimmed.match(/^(?:(?:if|elif|while|until|then|else|do|\{|!)\s+)+/);
+        if (ctrlMatch) {
+          prefix = ctrlMatch[0];
+          cmdBody = trimmed.slice(prefix.length).trim();
+        }
+        let suffix = "";
+        const trailMatch = cmdBody.match(/(\s+(?:fi|done|\}))$/);
+        if (trailMatch) {
+          suffix = trailMatch[1];
+          cmdBody = cmdBody.slice(0, -suffix.length).trim();
+        }
         if (isWin) {
-          return `atc exec${sessionFlag} --serial ${execSerial} -- ${trimmed}`;
+          return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
         const isSimpleStage =
-          !/[<>|&;`$()\r\n]/.test(trimmed) && !tokenizeSegment(trimmed)[0]?.includes("=");
+          !/[<>|&;`$()\r\n]/.test(cmdBody) && !tokenizeSegment(cmdBody)[0]?.includes("=");
         if (isSimpleStage) {
-          return `${posixEnvPrefix}atc exec --serial ${execSerial} -- ${trimmed}`;
+          return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
-        const escaped = `'${String(trimmed).replace(/'/g, `'\\''`)}'`;
-        return `${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
+        const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;
+        return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =

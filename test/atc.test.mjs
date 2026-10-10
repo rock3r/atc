@@ -2646,6 +2646,28 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             bashCompoundGuard.rewrittenCommand,
             "[[ -f app.apk ]] && ATC_SESSION_ID=bash-sess ATC_ANCHOR_PID=4321 atc exec --serial emulator-5554 -- adb install app.apk",
           );
+
+          // 10. Shell control structures (`if ...; then ...; fi`, `for ...; do ...; done`) keep control keywords outside `atc exec --`
+          const ifControlGuard = evaluateCommandGuard("if adb shell get-state; then echo ok; fi", {
+            sessionId: "bash-sess",
+            anchorPid: 4321,
+            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+            runningCount: 1,
+            platform: "linux",
+          });
+          assert.equal(ifControlGuard.allowed, true);
+          assert.equal(
+            ifControlGuard.rewrittenCommand,
+            "if ATC_SESSION_ID=bash-sess ATC_ANCHOR_PID=4321 atc exec --serial emulator-5554 -- adb shell get-state ; then echo ok ; fi",
+          );
+
+          // 11. parseAndroidEmulatorListOutput skips `AVD ID  AVD Name  API Level  Status  Serial` long-list header
+          const longHeaderParsed = parseAndroidEmulatorListOutput(
+            "AVD ID              AVD Name            API Level  Status    Serial\nPixel_8_API_35      Pixel 8 API 35      35         offline   -\n",
+          );
+          assert.equal(longHeaderParsed.length, 1);
+          assert.equal(longHeaderParsed[0].avd, "Pixel_8_API_35");
+          assert.equal(longHeaderParsed[0].online, false);
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }

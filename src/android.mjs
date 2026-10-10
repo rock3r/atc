@@ -212,8 +212,8 @@ export function parseAndroidEmulatorListOutput(stdout) {
     const line = raw.trim();
     if (
       !line ||
-      /^AVD(?:\s+NAME)?\s+(?:STATUS|STATE|SERIAL|API)\b/i.test(line) ||
-      /^AVD$/i.test(line) ||
+      /^AVD(?:\s+(?:ID|NAME))*\s+(?:AVD\s+NAME\s+)?(?:API(?:\s+LEVEL)?|STATUS|STATE|SERIAL)\b/i.test(line) ||
+      /^AVD(?:\s+(?:ID|NAME))?$/i.test(line) ||
       line.startsWith("---") ||
       line.startsWith("No ")
     ) {
