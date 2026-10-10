@@ -1,6 +1,6 @@
-# Android Traffic Control (ATC) — MVP Design Specification
+# Android Traffic Control (ATC) — 1.0 Design Specification
 
-- **Status:** MVP Design Specification
+- **Status:** 1.0 Design Specification (v1.0.0)
 - **Target Platforms:** macOS, Linux (Windows supported via `adb` and SDK `emulator` fallback; `android emulator` subcommands are macOS/Linux only per official Android CLI support)
 - **Runtime Stack:** Node.js (>= 20 LTS, zero external runtime dependencies, ESM `.mjs`)
 - **Integration Targets:** Official `android` CLI (`android emulator`, `android run`, `android layout`, `android screen`), `adb`, Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code, and Stdio MCP.
@@ -19,7 +19,7 @@ When multiple AI coding agents or developer terminal sessions work concurrently 
 ### Design Goal ("It Has One Job")
 ATC provides **exclusive, TTL-bounded device leases matched by hardware/OS profile, a daemonless bounded-window affinity wait queue, snapshot/wipe state preparation, device-scoped command execution, and cooperative agent-hook guardrails** around the official `android` CLI.
 
-### Non-Goals (MVP)
+### Non-Goals
 - Replicating `android` CLI features (SDK management, layout inspection, screenshot capture, APK installation).
 - Remote/distributed device farms across multiple physical hosts.
 - Multi-instance booting of the same AVD simultaneously (Android AVDs lock their `.avd` directory via `hardware-qemu.ini.lock`; ATC enforces a strict 1-lease-per-AVD invariant).

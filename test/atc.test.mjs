@@ -7045,8 +7045,12 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     assert.match(archText, /# atc architecture/);
     assert.match(archText, /atc\.lock/);
 
+    const pkgJson = JSON.parse(fs.readFileSync(new URL("package.json", rootDir), "utf8"));
+    assert.equal(pkgJson.version, "1.0.0");
+
     const agentPlugin = JSON.parse(fs.readFileSync(new URL("plugin.json", rootDir), "utf8"));
     assert.equal(agentPlugin.name, "atc");
+    assert.equal(agentPlugin.version, "1.0.0");
     assert.equal(agentPlugin.skills, "./skills/");
     assert.equal(agentPlugin.hooks, "./hooks/hooks.json");
 
@@ -7056,6 +7060,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
     const claudePlugin = JSON.parse(fs.readFileSync(new URL(".claude-plugin/plugin.json", rootDir), "utf8"));
     assert.equal(claudePlugin.name, "atc");
+    assert.equal(claudePlugin.version, "1.0.0");
     assert.equal(claudePlugin.skills, "./skills/");
 
     const marketplace = JSON.parse(fs.readFileSync(new URL(".claude-plugin/marketplace.json", rootDir), "utf8"));
@@ -7064,10 +7069,14 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
     const codexPlugin = JSON.parse(fs.readFileSync(new URL(".codex-plugin/plugin.json", rootDir), "utf8"));
     assert.equal(codexPlugin.name, "atc");
+    assert.equal(codexPlugin.version, "1.0.0");
     assert.equal(codexPlugin.mcpServers, "./.mcp.json");
 
     const mcpManifest = JSON.parse(fs.readFileSync(new URL(".mcp.json", rootDir), "utf8"));
     assert.equal(mcpManifest.mcpServers.atc.command, "atc");
+
+    const versionExit = await runCli(["version", "--json"], { ATC_STATE_DIR: dir });
+    assert.equal(versionExit, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

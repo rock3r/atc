@@ -48,6 +48,7 @@ import {
   withStateTransaction,
 } from "./state.mjs";
 
+export const ATC_VERSION = "1.0.0";
 export { GUIDE_TOPICS, cmdGuide };
 
 function parseBoolFlag(val) {
@@ -70,6 +71,7 @@ const BOOLEAN_FLAG_KEYS = new Set([
   "shutdown",
   "json",
   "help",
+  "version",
   "play",
 ]);
 
@@ -81,6 +83,8 @@ const COMMON_ALLOWED_FLAGS = new Set([
   "json",
   "help",
   "h",
+  "version",
+  "v",
 ]);
 
 const CLAIM_ALLOWED_FLAGS = new Set([
@@ -4070,6 +4074,15 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
 export async function runCli(argv = process.argv.slice(2), env = process.env, options = {}) {
   const parsed = parseCliArgs(argv);
   const stateDir = resolveStateDir(env.ATC_STATE_DIR);
+
+  if (parsed.flags.version || parsed.flags.v || parsed.subcommand === "version") {
+    if (parsed.flags.json) {
+      process.stdout.write(JSON.stringify({ version: ATC_VERSION }, null, 2) + "\n");
+    } else {
+      process.stdout.write(`${ATC_VERSION}\n`);
+    }
+    return 0;
+  }
 
   if (parsed.flags.help || parsed.flags.h || parsed.subcommand === "help") {
     const helpTopic =
