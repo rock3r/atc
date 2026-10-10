@@ -5,7 +5,9 @@ import path from "node:path";
 import {
   canSweepBreakClaimDir,
   isPidAlive,
+  isProcessGroupAlive,
   randomNonce,
+  sleepSync,
   trySweepBreakClaimDir,
   verifyLockOwnership,
   withLock,
@@ -246,30 +248,87 @@ export function validateTopLevelState(obj) {
   );
 }
 
-export function readState(stateDir) {
+function readStateFileRaw(statePath, hasLock = false) {
+  const maxAttempts = hasLock ? 1 : 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return fs.readFileSync(statePath, "utf8");
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        return null;
+      }
+      if (
+        !hasLock &&
+        attempt + 1 < maxAttempts &&
+        err &&
+        (err.code === "EBUSY" || err.code === "EPERM" || err.code === "EACCES")
+      ) {
+        sleepSync(5);
+        continue;
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
+function parseStateContent(raw) {
+  const parsed = JSON.parse(raw);
+  if (!validateTopLevelState(parsed)) {
+    throw new Error("Invalid state.json top-level schema");
+  }
+  parsed.config = { ...DEFAULT_CONFIG, ...parsed.config };
+  return parsed;
+}
+
+function quarantineCorruptStateUnderLock(stateDir, statePath, reasonMessage, lockHandle) {
+  if (!lockHandle || !verifyLockOwnership(lockHandle)) {
+    return createDefaultState();
+  }
+  const corruptPath = path.join(stateDir, `state.json.corrupt.${Date.now()}`);
+  try {
+    fs.renameSync(statePath, corruptPath);
+    process.stderr.write(
+      `[atc] Quarantined corrupt state.json to ${corruptPath} (${reasonMessage})\n`,
+    );
+  } catch {
+    // Ignore rename error if already removed
+  }
+  return createDefaultState();
+}
+
+export function readState(stateDir, options = {}) {
   const statePath = path.join(stateDir, "state.json");
-  if (!fs.existsSync(statePath)) {
+  const holdsLock = Boolean(options.lockHandle && verifyLockOwnership(options.lockHandle));
+  const raw = readStateFileRaw(statePath, holdsLock);
+  if (raw === null) {
     return createDefaultState();
   }
   try {
-    const raw = fs.readFileSync(statePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!validateTopLevelState(parsed)) {
-      throw new Error("Invalid state.json top-level schema");
+    return parseStateContent(raw);
+  } catch (parseErr) {
+    if (options.quarantine === false) {
+      return createDefaultState();
     }
-    parsed.config = { ...DEFAULT_CONFIG, ...parsed.config };
-    return parsed;
-  } catch (err) {
-    const corruptPath = path.join(stateDir, `state.json.corrupt.${Date.now()}`);
-    try {
-      fs.renameSync(statePath, corruptPath);
-      process.stderr.write(
-        `[atc] Quarantined corrupt state.json to ${corruptPath} (${err.message})\n`,
+    if (holdsLock) {
+      return quarantineCorruptStateUnderLock(
+        stateDir,
+        statePath,
+        parseErr.message,
+        options.lockHandle,
       );
-    } catch {
-      // Ignore rename error
     }
-    return createDefaultState();
+    return withLock(stateDir, (lh) => {
+      const lockedRaw = readStateFileRaw(statePath, true);
+      if (lockedRaw === null) {
+        return createDefaultState();
+      }
+      try {
+        return parseStateContent(lockedRaw);
+      } catch (lockedParseErr) {
+        return quarantineCorruptStateUnderLock(stateDir, statePath, lockedParseErr.message, lh);
+      }
+    });
   }
 }
 
@@ -319,13 +378,21 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
   if (lease.workerPid !== null && lease.workerPid !== undefined) {
     raw.push(lease.workerPid);
   }
+  const pgidSet = new Set(
+    Array.isArray(lease.workerPgids)
+      ? lease.workerPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
+      : [],
+  );
   const seen = new Set();
   const alive = [];
   for (const val of raw) {
     const pid = Number(val);
     if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
     seen.add(pid);
-    if (livenessCheck(pid)) {
+    const isAlive =
+      livenessCheck(pid) ||
+      (livenessCheck === isPidAlive && pgidSet.has(pid) && isProcessGroupAlive(pid));
+    if (isAlive) {
       alive.push(pid);
     }
   }
@@ -335,15 +402,31 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
 export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   lease.workerPids = alive;
+  if (Array.isArray(lease.workerPgids)) {
+    const aliveSet = new Set(alive);
+    lease.workerPgids = lease.workerPgids
+      .map(Number)
+      .filter((p) => aliveSet.has(p));
+    if (lease.workerPgids.length === 0) {
+      delete lease.workerPgids;
+    }
+  }
   lease.workerPid = alive[0] ?? null;
   return alive;
 }
 
-export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
+export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options = {}) {
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   const numericPid = Number(pid);
   if (Number.isInteger(numericPid) && numericPid > 0 && !alive.includes(numericPid)) {
     alive.push(numericPid);
+  }
+  if (options.isProcessGroup && Number.isInteger(numericPid) && numericPid > 1) {
+    const pgids = Array.isArray(lease.workerPgids) ? [...lease.workerPgids] : [];
+    if (!pgids.includes(numericPid)) {
+      pgids.push(numericPid);
+    }
+    lease.workerPgids = pgids;
   }
   lease.workerPids = alive;
   lease.workerPid = alive[0] ?? null;
@@ -352,6 +435,12 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
 
 export function removeLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
   const numericPid = Number(pid);
+  if (Array.isArray(lease.workerPgids)) {
+    lease.workerPgids = lease.workerPgids.filter((p) => Number(p) !== numericPid);
+    if (lease.workerPgids.length === 0) {
+      delete lease.workerPgids;
+    }
+  }
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck).filter((p) => p !== numericPid);
   lease.workerPids = alive;
   lease.workerPid = alive[0] ?? null;
@@ -678,6 +767,29 @@ export function reconcileOfflineLeases(
       continue;
     }
     if (lease.state !== "active") continue;
+    const leaseActiveSinceMs = Math.max(
+      typeof lease.activatedAtMs === "number" && Number.isFinite(lease.activatedAtMs)
+        ? lease.activatedAtMs
+        : 0,
+      typeof lease.claimedAtMs === "number" && Number.isFinite(lease.claimedAtMs)
+        ? lease.claimedAtMs
+        : 0,
+    );
+    if (
+      typeof lease.activatedEpoch === "number" &&
+      typeof inventory.fleetEpoch === "number" &&
+      inventory.fleetEpoch < lease.activatedEpoch
+    ) {
+      continue;
+    }
+    if (
+      typeof inventory.discoveredAtMs === "number" &&
+      Number.isFinite(inventory.discoveredAtMs) &&
+      leaseActiveSinceMs > 0 &&
+      inventory.discoveredAtMs < leaseActiveSinceMs
+    ) {
+      continue;
+    }
     if (lease.kind === "physical") {
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
       if (serialOnline) {
@@ -691,8 +803,39 @@ export function reconcileOfflineLeases(
         continue;
       }
     } else {
+      const runningForAvd = lease.avd
+        ? (inventory.running || []).find((d) => d.kind === "emulator" && d.avd === lease.avd)
+        : null;
+      const runningForSerial = lease.serial
+        ? (inventory.running || []).find((d) => d.kind === "emulator" && d.serial === lease.serial)
+        : null;
+      const serialTakenByOtherAvd = Boolean(
+        lease.avd &&
+          runningForSerial &&
+          runningForSerial.avd &&
+          runningForSerial.avd !== lease.avd,
+      );
+      if (
+        runningForAvd &&
+        runningForAvd.serial &&
+        runningForAvd.serial !== lease.serial
+      ) {
+        lease.serial = runningForAvd.serial;
+        mutated = true;
+      } else if (serialTakenByOtherAvd && (!runningForAvd || !runningForAvd.serial)) {
+        lease.serial = null;
+        mutated = true;
+      }
       const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
-      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
+      const serialOnline = Boolean(
+        lease.serial &&
+          onlineSerials.has(lease.serial) &&
+          !serialTakenByOtherAvd &&
+          (!lease.avd ||
+            !emulatorListOk ||
+            runningForSerial?.unknownAvd ||
+            runningForSerial?.avd === lease.avd),
+      );
       if (avdOnline || serialOnline) {
         if (lease.firstSeenOfflineAtMs !== null) {
           lease.firstSeenOfflineAtMs = null;
@@ -737,7 +880,7 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     stateDir,
     (lockHandle) => {
       const now = options.now ?? Date.now();
-      const state = readState(stateDir);
+      const state = readState(stateDir, { lockHandle });
       const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
       const result = fn(state, { now, pruned, lockHandle });
       const gcMutated =

@@ -170,6 +170,11 @@ export function wipeAvdUserData(avdId, avdHome = resolveAvdHome(), cfg = DEFAULT
   if (!avdPath || !fs.existsSync(avdPath)) {
     return;
   }
+  if (avdHasRuntimeLockFiles(avdId, avdHome)) {
+    throw new Error(
+      `Cannot wipe AVD ${avdId}: emulator runtime lock files are still present in ${avdPath}`,
+    );
+  }
   const filesToRemove = [
     "userdata-qemu.img",
     "userdata-qemu.img.qcow2",
@@ -510,11 +515,33 @@ export function checkResourceAdmission(
   return { ok: true, projectedAvailableRamMb };
 }
 
+export function isAndroidEmulatorCliUnavailable(res, platform = process.platform) {
+  if (!res || res.status === 0) return false;
+  if (platform === "win32") return true;
+  if (res.error && res.error.code === "ENOENT") return true;
+  if (res.status === 127 || res.status === 9009) return true;
+  const combined = `${res.stderr || ""} ${res.stdout || ""}`;
+  return /(?:not recognized|command not found|not supported|unsupported|unknown command|no such file)/i.test(
+    combined,
+  );
+}
+
 export function discoverFleet({
   avdHome = resolveAvdHome(),
   cfg = DEFAULT_CONFIG,
   runner = runCommandSync,
+  platform = process.platform,
+  onProgress = null,
 } = {}) {
+  const notifyProgress = () => {
+    if (typeof onProgress === "function") {
+      try {
+        onProgress();
+      } catch {
+        // Ignore progress callback failure
+      }
+    }
+  };
   const discoveredAtMs = Date.now();
   const host = readHostResources(avdHome);
   const knownAvds = new Map();
@@ -539,9 +566,11 @@ export function discoverFleet({
     }
   }
 
-  // 2. Query android emulator list --long
+  // 2. Query android emulator list --long (or SDK emulator -list-avds fallback when android CLI emulator subcommand is unavailable)
+  notifyProgress();
   const emuListRes = runner("android", ["emulator", "list", "--long"], { timeoutMs: 8000 });
-  const emulatorListOk = emuListRes.status === 0;
+  notifyProgress();
+  let emulatorListOk = emuListRes.status === 0;
   const onlineSerials = new Set();
   if (emulatorListOk && emuListRes.stdout) {
     for (const item of parseAndroidEmulatorListOutput(emuListRes.stdout)) {
@@ -560,12 +589,32 @@ export function discoverFleet({
       }
       knownAvds.set(item.avd, existing);
     }
+  } else if (isAndroidEmulatorCliUnavailable(emuListRes, platform)) {
+    const sdkListRes = runner("emulator", ["-list-avds"], { timeoutMs: 8000 });
+    notifyProgress();
+    if (sdkListRes.status === 0) {
+      emulatorListOk = true;
+      for (const rawLine of String(sdkListRes.stdout || "").split(/\r?\n/)) {
+        const avdId = rawLine.trim();
+        if (!avdId || !/^[A-Za-z0-9._-]+$/.test(avdId)) continue;
+        if (!knownAvds.has(avdId)) {
+          knownAvds.set(avdId, {
+            ...readLocalAvdMetadata(avdId, avdHome, cfg),
+            deviceKey: `avd:${avdId}`,
+            kind: "emulator",
+            online: false,
+            serial: null,
+          });
+        }
+      }
+    }
   }
 
   // 3. Query adb devices for online emulators and physical USB/Wi-Fi devices
   const physicalDevices = [];
   const unmappedEmulators = [];
   const adbRes = runner("adb", ["devices"], { timeoutMs: 8000 });
+  notifyProgress();
   const adbDevicesOk = adbRes.status === 0;
   if (adbDevicesOk && adbRes.stdout) {
     for (const dev of parseAdbDevicesOutput(adbRes.stdout)) {
@@ -577,6 +626,7 @@ export function discoverFleet({
           continue;
         }
         const nameRes = runner("adb", ["-s", dev.serial, "emu", "avd", "name"], { timeoutMs: 4000 });
+        notifyProgress();
         const avdId =
           nameRes.status === 0 && nameRes.stdout
             ? nameRes.stdout.split(/\r?\n/)[0].trim()
@@ -614,6 +664,7 @@ export function discoverFleet({
         }
       } else {
         const propRes = runner("adb", ["-s", dev.serial, "shell", "getprop"], { timeoutMs: 4000 });
+        notifyProgress();
         const props =
           propRes.status === 0 && propRes.stdout ? parseAdbGetpropOutput(propRes.stdout) : {};
         const sdk = props["ro.build.version.sdk"];

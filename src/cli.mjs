@@ -6,6 +6,7 @@ import {
   checkResourceAdmission,
   deterministicCreatedAvdId,
   discoverFleet,
+  isAndroidEmulatorCliUnavailable,
   parseAdbDevicesOutput,
   parseAndroidEmulatorListOutput,
   readFreeDiskMb,
@@ -445,11 +446,22 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
     const listRes = runner("android", ["emulator", "list", "--long"], {
       timeoutMs: Math.min(4000, Math.max(500, remainingForListMs)),
     });
-    const emulatorListOk = listRes.status === 0;
+    let emulatorListOk = listRes.status === 0;
     const listedAvds =
       emulatorListOk && listRes.stdout
         ? parseAndroidEmulatorListOutput(listRes.stdout)
         : [];
+    if (!emulatorListOk && isAndroidEmulatorCliUnavailable(listRes, "win32")) {
+      const remSdkMs = deadline - Date.now();
+      if (remSdkMs > 0) {
+        const sdkListRes = runner("emulator", ["-list-avds"], {
+          timeoutMs: Math.min(4000, Math.max(500, remSdkMs)),
+        });
+        if (sdkListRes.status === 0) {
+          emulatorListOk = true;
+        }
+      }
+    }
     for (const item of listedAvds) {
       if (!resolvedAvd && serial && item.serial === serial && item.avd) {
         resolvedAvd = item.avd;
@@ -705,16 +717,28 @@ export function selectCandidateUnderLock(
   }
 
   // Priority 2: Tier 1 Boot Into Free Slot (or reboot running match for wipeData/coldBoot)
-  // If any running emulator could not be mapped to its AVD name, fail closed on offline AVD launches
-  // so ATC never attempts to cold-boot an AVD that is already running under an unmapped serial.
+  // If any running emulator could not be mapped to its AVD name, or if discovery probes failed,
+  // fail closed on offline AVD launches/wipes so ATC never boots or wipes an AVD that is already running.
   const hasUnmappedRunningEmulator = (inventory.running || []).some(
     (d) => d.kind === "emulator" && !d.avd,
   );
+  const discoveryProbesFailed = Boolean(
+    inventory.probes &&
+      (inventory.probes.adbDevicesOk === false || inventory.probes.emulatorListOk === false),
+  );
+  const safeOfflineCandidates =
+    hasUnmappedRunningEmulator || discoveryProbesFailed
+      ? []
+      : (inventory.offline || []).filter(
+          (d) =>
+            !d.hasLockFiles &&
+            !(inventory.avdHome && d.avd && avdHasRuntimeLockFiles(d.avd, inventory.avdHome)),
+        );
   const bootPool = [
     ...(req.wipeData || req.coldBoot
       ? (inventory.running || []).filter((d) => d.kind === "emulator" && d.avd)
       : []),
-    ...(hasUnmappedRunningEmulator ? [] : inventory.offline || []),
+    ...safeOfflineCandidates,
   ]
     .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, req))
     .sort((a, b) => Number(isCallerOwnedResettable(b)) - Number(isCallerOwnedResettable(a)));
@@ -953,7 +977,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
   const initialCfg = initialState.config || DEFAULT_CONFIG;
   let inventoryEpoch = initialState.fleetEpoch || 0;
   let discoveryStartedAtMs = Date.now();
-  let rawInventory = options.inventory || discoverFleet({ runner, avdHome, cfg: initialCfg });
+  let rawInventory =
+    options.inventory ||
+    discoverFleet({ runner, avdHome, cfg: initialCfg, platform: options.platform });
   let inventory = {
     ...rawInventory,
     discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
@@ -961,6 +987,24 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
   };
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
+  const heartbeatQueuedTicket = () => {
+    if (!retainedTicketTiming?.ticketId) return;
+    try {
+      withStateTransaction(
+        stateDir,
+        (state, { now }) => {
+          const t = (state.queue || []).find((q) => q.ticketId === retainedTicketTiming.ticketId);
+          if (!t) return { mutated: false };
+          t.lastHeartbeatAtMs = now;
+          t.waiterPid = process.pid;
+          return { mutated: true };
+        },
+        options,
+      );
+    } catch {
+      // Best-effort queue heartbeat during discovery
+    }
+  };
 
   while (true) {
     let txOutcome;
@@ -1114,216 +1158,269 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           }
         }
 
-        const existingTicket = state.queue.find((t) => t.sessionId === identity.sessionId) || null;
-        const selection = selectCandidateUnderLock(
-          state,
-          effectiveInventory,
-          req,
-          existingTicket,
-          now,
-          identity.sessionId,
-          options.livenessCheck || isPidAlive,
-        );
+            const reorderWindowMs =
+              (rawReorderWindow !== undefined
+                ? Number(rawReorderWindow)
+                : (state.config?.reorderWindowSec ?? DEFAULT_CONFIG.reorderWindowSec ?? 120)) *
+              1000;
+            const waitExpiresAtMs = startWaitMs + waitSec * 1000;
+            let existingTicket =
+              state.queue.find((t) => t.sessionId === identity.sessionId) || null;
+            if (!existingTicket && retainedTicketTiming && waitSec > 0 && now < waitExpiresAtMs) {
+              existingTicket = {
+                ticketId: retainedTicketTiming.ticketId || `q_${randomNonce().slice(0, 12)}`,
+                sessionId: identity.sessionId,
+                waiterPid: process.pid,
+                requestedKind: req.kind,
+                requestedAvd: req.avd,
+                requestedSerial: req.serial,
+                requestedProfile: req,
+                enqueuedAtMs: retainedTicketTiming.enqueuedAtMs,
+                starvationDeadlineMs: retainedTicketTiming.starvationDeadlineMs,
+                queueSeq: retainedTicketTiming.queueSeq,
+                lastHeartbeatAtMs: now,
+                waitExpiresAtMs,
+                reason: req.reason,
+              };
+              state.queue.push(existingTicket);
+              state.queue.sort(
+                (a, b) =>
+                  (a.enqueuedAtMs ?? 0) - (b.enqueuedAtMs ?? 0) ||
+                  (a.queueSeq ?? Number.MAX_SAFE_INTEGER) -
+                    (b.queueSeq ?? Number.MAX_SAFE_INTEGER),
+              );
+              reconciledMutated = true;
+            }
+            const selection = selectCandidateUnderLock(
+              state,
+              effectiveInventory,
+              req,
+              existingTicket,
+              now,
+              identity.sessionId,
+              options.livenessCheck || isPidAlive,
+            );
 
-        if (selection.priority === 1 && !selection.needsWarmPrep) {
-          const dev = selection.candidate;
-          const leaseId = `lease_${randomNonce().slice(0, 12)}`;
-          const lease = {
-            leaseId,
-            deviceKey: dev.deviceKey,
-            kind: dev.kind,
-            avd: dev.avd || null,
-            serial: dev.serial,
-            profile: dev.profile,
-            sessionId: identity.sessionId,
-            anchorPid: identity.anchorPid,
-            parentPid: resolveStableParentPid(
-              options.ppid ?? process.ppid,
-              options.processChain,
-            ),
-            state: "active",
-            workerPid: null,
-            replacingAvd: null,
-            requiredRamMb: dev.requiredRamMb || 0,
-            loadedSnapshot: req.snapshotLoad || null,
-            saveSnapshotOnFree: req.snapshotSaveOnFree || null,
-            claimedAtMs: now,
-            activatedAtMs: now,
-            renewedAtMs: now,
-            expiresAtMs: now + ttlMs,
-            deadlineMs: null,
-            firstSeenOfflineAtMs: null,
-            reason: req.reason,
-          };
-          state.leases[dev.deviceKey] = lease;
-          state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
-          return {
-            mutated: true,
-            value: { status: "claimed_immediate", lease, idempotent: false },
-          };
-        }
+            if (selection.priority === 1 && !selection.needsWarmPrep) {
+              const dev = selection.candidate;
+              const leaseId = `lease_${randomNonce().slice(0, 12)}`;
+              const lease = {
+                leaseId,
+                deviceKey: dev.deviceKey,
+                kind: dev.kind,
+                avd: dev.avd || null,
+                serial: dev.serial,
+                profile: dev.profile,
+                sessionId: identity.sessionId,
+                anchorPid: identity.anchorPid,
+                parentPid: resolveStableParentPid(
+                  options.ppid ?? process.ppid,
+                  options.processChain,
+                ),
+                state: "active",
+                workerPid: null,
+                replacingAvd: null,
+                requiredRamMb: dev.requiredRamMb || 0,
+                loadedSnapshot: req.snapshotLoad || null,
+                saveSnapshotOnFree: req.snapshotSaveOnFree || null,
+                claimedAtMs: now,
+                activatedAtMs: now,
+                activatedEpoch: state.fleetEpoch || 0,
+                renewedAtMs: now,
+                expiresAtMs: now + ttlMs,
+                deadlineMs: null,
+                firstSeenOfflineAtMs: null,
+                reason: req.reason,
+              };
+              state.leases[dev.deviceKey] = lease;
+              state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+              return {
+                mutated: true,
+                value: { status: "claimed_immediate", lease, idempotent: false },
+              };
+            }
 
-        if (selection.priority !== null) {
-          const dev = selection.candidate;
-          const existingOwnLease =
-            state.leases[dev.deviceKey]?.sessionId === identity.sessionId &&
-            state.leases[dev.deviceKey]?.state === "active"
-              ? { ...state.leases[dev.deviceKey] }
-              : null;
-          const leaseId = existingOwnLease?.leaseId || `lease_${randomNonce().slice(0, 12)}`;
-          const bootTimeoutMs = (state.config.bootTimeoutSec || 180) * 1000;
-          const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
-          let victimLeaseId = null;
+            if (selection.priority !== null) {
+              const dev = selection.candidate;
+              const existingOwnLease =
+                state.leases[dev.deviceKey]?.sessionId === identity.sessionId &&
+                state.leases[dev.deviceKey]?.state === "active"
+                  ? { ...state.leases[dev.deviceKey] }
+                  : null;
+              const leaseId = existingOwnLease?.leaseId || `lease_${randomNonce().slice(0, 12)}`;
+              const bootTimeoutMs = (state.config.bootTimeoutSec || 180) * 1000;
+              const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
+              let victimLeaseId = null;
 
-          const overheadMb = state.config?.qemuOverheadRamMb ?? 1024;
-          const computeRequiredRam = (d) =>
-            typeof d.ramSizeMb === "number" && d.ramSizeMb > 0
-              ? d.ramSizeMb + overheadMb
-              : d.requiredRamMb || 2048 + overheadMb;
+              const overheadMb = state.config?.qemuOverheadRamMb ?? 1024;
+              const computeRequiredRam = (d) =>
+                typeof d.ramSizeMb === "number" && d.ramSizeMb > 0
+                  ? d.ramSizeMb + overheadMb
+                  : d.requiredRamMb || 2048 + overheadMb;
 
-          if (selection.victim) {
-            victimLeaseId = `lease_${randomNonce().slice(0, 12)}`;
-            state.leases[selection.victim.deviceKey] = {
-              leaseId: victimLeaseId,
-              deviceKey: selection.victim.deviceKey,
-              kind: "emulator",
-              avd: selection.victim.avd,
-              serial: selection.victim.serial,
-              profile: selection.victim.profile,
-              sessionId: identity.sessionId,
-              anchorPid: identity.anchorPid,
-              state: "stopping",
-              workerPid: process.pid,
-              replacingAvd: null,
-              requiredRamMb: computeRequiredRam(selection.victim),
-              claimedAtMs: now,
-              deadlineMs: now + stopTimeoutMs,
+              if (selection.victim) {
+                victimLeaseId = `lease_${randomNonce().slice(0, 12)}`;
+                state.leases[selection.victim.deviceKey] = {
+                  leaseId: victimLeaseId,
+                  deviceKey: selection.victim.deviceKey,
+                  kind: "emulator",
+                  avd: selection.victim.avd,
+                  serial: selection.victim.serial,
+                  profile: selection.victim.profile,
+                  sessionId: identity.sessionId,
+                  anchorPid: identity.anchorPid,
+                  state: "stopping",
+                  workerPid: process.pid,
+                  replacingAvd: null,
+                  requiredRamMb: computeRequiredRam(selection.victim),
+                  claimedAtMs: now,
+                  deadlineMs: now + stopTimeoutMs,
+                };
+              }
+
+              const startingLease = {
+                leaseId,
+                deviceKey: dev.deviceKey,
+                kind: dev.kind,
+                avd: dev.avd,
+                serial: dev.serial || null,
+                profile: dev.profile,
+                sessionId: identity.sessionId,
+                anchorPid: identity.anchorPid,
+                parentPid: resolveStableParentPid(
+                  options.ppid ?? process.ppid,
+                  options.processChain,
+                ),
+                state: "starting",
+                workerPid: process.pid,
+                replacingAvd: selection.victim ? selection.victim.avd : null,
+                requiredRamMb: computeRequiredRam(dev),
+                loadedSnapshot: req.resetApp ? null : req.snapshotLoad || null,
+                saveSnapshotOnFree:
+                  req.snapshotSaveOnFree || existingOwnLease?.saveSnapshotOnFree || null,
+                claimedAtMs: existingOwnLease?.claimedAtMs || now,
+                activatedAtMs: null,
+                renewedAtMs: now,
+                expiresAtMs: Math.max(
+                  rawTtl !== undefined ? 0 : existingOwnLease?.expiresAtMs || 0,
+                  now + ttlMs,
+                ),
+                deadlineMs: now + bootTimeoutMs,
+                firstSeenOfflineAtMs: null,
+                reason: req.reason || existingOwnLease?.reason || null,
+              };
+              state.leases[dev.deviceKey] = startingLease;
+              state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+
+              const knownAvdNames = new Set(
+                [...(effectiveInventory.running || []), ...(effectiveInventory.offline || [])]
+                  .filter((d) => d.kind === "emulator" && d.avd)
+                  .map((d) => d.avd),
+              );
+
+              return {
+                mutated: true,
+                value: {
+                  status: "needs_boot_or_prep",
+                  lease: startingLease,
+                  previousLease: existingOwnLease,
+                  selection,
+                  victimLeaseId,
+                  ttlMs,
+                  bootTimeoutMs,
+                  stopTimeoutMs,
+                  knownAvdNames,
+                },
+              };
+            }
+
+            // No candidate available right now
+            if (waitSec <= 0) {
+              return {
+                mutated: reconciledMutated,
+                value: { status: "busy" },
+              };
+            }
+
+            if (now >= waitExpiresAtMs) {
+              state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+              return {
+                mutated: true,
+                value: { status: "busy" },
+              };
+            }
+
+            let ticket = existingTicket;
+            if (!ticket) {
+              const enqueuedAtMs = retainedTicketTiming ? retainedTicketTiming.enqueuedAtMs : now;
+              const starvationDeadlineMs = retainedTicketTiming
+                ? retainedTicketTiming.starvationDeadlineMs
+                : enqueuedAtMs + reorderWindowMs;
+              const queueSeq =
+                retainedTicketTiming?.queueSeq ??
+                ((state.nextQueueSeq = (state.nextQueueSeq || 0) + 1));
+              const ticketId = retainedTicketTiming?.ticketId || `q_${randomNonce().slice(0, 12)}`;
+              ticket = {
+                ticketId,
+                sessionId: identity.sessionId,
+                waiterPid: process.pid,
+                requestedKind: req.kind,
+                requestedAvd: req.avd,
+                requestedSerial: req.serial,
+                requestedProfile: req,
+                enqueuedAtMs,
+                starvationDeadlineMs,
+                queueSeq,
+                lastHeartbeatAtMs: now,
+                waitExpiresAtMs,
+                reason: req.reason,
+              };
+              retainedTicketTiming = { ticketId, enqueuedAtMs, starvationDeadlineMs, queueSeq };
+              state.queue.push(ticket);
+              state.queue.sort(
+                (a, b) =>
+                  (a.enqueuedAtMs ?? 0) - (b.enqueuedAtMs ?? 0) ||
+                  (a.queueSeq ?? Number.MAX_SAFE_INTEGER) -
+                    (b.queueSeq ?? Number.MAX_SAFE_INTEGER),
+              );
+            } else {
+              retainedTicketTiming = {
+                ticketId: ticket.ticketId,
+                enqueuedAtMs: ticket.enqueuedAtMs,
+                starvationDeadlineMs: ticket.starvationDeadlineMs,
+                queueSeq:
+                  ticket.queueSeq ??
+                  ((ticket.queueSeq = state.nextQueueSeq = (state.nextQueueSeq || 0) + 1)),
+              };
+              ticket.lastHeartbeatAtMs = now;
+              ticket.waiterPid = process.pid;
+            }
+
+            const hbTimeoutSec =
+              state.config?.queueHeartbeatTimeoutSec ?? DEFAULT_CONFIG.queueHeartbeatTimeoutSec ?? 10;
+            return {
+              mutated: true,
+              value: { status: "queued", ticket, hbTimeoutSec },
             };
+          }, options);
+        } catch (err) {
+          if (err instanceof ResourceError) {
+            return { exitCode: err.exitCode, error: err.message };
           }
-
-          const startingLease = {
-            leaseId,
-            deviceKey: dev.deviceKey,
-            kind: dev.kind,
-            avd: dev.avd,
-            serial: dev.serial || null,
-            profile: dev.profile,
-            sessionId: identity.sessionId,
-            anchorPid: identity.anchorPid,
-            parentPid: resolveStableParentPid(
-              options.ppid ?? process.ppid,
-              options.processChain,
-            ),
-            state: "starting",
-            workerPid: process.pid,
-            replacingAvd: selection.victim ? selection.victim.avd : null,
-            requiredRamMb: computeRequiredRam(dev),
-            loadedSnapshot: req.resetApp ? null : req.snapshotLoad || null,
-            saveSnapshotOnFree: req.snapshotSaveOnFree || null,
-            claimedAtMs: now,
-            activatedAtMs: null,
-            renewedAtMs: now,
-            expiresAtMs: now + ttlMs,
-            deadlineMs: now + bootTimeoutMs,
-            firstSeenOfflineAtMs: null,
-            reason: req.reason,
-          };
-          state.leases[dev.deviceKey] = startingLease;
-          state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
-
-          const knownAvdNames = new Set(
-            [...(effectiveInventory.running || []), ...(effectiveInventory.offline || [])]
-              .filter((d) => d.kind === "emulator" && d.avd)
-              .map((d) => d.avd),
-          );
-
-          return {
-            mutated: true,
-            value: {
-              status: "needs_boot_or_prep",
-              lease: startingLease,
-              previousLease: existingOwnLease,
-              selection,
-              victimLeaseId,
-              ttlMs,
-              bootTimeoutMs,
-              stopTimeoutMs,
-              knownAvdNames,
-            },
-          };
+          return { exitCode: 1, error: err.message };
         }
 
-        // No candidate available right now
-        if (waitSec <= 0) {
-          return {
-            mutated: reconciledMutated,
-            value: { status: "busy" },
-          };
-        }
-
-        const reorderWindowMs =
-          (rawReorderWindow !== undefined
-            ? Number(rawReorderWindow)
-            : (state.config?.reorderWindowSec ?? DEFAULT_CONFIG.reorderWindowSec ?? 120)) * 1000;
-        const waitExpiresAtMs = startWaitMs + waitSec * 1000;
-        if (now >= waitExpiresAtMs) {
-          state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
-          return {
-            mutated: true,
-            value: { status: "busy" },
-          };
-        }
-
-        let ticket = existingTicket;
-        if (!ticket) {
-          const enqueuedAtMs = retainedTicketTiming ? retainedTicketTiming.enqueuedAtMs : now;
-          const starvationDeadlineMs = retainedTicketTiming
-            ? retainedTicketTiming.starvationDeadlineMs
-            : enqueuedAtMs + reorderWindowMs;
-          ticket = {
-            ticketId: `q_${randomNonce().slice(0, 12)}`,
-            sessionId: identity.sessionId,
-            waiterPid: process.pid,
-            requestedKind: req.kind,
-            requestedAvd: req.avd,
-            requestedSerial: req.serial,
-            requestedProfile: req,
-            enqueuedAtMs,
-            starvationDeadlineMs,
-            lastHeartbeatAtMs: now,
-            waitExpiresAtMs,
-            reason: req.reason,
-          };
-          retainedTicketTiming = { enqueuedAtMs, starvationDeadlineMs };
-          state.queue.push(ticket);
-        } else {
-          ticket.lastHeartbeatAtMs = now;
-          ticket.waiterPid = process.pid;
-        }
-
-        const hbTimeoutSec =
-          state.config?.queueHeartbeatTimeoutSec ?? DEFAULT_CONFIG.queueHeartbeatTimeoutSec ?? 10;
-        return {
-          mutated: true,
-          value: { status: "queued", ticket, hbTimeoutSec },
-        };
-      }, options);
-    } catch (err) {
-      if (err instanceof ResourceError) {
-        return { exitCode: err.exitCode, error: err.message };
-      }
-      return { exitCode: 1, error: err.message };
-    }
-
-    if (txOutcome.status === "stale_inventory") {
-      const refreshedState = readState(stateDir);
-      inventoryEpoch = refreshedState.fleetEpoch || 0;
-      discoveryStartedAtMs = Date.now();
-      rawInventory = discoverFleet({
-        runner,
-        avdHome,
-        cfg: refreshedState.config || DEFAULT_CONFIG,
-      });
+        if (txOutcome.status === "stale_inventory") {
+          const refreshedState = readState(stateDir);
+          inventoryEpoch = refreshedState.fleetEpoch || 0;
+          discoveryStartedAtMs = Date.now();
+          rawInventory = discoverFleet({
+            runner,
+            avdHome,
+            cfg: refreshedState.config || DEFAULT_CONFIG,
+            platform: options.platform,
+            onProgress: heartbeatQueuedTicket,
+          });
       inventory = {
         ...rawInventory,
         discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
@@ -1520,7 +1617,15 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         const curCfg = curState.config || DEFAULT_CONFIG;
         inventoryEpoch = curState.fleetEpoch || 0;
         discoveryStartedAtMs = Date.now();
-        rawInventory = options.inventory || discoverFleet({ runner, avdHome, cfg: curCfg });
+        rawInventory =
+          options.inventory ||
+          discoverFleet({
+            runner,
+            avdHome,
+            cfg: curCfg,
+            platform: options.platform,
+            onProgress: heartbeatQueuedTicket,
+          });
         inventory = {
           ...rawInventory,
           discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
@@ -1562,7 +1667,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
       : null;
   let resolvedSerial = candidate.serial;
   let bootedNewEmulator = false;
+  let partialBootNeedsStop = false;
   let stoppedExistingEmulator = false;
+  let prepInvalidatedSnapshot = false;
+  let prepLoadedSnapshot = null;
   let victimStopWaitTimedOut = false;
   let rebootStopWaitTimedOut = false;
 
@@ -1863,6 +1971,8 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
     if (selection.priority === 1 && selection.needsWarmPrep) {
       if (req.snapshotLoad) {
         assertReservationStillOwned();
+        prepInvalidatedSnapshot = true;
+        prepLoadedSnapshot = null;
         const snapRes = runner(
           "adb",
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
@@ -1875,9 +1985,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         }
         assertReservationStillOwned();
         waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
+        prepLoadedSnapshot = req.snapshotLoad;
       }
       if (req.resetApp) {
         assertReservationStillOwned();
+        prepInvalidatedSnapshot = true;
+        prepLoadedSnapshot = null;
         const resetRes = runner(
           "adb",
           ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp],
@@ -1930,6 +2043,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
       }
       if (req.wipeData) {
         assertReservationStillOwned();
+        if (stoppedExistingEmulator && !isWin && avdHome) {
+          const lockWaitDeadline = Date.now() + (stopTimeoutMs || 60_000);
+          while (avdHasRuntimeLockFiles(candidate.avd, avdHome) && Date.now() < lockWaitDeadline) {
+            sleepSync(100);
+          }
+        }
         wipeAvdUserData(candidate.avd, avdHome);
       }
       assertReservationStillOwned();
@@ -1953,18 +2072,61 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           timeoutMs: bootTimeoutMs,
         });
       }
+      const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
+      resolvedSerial = serialMatch ? serialMatch[1] : null;
       if (bootRes.status !== 0 || /\bError:\s+/i.test(bootRes.stdout || "")) {
+        const hasLocksAfterFailedStart = Boolean(
+          avdHome && avdHasRuntimeLockFiles(candidate.avd, avdHome),
+        );
+        if (resolvedSerial || hasLocksAfterFailedStart) {
+          bootedNewEmulator = true;
+          partialBootNeedsStop = true;
+        } else {
+          try {
+            const refreshed = discoverFleet({
+              runner,
+              avdHome,
+              platform: isWin ? "win32" : platform,
+            });
+            const booted = (refreshed.running || []).find(
+              (d) => d.kind === "emulator" && d.avd === candidate.avd,
+            );
+            if (booted?.serial) {
+              resolvedSerial = booted.serial;
+            }
+            const hasUnmapped = (refreshed.running || []).some(
+              (d) => d.kind === "emulator" && !d.avd,
+            );
+            const probesOk = Boolean(
+              refreshed.probes?.emulatorListOk && refreshed.probes?.adbDevicesOk,
+            );
+            if (
+              booted ||
+              hasUnmapped ||
+              !probesOk ||
+              (avdHome && avdHasRuntimeLockFiles(candidate.avd, avdHome))
+            ) {
+              bootedNewEmulator = true;
+              partialBootNeedsStop = true;
+            }
+          } catch {
+            bootedNewEmulator = true;
+            partialBootNeedsStop = true;
+          }
+        }
         throw new Error(
           `Failed to boot emulator ${candidate.avd}: ${(bootRes.stderr || bootRes.stdout || "").trim()}`,
         );
       }
       bootedNewEmulator = true;
 
-      const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
-      resolvedSerial = serialMatch ? serialMatch[1] : null;
       const pollDeadline = Date.now() + (bootTimeoutMs || 60_000);
       while (!resolvedSerial) {
-        const refreshed = discoverFleet({ runner, avdHome });
+        const refreshed = discoverFleet({
+          runner,
+          avdHome,
+          platform: isWin ? "win32" : platform,
+        });
         const booted = (refreshed.running || []).find(
           (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
         );
@@ -1973,17 +2135,25 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         sleepSync(250);
       }
       if (!resolvedSerial) {
+        partialBootNeedsStop = true;
         throw new Error(
           `Booted emulator ${candidate.avd} did not report an adb serial and could not be discovered.`,
         );
       }
       if (isWin) {
         assertReservationStillOwned();
-        waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
+        try {
+          waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
+        } catch (readyErr) {
+          partialBootNeedsStop = true;
+          throw readyErr;
+        }
       }
 
       if (req.snapshotLoad) {
         assertReservationStillOwned();
+        prepInvalidatedSnapshot = true;
+        prepLoadedSnapshot = null;
         const snapRes = runner(
           "adb",
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
@@ -1996,10 +2166,13 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         }
         assertReservationStillOwned();
         waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
+        prepLoadedSnapshot = req.snapshotLoad;
       }
 
       if (req.resetApp) {
         assertReservationStillOwned();
+        prepInvalidatedSnapshot = true;
+        prepLoadedSnapshot = null;
         const resetRes = runner(
           "adb",
           ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp],
@@ -2052,6 +2225,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         current.serial = resolvedSerial;
         current.loadedSnapshot = req.resetApp ? null : req.snapshotLoad || null;
         current.activatedAtMs = now;
+        current.activatedEpoch = state.fleetEpoch || 0;
         current.renewedAtMs = now;
         current.expiresAtMs = now + ttlMs;
         current.deadlineMs = null;
@@ -2074,7 +2248,11 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
     victimHbTimer?.stop();
     if (stoppedExistingEmulator && !resolvedSerial && previousLease) {
       try {
-        const refreshed = discoverFleet({ runner, avdHome });
+        const refreshed = discoverFleet({
+          runner,
+          avdHome,
+          platform: isWin ? "win32" : platform,
+        });
         const booted = (refreshed.running || []).find(
           (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
         );
@@ -2083,7 +2261,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         // Ignore discovery failure during rollback
       }
     }
-        const livenessCheck = execOptions.livenessCheck || isPidAlive;
+    const livenessCheck = execOptions.livenessCheck || isPidAlive;
     const effectiveStopTimeoutMs = stopTimeoutMs || 60_000;
     const rollbackInfo = withStateTransaction(
       stateDir,
@@ -2104,6 +2282,9 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         );
         const pendingStop = Boolean(current?.pendingStop);
         const needsStopOnRollback = Boolean(bootedNewEmulator || pendingStop);
+        const canRestorePreviousWithoutStop = Boolean(
+          previousLease && !shouldRelease && !partialBootNeedsStop && !pendingStop,
+        );
         const targetAvd = candidate.avd || lease.avd || null;
         let migratedToOtherLease = false;
 
@@ -2118,7 +2299,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               now,
               now + effectiveStopTimeoutMs,
             );
-          } else if (previousLease && !shouldRelease) {
+          } else if (canRestorePreviousWithoutStop) {
             state.leases[lease.deviceKey] = {
               ...previousLease,
               serial: stoppedExistingEmulator
@@ -2128,7 +2309,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               workerPid: null,
               workerPids: [],
               replacingAvd: null,
-              loadedSnapshot: stoppedExistingEmulator ? null : previousLease.loadedSnapshot,
+              loadedSnapshot:
+                stoppedExistingEmulator || prepInvalidatedSnapshot
+                  ? prepLoadedSnapshot
+                  : previousLease.loadedSnapshot,
               renewedAtMs: now,
               expiresAtMs: Math.max(previousLease.expiresAtMs || 0, now + ttlMs),
               deadlineMs: null,
@@ -2218,7 +2402,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         const stopBootedEmulator = Boolean(
           owned &&
             !rebootStopWaitTimedOut &&
-            (!previousLease || shouldRelease) &&
+            !canRestorePreviousWithoutStop &&
             !migratedToOtherLease &&
             !otherLeaseOwnsDevice &&
             needsStopOnRollback,
@@ -2226,7 +2410,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         if (
           owned &&
           !rebootStopWaitTimedOut &&
-          (!previousLease || shouldRelease) &&
+          !canRestorePreviousWithoutStop &&
           !migratedToOtherLease
         ) {
           if (stopBootedEmulator) {
@@ -2246,6 +2430,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           mutated: true,
           value: {
             owned,
+            shouldRelease,
             pendingStop,
             stopBootedEmulator,
           },
@@ -2265,7 +2450,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
       try {
         if (isWin) {
           if (!cleanupSerial) {
-            const refreshed = discoverFleet({ runner, avdHome });
+            const refreshed = discoverFleet({ runner, avdHome, platform: "win32" });
             const booted = (refreshed.running || []).find(
               (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
             );
@@ -2317,7 +2502,24 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 },
                 now,
               );
-              if (cur && cur.leaseId === lease.leaseId) {
+              if (
+                previousLease &&
+                !rollbackInfo.shouldRelease &&
+                !rollbackInfo.pendingStop
+              ) {
+                state.leases[lease.deviceKey] = {
+                  ...previousLease,
+                  serial: null,
+                  state: "active",
+                  workerPid: null,
+                  workerPids: [],
+                  replacingAvd: null,
+                  loadedSnapshot: null,
+                  renewedAtMs: now,
+                  expiresAtMs: Math.max(previousLease.expiresAtMs || 0, now + ttlMs),
+                  deadlineMs: null,
+                };
+              } else if (cur && cur.leaseId === lease.leaseId) {
                 delete state.leases[lease.deviceKey];
               }
             } else if (cur && cur.leaseId === lease.leaseId) {
@@ -2592,6 +2794,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
     let itemFailed = false;
     let windowsStopWaitTimedOut = false;
+    let loadedSnapOnFree = false;
     const checkAndRefreshStopping = () =>
       withStateTransaction(stateDir, (state, { now }) => {
         let mutated = false;
@@ -2670,6 +2873,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 );
               }
               waitForEmulatorReady(runner, lease.serial, stopTimeoutMs);
+              loadedSnapOnFree = true;
             } catch (err) {
               itemFailed = true;
               actionErrors.push(err.message);
@@ -2759,6 +2963,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               } else {
                 cur.state = "active";
                 cur.releaseOnWorkerExit = false;
+                if (loadSnap) {
+                  cur.loadedSnapshot = loadedSnapOnFree ? loadSnap : null;
+                }
                 if (
                   cur.anchorPid !== null &&
                   cur.anchorPid !== undefined &&
@@ -3056,6 +3263,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       lease.state = "starting";
       lease.workerPid = process.pid;
       lease.deadlineMs = now + stopTimeoutMs;
+      lease.loadedSnapshot = null;
     }
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + Math.max(ttlMs, stopTimeoutMs * 2));
@@ -3288,6 +3496,29 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }, options);
   };
 
+  let spawnedChildPid = null;
+  const onChildSpawn = (childPid, { isProcessGroup } = {}) => {
+    spawnedChildPid = childPid;
+    try {
+      withStateTransaction(
+        stateDir,
+        (state) => {
+          const cur = state.leases[check.lease.deviceKey];
+          if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+            addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
+              isProcessGroup: Boolean(isProcessGroup),
+            });
+            return { mutated: true };
+          }
+          return { mutated: false };
+        },
+        options,
+      );
+    } catch {
+      // Best-effort child PID registration
+    }
+  };
+
   try {
     const exitCode = await spawnWithHeartbeat(
       cmd,
@@ -3298,6 +3529,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       {
         ...options,
         heartbeatIntervalMs,
+        onChildSpawn,
       },
     );
     return { exitCode };
@@ -3309,6 +3541,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         check.lease.leaseId,
         check.ttlMs,
         options,
+        (cur) => {
+          if (spawnedChildPid) {
+            removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+          }
+        },
       );
     } catch {
       // Best-effort workerPid cleanup
@@ -3327,7 +3564,9 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   const cfg = preState.config || DEFAULT_CONFIG;
   const inventoryEpoch = preState.fleetEpoch || 0;
   const discoveryStartedAtMs = Date.now();
-  const rawInventory = options.inventory || discoverFleet({ runner, avdHome, cfg });
+  const rawInventory =
+    options.inventory ||
+    discoverFleet({ runner, avdHome, cfg, platform: options.platform });
   const inventory = {
     ...rawInventory,
     discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
@@ -3570,7 +3809,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
   };
 }
 
-export async function runCli(argv = process.argv.slice(2), env = process.env) {
+export async function runCli(argv = process.argv.slice(2), env = process.env, options = {}) {
   const parsed = parseCliArgs(argv);
   const stateDir = resolveStateDir(env.ATC_STATE_DIR);
 
@@ -3838,7 +4077,16 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
         );
         return 1;
       }
-      await startMcpServer(stateDir);
+      await startMcpServer(stateDir, {
+        ...options,
+        env,
+        sessionId:
+          (typeof parsed.flags.session === "string" && parsed.flags.session.trim()) ||
+          (typeof parsed.flags.role === "string" && parsed.flags.role.trim()) ||
+          options.sessionId,
+        anchorPid: parsed.flags.anchorPid ?? options.anchorPid,
+        flags: parsed.flags,
+      });
       return 0;
     }
 

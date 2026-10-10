@@ -5648,3 +5648,559 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
   }
 });
 
+test("regression: Astra review #20 hardening (offline lock safety, state I/O vs corruption, recycled serials, process group tracking, partial boot cleanup, wrapped ADB & piped sh rewrite)", async () => {
+  const dir = makeTempStateDir();
+  const avdHome = fs.mkdtempSync(path.join(os.tmpdir(), "atc-avd-r20-"));
+
+  try {
+    // 1. Codex 4237521395: releaseLock removes its .break-claim.* directory immediately
+    const lockH = acquireLock(dir, 1000);
+    releaseLock(lockH);
+    assert.equal(verifyLockOwnership(lockH), false);
+    const leftoverBreakClaims = fs
+      .readdirSync(dir)
+      .filter((name) => name.includes(".break-claim."));
+    assert.deepEqual(
+      leftoverBreakClaims,
+      [],
+      "releaseLock must remove its .break-claim.* directory on completion",
+    );
+
+    // 2. Finding #1: Offline candidates excluded when probes failed or runtime lock files exist
+    const lockedAvdDir = path.join(avdHome, "Pixel_Locked.avd");
+    fs.mkdirSync(lockedAvdDir, { recursive: true });
+    fs.writeFileSync(path.join(lockedAvdDir, "hardware-qemu.ini.lock"), "pid=123", "utf8");
+    const cleanAvdDir = path.join(avdHome, "Pixel_Clean.avd");
+    fs.mkdirSync(cleanAvdDir, { recursive: true });
+
+    const reqAny = {
+      kind: "emulator",
+      deviceType: null,
+      apiSpec: null,
+      services: null,
+      play: null,
+      abi: null,
+      avd: null,
+      serial: null,
+      cold: false,
+      wipeData: false,
+      snapshotLoad: null,
+      createIfMissing: false,
+      resetApp: null,
+      saveSnapshotOnFree: null,
+      ttlSec: 300,
+      waitSec: 0,
+      reason: "",
+    };
+
+    withStateTransaction(dir, (state, { now }) => {
+      // When adbDevicesOk is false, offline candidates must not be selected
+      const probeFailSel = selectCandidateUnderLock(
+        state,
+        {
+          avdHome,
+          running: [],
+          offline: [
+            {
+              deviceKey: "avd:Pixel_Clean",
+              kind: "emulator",
+              avd: "Pixel_Clean",
+              online: false,
+              apiLevel: 35,
+              deviceType: "phone",
+              services: "google_apis_playstore",
+              play: true,
+              abi: "arm64-v8a",
+              ramMb: 2048,
+              snapshots: ["clean_boot"],
+            },
+          ],
+          creatable: [],
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCount: 8 },
+          probes: { emulatorListOk: true, adbDevicesOk: false },
+        },
+        reqAny,
+        null,
+        now,
+        "sess-probe-fail",
+      );
+      assert.equal(probeFailSel.priority, null);
+      assert.equal(probeFailSel.candidate, undefined);
+
+      // When probes succeed, locked offline AVD is skipped while clean offline AVD is selected
+      const lockCheckSel = selectCandidateUnderLock(
+        state,
+        {
+          avdHome,
+          running: [],
+          offline: [
+            {
+              deviceKey: "avd:Pixel_Locked",
+              kind: "emulator",
+              avd: "Pixel_Locked",
+              online: false,
+              apiLevel: 35,
+              deviceType: "phone",
+              services: "google_apis_playstore",
+              play: true,
+              abi: "arm64-v8a",
+              ramMb: 2048,
+              snapshots: ["clean_boot"],
+            },
+            {
+              deviceKey: "avd:Pixel_Clean",
+              kind: "emulator",
+              avd: "Pixel_Clean",
+              online: false,
+              apiLevel: 35,
+              deviceType: "phone",
+              services: "google_apis_playstore",
+              play: true,
+              abi: "arm64-v8a",
+              ramMb: 2048,
+              snapshots: ["clean_boot"],
+            },
+          ],
+          creatable: [],
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCount: 8 },
+          probes: { emulatorListOk: true, adbDevicesOk: true },
+        },
+        reqAny,
+        null,
+        now,
+        "sess-lock-check",
+      );
+      assert.equal(lockCheckSel.priority, 2);
+      assert.equal(lockCheckSel.candidate.avd, "Pixel_Clean");
+      return { mutated: false };
+    });
+
+    // 3. Finding #2: readState propagates filesystem I/O errors instead of quarantining valid state
+    const ioErrDir = makeTempStateDir();
+    try {
+      withStateTransaction(ioErrDir, (s) => {
+        s.leases["avd:KeepMe"] = {
+          leaseId: "lease_keep_me",
+          deviceKey: "avd:KeepMe",
+          kind: "emulator",
+          avd: "KeepMe",
+          serial: "emulator-5554",
+          state: "active",
+          sessionId: "keep-sess",
+        };
+        return { mutated: true };
+      });
+      // Replace state.json with a directory so fs.readFileSync throws EISDIR (non-ENOENT I/O error)
+      const stateFile = path.join(ioErrDir, "state.json");
+      const savedBytes = fs.readFileSync(stateFile, "utf8");
+      fs.rmSync(stateFile, { force: true });
+      fs.mkdirSync(stateFile);
+      assert.throws(
+        () => readState(ioErrDir),
+        (err) => err && (err.code === "EISDIR" || err.message.includes("illegal operation")),
+      );
+      fs.rmdirSync(stateFile);
+      fs.writeFileSync(stateFile, savedBytes, "utf8");
+      assert.equal(readState(ioErrDir).leases["avd:KeepMe"]?.leaseId, "lease_keep_me");
+    } finally {
+      fs.rmSync(ioErrDir, { recursive: true, force: true });
+    }
+
+    // 4. Finding #3 & #4: reconcileOfflineLeases handles recycled serials and skips pre-activation snapshots
+    const reconcileDir = makeTempStateDir();
+    try {
+      const baseNow = Date.now();
+      withStateTransaction(reconcileDir, (s) => {
+        s.fleetEpoch = 10;
+        s.leases["avd:Pixel_Crashed"] = {
+          leaseId: "lease_crashed_avd",
+          deviceKey: "avd:Pixel_Crashed",
+          kind: "emulator",
+          avd: "Pixel_Crashed",
+          serial: "emulator-5554",
+          state: "active",
+          sessionId: "sess-a",
+          claimedAtMs: baseNow - 30_000,
+          activatedAtMs: baseNow - 20_000,
+          activatedEpoch: 5,
+          expiresAtMs: baseNow + 300_000,
+        };
+        s.leases["avd:Pixel_Just_Booted"] = {
+          leaseId: "lease_just_booted",
+          deviceKey: "avd:Pixel_Just_Booted",
+          kind: "emulator",
+          avd: "Pixel_Just_Booted",
+          serial: "emulator-5556",
+          state: "active",
+          sessionId: "sess-b",
+          claimedAtMs: baseNow - 5_000,
+          activatedAtMs: baseNow - 1_000,
+          activatedEpoch: 10,
+          expiresAtMs: baseNow + 300_000,
+        };
+        return { mutated: true };
+      });
+
+      // Pre-activation snapshot (discoveredAtMs < activatedAtMs and fleetEpoch < activatedEpoch) must NOT mark Pixel_Just_Booted offline
+      withStateTransaction(reconcileDir, (s) => {
+        reconcileOfflineLeases(
+          s,
+          {
+            avdHome,
+            discoveredAtMs: baseNow - 2_000,
+            fleetEpoch: 9,
+            running: [
+              // emulator-5554 is now running Pixel_Other, NOT Pixel_Crashed!
+              {
+                deviceKey: "avd:Pixel_Other",
+                kind: "emulator",
+                avd: "Pixel_Other",
+                serial: "emulator-5554",
+                online: true,
+              },
+            ],
+            offline: [
+              { deviceKey: "avd:Pixel_Crashed", kind: "emulator", avd: "Pixel_Crashed", online: false },
+              { deviceKey: "avd:Pixel_Just_Booted", kind: "emulator", avd: "Pixel_Just_Booted", online: false },
+            ],
+            probes: { emulatorListOk: true, adbDevicesOk: true },
+          },
+          "sess-observer",
+          baseNow,
+        );
+        return { mutated: true };
+      });
+
+      let recState = readState(reconcileDir);
+      assert.equal(
+        recState.leases["avd:Pixel_Just_Booted"].firstSeenOfflineAtMs,
+        undefined,
+        "Pre-activation snapshot must not mark newly activated lease as offline",
+      );
+      assert.equal(
+        recState.leases["avd:Pixel_Crashed"].serial,
+        null,
+        "Recycled serial occupied by another AVD must be cleared from crashed AVD lease",
+      );
+      assert.ok(
+        recState.leases["avd:Pixel_Crashed"].firstSeenOfflineAtMs,
+        "Crashed AVD whose serial was recycled by another AVD must start offline grace timer",
+      );
+
+      // After 6s, second post-activation snapshot revokes Pixel_Crashed while updating Pixel_Just_Booted if it moved to emulator-5558
+      withStateTransaction(reconcileDir, (s) => {
+        reconcileOfflineLeases(
+          s,
+          {
+            avdHome,
+            discoveredAtMs: baseNow + 6_000,
+            fleetEpoch: 10,
+            running: [
+              {
+                deviceKey: "avd:Pixel_Other",
+                kind: "emulator",
+                avd: "Pixel_Other",
+                serial: "emulator-5554",
+                online: true,
+              },
+              {
+                deviceKey: "avd:Pixel_Just_Booted",
+                kind: "emulator",
+                avd: "Pixel_Just_Booted",
+                serial: "emulator-5558",
+                online: true,
+              },
+            ],
+            offline: [
+              { deviceKey: "avd:Pixel_Crashed", kind: "emulator", avd: "Pixel_Crashed", online: false },
+            ],
+            probes: { emulatorListOk: true, adbDevicesOk: true },
+          },
+          "sess-observer-2",
+          baseNow + 6_000,
+        );
+        return { mutated: true };
+      });
+      recState = readState(reconcileDir);
+      assert.equal(recState.leases["avd:Pixel_Crashed"], undefined);
+      assert.equal(recState.leases["avd:Pixel_Just_Booted"].serial, "emulator-5558");
+    } finally {
+      fs.rmSync(reconcileDir, { recursive: true, force: true });
+    }
+
+    // 5. Finding #5: cmdExec tracks child process group and waits for backgrounded subchildren
+    if (process.platform !== "win32") {
+      const execDir = makeTempStateDir();
+      try {
+        withStateTransaction(execDir, (s, { now }) => {
+          s.leases["avd:Pixel_Exec"] = {
+            leaseId: "lease_exec_pgid",
+            deviceKey: "avd:Pixel_Exec",
+            kind: "emulator",
+            avd: "Pixel_Exec",
+            serial: "emulator-5554",
+            state: "active",
+            sessionId: "exec-pg-sess",
+            claimedAtMs: now,
+            renewedAtMs: now,
+            expiresAtMs: now + 60_000,
+          };
+          return { mutated: true };
+        });
+        const markerFile = path.join(execDir, "bg-done.txt");
+        const t0 = Date.now();
+        const execRes = await cmdExec(
+          execDir,
+          [
+            process.execPath,
+            "-e",
+            `const { spawn } = require("node:child_process"); const c = spawn(process.execPath, ["-e", "setTimeout(() => { require('node:fs').writeFileSync(process.argv[1], 'done'); }, 250)", process.argv[1]], { stdio: "ignore" }); c.unref(); process.exit(0);`,
+            markerFile,
+          ],
+          { session: "exec-pg-sess" },
+        );
+        const elapsedMs = Date.now() - t0;
+        assert.equal(execRes.exitCode, 0);
+        assert.ok(
+          fs.existsSync(markerFile),
+          `Expected spawnWithHeartbeat to wait for background process group member to exit (elapsed=${elapsedMs}ms)`,
+        );
+        const afterLease = readState(execDir).leases["avd:Pixel_Exec"];
+        assert.deepEqual(afterLease.workerPids || [], []);
+        assert.deepEqual(afterLease.workerPgids || [], []);
+      } finally {
+        fs.rmSync(execDir, { recursive: true, force: true });
+      }
+    }
+
+    // 6. Finding #6: Failed/timed-out start that left a partially started emulator stops it during rollback
+    const partialBootDir = makeTempStateDir();
+    try {
+      const partialAvdDir = path.join(avdHome, "Pixel_Partial.avd");
+      fs.mkdirSync(partialAvdDir, { recursive: true });
+      let stopCalls = 0;
+      const claimRes = cmdClaim(
+        partialBootDir,
+        { avd: "Pixel_Partial", session: "partial-sess", wait: 0 },
+        {
+          avdHome,
+          runner: (cmd, args) => {
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+              // Simulate emulator spawning QEMU (creating lock file) before start command times out
+              fs.writeFileSync(path.join(partialAvdDir, "hardware-qemu.ini.lock"), "pid=999", "utf8");
+              return { status: 124, stdout: "", stderr: "Timed out waiting for boot" };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+              stopCalls += 1;
+              fs.rmSync(path.join(partialAvdDir, "hardware-qemu.ini.lock"), { force: true });
+              return { status: 0, stdout: "Stopped\n", stderr: "" };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+              const hasLock = fs.existsSync(path.join(partialAvdDir, "hardware-qemu.ini.lock"));
+              return {
+                status: 0,
+                stdout: hasLock
+                  ? "AVD ID                   AVD Name                      API Level      Status         Serial\nPixel_Partial            Pixel Partial                 android-35     Online         emulator-5566\n"
+                  : "AVD ID                   AVD Name                      API Level      Status         Serial\nPixel_Partial            Pixel Partial                 android-35     Offline\n",
+                stderr: "",
+              };
+            }
+            if (cmd === "adb" && args[0] === "devices") {
+              return { status: 0, stdout: "List of devices attached\n", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      assert.notEqual(claimRes.exitCode, 0);
+      assert.ok(stopCalls >= 1, "Failed start that left lock files/online AVD must stop the partially started emulator");
+      assert.equal(readState(partialBootDir).leases["avd:Pixel_Partial"], undefined);
+    } finally {
+      fs.rmSync(partialBootDir, { recursive: true, force: true });
+    }
+
+    // 7. Finding #7 & #8: Wrapped ADB duplicate selectors and piped shell/xargs command rewrites
+    const wrappedDupClass = classifySegment(
+      "env FOO=1 adb -s emulator-5554 -s emulator-5556 shell getprop ro.build.version.sdk",
+    );
+    assert.equal(wrappedDupClass.targetSerial, "emulator-5554,emulator-5556");
+
+    const wrappedDupGuard = evaluateCommandGuard(
+      "env FOO=1 adb -s emulator-5554 -s emulator-5556 shell getprop ro.build.version.sdk",
+      {
+        sessionId: "guard-sess",
+        activeLeases: [
+          {
+            leaseId: "lease_guard_1",
+            deviceKey: "avd:Pixel_1",
+            serial: "emulator-5554",
+            state: "active",
+            sessionId: "guard-sess",
+          },
+        ],
+        runningCount: 2,
+      },
+    );
+    assert.equal(wrappedDupGuard.allowed, false);
+    assert.match(wrappedDupGuard.reason, /Multiple device selectors|emulator-5556/i);
+
+    const pipedShGuard = evaluateCommandGuard(
+      "printf '%s\\n' 'adb -s emulator-5554 shell getprop ro.build.version.sdk' | sh",
+      {
+        sessionId: "guard-sess",
+        activeLeases: [
+          {
+            leaseId: "lease_guard_1",
+            deviceKey: "avd:Pixel_1",
+            serial: "emulator-5554",
+            state: "active",
+            sessionId: "guard-sess",
+          },
+        ],
+        runningCount: 2,
+      },
+    );
+    assert.equal(pipedShGuard.allowed, true);
+    assert.match(
+      pipedShGuard.rewrittenCommand || "",
+      /\|\s*(?:ATC_SESSION_ID=guard-sess\s+)?atc exec(?:\s+--session\s+guard-sess)?\s+--serial emulator-5554 -- sh\b/,
+    );
+
+    // 8. Finding #9: Windows discoverFleet falls back to emulator -list-avds when android emulator list is unavailable
+    const winAvdDir = path.join(avdHome, "Pixel_Win_Fallback.avd");
+    fs.mkdirSync(winAvdDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(avdHome, "Pixel_Win_Fallback.ini"),
+      `target=android-35\npath=${winAvdDir}\n`,
+      "utf8",
+    );
+    const winFleet = discoverFleet({
+      platform: "win32",
+      avdHome,
+      runner: (cmd, args) => {
+        if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+          return { status: 1, stdout: "", stderr: "error: unsupported on Windows" };
+        }
+        if (cmd === "emulator" && args[0] === "-list-avds") {
+          return { status: 0, stdout: "Pixel_Win_Fallback\n", stderr: "" };
+        }
+        if (cmd === "adb" && args[0] === "devices") {
+          return { status: 0, stdout: "List of devices attached\n", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(winFleet.probes.emulatorListOk, true);
+    assert.ok(winFleet.offline.some((d) => d.avd === "Pixel_Win_Fallback"));
+
+    // 9. Finding #10 & #11: cmdFree snapshot-load failure invalidates loadedSnapshot; cold reclaim preserves saveSnapshotOnFree
+    const snapStateDir = makeTempStateDir();
+    try {
+      withStateTransaction(snapStateDir, (s, { now }) => {
+        s.leases["avd:Pixel_Snap"] = {
+          leaseId: "lease_snap_preserve",
+          deviceKey: "avd:Pixel_Snap",
+          kind: "emulator",
+          avd: "Pixel_Snap",
+          serial: "emulator-5554",
+          state: "active",
+          sessionId: "snap-sess",
+          loadedSnapshot: "clean_boot",
+          saveSnapshotOnFree: "after_run",
+          reason: "preserve-me",
+          claimedAtMs: now - 10_000,
+          renewedAtMs: now,
+          expiresAtMs: now + 900_000,
+          profile: {
+            apiLevel: 35,
+            deviceType: "phone",
+            services: "google_apis_playstore",
+            play: true,
+            abi: "arm64-v8a",
+          },
+        };
+        return { mutated: true };
+      });
+
+      // Cold reclaim of own lease preserves saveSnapshotOnFree, reason, claimedAtMs, and longer expiresAtMs
+      const coldReclaimRes = cmdClaim(
+        snapStateDir,
+        { avd: "Pixel_Snap", cold: true, session: "snap-sess", ttl: 60 },
+        {
+          avdHome,
+          inventory: {
+            avdHome,
+            running: [
+              {
+                deviceKey: "avd:Pixel_Snap",
+                kind: "emulator",
+                avd: "Pixel_Snap",
+                serial: "emulator-5554",
+                online: true,
+                apiLevel: 35,
+                deviceType: "phone",
+                services: "google_apis_playstore",
+                play: true,
+                abi: "arm64-v8a",
+                ramMb: 2048,
+                snapshots: ["clean_boot"],
+              },
+            ],
+            offline: [],
+            creatable: [],
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCount: 8 },
+            probes: { emulatorListOk: true, adbDevicesOk: true },
+          },
+          runner: (cmd, args) => {
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+              return { status: 0, stdout: "Stopped\n", stderr: "" };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+              return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
+            }
+            if (cmd === "adb" && args.includes("getprop")) {
+              return { status: 0, stdout: "1\n", stderr: "" };
+            }
+            return { status: 0, stdout: "emulator-5554\tdevice\n", stderr: "" };
+          },
+        },
+      );
+      assert.equal(coldReclaimRes.exitCode, 0);
+      assert.equal(coldReclaimRes.lease.saveSnapshotOnFree, "after_run");
+      assert.equal(coldReclaimRes.lease.reason, "preserve-me");
+
+      // Mark loadedSnapshot as clean_boot, then fail cmdFree with --snapshot-load + --stop at stop step
+      withStateTransaction(snapStateDir, (s) => {
+        s.leases["avd:Pixel_Snap"].loadedSnapshot = "clean_boot";
+        s.leases["avd:Pixel_Snap"].saveSnapshotOnFree = null;
+        return { mutated: true };
+      });
+      const failedFreeLoadRes = cmdFree(
+        snapStateDir,
+        "lease_snap_preserve",
+        { session: "snap-sess", snapshotLoad: "other_snap" },
+        {
+          avdHome,
+          runner: (cmd, args) => {
+            if (cmd === "adb" && args.includes("snapshot") && args.includes("load")) {
+              return { status: 1, stdout: "", stderr: "KO: snapshot load failed" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      assert.equal(failedFreeLoadRes.exitCode, 1);
+      assert.equal(
+        readState(snapStateDir).leases["avd:Pixel_Snap"].loadedSnapshot,
+        null,
+        "Failed snapshot load during free must clear loadedSnapshot",
+      );
+    } finally {
+      fs.rmSync(snapStateDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(avdHome, { recursive: true, force: true });
+  }
+});
+

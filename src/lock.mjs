@@ -23,6 +23,19 @@ export function isPidAlive(pid) {
   }
 }
 
+export function isProcessGroupAlive(pgid) {
+  if (process.platform === "win32" || !Number.isInteger(pgid) || pgid <= 1) {
+    return false;
+  }
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    if (err && err.code === "EPERM") return true;
+    return false;
+  }
+}
+
 export function resolveStateDir(overrideDir = process.env.ATC_STATE_DIR) {
   let stateDir;
   if (overrideDir && overrideDir.trim()) {
@@ -414,7 +427,7 @@ function tryRecoverAbandonedClaimDir(claimDir, now = Date.now()) {
   }
 }
 
-function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
+function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn, options = {}) {
   if (!candidateBreakToken) return false;
   const claimDir = path.join(stateDir, `${lockName}.stale.${candidateBreakToken}`);
   let createdFreshDir = false;
@@ -495,7 +508,7 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
     };
 
     completed = Boolean(fn({ claimDir, myClaimNonce, canProceed }));
-    if (completed) {
+    if (completed && !options.removeClaimOnComplete) {
       try {
         fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
       } catch {
@@ -511,7 +524,14 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
     } catch {
       // Ignore if already removed
     }
-    if (!completed) {
+    if (completed && options.removeClaimOnComplete) {
+      try {
+        fs.unlinkSync(path.join(claimDir, "done"));
+      } catch {
+        // Ignore if not written
+      }
+    }
+    if (!completed || options.removeClaimOnComplete) {
       try {
         const rem = fs.readdirSync(claimDir);
         if (rem.length === 0) {
@@ -927,7 +947,7 @@ export function releaseLock(lockHandle) {
       // Ignore
     }
     return true;
-  });
+  }, { removeClaimOnComplete: true });
   sweepStaleLockClaims(stateDir, lockName);
 }
 

@@ -994,17 +994,24 @@ export function parseSegment(segment, inheritedVars = {}) {
 export function extractTargetSerial(parsed) {
   const { baseCmd, args } = parsed;
   if (baseCmd === "adb") {
+    const selectors = [];
     let subIdx = 0;
     while (subIdx < args.length) {
       const a = String(args[subIdx]);
       if (a === "-d" || a === "-e" || a === "-t" || a.startsWith("-t")) {
-        return a === "-t" && subIdx + 1 < args.length ? `-t ${args[subIdx + 1]}` : a;
+        selectors.push(a === "-t" && subIdx + 1 < args.length ? `-t ${args[subIdx + 1]}` : a);
+        subIdx += a === "-t" && subIdx + 1 < args.length ? 2 : 1;
+        continue;
       }
       if (a === "-s" && subIdx + 1 < args.length) {
-        return String(args[subIdx + 1]);
+        selectors.push(String(args[subIdx + 1]));
+        subIdx += 2;
+        continue;
       }
       if (a.startsWith("-s") && a.length > 2) {
-        return a.slice(2);
+        selectors.push(a.slice(2));
+        subIdx += 1;
+        continue;
       }
       if (a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
@@ -1016,16 +1023,25 @@ export function extractTargetSerial(parsed) {
         break;
       }
     }
+    if (selectors.length > 0) {
+      const unique = Array.from(new Set(selectors));
+      return unique.length === 1 ? unique[0] : unique.join(",");
+    }
   } else {
+    const selectors = [];
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
       if (a === "--") break;
       if (a.startsWith("--device=")) {
-        return a.slice("--device=".length);
+        selectors.push(a.slice("--device=".length));
+      } else if ((a === "--device" || a === "-s") && i + 1 < args.length) {
+        selectors.push(args[i + 1]);
+        i += 1;
       }
-      if ((a === "--device" || a === "-s") && i + 1 < args.length) {
-        return args[i + 1];
-      }
+    }
+    if (selectors.length > 0) {
+      const unique = Array.from(new Set(selectors));
+      return unique.length === 1 ? unique[0] : unique.join(",");
     }
   }
   if (parsed.envVars.ANDROID_SERIAL) {
@@ -1909,17 +1925,39 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
   }
 
   const shellVars = {};
+  let pipeUpstreamArgs = [];
+  let inPipeline = false;
   return tokens
     .map((tok) => {
-      if (tok.type !== "stage") return tok.text;
+      if (tok.type !== "stage") {
+        if (tok.text.trim() === "|") {
+          inPipeline = true;
+        } else {
+          pipeUpstreamArgs = [];
+          inPipeline = false;
+        }
+        return tok.text;
+      }
       let trimmed = tok.text.trim();
       if (!trimmed) return tok.text;
       const subRewrite = rewriteStageCommandSubstitutions(trimmed, rewriteOpts);
-      const c = classifySegment(
-        subRewrite.changed ? subRewrite.maskedStage : trimmed,
-        shellVars,
-      );
+      const stageForClassify = subRewrite.changed ? subRewrite.maskedStage : trimmed;
+      const parsedStage = parseSegment(stageForClassify, shellVars);
+      let classifyInput = stageForClassify;
+      if (inPipeline && pipeUpstreamArgs.length > 0) {
+        if (SHELL_WRAPPERS.has(parsedStage.baseCmd)) {
+          classifyInput = `${stageForClassify} ${pipeUpstreamArgs.map((a) => JSON.stringify(a)).join(" ")}`;
+        } else if (parsedStage.baseCmd === "xargs" || parsedStage.baseCmd === "parallel") {
+          classifyInput = `${stageForClassify} ${pipeUpstreamArgs.join(" ")}`;
+        }
+      }
+      const c = classifySegment(classifyInput, shellVars);
       Object.assign(shellVars, c.parsed?.envVars || {});
+      for (const arg of parsedStage.args) {
+        if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
+          pipeUpstreamArgs.push(arg);
+        }
+      }
       if (subRewrite.changed) {
         trimmed = subRewrite.rewrittenStage;
         if (c.kind !== "device_action" && c.kind !== "atc") {

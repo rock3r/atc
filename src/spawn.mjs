@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isProcessGroupAlive, sleepSync } from "./lock.mjs";
 
 const SAFE_TOKEN_REGEX = /^[A-Za-z0-9._:/@=-]+$/;
 
@@ -510,16 +511,96 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   return { cmd, args: nextArgs, env };
 }
 
+function terminateChildTree(childPid, signal = "SIGTERM") {
+  if (!Number.isInteger(childPid) || childPid <= 0) return;
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/T", "/F", "/PID", String(childPid)], {
+        stdio: "ignore",
+        timeout: 3000,
+        windowsHide: true,
+      });
+    } catch {
+      try {
+        process.kill(childPid, signal);
+      } catch {
+        // Ignore
+      }
+    }
+    return;
+  }
+  try {
+    process.kill(-childPid, signal);
+  } catch {
+    try {
+      process.kill(childPid, signal);
+    } catch {
+      // Ignore
+    }
+  }
+}
+
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
   const invocation = buildChildInvocation(cmd, args, lease, sessionId, options.env);
+  const useProcessGroup = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
     stdio: options.stdio || "inherit",
     env: invocation.env,
+    detached: useProcessGroup,
   });
 
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
+    const childPid = child.pid || null;
+    if (childPid && typeof options.onChildSpawn === "function") {
+      try {
+        options.onChildSpawn(childPid, { isProcessGroup: useProcessGroup });
+      } catch {
+        // Best-effort worker registration
+      }
+    }
+
+    let wrapperSignal = null;
+    let killEscalationTimer = null;
+    const forwardedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
+    const signalHandlers = new Map();
+
+    const cleanupListenersAndTimers = () => {
+      clearInterval(timer);
+      if (killEscalationTimer) {
+        clearTimeout(killEscalationTimer);
+        killEscalationTimer = null;
+      }
+      for (const [sig, handler] of signalHandlers.entries()) {
+        process.removeListener(sig, handler);
+      }
+      signalHandlers.clear();
+    };
+
+    for (const sig of forwardedSignals) {
+      const handler = () => {
+        if (!wrapperSignal) {
+          wrapperSignal = sig;
+        }
+        if (childPid) {
+          terminateChildTree(childPid, sig);
+          if (!killEscalationTimer && useProcessGroup) {
+            killEscalationTimer = setTimeout(() => {
+              if (isProcessGroupAlive(childPid)) {
+                terminateChildTree(childPid, "SIGKILL");
+              }
+            }, 1500);
+            if (typeof killEscalationTimer.unref === "function") {
+              killEscalationTimer.unref();
+            }
+          }
+        }
+      };
+      signalHandlers.set(sig, handler);
+      process.on(sig, handler);
+    }
+
     const timer = setInterval(() => {
       try {
         onHeartbeat();
@@ -532,27 +613,66 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     }
 
     child.on("error", (err) => {
-      clearInterval(timer);
+      cleanupListenersAndTimers();
       reject(err);
     });
 
     child.on("close", (code, signal) => {
-      clearInterval(timer);
-      try {
-        onHeartbeat();
-      } catch {
-        // Ignore final heartbeat error
-      }
-      if (typeof code === "number") {
-        resolve(code);
+      const effectiveSignal = signal || wrapperSignal;
+      const finishClose = () => {
+        cleanupListenersAndTimers();
+        try {
+          onHeartbeat();
+        } catch {
+          // Ignore final heartbeat error
+        }
+        if (wrapperSignal) {
+          const sigNum = os.constants?.signals?.[wrapperSignal];
+          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
+          return;
+        }
+        if (typeof code === "number") {
+          resolve(code);
+          return;
+        }
+        if (effectiveSignal) {
+          const sigNum = os.constants?.signals?.[effectiveSignal];
+          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
+          return;
+        }
+        resolve(1);
+      };
+
+      if (useProcessGroup && childPid && isProcessGroupAlive(childPid)) {
+        if (effectiveSignal) {
+          terminateChildTree(childPid, "SIGTERM");
+          const killDeadline = Date.now() + 500;
+          while (isProcessGroupAlive(childPid) && Date.now() < killDeadline) {
+            sleepSync(25);
+          }
+          if (isProcessGroupAlive(childPid)) {
+            terminateChildTree(childPid, "SIGKILL");
+            const forceDeadline = Date.now() + 300;
+            while (isProcessGroupAlive(childPid) && Date.now() < forceDeadline) {
+              sleepSync(25);
+            }
+          }
+          finishClose();
+          return;
+        }
+        const waitGroupTimer = setInterval(() => {
+          if (wrapperSignal) {
+            terminateChildTree(childPid, wrapperSignal);
+          }
+          if (!isProcessGroupAlive(childPid)) {
+            clearInterval(waitGroupTimer);
+            finishClose();
+          }
+        }, 50);
         return;
       }
-      if (signal) {
-        const sigNum = os.constants?.signals?.[signal];
-        resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
-        return;
-      }
-      resolve(1);
+
+      finishClose();
     });
   });
 }
