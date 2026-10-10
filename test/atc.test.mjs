@@ -6787,8 +6787,21 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
             const fs = require("node:fs");
             const path = require("node:path");
             const statePath = path.join(process.argv[1], "state.json");
-            const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
-            const old = st.leases["serial:emulator-5576"];
+            const lockPath = path.join(process.argv[1], "atc.lock");
+            const deadline = Date.now() + 3000;
+            let st;
+            while (Date.now() < deadline) {
+              try {
+                if (!fs.existsSync(lockPath)) {
+                  st = JSON.parse(fs.readFileSync(statePath, "utf8"));
+                  if (st.leases["serial:emulator-5576"]?.workerPids?.includes(process.pid)) {
+                    break;
+                  }
+                }
+              } catch {}
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            }
+            const old = st?.leases?.["serial:emulator-5576"];
             if (old) {
               delete st.leases["serial:emulator-5576"];
               old.avd = "Pixel_Rekeyed";
@@ -7829,6 +7842,110 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     );
     assert.equal(fs.existsSync(raceLockFile), true);
     assert.equal(fs.readFileSync(raceLockFile, "utf8").trim(), "99222");
+
+    // 3e. Unquoted ${parts[*]} and ${!parts[*]} expand in the outer shell so custom outer IFS splitting is preserved
+    const readUnquotedStarRedir = evaluateCommandGuard(
+      "IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} > /tmp/out.txt; done < rows.txt",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readUnquotedStarRedir.allowed, true);
+    assert.match(
+      readUnquotedStarRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb install-multiple "\$@" > \/tmp\/out\.txt' sh \$\{parts\[\*\]\} ; done < rows\.txt$/,
+    );
+
+    const readUnquotedKeysStarRedir = evaluateCommandGuard(
+      "IFS=,; while read -ra parts; do adb shell echo ${!parts[*]} > /tmp/out.txt; done < rows.txt",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readUnquotedKeysStarRedir.allowed, true);
+    assert.match(
+      readUnquotedKeysStarRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$@" > \/tmp\/out\.txt' sh \$\{!parts\[\*\]\} ; done < rows\.txt$/,
+    );
+
+    // 1i. cmdGc and cmdFree on Windows reap orphaned grandchildren even when exited group leader PID is reused by an unrelated process
+    const reusedLeaderPgid = 760001;
+    clearKnownWindowsTreeDescendants(reusedLeaderPgid);
+    try {
+      const reusedGcState = createDefaultState();
+      reusedGcState.leases["serial:emulator-5562"] = {
+        leaseId: "lease_reused_leader_gc",
+        deviceKey: "serial:emulator-5562",
+        kind: "emulator",
+        avd: "Pixel_Reused_Leader_GC",
+        serial: "emulator-5562",
+        profile: { apiLevel: "android-35", deviceType: "phone" },
+        sessionId: "reused-gc-sess",
+        anchorPid: process.pid,
+        workerPid: reusedLeaderPgid,
+        workerPids: [reusedLeaderPgid],
+        workerPgids: [reusedLeaderPgid],
+        workerDescendants: {
+          [String(reusedLeaderPgid)]: [
+            { pid: reusedLeaderPgid, creationDate: "20261010200000.000000+000" },
+            { pid: 760003, creationDate: "20261010200002.000000+000" },
+          ],
+        },
+        releaseOnWorkerExit: true,
+        state: "active",
+        claimedAtMs: now - 10_000,
+        activatedAtMs: now - 9_000,
+        renewedAtMs: now - 1_000,
+        expiresAtMs: now + 300_000,
+      };
+      withLock(dir, (h) => commitState(dir, reusedGcState, h));
+      const reusedGcKilled = [];
+      const reusedGcRes = cmdGc(dir, {
+        platform: "win32",
+        // Numeric PID 760001 is alive in OS because an unrelated process reused it!
+        livenessCheck: (pid) => pid === process.pid || pid === reusedLeaderPgid || pid === 760003,
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                // Unrelated process with a different CreationDate now occupies 760001
+                { ProcessId: reusedLeaderPgid, ParentProcessId: 4000, CreationDate: "20261010209999.000000+000" },
+                // Surviving detached grandchild from the original worker tree
+                { ProcessId: 760003, ParentProcessId: 760002, CreationDate: "20261010200002.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            for (let i = 0; i < args.length; i++) {
+              if (args[i] === "/PID" && args[i + 1]) {
+                reusedGcKilled.push(Number(args[i + 1]));
+              }
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(reusedGcRes.exitCode, 0);
+      assert.deepEqual(
+        reusedGcKilled,
+        [760003],
+        "cmdGc must terminate orphaned Windows grandchild without killing the unrelated process that reused the leader PID",
+      );
+      assert.equal(
+        readState(dir).leases["serial:emulator-5562"],
+        undefined,
+        "cmdGc must prune the releaseOnWorkerExit lease once orphaned grandchild is terminated despite leader PID reuse",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(reusedLeaderPgid);
+    }
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

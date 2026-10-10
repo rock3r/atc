@@ -34,11 +34,13 @@ import {
   canJumpAhead,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
+  getKnownWindowsTreePids,
   hasAliveProcessInGroup,
   isTicketStarvationProtected,
   killProcessGroupTree,
   matchesProfile,
   offlineAvdHasRuntimeLockFiles,
+  queryWindowsProcessGroups,
   readState,
   reconcileOfflineLeases,
   recordDeviceBootedInState,
@@ -53,6 +55,43 @@ import {
 
 export const ATC_VERSION = "1.0.0";
 export { GUIDE_TOPICS, cmdGuide };
+
+function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {
+  const num = Number(pgid);
+  if (!Number.isInteger(num) || num <= 1) return false;
+  if (num === options.callerWorkerPid) return false;
+  const descEntries = lease?.workerDescendants?.[String(num)];
+  if (Array.isArray(descEntries)) {
+    const rootEntry = descEntries.find(
+      (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === num,
+    );
+    if (
+      rootEntry &&
+      (rootEntry.alive === false ||
+        String(rootEntry.creationDate ?? rootEntry.CreationDate ?? "").trim() === "__exited__")
+    ) {
+      return false;
+    }
+  }
+  if (!livenessCheck(num)) {
+    return false;
+  }
+  const effectivePlatform = options.platform || process.platform;
+  if (effectivePlatform === "win32") {
+    const qRes = queryWindowsProcessGroups(
+      [num],
+      options.spawnSyncFn || options.runner,
+      {
+        knownDescendants: lease?.workerDescendants,
+        triState: true,
+      },
+    );
+    if (qRes.refreshed) {
+      return getKnownWindowsTreePids(num, { liveOnly: true }).includes(num);
+    }
+  }
+  return true;
+}
 
 function parseBoolFlag(val) {
   if (val === undefined || val === null) return false;
@@ -2810,10 +2849,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           const num = Number(p);
           return num !== options.callerWorkerPid && !pgidSet.has(num) && preLiveness(num);
         });
-        const hasLiveLeaderPid = l.workerPgids.some((p) => {
-          const num = Number(p);
-          return num !== options.callerWorkerPid && preLiveness(num);
-        });
+        const hasLiveLeaderPid = l.workerPgids.some((p) =>
+          isWorkerGroupLeaderAlive(p, l, preLiveness, options),
+        );
         if (parseBoolFlag(flags.force) || (!hasLiveWrapperPid && !hasLiveLeaderPid)) {
           const killedRes = killProcessGroupTree(l, "SIGKILL", {
             spawnSyncFn: options.spawnSyncFn || options.runner,
@@ -4120,7 +4158,9 @@ export function cmdGc(stateDir, options = {}) {
         const num = Number(p);
         return !pgidSet.has(num) && preLiveness(num);
       });
-      const hasLiveLeaderPid = (lease.workerPgids || []).some((p) => preLiveness(Number(p)));
+      const hasLiveLeaderPid = (lease.workerPgids || []).some((p) =>
+        isWorkerGroupLeaderAlive(p, lease, preLiveness, options),
+      );
       if (hasLiveWrapperPid || hasLiveLeaderPid) continue;
       const lastRenewedMs =
         typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;

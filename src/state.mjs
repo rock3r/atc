@@ -414,11 +414,13 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
     const pid = Number(val);
     if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
     seen.add(pid);
+    const hasWindowsDescendantEntry = Boolean(lease.workerDescendants?.[String(pid)]);
     const isAlive = pgidSet.has(pid)
-      ? livenessCheck === isPidAlive
+      ? livenessCheck === isPidAlive || hasWindowsDescendantEntry
         ? hasAliveProcessInGroup(pid, {
             allowSubprocess: false,
             knownDescendants: lease.workerDescendants,
+            livenessCheck,
           })
         : livenessCheck(pid) ||
           hasAliveProcessInGroup(pid, {

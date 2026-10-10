@@ -56,6 +56,9 @@ export function seedWindowsKnownDescendants(pgidOrMap, entries) {
   const pgid = Number(pgidOrMap);
   if (!Number.isInteger(pgid) || pgid <= 1) return;
   if (!entries) return;
+  if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.get(pgid) === false) {
+    return;
+  }
   let known = winKnownTreeDescendants.get(pgid);
   if (!known) {
     known = new Map();
