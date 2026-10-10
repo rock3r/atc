@@ -7575,6 +7575,34 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb install-multiple "\$@" > \/tmp\/out\.txt' sh "\$\{parts\[@\]\}" ; done < rows\.txt$/,
     );
 
+    const readArrayKeysAtRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb shell echo "${!parts[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readArrayKeysAtRedir.allowed, true);
+    assert.match(
+      readArrayKeysAtRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$@" > \/tmp\/out\.txt' sh "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    const readArrayKeysStarRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb shell echo "${!parts[*]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readArrayKeysStarRedir.allowed, true);
+    assert.match(
+      readArrayKeysStarRedir.rewrittenCommand,
+      /do __atc_arr_parts_keys="\$\{!parts\[\*\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_keys\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
     // 1f. Tombstoned root identity when initial Windows snapshot misses already-exited root PID
     const missedRootPgid = 730001;
     clearKnownWindowsTreeDescendants(missedRootPgid);
@@ -7661,6 +7689,66 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(liveGcRes.exitCode, 0);
     assert.deepEqual(liveGcKilled, [], "cmdGc must not kill an active worker group leader while it is still alive");
     assert.ok(readState(dir).leases["serial:emulator-5558"], "Lease with live worker leader must remain active during GC");
+
+    // 1h. killProcessGroupTree on Windows aborts taskkill when PowerShell refresh fails/times out
+    const failedRefreshPgid = 750001;
+    seedWindowsKnownDescendants({
+      [String(failedRefreshPgid)]: [
+        { pid: failedRefreshPgid, creationDate: "20261010190000.000000+000" },
+        { pid: 750002, creationDate: "20261010190001.000000+000" },
+      ],
+    });
+    try {
+      const killedOnFailedRefresh = [];
+      const resFailedRefresh = killProcessGroupTree(failedRefreshPgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return { status: 1, stdout: "", stderr: "PowerShell timed out" };
+          }
+          if (cmd === "taskkill") {
+            killedOnFailedRefresh.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(resFailedRefresh, []);
+      assert.deepEqual(
+        killedOnFailedRefresh,
+        [],
+        "killProcessGroupTree must not kill cached PIDs when PowerShell snapshot refresh fails",
+      );
+      assert.equal(
+        getKnownWindowsTreeDescendants(failedRefreshPgid).length,
+        2,
+        "Cached descendants must remain tracked when refresh fails so a subsequent retry can verify CreationDate",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(failedRefreshPgid);
+    }
+
+    // 2f. Concurrent replacement of stale AVD lock during liveness check preserves the new live lock
+    const raceAvdDir = path.join(avdHome, "Pixel_Race.avd");
+    fs.mkdirSync(raceAvdDir, { recursive: true });
+    const raceLockFile = path.join(raceAvdDir, "hardware-qemu.ini.lock");
+    fs.writeFileSync(raceLockFile, "99111\n", "utf8");
+    const raceLive = avdHasRuntimeLockFiles("Pixel_Race", avdHome, (pid) => {
+      if (pid === 99111) {
+        // Simulate a new emulator replacing the lock file right as the dead PID check runs
+        fs.unlinkSync(raceLockFile);
+        fs.writeFileSync(raceLockFile, "99222\n", "utf8");
+        return false;
+      }
+      return pid === 99222;
+    });
+    assert.equal(
+      raceLive,
+      true,
+      "Replacement lock file created concurrently with stale-lock cleanup must be preserved and reported as live",
+    );
+    assert.equal(fs.existsSync(raceLockFile), true);
+    assert.equal(fs.readFileSync(raceLockFile, "utf8").trim(), "99222");
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

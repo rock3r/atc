@@ -109,6 +109,8 @@ export function clearKnownWindowsTreeDescendants(pgid = null) {
 
 export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, options = {}) {
   const result = new Map();
+  result.refreshed = false;
+  const triState = Boolean(options && options.triState);
   if (options && options.knownDescendants) {
     if (
       Array.isArray(options.knownDescendants) &&
@@ -123,7 +125,7 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
   for (const rawPgid of pgids || []) {
     const pgid = Number(rawPgid);
     if (Number.isInteger(pgid) && pgid > 1) {
-      result.set(pgid, true);
+      result.set(pgid, triState ? null : true);
     }
   }
   try {
@@ -273,9 +275,10 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
           result.set(pgid, false);
         }
       }
+      result.refreshed = true;
     }
   } catch {
-    // Preserve conservative alive (true) default when PowerShell fails or times out
+    // Preserve conservative alive (true) default (or null in triState mode) when PowerShell fails or times out
   }
   return result;
 }
@@ -499,14 +502,18 @@ export function killProcessGroupTree(
     }
     let refreshedAlive = null;
     if (options.refresh !== false) {
-      refreshedAlive = queryWindowsProcessGroups([childPid], spawnSyncFn).get(childPid);
+      refreshedAlive = queryWindowsProcessGroups([childPid], spawnSyncFn, {
+        triState: true,
+      }).get(childPid);
     }
     if (refreshedAlive === false) {
       winKnownTreeDescendants.delete(childPid);
       return [];
     }
+    if (refreshedAlive !== true) {
+      return [];
+    }
     const liveKnownPids = getKnownWindowsTreePids(childPid, { liveOnly: true });
-    const knownMap = winKnownTreeDescendants.get(childPid);
     const pidsToKill = [];
     const seen = new Set();
     for (const p of liveKnownPids) {
@@ -514,9 +521,6 @@ export function killProcessGroupTree(
         seen.add(p);
         pidsToKill.push(p);
       }
-    }
-    if (!seen.has(childPid) && knownMap === undefined && isPidAlive(childPid)) {
-      pidsToKill.push(childPid);
     }
     if (pidsToKill.length === 0) {
       winKnownTreeDescendants.delete(childPid);

@@ -668,39 +668,85 @@ const AVD_RUNTIME_LOCK_NAMES = new Set([
   "modem-nv-ram-5554.lock",
 ]);
 
+function readBareAvdLockPid(targetPath) {
+  const stat = fs.statSync(targetPath);
+  let rawContent = null;
+  let contentStat = stat;
+  if (stat.isDirectory()) {
+    const pidFile = path.join(targetPath, "pid");
+    if (!fs.existsSync(pidFile)) {
+      return { stat, contentStat: null, pid: null };
+    }
+    contentStat = fs.statSync(pidFile);
+    rawContent = fs.readFileSync(pidFile, "utf8");
+  } else if (stat.isFile()) {
+    rawContent = fs.readFileSync(targetPath, "utf8");
+  } else {
+    return { stat, contentStat: null, pid: null };
+  }
+  const cleaned = String(rawContent).replace(/\0/g, "");
+  const barePidMatch = cleaned.match(/^\s*(\d+)\s*$/);
+  if (!barePidMatch) {
+    return { stat, contentStat, pid: null };
+  }
+  const pid = Number(barePidMatch[1]);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { stat, contentStat, pid: null };
+  }
+  return { stat, contentStat, pid };
+}
+
 function isAvdLockEntryLive(lockPath, livenessCheck = isPidAlive) {
   try {
-    const stat = fs.statSync(lockPath);
-    let rawContent = null;
-    if (stat.isDirectory()) {
-      const pidFile = path.join(lockPath, "pid");
-      if (!fs.existsSync(pidFile)) {
-        return true;
-      }
-      rawContent = fs.readFileSync(pidFile, "utf8");
-    } else if (stat.isFile()) {
-      rawContent = fs.readFileSync(lockPath, "utf8");
-    } else {
+    const initial = readBareAvdLockPid(lockPath);
+    if (initial.pid === null) {
       return true;
     }
-    const cleaned = String(rawContent).replace(/\0/g, "");
-    const barePidMatch = cleaned.match(/^\s*(\d+)\s*$/);
-    if (!barePidMatch) {
+    if (livenessCheck(initial.pid)) {
       return true;
     }
-    const pid = Number(barePidMatch[1]);
-    if (!Number.isInteger(pid) || pid <= 0) {
-      return true;
-    }
-    if (livenessCheck(pid)) {
-      return true;
-    }
+    const stagedPath = `${lockPath}.stale.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+    let renamed = false;
     try {
-      fs.rmSync(lockPath, { recursive: true, force: true });
+      fs.renameSync(lockPath, stagedPath);
+      renamed = true;
     } catch {
-      // Ignore cleanup errors on read-only or race-removed lock paths
+      // Another caller removed or replaced the lock entry
+      return fs.existsSync(lockPath);
     }
-    return false;
+    if (renamed) {
+      try {
+        const staged = readBareAvdLockPid(stagedPath);
+        const sameEntry =
+          staged.pid === initial.pid &&
+          staged.stat.isDirectory() === initial.stat.isDirectory() &&
+          (!initial.stat.ino || !staged.stat.ino || staged.stat.ino === initial.stat.ino) &&
+          (!initial.contentStat?.ino ||
+            !staged.contentStat?.ino ||
+            staged.contentStat.ino === initial.contentStat.ino);
+        if (!sameEntry) {
+          const replacementLive = staged.pid === null || livenessCheck(staged.pid);
+          if (replacementLive) {
+            try {
+              if (!fs.existsSync(lockPath)) {
+                fs.renameSync(stagedPath, lockPath);
+              }
+            } catch {
+              // Ignore restore errors
+            }
+            return true;
+          }
+        }
+      } catch {
+        // Proceed to remove stagedPath below
+      }
+      try {
+        fs.rmSync(stagedPath, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup errors on staged path
+      }
+    }
+    return fs.existsSync(lockPath);
   } catch {
     return true;
   }
