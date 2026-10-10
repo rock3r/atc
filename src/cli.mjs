@@ -865,6 +865,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             delete lease.pendingStop;
             lease.renewedAtMs = now;
             lease.expiresAtMs = Math.max(
+              rawTtl !== undefined ? 0 : lease.expiresAtMs || 0,
               now + ttlMs,
               needsPrep ? now + stopTimeoutMs * 2 : 0,
             );
@@ -1205,7 +1206,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             }
             const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
             cur.renewedAtMs = now;
-            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+            cur.expiresAtMs =
+              rawTtl !== undefined ? now + ttlMs : Math.max(cur.expiresAtMs || 0, now + ttlMs);
             txOutcome.lease.state = "active";
             txOutcome.lease.workerPid = cur.workerPid;
             txOutcome.lease.workerPids = cur.workerPids;
@@ -1829,7 +1831,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         const activeWorkers = syncLeaseWorkers(lease, livenessCheck).filter(
           (p) => p !== process.pid,
         );
-        if (activeWorkers.length > 0 && !isForced) {
+        if (activeWorkers.length > 0) {
           lease.releaseOnWorkerExit = true;
           if (flags.snapshotSave) {
             lease.pendingSnapshotSave = flags.snapshotSave;
@@ -2333,12 +2335,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     const activeWorkers = syncLeaseWorkers(lease, livenessCheck).filter(
       (p) => p !== process.pid,
     );
-    if (effectiveAction === "load" && activeWorkers.length > 0 && !parseBoolFlag(flags.force)) {
+    if (effectiveAction === "load" && activeWorkers.length > 0) {
       return {
         mutated: false,
         value: {
           exitCode: 3,
-          error: `Lease ${lease.leaseId} (${lease.deviceKey}) has active in-flight worker(s) (${activeWorkers.join(", ")}); wait for completion or pass --force.`,
+          error: `Lease ${lease.leaseId} (${lease.deviceKey}) has active in-flight worker(s) (${activeWorkers.join(", ")}); wait for completion before loading a snapshot.`,
         },
       };
     }

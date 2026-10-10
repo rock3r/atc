@@ -41,7 +41,30 @@ export function resolveAtcExecutable(
   cwd: string = process.cwd(),
   platform: string = process.platform
 ): { executable: string; isBatch: boolean } {
+  const resolvedCwd = path.resolve(cwd);
+  const pathDirs = (env.PATH || env.Path || "")
+    .split(path.delimiter)
+    .map((d) => d.trim())
+    .filter((d) => Boolean(d) && path.isAbsolute(d) && path.resolve(d) !== resolvedCwd);
+
   if (platform !== "win32") {
+    pathDirs.push(
+      path.join(os.homedir(), ".local", "bin"),
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/usr/bin"
+    );
+    for (const dir of pathDirs) {
+      const candidate = path.join(dir, "atc");
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          fs.accessSync(candidate, fs.constants.X_OK);
+          return { executable: candidate, isBatch: false };
+        }
+      } catch {
+        // Ignore inaccessible or non-executable PATH entry
+      }
+    }
     return { executable: "atc", isBatch: false };
   }
 
@@ -51,11 +74,6 @@ export function resolveAtcExecutable(
     .filter((e) => e.startsWith("."));
   const extensions = Array.from(new Set([".exe", ".cmd", ".bat", ".com", ...rawExts]));
 
-  const resolvedCwd = path.resolve(cwd);
-  const pathDirs = (env.PATH || env.Path || "")
-    .split(path.delimiter)
-    .map((d) => d.trim())
-    .filter((d) => Boolean(d) && path.isAbsolute(d) && path.resolve(d) !== resolvedCwd);
   const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   pathDirs.push(path.join(appData, "npm"), path.join(os.homedir(), ".local", "bin"));
 
@@ -86,6 +104,17 @@ export function buildAtcSpawnConfig(
   const cwd = options.cwd || process.cwd();
   const platform = options.platform || process.platform;
   const resolved = resolveAtcExecutable(env, cwd, platform);
+  const resolvedCwd = path.resolve(cwd);
+  const safePath = (env.PATH || env.Path || "")
+    .split(path.delimiter)
+    .map((d: string) => d.trim())
+    .filter((d: string) => Boolean(d) && path.isAbsolute(d) && path.resolve(d) !== resolvedCwd)
+    .join(path.delimiter);
+  const spawnEnv = {
+    ...env,
+    PATH: safePath,
+    ...(platform === "win32" ? { NoDefaultCurrentDirectoryInExePath: "1" } : {}),
+  };
 
   if (platform === "win32" && resolved.isBatch) {
     for (const arg of args) {
@@ -104,7 +133,7 @@ export function buildAtcSpawnConfig(
       isBatch: true,
       options: {
         ...options,
-        env,
+        env: spawnEnv,
         shell: false,
         windowsHide: true,
         windowsVerbatimArguments: true,
@@ -118,7 +147,7 @@ export function buildAtcSpawnConfig(
     isBatch: false,
     options: {
       ...options,
-      env,
+      env: spawnEnv,
       shell: false,
     },
   };

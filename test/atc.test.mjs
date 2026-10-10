@@ -3780,6 +3780,69 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"]?.workerPid,
               999888,
             );
+
+            // 43. Forced release on a lease with a live worker retains the reservation until the worker exits
+            withStateTransaction(coldRediscoverDir, (state) => {
+              const cur = state.leases["avd:Pixel_9_API_36"];
+              cur.workerPid = 999777;
+              cur.workerPids = [999777];
+              return { mutated: true };
+            }, { livenessCheck: (pid) => pid === 999777 || pid === process.pid });
+
+            const forceFreeBusyRes = cmdFree(
+              coldRediscoverDir,
+              "Pixel_9_API_36",
+              { session: "other-admin-sess", force: true },
+              { livenessCheck: (pid) => pid === 999777 || pid === process.pid },
+            );
+            assert.equal(forceFreeBusyRes.exitCode, 3);
+            assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]);
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]?.releaseOnWorkerExit,
+              true,
+            );
+
+            // Clear worker 999777 and verify idempotent claim preserves a later expiresAtMs when --ttl is omitted
+            withStateTransaction(
+              coldRediscoverDir,
+              (state, { now }) => {
+                const cur = state.leases["avd:Pixel_9_API_36"];
+                cur.workerPid = null;
+                cur.workerPids = [];
+                cur.releaseOnWorkerExit = false;
+                cur.expiresAtMs = now + 3_600_000;
+                return { mutated: true };
+              },
+              { livenessCheck: (pid) => pid === 999777 || pid === process.pid },
+            );
+            const laterExpiryBefore =
+              readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"].expiresAtMs;
+            const idempotentPreserveTtl = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  host: singleMatchInv.host,
+                  running: [
+                    {
+                      deviceKey: "avd:Pixel_9_API_36",
+                      avd: "Pixel_9_API_36",
+                      serial: "emulator-5558",
+                      kind: "emulator",
+                      online: true,
+                      profile: { deviceType: "phone", apiLevel: "android-36" },
+                    },
+                  ],
+                  offline: [],
+                  creatable: [],
+                },
+              },
+            );
+            assert.equal(idempotentPreserveTtl.exitCode, 0);
+            assert.equal(idempotentPreserveTtl.idempotent, true);
+            assert.ok(idempotentPreserveTtl.lease.expiresAtMs >= laterExpiryBefore);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
