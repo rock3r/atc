@@ -472,7 +472,7 @@ export function reconcileOfflineLeases(
   ]);
 
   for (const [deviceKey, lease] of Object.entries(state.leases)) {
-    if (!lease.avd && lease.kind === "emulator" && lease.serial) {
+    if ((!lease.avd || deviceKey.startsWith("serial:")) && lease.kind === "emulator" && lease.serial) {
       const mappedDev = (inventory.running || []).find(
         (d) => d.kind === "emulator" && d.serial === lease.serial && d.avd,
       );
@@ -486,20 +486,33 @@ export function reconcileOfflineLeases(
           state.leases[mappedDev.deviceKey] = lease;
           mutated = true;
         } else {
-          const destHasLiveWorker =
-            destLease.state === "starting" || destLease.state === "stopping"
-              ? Boolean(destLease.workerPid && livenessCheck(destLease.workerPid))
+          const destInTransition =
+            (destLease.state === "starting" || destLease.state === "stopping") &&
+            Boolean(destLease.workerPid && livenessCheck(destLease.workerPid));
+          const destHasLiveWorker = destInTransition
+            ? true
+            : destLease.state === "starting" || destLease.state === "stopping"
+              ? false
               : syncLeaseWorkers(destLease, livenessCheck).length > 0;
           const srcHasLiveWorker =
             lease.state === "starting" || lease.state === "stopping"
               ? Boolean(lease.workerPid && livenessCheck(lease.workerPid))
               : syncLeaseWorkers(lease, livenessCheck).length > 0;
+          if (destInTransition && srcHasLiveWorker) {
+            if (lease.avd !== mappedDev.avd) {
+              lease.avd = mappedDev.avd;
+              lease.profile = mappedDev.profile || lease.profile;
+              mutated = true;
+            }
+            continue;
+          }
           const destWins =
-            !srcHasLiveWorker &&
-            (destLease.state === "starting" ||
-              destLease.state === "stopping" ||
-              destHasLiveWorker ||
-              (destLease.claimedAtMs || 0) <= (lease.claimedAtMs || Infinity));
+            destInTransition ||
+            (!srcHasLiveWorker &&
+              (destLease.state === "starting" ||
+                destLease.state === "stopping" ||
+                destHasLiveWorker ||
+                (destLease.claimedAtMs || 0) <= (lease.claimedAtMs || Infinity)));
           delete state.leases[deviceKey];
           if (!destWins) {
             lease.avd = mappedDev.avd;

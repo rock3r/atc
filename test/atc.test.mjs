@@ -3529,7 +3529,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               "active",
             );
 
-            // 38. Source `serial:<serial>` lease with live worker wins over `starting` destination AVD lease on collision
+            // 38. Source `serial:<serial>` lease with live worker does not displace an in-flight `starting` destination AVD lease until the transition worker drains
             const liveWorkerCollisionState = {
               config: {},
               leases: {
@@ -3559,25 +3559,46 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               },
               queue: [],
             };
+            const collisionInv = {
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+              running: [
+                {
+                  deviceKey: "avd:Pixel_9_API_36",
+                  avd: "Pixel_9_API_36",
+                  serial: "emulator-5564",
+                  kind: "emulator",
+                  online: true,
+                  profile: { deviceType: "phone", apiLevel: "android-36" },
+                },
+              ],
+              offline: [],
+            };
             reconcileOfflineLeases(
               liveWorkerCollisionState,
-              {
-                probes: { emulatorListOk: true, adbDevicesOk: true },
-                running: [
-                  {
-                    deviceKey: "avd:Pixel_9_API_36",
-                    avd: "Pixel_9_API_36",
-                    serial: "emulator-5564",
-                    kind: "emulator",
-                    online: true,
-                    profile: { deviceType: "phone", apiLevel: "android-36" },
-                  },
-                ],
-                offline: [],
-              },
+              collisionInv,
               "any-sess",
               6000,
               (pid) => pid === 777001 || pid === 777002,
+            );
+            assert.equal(
+              liveWorkerCollisionState.leases["avd:Pixel_9_API_36"]?.leaseId,
+              "lease_dest_starting",
+            );
+            assert.equal(
+              liveWorkerCollisionState.leases["serial:emulator-5564"]?.leaseId,
+              "lease_src_live",
+            );
+            assert.equal(
+              liveWorkerCollisionState.leases["serial:emulator-5564"]?.avd,
+              "Pixel_9_API_36",
+            );
+            // Once the transition worker (777002) exits, reconciliation transfers lease_src_live onto the AVD key
+            reconcileOfflineLeases(
+              liveWorkerCollisionState,
+              collisionInv,
+              "any-sess",
+              6000,
+              (pid) => pid === 777001,
             );
             assert.equal(liveWorkerCollisionState.leases["serial:emulator-5564"], undefined);
             assert.equal(
@@ -3843,6 +3864,49 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(idempotentPreserveTtl.exitCode, 0);
             assert.equal(idempotentPreserveTtl.idempotent, true);
             assert.ok(idempotentPreserveTtl.lease.expiresAtMs >= laterExpiryBefore);
+
+            // 44. Command substitutions in assignments and shell functions/subshells rewrite cleanly without losing caller-shell scope or breaking syntax
+            const cmdSubAssignRewrite = evaluateCommandGuard(
+              'value=$(adb shell getprop foo); echo "$value"',
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+                runningCount: 1,
+                platform: "darwin",
+              },
+            );
+            assert.equal(cmdSubAssignRewrite.allowed, true);
+            assert.equal(
+              cmdSubAssignRewrite.rewrittenCommand,
+              'value=$(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop foo) ; echo "$value"',
+            );
+
+            const funcDefRewrite = evaluateCommandGuard("f() { adb shell getprop; }; f", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              runningCount: 1,
+              platform: "darwin",
+            });
+            assert.equal(funcDefRewrite.allowed, true);
+            assert.equal(
+              funcDefRewrite.rewrittenCommand,
+              "f() { ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop ; } ; f",
+            );
+
+            const subshellRewrite = evaluateCommandGuard(
+              "(adb shell getprop; echo ok) && (echo pre; adb shell getprop)",
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+                runningCount: 1,
+                platform: "darwin",
+              },
+            );
+            assert.equal(subshellRewrite.allowed, true);
+            assert.equal(
+              subshellRewrite.rewrittenCommand,
+              "(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop ; echo ok) && (echo pre ; ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop)",
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

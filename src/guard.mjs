@@ -80,7 +80,7 @@ const CASE_PREFIX_BEFORE_PIPE_RE =
 const CASE_SUFFIX_AFTER_PIPE_RE =
   /^\s*(?:(?:"[^"]*"|'[^']*'|[^\s|);(]+)\s*\|\s*)*(?:"[^"]*"|'[^']*'|[^\s|);(]+)\)/;
 const LEADING_CONTROL_PREFIX_RE =
-  /^(?:(?:if|elif|while|until|then|else|do|\{|!)\s+|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in\s+|\(?\s*(?:(?:"[^"]*"|'[^']*'|[^\s|);(]+)\s*\|\s*)*(?:"[^"]*"|'[^']*'|[^\s|);(]+)\)\s*)+/;
+  /^(?:(?:if|elif|while|until|then|else|do|\{|!)\s+|(?:function\s+[A-Za-z_][A-Za-z0-9_.-]*(?:\s*\(\s*\))?\s*\{\s*|[A-Za-z_][A-Za-z0-9_.-]*\s*\(\s*\)\s*\{\s*)|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in\s+|\(?\s*(?:(?:"[^"]*"|'[^']*'|[^\s|);(]+)\s*\|\s*)*(?:"[^"]*"|'[^']*'|[^\s|);(]+)\)\s*|\((?!\()\s*)+/;
 
 function isCasePatternAlternationPipe(cur, rest) {
   return CASE_PREFIX_BEFORE_PIPE_RE.test(cur.trim()) && CASE_SUFFIX_AFTER_PIPE_RE.test(rest);
@@ -210,8 +210,11 @@ export function splitShellSegments(command) {
   const innerSubstitutions = [];
   const replaceSub = (_full, inner) => {
     innerSubstitutions.push(inner);
-    const tokenMatch = String(inner).match(FAST_PATH_REGEX);
-    return tokenMatch ? tokenMatch[1] : "";
+    if (classifySegment(inner).kind === "ignore") {
+      const tokenMatch = String(inner).match(FAST_PATH_REGEX);
+      return tokenMatch ? tokenMatch[1] : "";
+    }
+    return "__atc_cmd_sub__";
   };
   const inlineExpanded = command
     .replace(/(?:\$|<|>)\(([^)]+)\)/g, replaceSub)
@@ -527,9 +530,20 @@ export function parseSegment(segment, inheritedVars = {}) {
   const remaining = tokens.slice(idx).map((t) => expandVariables(t, allVars));
   while (
     remaining.length > 1 &&
-    ["fi", "done", "esac", "}"].includes(remaining[remaining.length - 1])
+    (["fi", "done", "esac", "}"].includes(remaining[remaining.length - 1]) ||
+      /^\)+$/.test(remaining[remaining.length - 1]))
   ) {
     remaining.pop();
+  }
+  if (
+    remaining.length > 0 &&
+    /\)+$/.test(remaining[remaining.length - 1]) &&
+    !remaining[remaining.length - 1].includes("(")
+  ) {
+    remaining[remaining.length - 1] = remaining[remaining.length - 1].replace(/\)+$/, "");
+    if (!remaining[remaining.length - 1] && remaining.length > 1) {
+      remaining.pop();
+    }
   }
   const cmd = remaining[0] || "";
   const baseCmd = path.basename(cmd, path.extname(cmd)).toLowerCase();
@@ -1136,7 +1150,160 @@ function extractEmbeddedCommands(args) {
   return candidates;
 }
 
+function splitTrailingControlClosers(cmdBody) {
+  const openStack = [];
+  const matchedCloseIndices = new Set();
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < cmdBody.length; i++) {
+    const ch = cmdBody[i];
+    if (ch === "\\" && !inSingle && i + 1 < cmdBody.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      if (ch === "(") {
+        openStack.push(i);
+      } else if (ch === ")" && openStack.length > 0) {
+        openStack.pop();
+        matchedCloseIndices.add(i);
+      }
+    }
+  }
+  let end = cmdBody.length;
+  while (end > 0) {
+    const slice = cmdBody.slice(0, end);
+    const kwMatch = slice.match(/\s+(?:fi|done|esac|\})$/);
+    if (kwMatch) {
+      end -= kwMatch[0].length;
+      continue;
+    }
+    if (cmdBody[end - 1] === ")" && !matchedCloseIndices.has(end - 1)) {
+      end--;
+      while (end > 0 && /\s/.test(cmdBody[end - 1])) {
+        end--;
+      }
+      continue;
+    }
+    break;
+  }
+  return {
+    body: cmdBody.slice(0, end).trim(),
+    suffix: cmdBody.slice(end),
+  };
+}
+
+function rewriteStageCommandSubstitutions(stageText, rewriteOpts) {
+  let rewrittenStage = "";
+  let maskedStage = "";
+  let changed = false;
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < stageText.length; i++) {
+    const ch = stageText[i];
+    if (ch === "\\" && !inSingle && i + 1 < stageText.length) {
+      rewrittenStage += ch + stageText[i + 1];
+      maskedStage += ch + stageText[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      rewrittenStage += ch;
+      maskedStage += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      rewrittenStage += ch;
+      maskedStage += ch;
+      continue;
+    }
+    if (
+      !inSingle &&
+      (ch === "$" || ch === "<" || ch === ">") &&
+      stageText[i + 1] === "(" &&
+      stageText[i + 2] !== "("
+    ) {
+      let depth = 1;
+      let j = i + 2;
+      let subSingle = false;
+      let subDouble = false;
+      while (j < stageText.length && depth > 0) {
+        const c = stageText[j];
+        if (c === "\\" && !subSingle && j + 1 < stageText.length) {
+          j += 2;
+          continue;
+        }
+        if (c === "'" && !subDouble) {
+          subSingle = !subSingle;
+        } else if (c === '"' && !subSingle) {
+          subDouble = !subDouble;
+        } else if (!subSingle && !subDouble) {
+          if (c === "(") depth++;
+          else if (c === ")") depth--;
+        }
+        j++;
+      }
+      if (depth === 0) {
+        const inner = stageText.slice(i + 2, j - 1);
+        const rewrittenInner = rewriteCompoundCommand(inner, rewriteOpts);
+        if (rewrittenInner !== inner) {
+          changed = true;
+          rewrittenStage += `${ch}(${rewrittenInner})`;
+          maskedStage += "__atc_cmd_sub__";
+        } else {
+          const orig = stageText.slice(i, j);
+          rewrittenStage += orig;
+          maskedStage += orig;
+        }
+        i = j - 1;
+        continue;
+      }
+    }
+    if (!inSingle && ch === "`") {
+      let j = i + 1;
+      while (j < stageText.length && stageText[j] !== "`") {
+        if (stageText[j] === "\\" && j + 1 < stageText.length) {
+          j += 2;
+          continue;
+        }
+        j++;
+      }
+      if (j < stageText.length && stageText[j] === "`") {
+        const inner = stageText.slice(i + 1, j);
+        const rewrittenInner = rewriteCompoundCommand(inner, rewriteOpts);
+        if (rewrittenInner !== inner) {
+          changed = true;
+          rewrittenStage += `\`${rewrittenInner}\``;
+          maskedStage += "__atc_cmd_sub__";
+        } else {
+          const orig = stageText.slice(i, j + 1);
+          rewrittenStage += orig;
+          maskedStage += orig;
+        }
+        i = j;
+        continue;
+      }
+    }
+    rewrittenStage += ch;
+    maskedStage += ch;
+  }
+
+  return { changed, rewrittenStage, maskedStage };
+}
+
 function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, platform = "win32" }) {
+  const rewriteOpts = { sessionId, anchorPid, execSerial, platform };
   const isWin = platform === "win32";
   const sessionFlag = sessionId
     ? anchorPid
@@ -1154,6 +1321,8 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
   let cur = "";
   let inSingle = false;
   let inDouble = false;
+  let inBacktick = false;
+  let subParenDepth = 0;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (ch === "\\" && !inSingle && i + 1 < command.length) {
@@ -1161,17 +1330,42 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       i++;
       continue;
     }
-    if (ch === "'" && !inDouble) {
+    if (ch === "'" && !inDouble && !inBacktick) {
       inSingle = !inSingle;
       cur += ch;
       continue;
     }
-    if (ch === '"' && !inSingle) {
+    if (ch === '"' && !inSingle && !inBacktick) {
       inDouble = !inDouble;
       cur += ch;
       continue;
     }
-    if (!inSingle && !inDouble) {
+    if (!inSingle) {
+      if (ch === "`") {
+        inBacktick = !inBacktick;
+        cur += ch;
+        continue;
+      }
+      if (!inBacktick) {
+        if ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(") {
+          subParenDepth++;
+          cur += ch + "(";
+          i++;
+          continue;
+        }
+        if (subParenDepth > 0 && ch === "(") {
+          subParenDepth++;
+          cur += ch;
+          continue;
+        }
+        if (subParenDepth > 0 && ch === ")") {
+          subParenDepth--;
+          cur += ch;
+          continue;
+        }
+      }
+    }
+    if (!inSingle && !inDouble && !inBacktick && subParenDepth === 0) {
       if ((ch === "&" && command[i + 1] === "&") || (ch === "|" && command[i + 1] === "|")) {
         tokens.push({ type: "stage", text: cur });
         tokens.push({ type: "sep", text: ` ${ch}${command[i + 1]} ` });
@@ -1216,10 +1410,20 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
   return tokens
     .map((tok) => {
       if (tok.type !== "stage") return tok.text;
-      const trimmed = tok.text.trim();
+      let trimmed = tok.text.trim();
       if (!trimmed) return tok.text;
-      const c = classifySegment(trimmed, shellVars);
+      const subRewrite = rewriteStageCommandSubstitutions(trimmed, rewriteOpts);
+      const c = classifySegment(
+        subRewrite.changed ? subRewrite.maskedStage : trimmed,
+        shellVars,
+      );
       Object.assign(shellVars, c.parsed?.envVars || {});
+      if (subRewrite.changed) {
+        trimmed = subRewrite.rewrittenStage;
+        if (c.kind !== "device_action" && c.kind !== "atc") {
+          return trimmed;
+        }
+      }
       if (c.kind === "device_action" && execSerial) {
         let prefix = "";
         let cmdBody = trimmed;
@@ -1228,12 +1432,8 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           prefix = ctrlMatch[0];
           cmdBody = trimmed.slice(prefix.length).trim();
         }
-        let suffix = "";
-        const trailMatch = cmdBody.match(/((?:\s+(?:fi|done|esac|\}))+)$/);
-        if (trailMatch) {
-          suffix = trailMatch[1];
-          cmdBody = cmdBody.slice(0, -suffix.length).trim();
-        }
+        const { body: strippedBody, suffix } = splitTrailingControlClosers(cmdBody);
+        cmdBody = strippedBody;
         if (Object.keys(shellVars).length > 0 && cmdBody.includes("$")) {
           const normalizedBody = cmdBody.replace(
             /\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g,

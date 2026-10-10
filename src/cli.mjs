@@ -407,6 +407,9 @@ export function selectCandidateUnderLock(
     (d.serial
       ? Object.values(state.leases || {}).find((l) => l.serial === d.serial)
       : null) ||
+    (d.avd
+      ? Object.values(state.leases || {}).find((l) => l.avd === d.avd)
+      : null) ||
     null;
   const isDeviceOccupied = (d) => Boolean(getOccupyingLease(d));
   const isCallerOwnedResettable = (d) => {
@@ -517,8 +520,14 @@ export function selectCandidateUnderLock(
 
   // Priority 1: Tier 0 Warm Idle Match
   if (!req.wipeData && !req.coldBoot) {
+    const hasUnmappedStartingEmulator = Object.values(state.leases || {}).some(
+      (l) => l.kind === "emulator" && l.state === "starting" && !l.serial,
+    );
     const warmCandidates = (inventory.running || []).filter(
-      (d) => !isDeviceOccupied(d) && matchesProfile(d, req),
+      (d) =>
+        !isDeviceOccupied(d) &&
+        !(d.kind === "emulator" && !d.avd && hasUnmappedStartingEmulator) &&
+        matchesProfile(d, req),
     );
     for (const dev of warmCandidates) {
       if (!isReservedForEarlierTicket(dev, false)) {
@@ -1316,19 +1325,37 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 
   const isWin = (platform || process.platform) === "win32";
   const assertReservationStillOwned = () => {
-    const owned = withStateTransaction(stateDir, (state) => {
+    const targetSerial = resolvedSerial || candidate.serial || null;
+    const targetAvd = candidate.avd || lease.avd || null;
+    const status = withStateTransaction(stateDir, (state) => {
       const current = state.leases[lease.deviceKey];
-      return {
-        mutated: false,
-        value: Boolean(
-          current &&
-            current.leaseId === lease.leaseId &&
-            current.state === "starting" &&
-            current.workerPid === process.pid,
-        ),
-      };
+      const owned = Boolean(
+        current &&
+          current.leaseId === lease.leaseId &&
+          current.state === "starting" &&
+          current.workerPid === process.pid,
+      );
+      if (!owned) {
+        return { mutated: false, value: "lost" };
+      }
+      const conflictingLease = Object.values(state.leases || {}).find(
+        (l) =>
+          l &&
+          l.leaseId !== lease.leaseId &&
+          ((targetSerial && l.serial === targetSerial) ||
+            (targetAvd && l.avd === targetAvd)),
+      );
+      if (conflictingLease) {
+        return { mutated: false, value: "conflict" };
+      }
+      let mutated = false;
+      if (targetSerial && current.serial !== targetSerial) {
+        current.serial = targetSerial;
+        mutated = true;
+      }
+      return { mutated, value: "ok" };
     });
-    if (!owned) {
+    if (status !== "ok") {
       throw new Error(`Lease reservation ${lease.leaseId} was lost during boot`);
     }
   };
@@ -1614,11 +1641,20 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     // 4. Activate lease under atc.lock
     const activeLease = withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
+      const targetAvd = candidate.avd || lease.avd || null;
+      const conflictingLease = Object.values(state.leases || {}).find(
+        (l) =>
+          l &&
+          l.leaseId !== lease.leaseId &&
+          ((resolvedSerial && l.serial === resolvedSerial) ||
+            (targetAvd && l.avd === targetAvd)),
+      );
       if (
         !current ||
         current.leaseId !== lease.leaseId ||
         current.state !== "starting" ||
-        current.workerPid !== process.pid
+        current.workerPid !== process.pid ||
+        conflictingLease
       ) {
         throw new Error(`Lease reservation ${lease.leaseId} was lost during boot`);
       }
@@ -1650,7 +1686,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         // Ignore discovery failure during rollback
       }
     }
-    const stillOwned = withStateTransaction(stateDir, (state, { now }) => {
+    const rollbackInfo = withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
       const owned = Boolean(
         current &&
@@ -1658,6 +1694,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
           current.state === "starting" &&
           current.workerPid === process.pid,
       );
+      let migratedToOtherLease = false;
       if (owned) {
         if (previousLease) {
           state.leases[lease.deviceKey] = {
@@ -1676,6 +1713,25 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
           };
         } else {
           delete state.leases[lease.deviceKey];
+          const targetAvd = candidate.avd || lease.avd || null;
+          if (targetAvd && lease.deviceKey === `avd:${targetAvd}`) {
+            const pendingSerialEntry = Object.entries(state.leases || {}).find(
+              ([k, l]) =>
+                k.startsWith("serial:") &&
+                l &&
+                l.kind === "emulator" &&
+                ((resolvedSerial && l.serial === resolvedSerial) || l.avd === targetAvd),
+            );
+            if (pendingSerialEntry) {
+              const [serialKey, serialLease] = pendingSerialEntry;
+              delete state.leases[serialKey];
+              serialLease.avd = targetAvd;
+              serialLease.deviceKey = lease.deviceKey;
+              serialLease.profile = candidate.profile || serialLease.profile;
+              state.leases[lease.deviceKey] = serialLease;
+              migratedToOtherLease = true;
+            }
+          }
         }
       }
       if (selection.victim) {
@@ -1684,9 +1740,24 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
           delete state.leases[selection.victim.deviceKey];
         }
       }
-      return { mutated: true, value: owned };
+      const targetAvd = candidate.avd || lease.avd || null;
+      const otherLeaseOwnsDevice = Object.values(state.leases || {}).some(
+        (l) =>
+          l &&
+          l.leaseId !== lease.leaseId &&
+          ((resolvedSerial && l.serial === resolvedSerial) ||
+            (targetAvd && l.avd === targetAvd)),
+      );
+      return {
+        mutated: true,
+        value: {
+          owned,
+          stopBootedEmulator:
+            owned && !previousLease && !migratedToOtherLease && !otherLeaseOwnsDevice,
+        },
+      };
     });
-    if (bootedNewEmulator && !previousLease && stillOwned) {
+    if (bootedNewEmulator && rollbackInfo.stopBootedEmulator) {
       try {
         if (isWin) {
           let cleanupSerial = resolvedSerial;
