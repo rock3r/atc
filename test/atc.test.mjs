@@ -3134,6 +3134,27 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               casePipePatternRewrite.rewrittenCommand,
               'case "$x" in foo|bar) ATC_SESSION_ID=target-sess atc exec --serial emulator-5556 -- adb shell get-state ;; *) echo "adb skipped" ;; esac',
             );
+
+            // 26. Invalid --ttl in cmdClaim/cmdRenew and omitted config set values are rejected
+            const invalidRenewTtl = cmdRenew(coldRediscoverDir, l2.lease.leaseId, {
+              session: "target-sess",
+              ttl: "3600s",
+            });
+            assert.equal(invalidRenewTtl.exitCode, 1);
+            assert.match(invalidRenewTtl.error, /Invalid --ttl duration "3600s"/);
+
+            const invalidClaimTtl = cmdClaim(coldRediscoverDir, {
+              session: "target-sess",
+              avd: "Pixel_9_API_36",
+              ttl: "10m",
+            });
+            assert.equal(invalidClaimTtl.exitCode, 1);
+            assert.match(invalidClaimTtl.error, /Invalid --ttl duration "10m"/);
+
+            const omittedConfigVal = cmdConfig(coldRediscoverDir, "set", "minFreeDiskMb");
+            assert.equal(omittedConfigVal.exitCode, 1);
+            assert.match(omittedConfigVal.error, /Missing value for config key "minFreeDiskMb"/);
+            assert.equal(readState(coldRediscoverDir).config.minFreeDiskMb, 2048);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

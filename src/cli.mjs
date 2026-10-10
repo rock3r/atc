@@ -222,7 +222,13 @@ export function parseCliArgs(argv) {
 function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
   const def = cfg.defaultTtlSec ?? 600;
   const max = cfg.maxTtlSec ?? 3600;
-  const n = rawTtl !== undefined ? Number(rawTtl) : def;
+  const n =
+    rawTtl !== undefined &&
+    rawTtl !== null &&
+    typeof rawTtl !== "boolean" &&
+    !(typeof rawTtl === "string" && !rawTtl.trim())
+      ? Number(rawTtl)
+      : def;
   if (!Number.isFinite(n)) return def;
   return Math.max(10, Math.min(max, Math.round(n)));
 }
@@ -682,8 +688,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
   const rawReorderWindow = flags.reorderWindow ?? flags.reorderWindowSec;
   const rawTtl = flags.ttl ?? flags.ttlSec;
 
-  if (rawWait !== undefined) {
-    const parsedWait = Number(rawWait);
+  if (rawWait !== undefined && rawWait !== null) {
+    const parsedWait =
+      typeof rawWait === "boolean" || (typeof rawWait === "string" && !rawWait.trim())
+        ? Number.NaN
+        : Number(rawWait);
     if (!Number.isFinite(parsedWait) || parsedWait < 0) {
       return {
         exitCode: 1,
@@ -691,12 +700,28 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       };
     }
   }
-  if (rawReorderWindow !== undefined) {
-    const rw = Number(rawReorderWindow);
+  if (rawReorderWindow !== undefined && rawReorderWindow !== null) {
+    const rw =
+      typeof rawReorderWindow === "boolean" ||
+      (typeof rawReorderWindow === "string" && !rawReorderWindow.trim())
+        ? Number.NaN
+        : Number(rawReorderWindow);
     if (!Number.isFinite(rw) || rw < 0) {
       return {
         exitCode: 1,
         error: `Invalid --reorder-window duration "${rawReorderWindow}". Expected a non-negative number of seconds.`,
+      };
+    }
+  }
+  if (rawTtl !== undefined && rawTtl !== null) {
+    const parsedTtl =
+      typeof rawTtl === "boolean" || (typeof rawTtl === "string" && !rawTtl.trim())
+        ? Number.NaN
+        : Number(rawTtl);
+    if (!Number.isFinite(parsedTtl) || parsedTtl <= 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --ttl duration "${rawTtl}". Expected a positive number of seconds.`,
       };
     }
   }
@@ -1799,6 +1824,20 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       error: 'Option "--target" requires a non-empty lease ID, serial, or AVD name.',
     };
   }
+  const rawExplicitTtl = flags.ttl ?? flags.ttlSec;
+  if (rawExplicitTtl !== undefined && rawExplicitTtl !== null) {
+    const parsedTtl =
+      typeof rawExplicitTtl === "boolean" ||
+      (typeof rawExplicitTtl === "string" && !rawExplicitTtl.trim())
+        ? Number.NaN
+        : Number(rawExplicitTtl);
+    if (!Number.isFinite(parsedTtl) || parsedTtl <= 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --ttl duration "${rawExplicitTtl}". Expected a positive number of seconds.`,
+      };
+    }
+  }
   const effectiveTarget = target || (typeof flags.target === "string" ? flags.target.trim() : null);
   return withStateTransaction(stateDir, (state, { now }) => {
     const identity = resolveSessionIdentity({
@@ -1810,7 +1849,6 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       ancestorPids: options.ancestorPids,
       processChain: options.processChain,
     });
-    const rawExplicitTtl = flags.ttl ?? flags.ttlSec;
     const ttlSec = clampTtlSec(rawExplicitTtl, state.config);
     const ttlMs = ttlSec * 1000;
 
@@ -2262,6 +2300,15 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
         return {
           mutated: false,
           value: { exitCode: 1, error: `Unknown config key "${key}".` },
+        };
+      }
+      if (val === undefined || val === null || (typeof val === "string" && !val.trim())) {
+        return {
+          mutated: false,
+          value: {
+            exitCode: 1,
+            error: `Missing value for config key "${key}". Usage: atc config set <key> <val>`,
+          },
         };
       }
       let parsedVal = val;
