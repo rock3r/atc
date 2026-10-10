@@ -240,6 +240,36 @@ export function parseCliArgs(argv) {
   };
 }
 
+function recordDeviceStoppedInState(state, deviceInfo, now = Date.now()) {
+  if (!state || !deviceInfo) return;
+  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
+  if (!state.stoppedDevices || typeof state.stoppedDevices !== "object") {
+    state.stoppedDevices = {};
+  }
+  const entry = {
+    epoch: state.fleetEpoch,
+    stoppedAtMs: now,
+    avd: deviceInfo.avd || null,
+    serial: deviceInfo.serial || null,
+  };
+  if (deviceInfo.deviceKey) {
+    state.stoppedDevices[deviceInfo.deviceKey] = entry;
+  }
+  if (deviceInfo.avd) {
+    state.stoppedDevices[`avd:${deviceInfo.avd}`] = entry;
+  }
+  if (deviceInfo.serial) {
+    state.stoppedDevices[`serial:${deviceInfo.serial}`] = entry;
+  }
+}
+
+function clearDeviceStoppedInState(state, deviceInfo) {
+  if (!state?.stoppedDevices || !deviceInfo) return;
+  if (deviceInfo.deviceKey) delete state.stoppedDevices[deviceInfo.deviceKey];
+  if (deviceInfo.avd) delete state.stoppedDevices[`avd:${deviceInfo.avd}`];
+  if (deviceInfo.serial) delete state.stoppedDevices[`serial:${deviceInfo.serial}`];
+}
+
 function clampTtlSec(rawTtl, cfg = DEFAULT_CONFIG) {
   const def = cfg.defaultTtlSec ?? 600;
   const max = cfg.maxTtlSec ?? 3600;
@@ -791,7 +821,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     }
   }
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
-  const initialCfg = readState(stateDir).config || DEFAULT_CONFIG;
+  const initialState = readState(stateDir);
+  const initialCfg = initialState.config || DEFAULT_CONFIG;
+  let inventoryEpoch = initialState.fleetEpoch || 0;
   let inventory = options.inventory || discoverFleet({ runner, avdHome, cfg: initialCfg });
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
@@ -800,6 +832,45 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     let txOutcome;
     try {
       txOutcome = withStateTransaction(stateDir, (state, { now }) => {
+        const stoppedMap = state.stoppedDevices || {};
+        const isStoppedSinceInventory = (d) => {
+          if (!d || d.kind === "physical") return false;
+          const byKey = d.deviceKey ? stoppedMap[d.deviceKey] : null;
+          const byAvd = d.avd ? stoppedMap[`avd:${d.avd}`] : null;
+          const bySerial = d.serial ? stoppedMap[`serial:${d.serial}`] : null;
+          return Boolean(
+            (byKey && byKey.epoch > inventoryEpoch) ||
+              (byAvd && byAvd.epoch > inventoryEpoch) ||
+              (bySerial && bySerial.epoch > inventoryEpoch),
+          );
+        };
+        const staleRunning = (inventory.running || []).filter(isStoppedSinceInventory);
+        if (staleRunning.length > 0 && !options.inventory) {
+          return {
+            mutated: false,
+            value: { status: "stale_inventory" },
+          };
+        }
+        let effectiveInventory = inventory;
+        if (staleRunning.length > 0) {
+          const staleOffline = [...(inventory.offline || [])];
+          for (const d of staleRunning) {
+            if (d.avd && !staleOffline.some((o) => o.avd === d.avd || o.deviceKey === d.deviceKey)) {
+              staleOffline.push({
+                ...d,
+                deviceKey: `avd:${d.avd}`,
+                serial: null,
+                online: false,
+              });
+            }
+          }
+          effectiveInventory = {
+            ...inventory,
+            running: (inventory.running || []).filter((d) => !isStoppedSinceInventory(d)),
+            offline: staleOffline,
+          };
+        }
+
         const waitSec =
           rawWait !== undefined
             ? Number(rawWait)
@@ -818,7 +889,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
         const reconciledMutated = reconcileOfflineLeases(
           state,
-          inventory,
+          effectiveInventory,
           identity.sessionId,
           now,
           options.livenessCheck || isPidAlive,
@@ -826,7 +897,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
         // Step 3: Idempotent Re-Claim (Same Session)
         for (const lease of Object.values(state.leases)) {
-          const invDev = (inventory.running || []).find(
+          if (isStoppedSinceInventory(lease)) {
+            continue;
+          }
+          const invDev = (effectiveInventory.running || []).find(
             (d) =>
               d.deviceKey === lease.deviceKey ||
               (d.avd && d.avd === lease.avd) ||
@@ -901,7 +975,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         const existingTicket = state.queue.find((t) => t.sessionId === identity.sessionId) || null;
         const selection = selectCandidateUnderLock(
           state,
-          inventory,
+          effectiveInventory,
           req,
           existingTicket,
           now,
@@ -1016,7 +1090,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
 
           const knownAvdNames = new Set(
-            [...(inventory.running || []), ...(inventory.offline || [])]
+            [...(effectiveInventory.running || []), ...(effectiveInventory.offline || [])]
               .filter((d) => d.kind === "emulator" && d.avd)
               .map((d) => d.avd),
           );
@@ -1097,6 +1171,17 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         return { exitCode: err.exitCode, error: err.message };
       }
       return { exitCode: 1, error: err.message };
+    }
+
+    if (txOutcome.status === "stale_inventory") {
+      const refreshedState = readState(stateDir);
+      inventoryEpoch = refreshedState.fleetEpoch || 0;
+      inventory = discoverFleet({
+        runner,
+        avdHome,
+        cfg: refreshedState.config || DEFAULT_CONFIG,
+      });
+      continue;
     }
 
     if (txOutcome.status === "claimed_immediate") {
@@ -1284,7 +1369,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         break;
       }
       if (tick % 5 === 0 || stageA.activeCount === 0) {
-        const curCfg = readState(stateDir).config || DEFAULT_CONFIG;
+        const curState = readState(stateDir);
+        const curCfg = curState.config || DEFAULT_CONFIG;
+        inventoryEpoch = curState.fleetEpoch || 0;
         inventory = options.inventory || discoverFleet({ runner, avdHome, cfg: curCfg });
         break;
       }
@@ -1382,13 +1469,13 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
           `Failed to stop idle victim emulator ${selection.victim.avd}: ${stopRes.stderr || stopRes.stdout}`,
         );
       }
-      withStateTransaction(stateDir, (state) => {
+      withStateTransaction(stateDir, (state, { now }) => {
         const vLease = state.leases[selection.victim.deviceKey];
+        recordDeviceStoppedInState(state, selection.victim, now);
         if (vLease && vLease.leaseId === victimLeaseId) {
           delete state.leases[selection.victim.deviceKey];
-          return { mutated: true };
         }
-        return { mutated: false };
+        return { mutated: true };
       });
     }
 
@@ -1668,6 +1755,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       current.renewedAtMs = now;
       current.expiresAtMs = now + ttlMs;
       current.deadlineMs = null;
+      clearDeviceStoppedInState(state, current);
       return { mutated: true, value: current };
     });
 
@@ -2149,6 +2237,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               cur.renewedAtMs = now;
               cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
             } else {
+              if (doStop) {
+                recordDeviceStoppedInState(state, cur, now);
+              }
               delete state.leases[lease.deviceKey];
             }
             return { mutated: true };

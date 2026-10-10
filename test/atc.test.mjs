@@ -4038,6 +4038,113 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             );
             assert.equal(subPrintfOctalKill.allowed, false);
             assert.match(subPrintfOctalKill.reason, /adb kill-server/);
+
+            // 49. Non-static command substitution in executable position fails closed (`$(python -c ...) kill-server`)
+            const nonStaticCmdSubKill = evaluateCommandGuard(
+              "$(python -c 'print(chr(97)+chr(100)+chr(98))') kill-server",
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              },
+            );
+            assert.equal(nonStaticCmdSubKill.allowed, false);
+            assert.match(nonStaticCmdSubKill.reason, /Opaque command substitution/);
+
+            // 50. Stale warm candidate in cached inventory is revalidated when concurrent `free --stop` stops the emulator before lock acquisition
+            let discoverCalls = 0;
+            const staleRaceDir = makeTempStateDir();
+            try {
+              const firstClaim = cmdClaim(
+                staleRaceDir,
+                { session: "owner-a", avd: "Pixel_8_API_35", wait: 0 },
+                {
+                  platform: "darwin",
+                  avdHome,
+                  inventory: {
+                    host: singleMatchInv.host,
+                    running: [
+                      {
+                        deviceKey: "avd:Pixel_8_API_35",
+                        avd: "Pixel_8_API_35",
+                        serial: "emulator-5554",
+                        kind: "emulator",
+                        online: true,
+                        profile: { deviceType: "phone", apiLevel: "android-35" },
+                      },
+                    ],
+                    offline: [],
+                    creatable: [],
+                  },
+                },
+              );
+              assert.equal(firstClaim.exitCode, 0);
+
+              let bootedAfterStop = false;
+              const secondClaim = cmdClaim(
+                staleRaceDir,
+                { session: "claimer-b", avd: "Pixel_8_API_35", wait: 0, force: true },
+                {
+                  platform: "darwin",
+                  avdHome,
+                  runner: (cmd, args) => {
+                    if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+                      discoverCalls++;
+                      if (discoverCalls === 1) {
+                        // Simulate concurrent `free --stop` completing right after initial fleet discovery
+                        cmdFree(
+                          staleRaceDir,
+                          firstClaim.lease.leaseId,
+                          { session: "owner-a", stop: true },
+                          {
+                            platform: "darwin",
+                            runner: () => ({ status: 0, stdout: "Stopped\n", stderr: "" }),
+                          },
+                        );
+                        return {
+                          status: 0,
+                          stdout: "Pixel_8_API_35 online emulator-5554 android-35\n",
+                          stderr: "",
+                        };
+                      }
+                      return {
+                        status: 0,
+                        stdout: bootedAfterStop
+                          ? "Pixel_8_API_35 online emulator-5560 android-35\n"
+                          : "Pixel_8_API_35 offline android-35\n",
+                        stderr: "",
+                      };
+                    }
+                    if (cmd === "adb" && args[0] === "devices") {
+                      if (discoverCalls === 1) {
+                        return {
+                          status: 0,
+                          stdout: "List of devices attached\nemulator-5554\tdevice\n",
+                          stderr: "",
+                        };
+                      }
+                      return {
+                        status: 0,
+                        stdout: bootedAfterStop
+                          ? "List of devices attached\nemulator-5560\tdevice\n"
+                          : "List of devices attached\n",
+                        stderr: "",
+                      };
+                    }
+                    if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                      bootedAfterStop = true;
+                      return { status: 0, stdout: "Started on emulator-5560\n", stderr: "" };
+                    }
+                    return { status: 0, stdout: "OK\n", stderr: "" };
+                  },
+                },
+              );
+              assert.equal(secondClaim.exitCode, 0);
+              assert.equal(bootedAfterStop, true);
+              assert.equal(secondClaim.lease.serial, "emulator-5560");
+              assert.ok(discoverCalls >= 2);
+            } finally {
+              fs.rmSync(staleRaceDir, { recursive: true, force: true });
+            }
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

@@ -217,6 +217,7 @@ export function hasAndroidOrAtcTokens(command: string): boolean {
     .replace(/\\(.)/g, "$1")
     .replace(/["']/g, "");
   if (FAST_PATH_REGEX.test(collapsed)) return true;
+  let expandedForCmdCheck = collapsed;
   if (collapsed.includes("$")) {
     const vars: Record<string, string> = {};
     const assignRe = /\b([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&)]+)/g;
@@ -227,6 +228,26 @@ export function hasAndroidOrAtcTokens(command: string): boolean {
     let expanded = expandVariables(collapsed, vars);
     expanded = expandVariables(expanded, vars);
     if (FAST_PATH_REGEX.test(expanded)) return true;
+    expandedForCmdCheck = expanded;
+  }
+  if (expandedForCmdCheck.includes("__atc_cmd_sub__")) {
+    for (const rawClause of expandedForCmdCheck.split(/[;&|\r\n]+/)) {
+      const tokens = rawClause
+        .trim()
+        .split(/\s+/)
+        .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+      while (
+        tokens.length > 0 &&
+        /^(?:env|command|nohup|timeout|sudo|nice|time|then|else|do|if|elif|while|until|!|\{|\()+$/i.test(
+          tokens[0]
+        )
+      ) {
+        tokens.shift();
+      }
+      if (tokens[0] && tokens[0].includes("__atc_cmd_sub__")) {
+        return true;
+      }
+    }
   }
   return false;
 }

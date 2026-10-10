@@ -234,12 +234,14 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}) {
 export function hasAndroidOrAtcTokens(command) {
   if (!command || typeof command !== "string") return false;
   if (matchesAndroidOrAtcText(command)) return true;
-  if (command.includes("$")) {
+  if (command.includes("$") || command.includes("`")) {
     const shellVars = {};
     for (const seg of splitShellSegments(command)) {
       const parsed = parseSegment(seg, shellVars);
       Object.assign(shellVars, parsed.envVars || {});
       if (
+        parsed.cmd.includes("__atc_cmd_sub__") ||
+        parsed.baseCmd.includes("__atc_cmd_sub__") ||
         matchesAndroidOrAtcText(parsed.baseCmd, shellVars) ||
         matchesAndroidOrAtcText(parsed.raw, shellVars) ||
         parsed.args.some((a) => matchesAndroidOrAtcText(a, shellVars))
@@ -816,6 +818,15 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   if (!baseCmd || (baseCmd === "command" && (args[0] === "-v" || args[0] === "-V"))) {
     return { kind: "ignore", parsed };
+  }
+
+  if (parsed.cmd.includes("__atc_cmd_sub__") || baseCmd.includes("__atc_cmd_sub__")) {
+    return {
+      kind: "deny_lifecycle",
+      reason:
+        "Opaque command substitution in executable position is blocked; invoke Android/ATC tools directly or via 'atc exec'.",
+      parsed,
+    };
   }
 
   // Precedence 1: ATC commands (`atc ...`)
