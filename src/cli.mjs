@@ -383,7 +383,7 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
-  const stopFlag = new Int32Array(new SharedArrayBuffer(4));
+  const stopFlag = new Int32Array(new SharedArrayBuffer(8));
   const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
   const worker = new Worker(workerUrl, {
     workerData: {
@@ -402,6 +402,11 @@ function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
   return {
     stop() {
       Atomics.store(stopFlag, 0, 1);
+      Atomics.notify(stopFlag, 0);
+      const waitStart = Date.now();
+      while (Atomics.load(stopFlag, 1) !== 0 && Date.now() - waitStart < 1500) {
+        Atomics.wait(stopFlag, 1, 1, 20);
+      }
       try {
         worker.terminate();
       } catch {

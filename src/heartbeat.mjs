@@ -4,13 +4,18 @@ import { withStateTransaction } from "./state.mjs";
 const { stateDir, deviceKey, leaseId, timeoutMs, workerPid, stopFlag } = workerData;
 const intervalMs = Math.max(250, Math.min(15_000, Math.floor((Number(timeoutMs) || 15_000) / 3)));
 
-function beat() {
-  if (stopFlag && Atomics.load(stopFlag, 0) !== 0) {
-    return false;
+while (Atomics.load(stopFlag, 0) === 0) {
+  Atomics.wait(stopFlag, 0, 0, intervalMs);
+  if (Atomics.load(stopFlag, 0) !== 0) {
+    break;
   }
+  Atomics.store(stopFlag, 1, 1);
   try {
+    if (Atomics.load(stopFlag, 0) !== 0) {
+      break;
+    }
     withStateTransaction(stateDir, (state, { now }) => {
-      if (stopFlag && Atomics.load(stopFlag, 0) !== 0) {
+      if (Atomics.load(stopFlag, 0) !== 0) {
         return { mutated: false };
       }
       const lease =
@@ -29,14 +34,8 @@ function beat() {
     });
   } catch {
     // Ignore transient lock contention during background heartbeat
+  } finally {
+    Atomics.store(stopFlag, 1, 0);
+    Atomics.notify(stopFlag, 1);
   }
-  return true;
-}
-
-if (beat()) {
-  const timer = setInterval(() => {
-    if (!beat()) {
-      clearInterval(timer);
-    }
-  }, intervalMs);
 }

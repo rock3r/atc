@@ -5,6 +5,18 @@ import path from "node:path";
 
 const SAFE_TOKEN_REGEX = /^[A-Za-z0-9._:/@=-]+$/;
 
+function isPosixExecutableFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return false;
+    }
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function resolveExecutable(
   command,
   env = process.env,
@@ -20,14 +32,7 @@ export function resolveExecutable(
       !command.includes("/")
     ) {
       const posixPathDirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
-      const inPath = posixPathDirs.some((dir) => {
-        try {
-          const p = path.join(dir, command);
-          return fs.existsSync(p) && fs.statSync(p).isFile();
-        } catch {
-          return false;
-        }
-      });
+      const inPath = posixPathDirs.some((dir) => isPosixExecutableFile(path.join(dir, command)));
       if (!inPath) {
         const home = env.HOME || os.homedir();
         const sdkRoot =
@@ -43,13 +48,9 @@ export function resolveExecutable(
           path.join(sdkRoot, "cmdline-tools", "latest", "bin"),
         ];
         for (const dir of fallbackDirs) {
-          try {
-            const candidate = path.join(dir, command);
-            if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-              return { executable: candidate, isBatch: false };
-            }
-          } catch {
-            // Ignore inaccessible fallback dir
+          const candidate = path.join(dir, command);
+          if (isPosixExecutableFile(candidate)) {
+            return { executable: candidate, isBatch: false };
           }
         }
       }

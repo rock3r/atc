@@ -5132,6 +5132,135 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       } finally {
         fs.rmSync(abandonedClaimStateDir, { recursive: true, force: true });
       }
+
+      // 17. Deterministic pause of Breaker A immediately before renameSync (>2s) does not allow Breaker B to expire A's live claim or replace lock
+      const pausedBreakerDir = makeTempStateDir();
+      try {
+        const staleLockPath = path.join(pausedBreakerDir, "atc.lock");
+        fs.mkdirSync(staleLockPath, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(
+          path.join(staleLockPath, "owner.json"),
+          JSON.stringify({
+            pid: 99999999,
+            createdAtMs: Date.now() - 60_000,
+            staleAfterMs: 10_000,
+            nonce: "paused-breaker-stale-nonce",
+          }),
+          "utf8",
+        );
+
+        const lockModUrl = new URL("../src/lock.mjs", import.meta.url).href;
+        const pauseSab = new SharedArrayBuffer(16);
+        const pauseView = new Int32Array(pauseSab);
+        // pauseView[0] = 1 when A reaches beforeBreakRename, pauseView[1] = active holders, pauseView[2] = max holders
+        const workerBCode = `
+          const { workerData, parentPort } = require("node:worker_threads");
+          const view = new Int32Array(workerData.sab);
+          import(workerData.lockModUrl)
+            .then(({ acquireLock, verifyLockOwnership, releaseLock, sleepSync }) => {
+              const waitStart = Date.now();
+              while (Atomics.load(view, 0) === 0 && Date.now() - waitStart < 5000) {
+                Atomics.wait(view, 0, 0, 20);
+              }
+              const handleB = acquireLock(workerData.stateDir, 6000);
+              const activeNow = Atomics.add(view, 1, 1) + 1;
+              let prevMax = Atomics.load(view, 2);
+              while (activeNow > prevMax) {
+                Atomics.compareExchange(view, 2, prevMax, activeNow);
+                prevMax = Atomics.load(view, 2);
+              }
+              const ownedStart = verifyLockOwnership(handleB);
+              sleepSync(40);
+              const ownedEnd = verifyLockOwnership(handleB);
+              Atomics.sub(view, 1, 1);
+              releaseLock(handleB);
+              parentPort.postMessage({ ownedStart, ownedEnd, acquiredAtMs: Date.now() });
+            })
+            .catch((err) => {
+              throw err;
+            });
+        `;
+
+        const workerBPromise = new Promise((resolve, reject) => {
+          const w = new Worker(workerBCode, {
+            eval: true,
+            workerData: {
+              lockModUrl,
+              stateDir: pausedBreakerDir,
+              sab: pauseSab,
+            },
+          });
+          w.once("message", resolve);
+          w.once("error", reject);
+          w.once("exit", (code) => {
+            if (code !== 0) {
+              reject(new Error(`Worker B exited with code ${code}`));
+            }
+          });
+        });
+
+        let pausedBeforeRename = false;
+        const handleA = acquireLock(pausedBreakerDir, 6000, "atc.lock", 10_000, {
+          beforeBreakRename: () => {
+            pausedBeforeRename = true;
+            Atomics.store(pauseView, 0, 1);
+            Atomics.notify(pauseView, 0, 1);
+            // Pause longer than MISSING_OWNER_STALE_MS (2000ms) right before renameSync
+            sleepSync(2200);
+          },
+        });
+        assert.equal(pausedBeforeRename, true);
+        const activeA = Atomics.add(pauseView, 1, 1) + 1;
+        let prevMaxA = Atomics.load(pauseView, 2);
+        while (activeA > prevMaxA) {
+          Atomics.compareExchange(pauseView, 2, prevMaxA, activeA);
+          prevMaxA = Atomics.load(pauseView, 2);
+        }
+        assert.equal(verifyLockOwnership(handleA), true);
+        sleepSync(50);
+        assert.equal(verifyLockOwnership(handleA), true);
+        const releasedAAtMs = Date.now();
+        Atomics.sub(pauseView, 1, 1);
+        releaseLock(handleA);
+
+        const resB = await workerBPromise;
+        assert.equal(resB.ownedStart, true);
+        assert.equal(resB.ownedEnd, true);
+        assert.equal(Atomics.load(pauseView, 2), 1);
+        assert.ok(
+          resB.acquiredAtMs >= releasedAAtMs,
+          "Worker B must not acquire the lock before paused Breaker A releases it",
+        );
+      } finally {
+        fs.rmSync(pausedBreakerDir, { recursive: true, force: true });
+      }
+
+      // 18. POSIX resolveExecutable skips non-executable files in PATH and fallback directories
+      if (process.platform !== "win32") {
+        const fakeHome = makeTempStateDir();
+        try {
+          const localBin = path.join(fakeHome, ".local", "bin");
+          const sdkPlatformTools = path.join(fakeHome, "Library", "Android", "sdk", "platform-tools");
+          fs.mkdirSync(localBin, { recursive: true });
+          fs.mkdirSync(sdkPlatformTools, { recursive: true });
+          const nonExecAdb = path.join(localBin, "adb");
+          const execAdb = path.join(sdkPlatformTools, "adb");
+          fs.writeFileSync(nonExecAdb, "#!/bin/sh\n", "utf8");
+          fs.chmodSync(nonExecAdb, 0o644);
+          fs.writeFileSync(execAdb, "#!/bin/sh\n", "utf8");
+          fs.chmodSync(execAdb, 0o755);
+
+          const resolvedPosixAdb = resolveExecutable(
+            "adb",
+            { PATH: localBin, HOME: fakeHome },
+            fakeHome,
+            "darwin",
+          );
+          assert.equal(resolvedPosixAdb.executable, execAdb);
+        } finally {
+          fs.rmSync(fakeHome, { recursive: true, force: true });
+        }
+      }
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
     }

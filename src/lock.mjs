@@ -231,12 +231,13 @@ function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
       try {
         const raw = fs.readFileSync(fullPath, "utf8");
         const parsed = JSON.parse(raw);
-        const alive = parsed && isPidAlive(parsed.pid);
-        const fresh =
+        const validRecord =
           parsed &&
-          typeof parsed.createdAtMs === "number" &&
-          now - parsed.createdAtMs < MISSING_OWNER_STALE_MS;
-        if (alive && fresh) {
+          typeof parsed === "object" &&
+          typeof parsed.nonce === "string" &&
+          parsed.nonce.length > 0;
+        const alive = validRecord && isPidAlive(parsed.pid);
+        if (alive) {
           hasActive = true;
         } else {
           try {
@@ -264,9 +265,11 @@ function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
       const tmpPid = m ? Number(m[1]) : 0;
       try {
         const st = fs.lstatSync(fullPath);
-        const alive = tmpPid > 0 && isPidAlive(tmpPid);
-        const fresh = now - (st.mtimeMs || st.ctimeMs || 0) < MISSING_OWNER_STALE_MS;
-        if (alive && fresh) {
+        const alive =
+          tmpPid > 0
+            ? isPidAlive(tmpPid)
+            : now - (st.mtimeMs || st.ctimeMs || 0) < MISSING_OWNER_STALE_MS;
+        if (alive) {
           hasActive = true;
         } else {
           fs.unlinkSync(fullPath);
@@ -310,16 +313,12 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
     const verifyEntries = fs.readdirSync(claimDir);
     if (
       verifyEntries.some((n) => n === "done" || n.startsWith("moved.")) ||
-      verifyEntries.some((n) => n !== myBreakerName) ||
-      Date.now() - myClaimStartMs >= Math.floor(MISSING_OWNER_STALE_MS / 2)
+      verifyEntries.some((n) => n !== myBreakerName)
     ) {
       return false;
     }
 
     const canProceed = () => {
-      if (Date.now() - myClaimStartMs >= Math.floor(MISSING_OWNER_STALE_MS / 2)) {
-        return false;
-      }
       try {
         const curEntries = fs.readdirSync(claimDir);
         return (
@@ -607,6 +606,12 @@ export function acquireLock(
 
           if (!verifiedStale || !canProceed()) {
             return false;
+          }
+          if (typeof options?.beforeBreakRename === "function") {
+            options.beforeBreakRename({ lockDir, claimDir, candidateBreakToken });
+            if (!canProceed()) {
+              return false;
+            }
           }
           const movedLockDir = path.join(claimDir, `moved.${myClaimNonce}`);
           fs.renameSync(lockDir, movedLockDir);
