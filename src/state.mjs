@@ -436,6 +436,16 @@ function isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck = isPidAlive) {
 }
 
 function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
+  if (
+    freshPid &&
+    lease?.workerPgidStartTokens &&
+    typeof lease.workerPgidStartTokens === "object"
+  ) {
+    delete lease.workerPgidStartTokens[String(freshPid)];
+    if (Object.keys(lease.workerPgidStartTokens).length === 0) {
+      delete lease.workerPgidStartTokens;
+    }
+  }
   if (!lease?.workerDescendants || typeof lease.workerDescendants !== "object") {
     if (freshPid) {
       const curKnown = getKnownWindowsTreeDescendants(freshPid);
@@ -472,6 +482,15 @@ function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
     if (isNewGeneration) {
       lease.workerDescendants[archiveKey] = prevEntries;
       delete lease.workerDescendants[key];
+      if (
+        lease.workerPgidStartTokens &&
+        typeof lease.workerPgidStartTokens === "object"
+      ) {
+        delete lease.workerPgidStartTokens[key];
+        if (Object.keys(lease.workerPgidStartTokens).length === 0) {
+          delete lease.workerPgidStartTokens;
+        }
+      }
       seedWindowsKnownDescendants(archiveKey, prevEntries);
       const pgids = Array.isArray(lease.workerPgids)
         ? lease.workerPgids.filter(
@@ -578,10 +597,11 @@ function syncLeasePosixStartTokens(lease) {
       : {};
   for (const rawPgid of lease.workerPgids) {
     const keyStr = String(rawPgid).trim();
-    const numPid = Number(keyStr.split("@")[0]);
+    if (keyStr.includes("@")) continue;
+    const numPid = Number(keyStr);
     if (!Number.isInteger(numPid) || numPid <= 1) continue;
     const pidKey = String(numPid);
-    const prevTok = prevTokens[pidKey] || prevTokens[keyStr] || null;
+    const prevTok = prevTokens[pidKey] || null;
     const knownTok = getKnownPosixPgidStartToken(numPid);
     const resolvedTok =
       typeof prevTok === "string" && prevTok.trim()
@@ -648,31 +668,29 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
       seedWindowsKnownDescendants(numericPid, options.descendants);
     }
     const effectivePlatform = options.platform || process.platform;
-    if (effectivePlatform !== "win32") {
-      const explicitToken =
-        typeof options.startToken === "string" && options.startToken.trim()
-          ? options.startToken.trim()
-          : null;
-      const startToken =
-        explicitToken ||
-        getKnownPosixPgidStartToken(numericPid) ||
-        (livenessCheck === isPidAlive
-          ? getPosixProcessStartToken(numericPid, {
-              platform: effectivePlatform,
-              spawnSyncFn: options.spawnSyncFn || options.runner,
-              allowSubprocess: Boolean(options.allowSubprocess),
-            })
-          : null);
-      if (startToken) {
-        seedPosixPgidStartTokens(numericPid, startToken);
-        if (
-          !lease.workerPgidStartTokens ||
-          typeof lease.workerPgidStartTokens !== "object"
-        ) {
-          lease.workerPgidStartTokens = {};
-        }
-        lease.workerPgidStartTokens[String(numericPid)] = startToken;
+    const explicitToken =
+      typeof options.startToken === "string" && options.startToken.trim()
+        ? options.startToken.trim()
+        : null;
+    const startToken =
+      explicitToken ||
+      getKnownPosixPgidStartToken(numericPid) ||
+      (livenessCheck === isPidAlive
+        ? getPosixProcessStartToken(numericPid, {
+            platform: effectivePlatform,
+            spawnSyncFn: options.spawnSyncFn || options.runner,
+            allowSubprocess: Boolean(options.allowSubprocess),
+          })
+        : null);
+    if (startToken) {
+      seedPosixPgidStartTokens(numericPid, startToken);
+      if (
+        !lease.workerPgidStartTokens ||
+        typeof lease.workerPgidStartTokens !== "object"
+      ) {
+        lease.workerPgidStartTokens = {};
       }
+      lease.workerPgidStartTokens[String(numericPid)] = startToken;
     }
   }
   lease.workerPids = alive;
@@ -1432,6 +1450,12 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     for (const freshPid of freshGenerationSet) {
       if (!isTerminatedKey(freshPid)) {
         pgids.push(freshPid);
+        const freshTok =
+          options.freshGenerationStartTokens?.[String(freshPid)] ??
+          getKnownPosixPgidStartToken(freshPid);
+        if (freshTok) {
+          pgidStartTokens[String(freshPid)] = freshTok;
+        }
       }
     }
     if (Object.keys(knownDescendants).length > 0) {

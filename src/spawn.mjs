@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   archiveWindowsProcessGroupGeneration,
+  clearKnownPosixPgidStartTokens,
   getPosixProcessStartToken,
   hasAliveProcessInGroup,
   isProcessGroupAlive,
@@ -673,65 +674,11 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     const childPid = child.pid || null;
     const effectivePlatform = options.platform || process.platform;
     let childStartToken = null;
-    if (childPid && effectivePlatform === "win32") {
-      archiveWindowsProcessGroupGeneration(childPid);
-    } else if (childPid) {
-      childStartToken = getPosixProcessStartToken(childPid, {
-        platform: effectivePlatform,
-      });
-      if (childStartToken) {
-        seedPosixPgidStartTokens(childPid, childStartToken);
-      }
-    }
-    if (childPid && typeof options.onChildSpawn === "function") {
-      try {
-        options.onChildSpawn(childPid, {
-          isProcessGroup: true,
-          freshGeneration: true,
-          startToken: childStartToken,
-        });
-      } catch {
-        // Best-effort worker registration
-      }
-    }
-
     let wrapperSignal = null;
     let killEscalationTimer = null;
     let earlyWinDiscoveryTimer = null;
     const forwardedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
     const signalHandlers = new Map();
-
-    if (childPid && (options.platform || process.platform) === "win32") {
-      earlyWinDiscoveryTimer = setTimeout(() => {
-        earlyWinDiscoveryTimer = null;
-        try {
-          if (hasAliveProcessInGroup(childPid)) {
-            onHeartbeat();
-          }
-        } catch {
-          // Best-effort early descendant discovery
-        }
-      }, 80);
-      if (typeof earlyWinDiscoveryTimer.unref === "function") {
-        earlyWinDiscoveryTimer.unref();
-      }
-    }
-
-    const cleanupListenersAndTimers = () => {
-      clearInterval(timer);
-      if (earlyWinDiscoveryTimer) {
-        clearTimeout(earlyWinDiscoveryTimer);
-        earlyWinDiscoveryTimer = null;
-      }
-      if (killEscalationTimer) {
-        clearTimeout(killEscalationTimer);
-        killEscalationTimer = null;
-      }
-      for (const [sig, handler] of signalHandlers.entries()) {
-        process.removeListener(sig, handler);
-      }
-      signalHandlers.clear();
-    };
 
     for (const sig of forwardedSignals) {
       const handler = () => {
@@ -756,8 +703,65 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
       process.on(sig, handler);
     }
 
+    if (childPid && effectivePlatform === "win32") {
+      archiveWindowsProcessGroupGeneration(childPid);
+      clearKnownPosixPgidStartTokens(childPid);
+    }
+
+    const captureStartTokenWhileHandleOpen = () => {
+      if (
+        !childStartToken &&
+        childPid &&
+        !options.livenessCheck &&
+        child.exitCode === null &&
+        child.signalCode === null
+      ) {
+        childStartToken = getPosixProcessStartToken(childPid, {
+          platform: effectivePlatform,
+          spawnSyncFn: options.spawnSyncFn || options.runner,
+          isSpawnCapture: true,
+        });
+        if (childStartToken) {
+          seedPosixPgidStartTokens(childPid, childStartToken);
+        }
+      }
+    };
+
+    captureStartTokenWhileHandleOpen();
+
+    if (childPid && typeof options.onChildSpawn === "function") {
+      try {
+        options.onChildSpawn(childPid, {
+          isProcessGroup: true,
+          freshGeneration: true,
+          archivedGeneration: effectivePlatform === "win32",
+          startToken: childStartToken,
+        });
+      } catch {
+        // Best-effort worker registration
+      }
+    }
+
+    if (childPid && effectivePlatform === "win32") {
+      earlyWinDiscoveryTimer = setTimeout(() => {
+        earlyWinDiscoveryTimer = null;
+        try {
+          captureStartTokenWhileHandleOpen();
+          if (hasAliveProcessInGroup(childPid)) {
+            onHeartbeat();
+          }
+        } catch {
+          // Best-effort early descendant discovery
+        }
+      }, 80);
+      if (typeof earlyWinDiscoveryTimer.unref === "function") {
+        earlyWinDiscoveryTimer.unref();
+      }
+    }
+
     const timer = setInterval(() => {
       try {
+        captureStartTokenWhileHandleOpen();
         onHeartbeat();
       } catch {
         // Best-effort heartbeat
@@ -766,6 +770,22 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     if (typeof timer.unref === "function") {
       timer.unref();
     }
+
+    const cleanupListenersAndTimers = () => {
+      clearInterval(timer);
+      if (earlyWinDiscoveryTimer) {
+        clearTimeout(earlyWinDiscoveryTimer);
+        earlyWinDiscoveryTimer = null;
+      }
+      if (killEscalationTimer) {
+        clearTimeout(killEscalationTimer);
+        killEscalationTimer = null;
+      }
+      for (const [sig, handler] of signalHandlers.entries()) {
+        process.removeListener(sig, handler);
+      }
+      signalHandlers.clear();
+    };
 
     child.on("error", (err) => {
       cleanupListenersAndTimers();

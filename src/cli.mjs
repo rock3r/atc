@@ -91,6 +91,9 @@ function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, optio
       options.spawnSyncFn || options.runner,
       {
         knownDescendants: lease?.workerDescendants,
+        pgidStartTokens:
+          options.pgidStartTokens || lease?.workerPgidStartTokens || null,
+        lease,
         triState: true,
       },
     );
@@ -3893,25 +3896,26 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   let spawnedChildStartToken = null;
   const onChildSpawn = (
     childPid,
-    { isProcessGroup, freshGeneration, startToken } = {},
+    { isProcessGroup, freshGeneration, archivedGeneration, startToken } = {},
   ) => {
     spawnedChildPid = childPid;
     const effectivePlatform = options.platform || process.platform;
     const isWin = effectivePlatform === "win32";
-    spawnedChildStartToken =
-      startToken ||
-      (!isWin && isProcessGroup && !options.livenessCheck
-        ? getPosixProcessStartToken(childPid, {
-            platform: effectivePlatform,
-            spawnSyncFn: options.spawnSyncFn || options.runner,
-          })
-        : null);
-    if (spawnedChildStartToken) {
-      seedPosixPgidStartTokens(childPid, spawnedChildStartToken);
-    }
     try {
-      if (isProcessGroup && isWin) {
+      if (isProcessGroup && isWin && !archivedGeneration) {
         archiveWindowsProcessGroupGeneration(childPid);
+      }
+      spawnedChildStartToken =
+        startToken ||
+        (isProcessGroup && !options.livenessCheck
+          ? getPosixProcessStartToken(childPid, {
+              platform: effectivePlatform,
+              spawnSyncFn: options.spawnSyncFn || options.runner,
+              isSpawnCapture: true,
+            })
+          : null);
+      if (spawnedChildStartToken) {
+        seedPosixPgidStartTokens(childPid, spawnedChildStartToken);
       }
       withStateTransaction(
         stateDir,
@@ -3938,6 +3942,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           ...options,
           freshGenerationPgids:
             isProcessGroup && isWin && !options.livenessCheck ? [childPid] : undefined,
+          freshGenerationStartTokens:
+            spawnedChildStartToken && isProcessGroup
+              ? { [String(childPid)]: spawnedChildStartToken }
+              : undefined,
         },
       );
     } catch {

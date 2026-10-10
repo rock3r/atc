@@ -2727,6 +2727,215 @@ function stageReferencesPositionalParams(cmdBody) {
   return false;
 }
 
+function stageContainsUnquotedGlob(cmdBody, { includeCommandSub = true } = {}) {
+  const s = String(cmdBody || "");
+  let inSingle = false;
+  let inDouble = false;
+  let arithDepth = 0;
+  let bracketArithDepth = 0;
+  let inDoubleBracket = false;
+  const subStack = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && !inSingle && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (inSingle) continue;
+    if (!inDouble) {
+      if (ch === "$" && s[i + 1] === "[") {
+        bracketArithDepth++;
+        i++;
+        continue;
+      }
+      if (bracketArithDepth > 0) {
+        if (ch === "[") bracketArithDepth++;
+        else if (ch === "]") bracketArithDepth--;
+        continue;
+      }
+      if (arithDepth === 0 && ch === "$" && s[i + 1] === "(" && s[i + 2] === "(") {
+        arithDepth = 2;
+        i += 2;
+        continue;
+      }
+      if (arithDepth === 0 && ch === "(" && s[i + 1] === "(") {
+        arithDepth = 2;
+        i++;
+        continue;
+      }
+      if (arithDepth > 0) {
+        if (ch === "(") arithDepth++;
+        else if (ch === ")") arithDepth--;
+        continue;
+      }
+      if (
+        !inDoubleBracket &&
+        ch === "[" &&
+        s[i + 1] === "[" &&
+        (i === 0 || /[\s;(|&!]/.test(s[i - 1])) &&
+        /\s/.test(s[i + 2] || "")
+      ) {
+        inDoubleBracket = true;
+        i++;
+        continue;
+      }
+      if (
+        inDoubleBracket &&
+        ch === "]" &&
+        s[i + 1] === "]" &&
+        /\s/.test(s[i - 1] || "") &&
+        (i + 2 >= s.length || /[\s;)|&]/.test(s[i + 2]))
+      ) {
+        inDoubleBracket = false;
+        i++;
+        continue;
+      }
+    }
+    if (ch === "$" && s[i + 1] === "(" && s[i + 2] !== "(") {
+      if (!inDouble && !inDoubleBracket && includeCommandSub) {
+        return true;
+      }
+      subStack.push(inDouble);
+      inDouble = false;
+      i++;
+      continue;
+    }
+    if (!inDouble && ch === "`" && !inDoubleBracket && includeCommandSub) {
+      return true;
+    }
+    if (!inDouble && subStack.length > 0) {
+      if (ch === "(") {
+        subStack.push(null);
+        continue;
+      }
+      if (ch === ")") {
+        const popped = subStack.pop();
+        if (typeof popped === "boolean") {
+          inDouble = popped;
+        }
+        continue;
+      }
+    }
+    if (ch === "$" && s[i + 1] === "{") {
+      let j = i + 2;
+      let depth = 1;
+      while (j < s.length && depth > 0) {
+        if (s[j] === "\\" && j + 1 < s.length) {
+          j += 2;
+          continue;
+        }
+        if (s[j] === "{") depth++;
+        else if (s[j] === "}") depth--;
+        j++;
+      }
+      if (depth === 0) {
+        const inner = s.slice(i + 2, j - 1);
+        if (!inDouble && !inDoubleBracket && !inner.startsWith("#")) {
+          return true;
+        }
+        i = j - 1;
+        continue;
+      }
+    }
+    if (!inDouble && !inDoubleBracket && ch === "$") {
+      const next = s[i + 1] || "";
+      if (/[A-Za-z0-9_@*\-!]/.test(next)) {
+        return true;
+      }
+    }
+    if (!inDouble && !inDoubleBracket) {
+      if (ch === "*" || ch === "?") {
+        return true;
+      }
+      if (ch === "[" && s[i + 1] && !/\s/.test(s[i + 1])) {
+        let k = i + 1;
+        if (s[k] === "!" || s[k] === "^") k++;
+        if (s[k] === "]") k++;
+        while (k < s.length && !/[\s;|&<>()]/.test(s[k])) {
+          if (s[k] === "\\" && k + 1 < s.length) {
+            k += 2;
+            continue;
+          }
+          if (s[k] === "]") {
+            return true;
+          }
+          k++;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function extractStageNoglobUpdate(stageText) {
+  let body = String(stageText || "").trim();
+  if (!body) return null;
+  const ctrlMatch = body.match(LEADING_CONTROL_PREFIX_RE);
+  if (ctrlMatch) {
+    body = body.slice(ctrlMatch[0].length).trim();
+  }
+  body = splitTrailingControlClosers(body).body.trim();
+  if (!body) return null;
+  const parsed = parseSegment(body);
+  let result = null;
+  if (parsed.baseCmd === "set") {
+    const args = parsed.args || [];
+    for (let i = 0; i < args.length; i++) {
+      const arg = String(args[i]);
+      if (arg === "--" || arg === "-") break;
+      if (arg === "-o" || arg === "+o") {
+        const optName = String(args[i + 1] || "");
+        i++;
+        if (optName === "noglob") {
+          result = arg === "-o";
+        }
+        continue;
+      }
+      if (/^-[A-Za-z]+$/.test(arg)) {
+        if (arg.includes("f")) {
+          result = true;
+        }
+        if (arg.endsWith("o") && i + 1 < args.length) {
+          if (String(args[++i]) === "noglob") {
+            result = true;
+          }
+        }
+        continue;
+      }
+      if (/^\+[A-Za-z]+$/.test(arg)) {
+        if (arg.includes("f")) {
+          result = false;
+        }
+        if (arg.endsWith("o") && i + 1 < args.length) {
+          if (String(args[++i]) === "noglob") {
+            result = false;
+          }
+        }
+        continue;
+      }
+      break;
+    }
+  } else if (parsed.baseCmd === "shopt") {
+    const args = (parsed.args || []).map(String);
+    if (args.includes("noglob") && args.some((a) => /^-[A-Za-z]*o/.test(a))) {
+      if (args.some((a) => /^-[A-Za-z]*s/.test(a))) {
+        result = true;
+      } else if (args.some((a) => /^-[A-Za-z]*u/.test(a))) {
+        result = false;
+      }
+    }
+  }
+  return result;
+}
+
 function rewriteCompoundCommand(
   command,
   {
@@ -2884,10 +3093,14 @@ function rewriteCompoundCommand(
 
   const loopDynamicVars = new Set();
   const stageAssignedCounts = new Map();
+  let hasNoglobDirective = false;
   for (const tok of tokens) {
     if (tok.type !== "stage") continue;
     const t = tok.text.trim();
     if (!t) continue;
+    if (extractStageNoglobUpdate(t) !== null) {
+      hasNoglobDirective = true;
+    }
     for (const v of extractStageLoopVariables(t)) {
       loopDynamicVars.add(v);
     }
@@ -2910,6 +3123,9 @@ function rewriteCompoundCommand(
     inheritedShellVars && typeof inheritedShellVars === "object"
       ? { ...inheritedShellVars }
       : {};
+  if (hasNoglobDirective) {
+    shellVars.__atc_noglob_seen = "1";
+  }
   let pipeUpstreamArgs = [];
   let inPipeline = false;
   let loopDepth = Number.isInteger(inheritedLoopDepth) && inheritedLoopDepth > 0 ? inheritedLoopDepth : 0;
@@ -2929,6 +3145,10 @@ function rewriteCompoundCommand(
       if (!trimmed) return tok.text;
       if (/(?:^|\s)(?:for|select|while|until)\b/.test(trimmed)) {
         loopDepth++;
+      }
+      const noglobUpdate = extractStageNoglobUpdate(trimmed);
+      if (noglobUpdate !== null) {
+        shellVars.__atc_noglob_seen = "1";
       }
       if (loopDepth > 0) {
         for (const dv of loopDynamicVars) {
@@ -3444,10 +3664,20 @@ function rewriteCompoundCommand(
         if (atArrayExprs.length > 0) {
           const needsOuterIfs =
             atArrayExprs.some((entry) => entry.hasUnquoted) || hasUnquotedAlias;
+          const needsOuterNoglob =
+            needsOuterIfs ||
+            usesExtglob ||
+            Boolean(shellVars.__atc_noglob_seen) ||
+            stageContainsUnquotedGlob(cmdBody);
+          const noglobEnv = needsOuterNoglob ? '__atc_flags="$-" ' : "";
+          const noglobPrelude = needsOuterNoglob
+            ? "case $__atc_flags in *f*) set -f;; esac; "
+            : "";
           const ifsPrelude = needsOuterIfs
             ? 'if [ -n "$1" ]; then IFS=$2; else unset IFS; fi; shift 2; '
             : "";
           const prelude =
+            noglobPrelude +
             ifsPrelude +
             atArrayExprs
               .map((entry) =>
@@ -3471,21 +3701,30 @@ function rewriteCompoundCommand(
             (hasPositionalParams ? ' "$@"' : "");
           const bashExec = usesExtglob ? "bash -O extglob" : "bash";
           const zeroArg = hasZeroParam ? '"$0"' : "bash";
-          return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
+          return `${prefix}${arrayEnvAssigns}${noglobEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
         }
+        const needsOuterNoglob =
+          hasUnquotedAlias ||
+          usesExtglob ||
+          Boolean(shellVars.__atc_noglob_seen) ||
+          stageContainsUnquotedGlob(cmdBody);
+        const noglobEnv = needsOuterNoglob ? '__atc_flags="$-" ' : "";
+        const noglobPrelude = needsOuterNoglob
+          ? "case $__atc_flags in *f*) set -f;; esac; "
+          : "";
         const shIfsEnv = hasUnquotedAlias ? '__atc_ifs_set="${IFS+1}" __atc_ifs="${IFS-}" ' : "";
         const shIfsPrelude = hasUnquotedAlias
           ? 'if [ -n "$__atc_ifs_set" ]; then IFS=$__atc_ifs; else unset IFS; fi; '
           : "";
         const targetShell = usesExtglob || stageRequiresBashShell(cmdBody) ? "bash" : "sh";
         const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
-        const escaped = `'${String(shIfsPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
+        const escaped = `'${String(noglobPrelude + shIfsPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
         const trailingAtArgs = hasPositionalParams
           ? ` ${hasZeroParam ? '"$0"' : targetShell} "$@"`
           : hasZeroParam
             ? ' "$0"'
             : "";
-        return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
+        return `${prefix}${arrayEnvAssigns}${noglobEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =
@@ -3670,8 +3909,16 @@ export function evaluateCommandGuard(
           platform,
         });
       } else {
-        const escaped = `'${String(command).replace(/'/g, `'\\''`)}'`;
-        rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
+        const usesExtglob = stageUsesExtglob(command);
+        const needsOuterNoglob = usesExtglob || stageContainsUnquotedGlob(command);
+        const noglobEnv = needsOuterNoglob ? '__atc_flags="$-" ' : "";
+        const noglobPrelude = needsOuterNoglob
+          ? "case $__atc_flags in *f*) set -f;; esac; "
+          : "";
+        const targetShell = usesExtglob || stageRequiresBashShell(command) ? "bash" : "sh";
+        const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
+        const escaped = `'${String(noglobPrelude + command).replace(/'/g, `'\\''`)}'`;
+        rewrittenCommand = `${noglobEnv}${envPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}`;
       }
     }
   } else if (needsAtcRewrite && sessionId) {

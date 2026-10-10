@@ -4063,7 +4063,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(subPrintfDeviceRewrite.fastPath, false);
             assert.equal(
               subPrintfDeviceRewrite.rewrittenCommand,
-              "ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c '$(printf ad)b shell getprop'",
+              '__atc_flags="$-" ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c \'case $__atc_flags in *f*) set -f;; esac; $(printf ad)b shell getprop\'',
             );
 
             const subPrintfHexKill = evaluateCommandGuard(
@@ -7123,11 +7123,15 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       { ProcessId: 710002, ParentProcessId: 710001, CreationDate: "20261010150001.000000+000" },
       { ProcessId: 710003, ParentProcessId: 710002, CreationDate: "20261010150002.000000+000" },
     ];
-    const mapA = queryWindowsProcessGroups([rootPgid], () => ({
-      status: 0,
-      stdout: JSON.stringify(phaseAProcesses),
-      stderr: "",
-    }));
+    const mapA = queryWindowsProcessGroups(
+      [rootPgid],
+      () => ({
+        status: 0,
+        stdout: JSON.stringify(phaseAProcesses),
+        stderr: "",
+      }),
+      { pgidStartTokens: { [String(rootPgid)]: "20261010150000.000000+000" } },
+    );
     assert.equal(mapA.get(rootPgid), true);
     const knownAfterA = getKnownWindowsTreeDescendants(rootPgid);
     assert.deepEqual(knownAfterA, [
@@ -7625,14 +7629,18 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     const missedRootPgid = 730001;
     clearKnownWindowsTreeDescendants(missedRootPgid);
     try {
-      // Snapshot 1: root (730001) already exited, but child (730002) is alive
-      const mapMissed1 = queryWindowsProcessGroups([missedRootPgid], () => ({
-        status: 0,
-        stdout: JSON.stringify([
-          { ProcessId: 730002, ParentProcessId: 730001, CreationDate: "20261010170001.000000+000" },
-        ]),
-        stderr: "",
-      }));
+      // Snapshot 1: root (730001) already exited, but child (730002) is alive and spawn-time root token was captured
+      const mapMissed1 = queryWindowsProcessGroups(
+        [missedRootPgid],
+        () => ({
+          status: 0,
+          stdout: JSON.stringify([
+            { ProcessId: 730002, ParentProcessId: 730001, CreationDate: "20261010170001.000000+000" },
+          ]),
+          stderr: "",
+        }),
+        { pgidStartTokens: { [String(missedRootPgid)]: "20261010170000.000000+000" } },
+      );
       assert.equal(mapMissed1.get(missedRootPgid), true);
       const knownMissed1 = getKnownWindowsTreeDescendants(missedRootPgid);
       assert.deepEqual(
@@ -7675,6 +7683,9 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       workerPid: liveLeaderPgid,
       workerPids: [liveLeaderPgid],
       workerPgids: [liveLeaderPgid],
+      workerPgidStartTokens: {
+        [String(liveLeaderPgid)]: "20261010180000.000000+000",
+      },
       releaseOnWorkerExit: true,
       state: "active",
       claimedAtMs: now - 5_000,
@@ -7860,7 +7871,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(readUnquotedStarRedir.allowed, true);
     assert.match(
       readUnquotedStarRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
     );
 
     const readUnquotedKeysStarRedir = evaluateCommandGuard(
@@ -7874,7 +7885,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(readUnquotedKeysStarRedir.allowed, true);
     assert.match(
       readUnquotedKeysStarRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
     );
 
     // 1i. cmdGc and cmdFree on Windows reap orphaned grandchildren even when exited group leader PID is reused by an unrelated process
@@ -8081,7 +8092,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(unquotedScalarModIfs.allowed, true);
     assert.match(
       unquotedScalarModIfs.rewrittenCommand,
-      /do __atc_var_x_0="\$\{x\^\^\}" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$\{__atc_var_x_0\} > \/tmp\/out\.txt' ; done$/,
+      /do __atc_var_x_0="\$\{x\^\^\}" __atc_flags="\$-\" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$\{__atc_var_x_0\} > \/tmp\/out\.txt' ; done$/,
     );
 
     // 1l. Exited tracked intermediate PID is not traversed for new children after unobserved PID reuse + exit
@@ -8137,7 +8148,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
           ]),
           stderr: "",
         }),
-        { triState: true },
+        { triState: true, pgidStartTokens: { [String(nullInitialPgid)]: "20261010230000.000000+000" } },
       );
       assert.equal(
         firstNullQuery.get(nullInitialPgid),
@@ -8161,7 +8172,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
           ]),
           stderr: "",
         }),
-        { triState: true },
+        { triState: true, pgidStartTokens: { [String(nullInitialPgid)]: "20261010230000.000000+000" } },
       );
       assert.equal(
         bfsNullQuery.get(nullInitialPgid),
@@ -8203,7 +8214,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(prefixNameUnquotedStarRedir.allowed, true);
     assert.match(
       prefixNameUnquotedStarRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{!x@\}" "--" ; done$/,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{!x@\}" "--" ; done$/,
     );
 
     // 1n. POSIX killProcessGroupTree does not signal positive childPid when kill(-childPid) returns ESRCH
@@ -8238,7 +8249,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(unquotedPlainVarIfs.allowed, true);
     assert.match(
       unquotedPlainVarIfs.rewrittenCommand,
-      /do __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$x > \/tmp\/out\.txt' ; done$/,
+      /do __atc_flags="\$-\" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$x > \/tmp\/out\.txt' ; done$/,
     );
 
     // 3k. Bare arithmetic variables ($((x + 1))) and array subscripts ($((parts[1] + 1))) are forwarded into rewritten shells
@@ -8329,7 +8340,10 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
             stdout: JSON.stringify(gen2Snapshot),
             stderr: "",
           }),
-          { knownDescendants: genLease.workerDescendants },
+          {
+            knownDescendants: genLease.workerDescendants,
+            pgidStartTokens: { [String(genLeaderPgid)]: gen2Creation },
+          },
         );
 
         addLeaseWorker(
@@ -8465,7 +8479,10 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
             stdout: JSON.stringify(crossSnapshot),
             stderr: "",
           }),
-          { knownDescendants: leaseA.workerDescendants },
+          {
+            knownDescendants: leaseA.workerDescendants,
+            pgidStartTokens: { [String(crossLeaderPgid)]: genBCreation },
+          },
         );
 
         const liveCheck = (pid) =>
@@ -8607,7 +8624,10 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
             stdout: JSON.stringify(tombSnapshot),
             stderr: "",
           }),
-          { knownDescendants: tombLeaseA.workerDescendants },
+          {
+            knownDescendants: tombLeaseA.workerDescendants,
+            pgidStartTokens: { [String(tombLeaderPgid)]: tombNewRootCreation },
+          },
         );
 
         const liveCheck = (pid) =>
@@ -8922,7 +8942,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(extglobLoopRedir.allowed, true);
     assert.match(
       extglobLoopRedir.rewrittenCommand,
-      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
+      /__atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
     );
 
     const arithMultLoopRedir = evaluateCommandGuard(
@@ -9010,6 +9030,207 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       prefixSubstrLoopRedir.rewrittenCommand,
       /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!pre@\}" "--" ; done$/,
     );
+
+    // 1s. Windows root identity captured at spawn protects against PID reuse before the first full tree snapshot
+    {
+      const fastExitRootPgid = 860001;
+      const reusedRootChildPid = 860099;
+      const earlierOrphanPid = 860050;
+      const legitimateSurvivingChildPid = 860055;
+      const earlierOrphanToken = "20261010235850.000000+000";
+      const genuineSpawnToken = "20261010235900.000000+000";
+      const legitimateChildToken = "20261010235902.000000+000";
+      const reusedRootToken = "20261010235905.000000+000";
+      clearKnownWindowsTreeDescendants(fastExitRootPgid);
+      clearKnownPosixPgidStartTokens(fastExitRootPgid);
+      try {
+        // Case A: Root exited and its PID was reused BEFORE the first full Windows process-table snapshot,
+        // while the spawn-time CreationDate was captured in pgidStartTokens, and an earlier-generation orphan
+        // still has ParentProcessId === fastExitRootPgid. Neither the reused root's child nor the older orphan is adopted.
+        const reusedFirstSnap = queryWindowsProcessGroups(
+          [fastExitRootPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: fastExitRootPgid, ParentProcessId: 4000, CreationDate: reusedRootToken },
+              { ProcessId: reusedRootChildPid, ParentProcessId: fastExitRootPgid, CreationDate: "20261010235906.000000+000" },
+              { ProcessId: earlierOrphanPid, ParentProcessId: fastExitRootPgid, CreationDate: earlierOrphanToken },
+            ]),
+            stderr: "",
+          }),
+          {
+            triState: true,
+            pgidStartTokens: { [String(fastExitRootPgid)]: genuineSpawnToken },
+          },
+        );
+        assert.equal(
+          reusedFirstSnap.get(fastExitRootPgid),
+          false,
+          "First Windows snapshot must reject a live root PID whose CreationDate mismatches the spawn-time token and ignore older-generation orphans",
+        );
+        assert.deepEqual(
+          getKnownWindowsTreeDescendants(fastExitRootPgid),
+          [],
+          "Unrelated process reusing the root PID or older-generation orphans must not be cached or adopted",
+        );
+
+        // Case A2: Legitimate surviving child created during [genuineSpawnToken, reusedRootToken) IS still discovered
+        // even when the root PID was reused before the first snapshot.
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+        const survivingChildSnap = queryWindowsProcessGroups(
+          [fastExitRootPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: fastExitRootPgid, ParentProcessId: 4000, CreationDate: reusedRootToken },
+              { ProcessId: reusedRootChildPid, ParentProcessId: fastExitRootPgid, CreationDate: "20261010235906.000000+000" },
+              { ProcessId: legitimateSurvivingChildPid, ParentProcessId: fastExitRootPgid, CreationDate: legitimateChildToken },
+            ]),
+            stderr: "",
+          }),
+          {
+            triState: true,
+            pgidStartTokens: { [String(fastExitRootPgid)]: genuineSpawnToken },
+          },
+        );
+        assert.equal(
+          survivingChildSnap.get(fastExitRootPgid),
+          true,
+          "Surviving child created between genuineSpawnToken and reusedRootToken must keep the group alive",
+        );
+        assert.deepEqual(
+          getKnownWindowsTreeDescendants(fastExitRootPgid),
+          [
+            { pid: fastExitRootPgid, creationDate: "__exited__" },
+            { pid: legitimateSurvivingChildPid, creationDate: legitimateChildToken },
+          ],
+          "Only the __exited__ root sentinel and legitimate surviving child (not the reused root CreationDate or its new child) may be cached",
+        );
+
+        // Case B: If the root exited so quickly that even spawn-time CreationDate capture missed it (no expectedStartToken),
+        // and the PID is now occupied in the first snapshot, queryWindowsProcessGroups treats it as unverifiable (null) and
+        // killProcessGroupTree refuses to run taskkill /F.
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+        const uncapturedKilled = [];
+        const uncapturedKillRes = killProcessGroupTree(fastExitRootPgid, "SIGKILL", {
+          platform: "win32",
+          runner: (cmd, args) => {
+            if (cmd === "powershell.exe") {
+              return {
+                status: 0,
+                stdout: JSON.stringify([
+                  { ProcessId: fastExitRootPgid, ParentProcessId: 4000, CreationDate: reusedRootToken },
+                ]),
+                stderr: "",
+              };
+            }
+            if (cmd === "taskkill") {
+              for (let i = 0; i < args.length; i += 1) {
+                if (args[i] === "/PID") {
+                  uncapturedKilled.push(Number(args[i + 1]));
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        });
+        assert.deepEqual(
+          uncapturedKilled,
+          [],
+          "killProcessGroupTree on Windows must not taskkill a live root PID when no spawn-time CreationDate was captured",
+        );
+        assert.deepEqual(uncapturedKillRes.terminatedPgids, []);
+      } finally {
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+      }
+    }
+
+    // 3t. `set -f` / `set -o noglob` and caller-shell `$-` noglob state are preserved across `sh -c` / `bash -c` loop stage rewrites
+    const noglobExplicitLoopRedir = evaluateCommandGuard(
+      "set -f; for x in 1; do adb install *.apk > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(noglobExplicitLoopRedir.allowed, true);
+    assert.match(
+      noglobExplicitLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const noglobCallerGlobLoopRedir = evaluateCommandGuard(
+      "for x in 1; do adb install *.apk > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(noglobCallerGlobLoopRedir.allowed, true);
+    assert.match(
+      noglobCallerGlobLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const noglobOptionLoopRedir = evaluateCommandGuard(
+      "set -o noglob; for x in 1; do adb shell echo ok > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(noglobOptionLoopRedir.allowed, true);
+    assert.match(
+      noglobOptionLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb shell echo ok > \/tmp\/out\.txt' ; done$/,
+    );
+
+    if (process.platform !== "win32") {
+      const noglobExecDir = makeTempStateDir();
+      try {
+        fs.writeFileSync(path.join(noglobExecDir, "sample.apk"), "dummy", "utf8");
+        const stubBinDir = path.join(noglobExecDir, "bin");
+        fs.mkdirSync(stubBinDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(stubBinDir, "atc"),
+          '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ "$1" = "--" ] && shift\nexec "$@"\n',
+          { mode: 0o755 },
+        );
+        fs.writeFileSync(
+          path.join(stubBinDir, "adb"),
+          '#!/bin/sh\nprintf "%s\\n" "$*"\n',
+          { mode: 0o755 },
+        );
+        const outWithNoglob = path.join(noglobExecDir, "out-noglob.txt");
+        const outAfterUnsetNoglob = path.join(noglobExecDir, "out-glob.txt");
+        const rewrittenNoglobExec = evaluateCommandGuard(
+          `set -f; for x in 1; do adb install *.apk > "${outWithNoglob}"; done; set +f; for x in 1; do adb install *.apk > "${outAfterUnsetNoglob}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenNoglobExec.allowed, true);
+        const execRes = spawnSync("sh", ["-c", rewrittenNoglobExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(execRes.status, 0, execRes.stderr);
+        assert.equal(fs.readFileSync(outWithNoglob, "utf8").trim(), "install *.apk");
+        assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk");
+      } finally {
+        fs.rmSync(noglobExecDir, { recursive: true, force: true });
+      }
+    }
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
