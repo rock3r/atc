@@ -3907,7 +3907,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       }
       spawnedChildStartToken =
         startToken ||
-        (isProcessGroup && !options.livenessCheck
+        (isProcessGroup && !options.livenessCheck && !(isWin && archivedGeneration)
           ? getPosixProcessStartToken(childPid, {
               platform: effectivePlatform,
               spawnSyncFn: options.spawnSyncFn || options.runner,
@@ -3917,6 +3917,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       if (spawnedChildStartToken) {
         seedPosixPgidStartTokens(childPid, spawnedChildStartToken);
       }
+      const alreadyArchivedInMemory = Boolean(archivedGeneration || (isProcessGroup && isWin));
       withStateTransaction(
         stateDir,
         (state) => {
@@ -3929,6 +3930,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
               isProcessGroup: Boolean(isProcessGroup),
               freshGeneration: Boolean(freshGeneration ?? true),
+              archivedGeneration: alreadyArchivedInMemory,
               startToken: spawnedChildStartToken,
               platform: effectivePlatform,
               spawnSyncFn: options.spawnSyncFn || options.runner,
@@ -3940,10 +3942,15 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         },
         {
           ...options,
+          archivedGeneration: alreadyArchivedInMemory,
           freshGenerationPgids:
-            isProcessGroup && isWin && !options.livenessCheck ? [childPid] : undefined,
+            isProcessGroup && isWin && !options.livenessCheck
+              ? [childPid]
+              : undefined,
           freshGenerationStartTokens:
-            spawnedChildStartToken && isProcessGroup
+            spawnedChildStartToken &&
+            spawnedChildStartToken !== "__exited__" &&
+            isProcessGroup
               ? { [String(childPid)]: spawnedChildStartToken }
               : undefined,
         },

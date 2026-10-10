@@ -435,7 +435,11 @@ function isLeaseProcessGroupKeyAlive(lease, pgKey, livenessCheck = isPidAlive) {
         });
 }
 
-function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
+function reconcileLeaseWindowsGenerations(
+  lease,
+  freshPid = null,
+  { archivedGeneration = false } = {},
+) {
   if (
     freshPid &&
     lease?.workerPgidStartTokens &&
@@ -447,7 +451,7 @@ function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
     }
   }
   if (!lease?.workerDescendants || typeof lease.workerDescendants !== "object") {
-    if (freshPid) {
+    if (freshPid && !archivedGeneration) {
       const curKnown = getKnownWindowsTreeDescendants(freshPid);
       const curRoot = curKnown.find((e) => Number(e?.pid) === Number(freshPid));
       if (
@@ -472,7 +476,7 @@ function reconcileLeaseWindowsGenerations(lease, freshPid = null) {
     const archivedKnown = getKnownWindowsTreeDescendants(archiveKey);
     const curKnown = getKnownWindowsTreeDescendants(numericPid);
     const curGenToken = deriveWindowsTreeGenerationToken(numericPid, curKnown);
-    if (freshPid === numericPid && curGenToken === prevGenToken) {
+    if (freshPid === numericPid && curGenToken === prevGenToken && !archivedGeneration) {
       archiveWindowsProcessGroupGeneration(numericPid);
     }
     const isNewGeneration =
@@ -604,9 +608,9 @@ function syncLeasePosixStartTokens(lease) {
     const prevTok = prevTokens[pidKey] || null;
     const knownTok = getKnownPosixPgidStartToken(numPid);
     const resolvedTok =
-      typeof prevTok === "string" && prevTok.trim()
+      typeof prevTok === "string" && prevTok.trim() && prevTok.trim() !== "__exited__"
         ? prevTok.trim()
-        : typeof knownTok === "string" && knownTok.trim()
+        : typeof knownTok === "string" && knownTok.trim() && knownTok.trim() !== "__exited__"
           ? knownTok.trim()
           : null;
     if (resolvedTok) {
@@ -644,6 +648,7 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
     reconcileLeaseWindowsGenerations(
       lease,
       options.freshGeneration ? numericPid : null,
+      { archivedGeneration: Boolean(options.archivedGeneration) },
     );
   }
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
@@ -682,7 +687,7 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
             allowSubprocess: Boolean(options.allowSubprocess),
           })
         : null);
-    if (startToken) {
+    if (startToken && startToken !== "__exited__") {
       seedPosixPgidStartTokens(numericPid, startToken);
       if (
         !lease.workerPgidStartTokens ||
@@ -1395,8 +1400,10 @@ export function withStateTransaction(stateDir, fn, options = {}) {
       ? options.freshGenerationPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
       : [],
   );
-  for (const freshPid of freshGenerationSet) {
-    archiveWindowsProcessGroupGeneration(freshPid);
+  if (!options.archivedGeneration) {
+    for (const freshPid of freshGenerationSet) {
+      archiveWindowsProcessGroupGeneration(freshPid);
+    }
   }
   try {
     const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
@@ -1410,13 +1417,25 @@ export function withStateTransaction(stateDir, fn, options = {}) {
         if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
           for (const [k, v] of Object.entries(lease.workerDescendants)) {
             if (isTerminatedKey(k)) continue;
-            if (!k.includes("@") && freshGenerationSet.has(Number(k)) && Array.isArray(v)) {
+            if (!k.includes("@") && Array.isArray(v)) {
               const numPid = Number(k);
               const prevGenToken = deriveWindowsTreeGenerationToken(numPid, v);
-              if (prevGenToken) {
+              const curKnown = getKnownWindowsTreeDescendants(numPid);
+              const curGenToken = deriveWindowsTreeGenerationToken(numPid, curKnown);
+              const isReplacedGen =
+                freshGenerationSet.has(numPid) ||
+                Boolean(
+                  prevGenToken &&
+                    (getKnownWindowsTreeDescendants(`${numPid}@${prevGenToken}`).length > 0 ||
+                      (curGenToken && curGenToken !== prevGenToken)),
+                );
+              if (isReplacedGen && prevGenToken) {
                 const archiveKey = `${numPid}@${prevGenToken}`;
                 knownDescendants[archiveKey] = v;
                 pgids.push(archiveKey);
+                if (curKnown.length > 0) {
+                  knownDescendants[k] = curKnown;
+                }
                 continue;
               }
             }
@@ -1428,13 +1447,20 @@ export function withStateTransaction(stateDir, fn, options = {}) {
           typeof lease.workerPgidStartTokens === "object"
         ) {
           for (const [k, v] of Object.entries(lease.workerPgidStartTokens)) {
-            if (
-              !isTerminatedKey(k) &&
-              !freshGenerationSet.has(Number(k)) &&
-              typeof v === "string" &&
-              v.trim()
-            ) {
-              pgidStartTokens[k] = v.trim();
+            if (typeof v !== "string" || !v.trim()) continue;
+            const trimmedV = v.trim();
+            const numPid = Number(k);
+            const curKnown = getKnownWindowsTreeDescendants(numPid);
+            const curGenToken = deriveWindowsTreeGenerationToken(numPid, curKnown);
+            const inMemStartTok = getKnownPosixPgidStartToken(numPid);
+            const isReplacedStartTok =
+              freshGenerationSet.has(numPid) ||
+              Boolean(inMemStartTok && inMemStartTok !== trimmedV) ||
+              Boolean(curGenToken && curGenToken !== trimmedV);
+            if (!isTerminatedKey(k) && !isReplacedStartTok) {
+              pgidStartTokens[k] = trimmedV;
+            } else if (!isTerminatedKey(k) && inMemStartTok) {
+              pgidStartTokens[k] = inMemStartTok;
             }
           }
         }
@@ -1491,6 +1517,20 @@ export function withStateTransaction(stateDir, fn, options = {}) {
       withProcessGroupSnapshot(pgidSnapshot, () => {
         const now = options.now ?? Date.now();
         const state = readState(stateDir, { lockHandle });
+        if (
+          freshGenerationSet.size > 0 &&
+          state?.leases &&
+          typeof state.leases === "object"
+        ) {
+          for (const lease of Object.values(state.leases)) {
+            if (!lease || typeof lease !== "object") continue;
+            for (const freshPid of freshGenerationSet) {
+              reconcileLeaseWindowsGenerations(lease, freshPid, {
+                archivedGeneration: Boolean(options.archivedGeneration),
+              });
+            }
+          }
+        }
         const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
         const result = fn(state, { now, pruned, lockHandle });
         const gcMutated =

@@ -12,6 +12,7 @@ import {
   clearKnownWindowsTreeDescendants,
   getKnownWindowsTreeDescendants,
   getKnownWindowsTreePids,
+  getPosixProcessStartToken,
   hasAliveProcessInGroup,
   isProcessGroupAlive,
   killProcessGroupTree,
@@ -8985,7 +8986,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(funcPositionalLoopRedir.allowed, true);
     assert.match(
       funcPositionalLoopRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo "\$1" "\$\{!#\}" > \/tmp\/out\.txt' bash "\$@" ; done ; \} ; f expected$/,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell echo "\$1" "\$\{!#\}" > \/tmp\/out\.txt' bash "\$@" ; done ; \} ; f expected$/,
     );
 
     const funcArrayAndPositionalLoopRedir = evaluateCommandGuard(
@@ -8999,7 +9000,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(funcArrayAndPositionalLoopRedir.allowed, true);
     assert.match(
       funcArrayAndPositionalLoopRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$0" "\$1" "\$\{X:-\$\{__atc_arr_at_0\[@\]\}\}" > \/tmp\/out\.txt' "\$0" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; case \$__atc_flags in \*u\*\) set -u;; esac; adb shell echo "\$0" "\$1" "\$\{X:-\$\{__atc_arr_at_0\[@\]\}\}" > \/tmp\/out\.txt' "\$0" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
     );
 
     // 3s. Array alias names do not collide when distinct array/subscript pairs flatten to the same prefix (${a_b[c]} vs ${a[b_c]}) or with reserved __atc_arr_at_<idx> (${at[0]})
@@ -9108,6 +9109,53 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
           "Only the __exited__ root sentinel and legitimate surviving child (not the reused root CreationDate or its new child) may be cached",
         );
 
+        // Case A3: When the Windows wrapper exits during spawn-time capture (`getPosixProcessStartToken(..., { isSpawnCapture: true })`),
+        // subsequent `addLeaseWorker(..., { isProcessGroup: true, freshGeneration: false, archivedGeneration: true })` must NOT
+        // re-archive the freshly captured tree and must persist the detached child under `lease.workerDescendants[String(fastExitRootPgid)]`.
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+        archiveWindowsProcessGroupGeneration(fastExitRootPgid);
+        const spawnCapTok = getPosixProcessStartToken(fastExitRootPgid, {
+          platform: "win32",
+          isSpawnCapture: true,
+          spawnSyncFn: () => ({
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: legitimateSurvivingChildPid, ParentProcessId: fastExitRootPgid, CreationDate: legitimateChildToken },
+            ]),
+            stderr: "",
+          }),
+        });
+        assert.equal(spawnCapTok, "__exited__");
+        const fastExitLease = {
+          leaseId: "lease_fast_exit_win",
+          deviceKey: "avd:Pixel_Fast_Exit",
+          state: "active",
+          sessionId: "fast-exit-sess",
+          workerPids: [],
+          workerPid: null,
+        };
+        addLeaseWorker(
+          fastExitLease,
+          fastExitRootPgid,
+          (pid) => pid === legitimateSurvivingChildPid,
+          {
+            isProcessGroup: true,
+            freshGeneration: false,
+            archivedGeneration: true,
+            platform: "win32",
+            allowSubprocess: false,
+          },
+        );
+        assert.deepEqual(
+          fastExitLease.workerDescendants?.[String(fastExitRootPgid)],
+          [
+            { pid: fastExitRootPgid, creationDate: "__exited__" },
+            { pid: legitimateSurvivingChildPid, creationDate: legitimateChildToken },
+          ],
+          "Fast-exited Windows wrapper's detached child must remain registered under bare numeric PGID in lease.workerDescendants",
+        );
+
         // Case B: If the root exited so quickly that even spawn-time CreationDate capture missed it (no expectedStartToken),
         // and the PID is now occupied in the first snapshot, queryWindowsProcessGroups treats it as unverifiable (null) and
         // killProcessGroupTree refuses to run taskkill /F.
@@ -9149,7 +9197,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       }
     }
 
-    // 3t. `set -f` / `set -o noglob` and caller-shell `$-` noglob state are preserved across `sh -c` / `bash -c` loop stage rewrites
+    // 3t. `set -f` / `set -o noglob` and `set -u` / `set -o nounset` and caller-shell `$-` state are preserved across `sh -c` / `bash -c` loop stage rewrites
     const noglobExplicitLoopRedir = evaluateCommandGuard(
       "set -f; for x in 1; do adb install *.apk > /tmp/out.txt; done",
       {
@@ -9192,6 +9240,20 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb shell echo ok > \/tmp\/out\.txt' ; done$/,
     );
 
+    const nounsetExplicitLoopRedir = evaluateCommandGuard(
+      'set -u; for x in 1; do adb shell rm -rf "$MISSING" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(nounsetExplicitLoopRedir.allowed, true);
+    assert.match(
+      nounsetExplicitLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell rm -rf "\$MISSING" > \/tmp\/out\.txt' ; done$/,
+    );
+
     if (process.platform !== "win32") {
       const noglobExecDir = makeTempStateDir();
       try {
@@ -9227,6 +9289,67 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         assert.equal(execRes.status, 0, execRes.stderr);
         assert.equal(fs.readFileSync(outWithNoglob, "utf8").trim(), "install *.apk");
         assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk");
+
+        const outNounset = path.join(noglobExecDir, "out-nounset.txt");
+        const rewrittenNounsetExec = evaluateCommandGuard(
+          `set -u; for x in 1; do adb shell rm -rf "$MISSING" > "${outNounset}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenNounsetExec.allowed, true);
+        const nounsetRes = spawnSync("sh", ["-c", rewrittenNounsetExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.notEqual(nounsetRes.status, 0, "set -u must abort when $MISSING is unset inside rewritten sh -c");
+        assert.equal(
+          fs.existsSync(outNounset) ? fs.readFileSync(outNounset, "utf8").trim() : "",
+          "",
+          "adb command must not execute when $MISSING is unset under set -u",
+        );
+
+        const outNounsetDefault = path.join(noglobExecDir, "out-nounset-default.txt");
+        const rewrittenCondDefault = evaluateCommandGuard(
+          `set -u; if false; then X=$(echo hi); fi; adb shell "\${X:-none}" > "${outNounsetDefault}"`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenCondDefault.allowed, true);
+        const condDefaultRes = spawnSync("sh", ["-c", rewrittenCondDefault.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(condDefaultRes.status, 0, condDefaultRes.stderr);
+        assert.equal(fs.readFileSync(outNounsetDefault, "utf8").trim(), "shell none");
+
+        const outNounsetCondFail = path.join(noglobExecDir, "out-nounset-cond-fail.txt");
+        const rewrittenCondFail = evaluateCommandGuard(
+          `set -u; if false; then X=$(echo hi); fi; adb shell "$X" > "${outNounsetCondFail}"`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenCondFail.allowed, true);
+        const condFailRes = spawnSync("sh", ["-c", rewrittenCondFail.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.notEqual(
+          condFailRes.status,
+          0,
+          "set -u must abort when conditionally assigned dynamic variable $X remains unset",
+        );
       } finally {
         fs.rmSync(noglobExecDir, { recursive: true, force: true });
       }

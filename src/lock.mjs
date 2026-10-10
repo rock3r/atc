@@ -293,12 +293,19 @@ export function deriveWindowsTreeGenerationToken(pgid, entriesOrMap) {
       item.creationDate ?? item.CreationDate ?? item.startToken ?? null,
     );
     if (c && c !== "__exited__") {
-      descParts.push(`${pid}:${c}`);
+      descParts.push({ pid, creationDate: c, token: `${pid}:${c}` });
     }
   }
-  descParts.sort();
+  descParts.sort((a, b) => {
+    const cmp = compareWindowsCreationTokens(a.creationDate, b.creationDate);
+    if (cmp !== null && cmp !== 0) return cmp;
+    if (a.creationDate !== b.creationDate) {
+      return a.creationDate < b.creationDate ? -1 : 1;
+    }
+    return a.pid - b.pid;
+  });
   if (descParts.length > 0) {
-    return `__exited__:${descParts[0]}`;
+    return `__exited__:${descParts[0].token}`;
   }
   return rootCreation === "__exited__" ? "__exited__" : null;
 }

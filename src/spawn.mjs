@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
+  getKnownWindowsTreeDescendants,
   getPosixProcessStartToken,
   hasAliveProcessInGroup,
   isProcessGroupAlive,
@@ -714,7 +715,8 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
         childPid &&
         !options.livenessCheck &&
         child.exitCode === null &&
-        child.signalCode === null
+        child.signalCode === null &&
+        !(effectivePlatform === "win32" && getKnownWindowsTreeDescendants(childPid).length > 0)
       ) {
         childStartToken = getPosixProcessStartToken(childPid, {
           platform: effectivePlatform,
