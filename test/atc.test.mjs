@@ -2668,6 +2668,63 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           assert.equal(longHeaderParsed.length, 1);
           assert.equal(longHeaderParsed[0].avd, "Pixel_8_API_35");
           assert.equal(longHeaderParsed[0].online, false);
+
+          // 12. Cold restart of an online AVD clears the stale serial and rediscovers the new emulator port when stdout omits the serial
+          const coldRediscoverDir = makeTempStateDir();
+          try {
+            const coldRediscoverRes = cmdClaim(
+              coldRediscoverDir,
+              { session: "cold-rediscover", avd: "Pixel_8_API_35", cold: true, force: true, wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: npxInv,
+                runner: (cmd, args) => {
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                    return { status: 0, stdout: "", stderr: "" };
+                  }
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    // Omit serial from stdout so it must be rediscovered from fleet
+                    return { status: 0, stdout: "Started Pixel_8_API_35\n", stderr: "" };
+                  }
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+                    return {
+                      status: 0,
+                      stdout: "AVD                 Status    Serial          API\nPixel_8_API_35      online    emulator-5558   android-35\n",
+                      stderr: "",
+                    };
+                  }
+                  if (cmd === "adb" && args[0] === "devices") {
+                    return {
+                      status: 0,
+                      stdout: "List of devices attached\nemulator-5558\tdevice\n",
+                      stderr: "",
+                    };
+                  }
+                  return { status: 0, stdout: "", stderr: "" };
+                },
+              },
+            );
+            assert.equal(coldRediscoverRes.exitCode, 0);
+            assert.equal(coldRediscoverRes.lease.serial, "emulator-5558");
+
+            // 13. `atc exec` heartbeats do not shorten a long lease TTL (e.g. 3600s) down to defaultTtlSec (600s)
+            const renewLong = cmdRenew(coldRediscoverDir, coldRediscoverRes.lease.leaseId, {
+              session: "cold-rediscover",
+              ttl: 3600,
+            });
+            assert.equal(renewLong.exitCode, 0);
+            const longExpiresAt = renewLong.lease.expiresAtMs;
+            const execLongRes = await cmdExec(
+              coldRediscoverDir,
+              [process.execPath, "-e", "process.exit(0);"],
+              { session: "cold-rediscover" },
+            );
+            assert.equal(execLongRes.exitCode, 0);
+            assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"].expiresAtMs >= longExpiresAt);
+          } finally {
+            fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
+          }
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }

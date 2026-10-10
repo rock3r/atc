@@ -1137,6 +1137,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
             `Failed to stop emulator ${candidate.avd} before reboot: ${rebootStopRes.stderr || rebootStopRes.stdout}`,
           );
         }
+        resolvedSerial = null;
       }
       if (req.wipeData) {
         wipeAvdUserData(candidate.avd, avdHome);
@@ -1169,7 +1170,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       bootedNewEmulator = true;
 
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
-      resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
+      resolvedSerial = serialMatch ? serialMatch[1] : null;
       const pollDeadline = Date.now() + (bootTimeoutMs || 60_000);
       while (!resolvedSerial) {
         const refreshed = discoverFleet({ runner, avdHome });
@@ -1928,7 +1929,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       const cur = state.leases[check.lease.deviceKey];
       if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
         cur.renewedAtMs = now;
-        cur.expiresAtMs = now + check.ttlMs;
+        cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
         return { mutated: true };
       }
       return { mutated: false };
