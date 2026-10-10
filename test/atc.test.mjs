@@ -7774,6 +7774,36 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         2,
         "cmdGc must preserve workerDescendants when Windows tree termination could not be verified",
       );
+
+      const resTimedOutTaskkill = killProcessGroupTree(failedRefreshPgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                { ProcessId: 750002, ParentProcessId: failedRefreshPgid, CreationDate: "20261010190001.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            return { status: null, error: new Error("spawnSync taskkill ETIMEDOUT") };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(resTimedOutTaskkill, []);
+      assert.deepEqual(
+        resTimedOutTaskkill.terminatedPgids,
+        [],
+        "killProcessGroupTree must not confirm termination when taskkill times out with status: null",
+      );
+      assert.equal(
+        getKnownWindowsTreeDescendants(failedRefreshPgid).length,
+        2,
+        "Cached descendants must remain tracked when taskkill times out",
+      );
     } finally {
       clearKnownWindowsTreeDescendants(failedRefreshPgid);
     }

@@ -555,11 +555,9 @@ export function killProcessGroupTree(
         windowsHide: true,
       });
       taskkillConfirmed =
-        !tkRes ||
-        tkRes.status === null ||
-        tkRes.status === undefined ||
-        tkRes.status === 0 ||
-        tkRes.status === 128;
+        Boolean(tkRes) &&
+        !tkRes.error &&
+        (tkRes.status === 0 || tkRes.status === 128);
     } catch {
       let allSignaled = true;
       for (const p of pidsToKill) {
