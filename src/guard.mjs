@@ -2443,7 +2443,22 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
               continue;
             }
             if (!scanInSingle && ch === "$" && cmdBody[i + 1] === "{") {
-              const closeIdx = cmdBody.indexOf("}", i + 2);
+              let closeIdx = -1;
+              let braceDepth = 1;
+              for (let j = i + 2; j < cmdBody.length; j++) {
+                if (cmdBody[j] === "\\" && j + 1 < cmdBody.length) {
+                  j++;
+                  continue;
+                }
+                if (cmdBody[j] === "{") braceDepth++;
+                else if (cmdBody[j] === "}") {
+                  braceDepth--;
+                  if (braceDepth === 0) {
+                    closeIdx = j;
+                    break;
+                  }
+                }
+              }
               if (closeIdx !== -1) {
                 const inner = cmdBody.slice(i + 2, closeIdx);
                 const arrMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\](.*)$/);
@@ -2490,6 +2505,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           let arrInSingle = false;
           let arrInDouble = false;
           let aliasSeq = 0;
+          const exprToAlias = new Map();
           for (let i = 0; i < cmdBody.length; i++) {
             const ch = cmdBody[i];
             if (ch === "\\" && !arrInSingle && i + 1 < cmdBody.length) {
@@ -2508,7 +2524,22 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
               continue;
             }
             if (!arrInSingle && ch === "$" && cmdBody[i + 1] === "{") {
-              const closeIdx = cmdBody.indexOf("}", i + 2);
+              let closeIdx = -1;
+              let braceDepth = 1;
+              for (let j = i + 2; j < cmdBody.length; j++) {
+                if (cmdBody[j] === "\\" && j + 1 < cmdBody.length) {
+                  j++;
+                  continue;
+                }
+                if (cmdBody[j] === "{") braceDepth++;
+                else if (cmdBody[j] === "}") {
+                  braceDepth--;
+                  if (braceDepth === 0) {
+                    closeIdx = j;
+                    break;
+                  }
+                }
+              }
               if (closeIdx !== -1) {
                 const inner = cmdBody.slice(i + 2, closeIdx);
                 const arrMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\](.*)$/);
@@ -2528,17 +2559,40 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                     i = closeIdx;
                     continue;
                   }
-                  let aliasName;
-                  if (prefixOp === "#" && (subscript === "@" || subscript === "*")) {
-                    aliasName = `__atc_arr_${arrName}_len`;
-                  } else if (prefixOp === "!" && !modifier && subscript === "*") {
-                    aliasName = `__atc_arr_${arrName}_keys`;
-                  } else if (!prefixOp && !modifier && subscript === "*") {
-                    aliasName = `__atc_arr_${arrName}_all`;
-                  } else if (!prefixOp && !modifier && /^[A-Za-z0-9_]+$/.test(subscript)) {
-                    aliasName = `__atc_arr_${arrName}_${subscript}`;
-                  } else {
-                    aliasName = `__atc_arr_${arrName}_${aliasSeq++}`;
+                  let aliasName = exprToAlias.get(inner);
+                  if (!aliasName) {
+                    if (prefixOp === "#" && (subscript === "@" || subscript === "*")) {
+                      aliasName = `__atc_arr_${arrName}_len`;
+                    } else if (prefixOp === "!" && !modifier && subscript === "*") {
+                      aliasName = `__atc_arr_${arrName}_keys`;
+                    } else if (!prefixOp && !modifier && subscript === "*") {
+                      aliasName = `__atc_arr_${arrName}_all`;
+                    } else if (!prefixOp && !modifier && /^[A-Za-z0-9_]+$/.test(subscript)) {
+                      aliasName = `__atc_arr_${arrName}_${subscript}`;
+                    } else {
+                      aliasName = `__atc_arr_${arrName}_${aliasSeq++}`;
+                    }
+                    exprToAlias.set(inner, aliasName);
+                  }
+                  arrayEnvEntries.set(aliasName, inner);
+                  rewrittenArrBody += `\${${aliasName}}`;
+                  i = closeIdx;
+                  continue;
+                }
+                const scalarModMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)(.*)$/s);
+                if (
+                  scalarModMatch &&
+                  dynamicVarNames.has(scalarModMatch[2]) &&
+                  (scalarModMatch[1] !== "" || scalarModMatch[3] !== "")
+                ) {
+                  const [, prefixOp, varName, modifier] = scalarModMatch;
+                  let aliasName = exprToAlias.get(inner);
+                  if (!aliasName) {
+                    aliasName =
+                      prefixOp === "#" && !modifier
+                        ? `__atc_var_${varName}_len`
+                        : `__atc_var_${varName}_${aliasSeq++}`;
+                    exprToAlias.set(inner, aliasName);
                   }
                   arrayEnvEntries.set(aliasName, inner);
                   rewrittenArrBody += `\${${aliasName}}`;

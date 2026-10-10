@@ -8016,6 +8016,53 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       multiUnquotedArraysRedir.rewrittenCommand,
       /bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
     );
+
+    // 3g. Bash scalar parameter modifiers (${x^^}, ${x:0:2}, ${#x}) are evaluated in the outer shell so /bin/sh (dash) does not fail with Bad substitution
+    const bashScalarModRedir = evaluateCommandGuard(
+      'for x in foo; do adb shell echo "${x^^}" "${x:0:2}" "${#x}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bashScalarModRedir.allowed, true);
+    assert.match(
+      bashScalarModRedir.rewrittenCommand,
+      /do __atc_var_x_0="\$\{x\^\^\}" __atc_var_x_1="\$\{x:0:2\}" __atc_var_x_len="\$\{#x\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_var_x_0\}" "\$\{__atc_var_x_1\}" "\$\{__atc_var_x_len\}" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 1k. POSIX killProcessGroupTree does not report pgid in terminatedPgids when kill(-pgid) fails with EPERM and group remains alive
+    const posixEpermPgid = 780001;
+    const posixEpermRes = killProcessGroupTree(posixEpermPgid, "SIGKILL", {
+      platform: "darwin",
+      killFn: (target) => {
+        if (target === -posixEpermPgid) {
+          const eperm = new Error("Operation not permitted");
+          eperm.code = "EPERM";
+          throw eperm;
+        }
+        const esrch = new Error("No such process");
+        esrch.code = "ESRCH";
+        throw esrch;
+      },
+      runner: (cmd) => {
+        if (cmd === "ps") {
+          return {
+            status: 0,
+            stdout: `${posixEpermPgid} S\n`,
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.deepEqual(posixEpermRes, []);
+    assert.deepEqual(
+      posixEpermRes.terminatedPgids,
+      [],
+      "POSIX killProcessGroupTree must not confirm termination when kill(-pgid) returns EPERM and group remains alive",
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

@@ -350,6 +350,7 @@ export function isProcessGroupAlive(
     livenessCheck = isPidAlive,
   } = options;
   const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+  const killFn = options.killFn || process.kill.bind(process);
 
   if (pgidOrLease && typeof pgidOrLease === "object") {
     const targetLease = pgidOrLease;
@@ -367,6 +368,7 @@ export function isProcessGroupAlive(
         spawnSyncFn,
         platform,
         livenessCheck,
+        killFn,
       }),
     );
   }
@@ -409,7 +411,7 @@ export function isProcessGroupAlive(
     return false;
   }
   try {
-    process.kill(-pgid, 0);
+    killFn(-pgid, 0);
   } catch (err) {
     if (!err || err.code !== "EPERM") return false;
   }
@@ -604,14 +606,30 @@ export function killProcessGroupTree(
     return withTerminatedPgids(pidsToKill, [childPid]);
   }
 
+  const killFn = options.killFn || process.kill.bind(process);
+  let groupSignaled = false;
+  let groupMissing = false;
   try {
-    process.kill(-childPid, signal);
-  } catch {
+    killFn(-childPid, signal);
+    groupSignaled = true;
+  } catch (groupErr) {
+    groupMissing = Boolean(groupErr && groupErr.code === "ESRCH");
     try {
-      process.kill(childPid, signal);
-    } catch {
-      // Ignore
+      killFn(childPid, signal);
+      if (groupMissing) {
+        groupSignaled = true;
+      }
+    } catch (pidErr) {
+      if (groupMissing && pidErr && pidErr.code === "ESRCH") {
+        groupSignaled = true;
+      }
     }
+  }
+  if (
+    !groupSignaled &&
+    isProcessGroupAlive(childPid, { allowSubprocess: true, spawnSyncFn, platform, killFn })
+  ) {
+    return withTerminatedPgids([], []);
   }
   return withTerminatedPgids([childPid], [childPid]);
 }
