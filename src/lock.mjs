@@ -167,15 +167,14 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
       const isSameProcessInstance = (pid, expectedCreation, prevAlive = true) => {
         if (!alivePids.has(pid)) return false;
         if (prevAlive === false || expectedCreation === "__exited__") return false;
-        if (!expectedCreation) return true;
         const actualCreation = creationByPid.get(pid) ?? null;
         if (!actualCreation) return false;
+        if (!expectedCreation) return true;
         return actualCreation === expectedCreation;
       };
       const isIdentityUnverifiable = (pid, expectedCreation, prevAlive = true) =>
         alivePids.has(pid) &&
         prevAlive !== false &&
-        Boolean(expectedCreation) &&
         expectedCreation !== "__exited__" &&
         !creationByPid.get(pid);
       for (const rawPgid of pgids || []) {
@@ -263,6 +262,10 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
           for (const kid of kids) {
             const prevKidMeta = prevKnown.get(kid);
             const expectedKidCreation = prevKidMeta?.creationDate ?? null;
+            if (isIdentityUnverifiable(kid, expectedKidCreation, prevKidMeta?.alive)) {
+              hasUnverifiableIdentity = true;
+              break;
+            }
             if (isSameProcessInstance(kid, expectedKidCreation, prevKidMeta?.alive)) {
               liveMembers.add(kid);
               nextKnown.set(kid, {
@@ -276,6 +279,11 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
               }
             }
           }
+          if (hasUnverifiableIdentity) break;
+        }
+        if (hasUnverifiableIdentity) {
+          result.set(pgid, triState ? null : true);
+          continue;
         }
 
         if (liveMembers.size > 0) {

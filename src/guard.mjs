@@ -2493,6 +2493,41 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                       }
                     }
                   }
+                } else {
+                  const scalarModMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)(.*)$/s);
+                  if (
+                    scalarModMatch &&
+                    dynamicVarNames.has(scalarModMatch[2]) &&
+                    scalarModMatch[1] === "!" &&
+                    (scalarModMatch[3] === "@" || (scalarModMatch[3] === "*" && !scanInDouble))
+                  ) {
+                    const [, prefixOp, varName, modifier] = scalarModMatch;
+                    const baseKey = `${prefixOp}${varName}@`;
+                    if (!atExprMap.has(baseKey)) {
+                      const entry = {
+                        idx: atArrayExprs.length,
+                        inner,
+                        baseKey,
+                        prefixOp,
+                        arrName: varName,
+                        subscript: modifier,
+                        modifier: "",
+                        isPrefixExpansion: true,
+                        quoted: scanInDouble,
+                        hasUnquoted: !scanInDouble,
+                      };
+                      atExprMap.set(baseKey, entry);
+                      atArrayExprs.push(entry);
+                    } else {
+                      const existing = atExprMap.get(baseKey);
+                      if (!scanInDouble) {
+                        existing.hasUnquoted = true;
+                      }
+                      if (inner !== existing.inner || scanInDouble !== existing.quoted) {
+                        existing.hasDistinctModifier = true;
+                      }
+                    }
+                  }
                 }
                 i = closeIdx;
               }
@@ -2590,6 +2625,20 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                   (scalarModMatch[1] !== "" || scalarModMatch[3] !== "")
                 ) {
                   const [, prefixOp, varName, modifier] = scalarModMatch;
+                  const isPositionalPrefix =
+                    prefixOp === "!" &&
+                    (modifier === "@" || (modifier === "*" && !arrInDouble));
+                  if (isPositionalPrefix) {
+                    if (singleAtExpr) {
+                      rewrittenArrBody += arrInDouble ? "$@" : '"$@"';
+                    } else {
+                      const baseKey = `${prefixOp}${varName}@`;
+                      const entry = atExprMap.get(baseKey);
+                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
+                    }
+                    i = closeIdx;
+                    continue;
+                  }
                   if (!arrInDouble && prefixOp !== "#") {
                     hasUnquotedAlias = true;
                   }
@@ -2634,9 +2683,10 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           const prelude =
             ifsPrelude +
             atArrayExprs
-              .map(
-                (entry) =>
-                  `__atc_n=$1; shift; __atc_arr_at_${entry.idx}=("\${@:1:$__atc_n}"); shift "$__atc_n"`,
+              .map((entry) =>
+                entry.isPrefixExpansion
+                  ? `__atc_arr_at_${entry.idx}=(); while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do __atc_arr_at_${entry.idx}+=("$1"); shift; done; [ "$#" -gt 0 ] && shift`
+                  : `__atc_n=$1; shift; __atc_arr_at_${entry.idx}=("\${@:1:$__atc_n}"); shift "$__atc_n"`,
               )
               .join("; ") +
             "; ";
@@ -2645,7 +2695,11 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           const trailingArrays =
             ifsArgs +
             atArrayExprs
-              .map((entry) => `"\${#${entry.arrName}[@]}" "\${${entry.baseKey}}"`)
+              .map((entry) =>
+                entry.isPrefixExpansion
+                  ? `"\${${entry.baseKey}}" "--"`
+                  : `"\${#${entry.arrName}[@]}" "\${${entry.baseKey}}"`,
+              )
               .join(" ");
           return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- bash -c ${escaped} bash ${trailingArrays}${suffix}`;
         }

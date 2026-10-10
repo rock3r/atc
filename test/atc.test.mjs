@@ -8118,6 +8118,88 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     } finally {
       clearKnownWindowsTreeDescendants(unobservedReusePgid);
     }
+
+    // 1m. Newly discovered Windows root or child PID with missing/null CreationDate is rejected and not cached as creationDate: null
+    const nullInitialPgid = 800001;
+    clearKnownWindowsTreeDescendants(nullInitialPgid);
+    try {
+      const firstNullQuery = queryWindowsProcessGroups(
+        [nullInitialPgid],
+        () => ({
+          status: 0,
+          stdout: JSON.stringify([
+            { ProcessId: nullInitialPgid, ParentProcessId: 4000, CreationDate: null },
+          ]),
+          stderr: "",
+        }),
+        { triState: true },
+      );
+      assert.equal(
+        firstNullQuery.get(nullInitialPgid),
+        null,
+        "Initial snapshot with null CreationDate on live root PID must be treated as unverifiable (null in triState mode)",
+      );
+      assert.deepEqual(
+        getKnownWindowsTreeDescendants(nullInitialPgid),
+        [],
+        "PID with missing CreationDate must not be cached with creationDate: null",
+      );
+
+      // Child discovered via BFS with null CreationDate also marks snapshot unverifiable without caching creationDate: null
+      const bfsNullQuery = queryWindowsProcessGroups(
+        [nullInitialPgid],
+        () => ({
+          status: 0,
+          stdout: JSON.stringify([
+            { ProcessId: nullInitialPgid, ParentProcessId: 4000, CreationDate: "20261010230000.000000+000" },
+            { ProcessId: 800002, ParentProcessId: nullInitialPgid, CreationDate: null },
+          ]),
+          stderr: "",
+        }),
+        { triState: true },
+      );
+      assert.equal(
+        bfsNullQuery.get(nullInitialPgid),
+        null,
+        "Child discovered via BFS with null CreationDate must mark snapshot unverifiable",
+      );
+      assert.deepEqual(
+        getKnownWindowsTreeDescendants(nullInitialPgid),
+        [],
+        "Partial tree with unverifiable child CreationDate must not be cached",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(nullInitialPgid);
+    }
+
+    // 3i. Bash prefix-name expansions ("${!x@}" and unquoted ${!x*}) preserve multi-word positional arguments
+    const prefixNameAtRedir = evaluateCommandGuard(
+      'for x in ignored; do adb shell printf "%s\\n" "${!x@}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(prefixNameAtRedir.allowed, true);
+    assert.match(
+      prefixNameAtRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell printf "%s\\n" "\$@" > \/tmp\/out\.txt' sh "\$\{!x@\}" ; done$/,
+    );
+
+    const prefixNameUnquotedStarRedir = evaluateCommandGuard(
+      'for x in ignored; do adb shell printf "%s\\n" ${!x*} > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(prefixNameUnquotedStarRedir.allowed, true);
+    assert.match(
+      prefixNameUnquotedStarRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell printf "%s\\n" "\$@" > \/tmp\/out\.txt' sh \$\{!x\*\} ; done$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
