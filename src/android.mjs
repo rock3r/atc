@@ -210,7 +210,13 @@ export function parseAndroidEmulatorListOutput(stdout) {
   const lines = String(stdout).split(/\r?\n/);
   for (const raw of lines) {
     const line = raw.trim();
-    if (!line || line.startsWith("AVD") || line.startsWith("---") || line.startsWith("No ")) {
+    if (
+      !line ||
+      /^AVD(?:\s+NAME)?\s+(?:STATUS|STATE|SERIAL|API)\b/i.test(line) ||
+      /^AVD$/i.test(line) ||
+      line.startsWith("---") ||
+      line.startsWith("No ")
+    ) {
       continue;
     }
     const tokens = line.split(/\s+/).filter(Boolean);

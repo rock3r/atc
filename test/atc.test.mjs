@@ -2465,6 +2465,81 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           } finally {
             fs.rmSync(collisionDir, { recursive: true, force: true });
           }
+
+          // 4. POSIX emulator start keeps polling discoverFleet when serial appears on second refresh
+          const posixPollDir = makeTempStateDir();
+          try {
+            let listCalls = 0;
+            const posixPollRes = cmdClaim(
+              posixPollDir,
+              { session: "posix-poll-sess", avd: "Pixel_8_API_35", force: true, wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  running: [],
+                  offline: [
+                    {
+                      deviceKey: "avd:Pixel_8_API_35",
+                      kind: "emulator",
+                      avd: "Pixel_8_API_35",
+                      serial: null,
+                      online: false,
+                      profile: { deviceType: "phone", apiLevel: "android-35", numericApi: 35, hasPlayStore: true },
+                      snapshots: [],
+                    },
+                  ],
+                  creatable: [],
+                },
+                runner: (cmd, args) => {
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    // Return without printing emulator-<port> so serial discovery must poll discoverFleet
+                    return { status: 0, stdout: "Started successfully\n", stderr: "" };
+                  }
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+                    listCalls += 1;
+                    if (listCalls === 1) {
+                      return {
+                        status: 0,
+                        stdout: "AVD                 Status    Serial          API\nPixel_8_API_35      offline   -               android-35\n",
+                        stderr: "",
+                      };
+                    }
+                    return {
+                      status: 0,
+                      stdout: "AVD                 Status    Serial          API\nPixel_8_API_35      online    emulator-5554   android-35\n",
+                      stderr: "",
+                    };
+                  }
+                  if (cmd === "adb" && args[0] === "devices") {
+                    return {
+                      status: 0,
+                      stdout:
+                        listCalls >= 2
+                          ? "List of devices attached\nemulator-5554\tdevice\n"
+                          : "List of devices attached\n",
+                      stderr: "",
+                    };
+                  }
+                  return { status: 0, stdout: "", stderr: "" };
+                },
+              },
+            );
+            assert.equal(posixPollRes.exitCode, 0);
+            assert.equal(posixPollRes.lease.serial, "emulator-5554");
+            assert.ok(listCalls >= 2);
+          } finally {
+            fs.rmSync(posixPollDir, { recursive: true, force: true });
+          }
+
+          // 5. parseAndroidEmulatorListOutput preserves AVD identifiers starting with "AVD" while skipping the header row
+          const avdPrefixList = parseAndroidEmulatorListOutput(
+            "AVD                 Status    Serial          API\nAVD_Pixel_9         online    emulator-5558   android-36\n",
+          );
+          assert.equal(avdPrefixList.length, 1);
+          assert.equal(avdPrefixList[0].avd, "AVD_Pixel_9");
+          assert.equal(avdPrefixList[0].online, true);
+          assert.equal(avdPrefixList[0].serial, "emulator-5558");
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }

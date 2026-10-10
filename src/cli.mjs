@@ -1169,15 +1169,15 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 
       const serialMatch = (bootRes.stdout || "").match(/\b(emulator-\d+)\b/);
       resolvedSerial = serialMatch ? serialMatch[1] : resolvedSerial;
-      const pollDeadline = Date.now() + bootTimeoutMs;
+      const pollDeadline = Date.now() + (bootTimeoutMs || 60_000);
       while (!resolvedSerial) {
         const refreshed = discoverFleet({ runner, avdHome });
         const booted = (refreshed.running || []).find(
           (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
         );
         resolvedSerial = booted?.serial || null;
-        if (resolvedSerial || !isWin || Date.now() >= pollDeadline) break;
-        sleepSync(500);
+        if (resolvedSerial || Date.now() >= pollDeadline) break;
+        sleepSync(250);
       }
       if (!resolvedSerial) {
         throw new Error(
