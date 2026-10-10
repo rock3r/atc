@@ -4,6 +4,7 @@ Coordinate exclusive Android emulator (AVD) and physical USB/Wi-Fi device leases
 
 - **Design Specification:** [https://specs.sebastiano.dev/atc/](https://specs.sebastiano.dev/atc/) ([`DESIGN.md`](./DESIGN.md))
 - **User Guide:** [`docs/user-guide.md`](./docs/user-guide.md)
+- **Architecture:** [`docs/architecture.md`](./docs/architecture.md)
 - **License:** Apache-2.0
 
 | Part | What it is |
@@ -85,3 +86,17 @@ The [user guide](docs/user-guide.md) walks through profile matching, QEMU snapsh
 | `atc guard [--format=json] <command>` | Evaluate whether a shell command is safe, requires `atc exec` rewriting, or violates device/lifecycle guardrails |
 | `atc hook <pre-tool-use\|stop>` | Agent lifecycle hook handler for Claude Code, Codex, Gemini CLI, Antigravity, and Cursor |
 | `atc mcp` | Start the zero-dependency JSON-RPC stdio MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`) |
+
+## Documentation
+
+- [User guide](docs/user-guide.md): installation, profile matching, QEMU snapshots, multi-agent coordination, physical device safety, and troubleshooting.
+- [Architecture](docs/architecture.md): how the CLI, lock boundary, fleet discovery, warm-affinity queue, and hooks fit together, for contributors modifying the code.
+- [Design specification](DESIGN.md): full formal specification ([live spec](https://specs.sebastiano.dev/atc/)).
+
+## Development
+
+```bash
+npm test
+npm run check
+```
+

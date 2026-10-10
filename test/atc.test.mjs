@@ -7041,11 +7041,18 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     const userGuideText = fs.readFileSync(new URL("docs/user-guide.md", rootDir), "utf8");
     assert.match(userGuideText, /# `atc` user guide/);
     assert.match(userGuideText, /atc guide/);
+    const archText = fs.readFileSync(new URL("docs/architecture.md", rootDir), "utf8");
+    assert.match(archText, /# atc architecture/);
+    assert.match(archText, /atc\.lock/);
 
     const agentPlugin = JSON.parse(fs.readFileSync(new URL("plugin.json", rootDir), "utf8"));
     assert.equal(agentPlugin.name, "atc");
     assert.equal(agentPlugin.skills, "./skills/");
     assert.equal(agentPlugin.hooks, "./hooks/hooks.json");
+
+    const agentsMarketplace = JSON.parse(fs.readFileSync(new URL(".agents/plugins/marketplace.json", rootDir), "utf8"));
+    assert.equal(agentsMarketplace.name, "atc");
+    assert.ok(Array.isArray(agentsMarketplace.plugins) && agentsMarketplace.plugins[0].name === "atc");
 
     const claudePlugin = JSON.parse(fs.readFileSync(new URL(".claude-plugin/plugin.json", rootDir), "utf8"));
     assert.equal(claudePlugin.name, "atc");
