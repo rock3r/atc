@@ -42,10 +42,14 @@ export function resolveAtcExecutable(
   platform: string = process.platform
 ): { executable: string; isBatch: boolean } {
   const resolvedCwd = path.resolve(cwd);
+  const isOutsideCwd = (p: string) => {
+    const rp = path.resolve(p);
+    return rp !== resolvedCwd && !rp.startsWith(resolvedCwd + path.sep);
+  };
   const pathDirs = (env.PATH || env.Path || "")
     .split(path.delimiter)
     .map((d) => d.trim())
-    .filter((d) => Boolean(d) && path.isAbsolute(d) && path.resolve(d) !== resolvedCwd);
+    .filter((d) => Boolean(d) && path.isAbsolute(d) && isOutsideCwd(d));
 
   if (platform !== "win32") {
     pathDirs.push(
@@ -105,10 +109,14 @@ export function buildAtcSpawnConfig(
   const platform = options.platform || process.platform;
   const resolved = resolveAtcExecutable(env, cwd, platform);
   const resolvedCwd = path.resolve(cwd);
+  const isOutsideCwd = (p: string) => {
+    const rp = path.resolve(p);
+    return rp !== resolvedCwd && !rp.startsWith(resolvedCwd + path.sep);
+  };
   const safePath = (env.PATH || env.Path || "")
     .split(path.delimiter)
     .map((d: string) => d.trim())
-    .filter((d: string) => Boolean(d) && path.isAbsolute(d) && path.resolve(d) !== resolvedCwd)
+    .filter((d: string) => Boolean(d) && path.isAbsolute(d) && isOutsideCwd(d))
     .join(path.delimiter);
   const spawnEnv = {
     ...env,

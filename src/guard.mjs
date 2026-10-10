@@ -205,20 +205,101 @@ function splitOutsideQuotes(str, sepType) {
   return parts;
 }
 
+function extractCommandSubstitutions(str, innerSubstitutions) {
+  let out = "";
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === "\\" && !inSingle && i + 1 < str.length) {
+      out += ch + str[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+    if (
+      !inSingle &&
+      (ch === "$" || ch === "<" || ch === ">") &&
+      str[i + 1] === "(" &&
+      str[i + 2] !== "("
+    ) {
+      let depth = 1;
+      let j = i + 2;
+      let subSingle = false;
+      let subDouble = false;
+      while (j < str.length && depth > 0) {
+        const c = str[j];
+        if (c === "\\" && !subSingle && j + 1 < str.length) {
+          j += 2;
+          continue;
+        }
+        if (c === "'" && !subDouble) {
+          subSingle = !subSingle;
+        } else if (c === '"' && !subSingle) {
+          subDouble = !subDouble;
+        } else if (!subSingle && !subDouble) {
+          if (c === "(") depth++;
+          else if (c === ")") depth--;
+        }
+        j++;
+      }
+      if (depth === 0) {
+        const rawInner = str.slice(i + 2, j - 1);
+        const expandedInner = extractCommandSubstitutions(rawInner, innerSubstitutions);
+        innerSubstitutions.push(expandedInner);
+        if (classifySegment(expandedInner).kind === "ignore") {
+          const tokenMatch = String(expandedInner).match(FAST_PATH_REGEX);
+          out += tokenMatch ? tokenMatch[1] : "";
+        } else {
+          out += "__atc_cmd_sub__";
+        }
+        i = j - 1;
+        continue;
+      }
+    }
+    if (!inSingle && ch === "`") {
+      let j = i + 1;
+      while (j < str.length && str[j] !== "`") {
+        if (str[j] === "\\" && j + 1 < str.length) {
+          j += 2;
+          continue;
+        }
+        j++;
+      }
+      if (j < str.length && str[j] === "`") {
+        const rawInner = str.slice(i + 1, j);
+        const expandedInner = extractCommandSubstitutions(rawInner, innerSubstitutions);
+        innerSubstitutions.push(expandedInner);
+        if (classifySegment(expandedInner).kind === "ignore") {
+          const tokenMatch = String(expandedInner).match(FAST_PATH_REGEX);
+          out += tokenMatch ? tokenMatch[1] : "";
+        } else {
+          out += "__atc_cmd_sub__";
+        }
+        i = j;
+        continue;
+      }
+    }
+    out += ch;
+  }
+
+  return out;
+}
+
 export function splitShellSegments(command) {
   if (!command || typeof command !== "string") return [];
   const innerSubstitutions = [];
-  const replaceSub = (_full, inner) => {
-    innerSubstitutions.push(inner);
-    if (classifySegment(inner).kind === "ignore") {
-      const tokenMatch = String(inner).match(FAST_PATH_REGEX);
-      return tokenMatch ? tokenMatch[1] : "";
-    }
-    return "__atc_cmd_sub__";
-  };
-  const inlineExpanded = command
-    .replace(/(?:\$|<|>)\(([^)]+)\)/g, replaceSub)
-    .replace(/`([^`]+)`/g, replaceSub);
+  const inlineExpanded = extractCommandSubstitutions(command, innerSubstitutions);
   const normalized =
     innerSubstitutions.length > 0
       ? `${inlineExpanded} ; ${innerSubstitutions.join(" ; ")}`

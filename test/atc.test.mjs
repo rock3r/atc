@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -3907,6 +3908,81 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               subshellRewrite.rewrittenCommand,
               "(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop ; echo ok) && (echo pre ; ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop)",
             );
+
+            // 45. Nested command substitutions are parsed with balanced parentheses for both policy enforcement and rewriting
+            const nestedSubDenied = evaluateCommandGuard(
+              "value=$(echo $(adb shell getprop foo))",
+              {
+                sessionId: "unleased-sess",
+                activeLeases: [],
+                runningCount: 1,
+                platform: "darwin",
+              },
+            );
+            assert.equal(nestedSubDenied.allowed, false);
+
+            const nestedSubRewrite = evaluateCommandGuard(
+              'value=$(echo $(adb shell getprop foo)); echo "$value"',
+              {
+                sessionId: "target-sess",
+                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+                runningCount: 1,
+                platform: "darwin",
+              },
+            );
+            assert.equal(nestedSubRewrite.allowed, true);
+            assert.equal(
+              nestedSubRewrite.rewrittenCommand,
+              'value=$(echo $(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop foo)) ; echo "$value"',
+            );
+
+            // 46. `atc free` rejects extra positional targets instead of ignoring them
+            const extraFreeExit = await runCli(["free", "lease-a", "lease-b"], {
+              ...process.env,
+              ATC_STATE_DIR: coldRediscoverDir,
+            });
+            assert.equal(extraFreeExit, 1);
+
+            // 47. hooks/hooks.json strips workspace-local PATH entries (e.g. <checkout>/node_modules/.bin) before launching node
+            if (process.platform !== "win32") {
+              const evilWorkDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-evil-hook-cwd-"));
+              try {
+                const evilNodeBinDir = path.join(evilWorkDir, "node_modules", ".bin");
+                fs.mkdirSync(evilNodeBinDir, { recursive: true });
+                const evilNodePath = path.join(evilNodeBinDir, "node");
+                fs.writeFileSync(evilNodePath, "#!/bin/sh\necho EVIL_NODE_EXECUTED >&2\nexit 99\n");
+                fs.chmodSync(evilNodePath, 0o755);
+
+                const hooksCfg = JSON.parse(
+                  fs.readFileSync(new URL("../hooks/hooks.json", import.meta.url), "utf8"),
+                );
+                const preHookCmd = hooksCfg.hooks.PreToolUse[0].hooks[0].command;
+                const repoRoot = path.resolve(
+                  path.dirname(new URL(import.meta.url).pathname),
+                  "..",
+                );
+                const hookRun = spawnSync("/bin/sh", ["-c", preHookCmd], {
+                  cwd: evilWorkDir,
+                  input: JSON.stringify({
+                    session_id: "hook-safe-node-sess",
+                    tool_name: "Bash",
+                    tool_input: { command: "adb shell getprop" },
+                  }),
+                  env: {
+                    ...process.env,
+                    ATC_STATE_DIR: coldRediscoverDir,
+                    CLAUDE_PLUGIN_ROOT: repoRoot,
+                    PATH: `${evilWorkDir}:${evilNodeBinDir}:${path.dirname(process.execPath)}:${process.env.PATH || ""}`,
+                  },
+                  encoding: "utf8",
+                });
+                assert.notEqual(hookRun.status, 99);
+                assert.equal(hookRun.stderr.includes("EVIL_NODE_EXECUTED"), false);
+                assert.equal(hookRun.status, 2);
+              } finally {
+                fs.rmSync(evilWorkDir, { recursive: true, force: true });
+              }
+            }
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

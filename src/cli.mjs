@@ -2976,6 +2976,15 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "free": {
+      if (
+        parsed.positionals.length > 1 ||
+        (parsed.positionals.length > 0 && parsed.flags.target !== undefined)
+      ) {
+        const extra =
+          parsed.positionals.length > 1 ? parsed.positionals[1] : parsed.positionals[0];
+        process.stderr.write(`[atc] Unexpected argument "${extra}" for "atc free".\n`);
+        return 1;
+      }
       const targetArg =
         parsed.positionals[0] ||
         (typeof parsed.flags.target === "string" ? parsed.flags.target : null);
@@ -2997,6 +3006,15 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "renew": {
+      if (
+        parsed.positionals.length > 1 ||
+        (parsed.positionals.length > 0 && parsed.flags.target !== undefined)
+      ) {
+        const extra =
+          parsed.positionals.length > 1 ? parsed.positionals[1] : parsed.positionals[0];
+        process.stderr.write(`[atc] Unexpected argument "${extra}" for "atc renew".\n`);
+        return 1;
+      }
       const targetArg =
         parsed.positionals[0] ||
         (typeof parsed.flags.target === "string" ? parsed.flags.target : null);
@@ -3010,6 +3028,15 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "snapshot": {
+      if (
+        parsed.positionals.length > 2 ||
+        (parsed.positionals[0] === "list" && parsed.positionals.length > 1)
+      ) {
+        const extra =
+          parsed.positionals[0] === "list" ? parsed.positionals[1] : parsed.positionals[2];
+        process.stderr.write(`[atc] Unexpected argument "${extra}" for "atc snapshot".\n`);
+        return 1;
+      }
       const [action, name] = parsed.positionals;
       const res = cmdSnapshot(stateDir, action, name, parsed.flags, { env });
       if (res.exitCode !== 0) {
@@ -3031,6 +3058,12 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "status": {
+      if (parsed.positionals.length > 0) {
+        process.stderr.write(
+          `[atc] Unexpected argument "${parsed.positionals[0]}" for "atc status".\n`,
+        );
+        return 1;
+      }
       const res = cmdStatus(stateDir, parsed.flags, { env });
       if (res.exitCode !== 0) {
         process.stderr.write(`[atc] ${res.error}\n`);
@@ -3057,6 +3090,15 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
         process.stderr.write(`[atc] ${unknownFlagErr}\n`);
         return 1;
       }
+      if (
+        parsed.positionals.length > 3 ||
+        (parsed.positionals[0] === "get" && parsed.positionals.length > 2)
+      ) {
+        const extra =
+          parsed.positionals[0] === "get" ? parsed.positionals[2] : parsed.positionals[3];
+        process.stderr.write(`[atc] Unexpected argument "${extra}" for "atc config".\n`);
+        return 1;
+      }
       const [action, key, val] = parsed.positionals;
       const res = cmdConfig(stateDir, action, key, val);
       if (res.exitCode !== 0) {
@@ -3071,6 +3113,12 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
       const unknownFlagErr = validateCommandFlags(parsed.flags, COMMON_ALLOWED_FLAGS, "gc");
       if (unknownFlagErr) {
         process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
+      if (parsed.positionals.length > 0) {
+        process.stderr.write(
+          `[atc] Unexpected argument "${parsed.positionals[0]}" for "atc gc".\n`,
+        );
         return 1;
       }
       const res = cmdGc(stateDir);
@@ -3110,6 +3158,12 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
         process.stderr.write(`[atc] ${unknownFlagErr}\n`);
         return 1;
       }
+      if (parsed.positionals.length > 1) {
+        process.stderr.write(
+          `[atc] Unexpected argument "${parsed.positionals[1]}" for "atc hook".\n`,
+        );
+        return 1;
+      }
       const hookType = String(parsed.positionals[0] || "pre-tool-use").toLowerCase();
       const rawStdin = readStdinSync();
       if (
@@ -3132,6 +3186,12 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
       const unknownFlagErr = validateCommandFlags(parsed.flags, COMMON_ALLOWED_FLAGS, "mcp");
       if (unknownFlagErr) {
         process.stderr.write(`[atc] ${unknownFlagErr}\n`);
+        return 1;
+      }
+      if (parsed.positionals.length > 0) {
+        process.stderr.write(
+          `[atc] Unexpected argument "${parsed.positionals[0]}" for "atc mcp".\n`,
+        );
         return 1;
       }
       await startMcpServer(stateDir);
