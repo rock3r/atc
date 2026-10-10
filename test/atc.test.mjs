@@ -4469,6 +4469,10 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             if (cmd === "adb" && args[0] === "devices") {
               adbPollCount += 1;
               if (adbPollCount === 1) {
+                // Failed discovery probe must not be treated as confirmed shutdown
+                return { status: 1, stdout: "", stderr: "adb server error\n" };
+              }
+              if (adbPollCount === 2) {
                 return {
                   status: 0,
                   stdout: "List of devices attached\nemulator-5564\tdevice\n",
@@ -4485,7 +4489,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         },
       );
       assert.equal(freeWin.exitCode, 0);
-      assert.ok(adbPollCount >= 2);
+      assert.ok(adbPollCount >= 3);
     } finally {
       fs.rmSync(winShutdownDir, { recursive: true, force: true });
       fs.rmSync(relocatedRoot, { recursive: true, force: true });

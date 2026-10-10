@@ -428,11 +428,16 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const fleet = discoverFleet({ runner, avdHome });
-    const stillRunning = (fleet.running || []).some(
-      (d) =>
-        d.kind === "emulator" &&
-        ((serial && d.serial === serial) || (avd && d.avd === avd)),
+    const probesOk = Boolean(
+      fleet.probes?.adbDevicesOk && fleet.probes?.emulatorListOk,
     );
+    const stillRunning =
+      !probesOk ||
+      (fleet.running || []).some(
+        (d) =>
+          d.kind === "emulator" &&
+          ((serial && d.serial === serial) || (avd && d.avd === avd)),
+      );
     let hasLockFiles = false;
     if (avd && avdHome) {
       try {
@@ -444,7 +449,7 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
             .some((entry) => entry.endsWith(".lock"));
         }
       } catch {
-        // Ignore transient directory read errors while QEMU exits
+        hasLockFiles = true;
       }
     }
     if (!stillRunning && !hasLockFiles) {
