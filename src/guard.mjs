@@ -2371,6 +2371,30 @@ function extractStageLoopVariables(stageText) {
 const BASH_SPECIAL_VAR_RE =
   /^(?:RANDOM|SRANDOM|SECONDS|EPOCHSECONDS|EPOCHREALTIME|LINENO|BASH|BASHOPTS|BASHPID|BASH_[A-Z0-9_]+|UID|EUID|GROUPS|HOSTNAME|HOSTTYPE|OSTYPE|MACHTYPE|SHELLOPTS|SHLVL|PPID|DIRSTACK|FUNCNAME|HISTCMD|MAPFILE|PIPESTATUS|COMP_[A-Z0-9_]+)$/;
 
+const BASH_CALLER_SNAPSHOT_VARS = new Set([
+  "PIPESTATUS",
+  "FUNCNAME",
+  "BASH_SOURCE",
+  "BASH_LINENO",
+  "BASH_ARGV",
+  "BASH_ARGC",
+  "BASH_REMATCH",
+  "MAPFILE",
+  "DIRSTACK",
+  "COMP_WORDS",
+  "COMP_CWORD",
+  "COMP_LINE",
+  "COMP_POINT",
+  "COMP_TYPE",
+  "COMP_KEY",
+  "COMP_WORDBREAKS",
+  "PPID",
+  "BASHOPTS",
+  "SHELLOPTS",
+  "BASH_COMMAND",
+  "BASH_EXECUTION_STRING",
+]);
+
 const BASH_DYNAMIC_SPECIAL_VARS = new Set([
   "RANDOM",
   "SRANDOM",
@@ -2383,6 +2407,7 @@ const BASH_DYNAMIC_SPECIAL_VARS = new Set([
   "SHLVL",
   "HISTCMD",
   "GLOBIGNORE",
+  ...BASH_CALLER_SNAPSHOT_VARS,
 ]);
 
 function extractReferencedBashSpecialVars(cmdBody) {
@@ -3657,6 +3682,7 @@ function rewriteCompoundCommand(
         if (isSimpleStage) {
           return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
+        const specialBashRefs = extractReferencedBashSpecialVars(cmdBody);
         const dynamicVarNames = new Set(
           Object.keys(shellVars).filter(
             (k) =>
@@ -3666,6 +3692,15 @@ function rewriteCompoundCommand(
               !Object.prototype.hasOwnProperty.call(staticShellVars, k),
           ),
         );
+        for (const v of specialBashRefs.vars) {
+          if (
+            BASH_CALLER_SNAPSHOT_VARS.has(v) &&
+            !specialBashRefs.assigned.has(v) &&
+            !(v === "BASH_REMATCH" && /\[\[[^\]]*=~/.test(cmdBody))
+          ) {
+            dynamicVarNames.add(v);
+          }
+        }
         const arrayEnvEntries = new Map();
         const exprToAlias = new Map();
         let aliasSeq = 0;
@@ -3824,7 +3859,11 @@ function rewriteCompoundCommand(
                       }
                     }
                   }
-                  if (scalarModMatch[1] !== "" || scalarModMatch[3] !== "") {
+                  if (
+                    scalarModMatch[1] !== "" ||
+                    scalarModMatch[3] !== "" ||
+                    BASH_CALLER_SNAPSHOT_VARS.has(scalarModMatch[2])
+                  ) {
                     i = closeIdx;
                     continue;
                   }
@@ -3941,7 +3980,11 @@ function rewriteCompoundCommand(
                   scalarModMatch &&
                   (dynamicVarNames.has(scalarModMatch[2]) || isPrefixMatch)
                 ) {
-                  if (scalarModMatch[1] !== "" || scalarModMatch[3] !== "") {
+                  if (
+                    scalarModMatch[1] !== "" ||
+                    scalarModMatch[3] !== "" ||
+                    BASH_CALLER_SNAPSHOT_VARS.has(scalarModMatch[2])
+                  ) {
                     const [, prefixOp, varName, modifier] = scalarModMatch;
                     const isPositionalPrefix =
                       prefixOp === "!" &&
@@ -3968,7 +4011,9 @@ function rewriteCompoundCommand(
                       const preferredAlias =
                         prefixOp === "#" && !modifier
                           ? `__atc_var_${varName}_len`
-                          : `__atc_var_${varName}_${aliasSeq++}`;
+                          : !prefixOp && !modifier
+                            ? `__atc_var_${varName}`
+                            : `__atc_var_${varName}_${aliasSeq++}`;
                       const aliasName = allocateEnvAlias(inner, preferredAlias);
                       rewrittenArrBody += `\${${aliasName}}`;
                       i = closeIdx;
@@ -3980,10 +4025,19 @@ function rewriteCompoundCommand(
                   }
                 }
               }
-            } else if (!arrInSingle && !arrInDouble && ch === "$") {
+            } else if (!arrInSingle && ch === "$") {
               const plainVarMatch = cmdBody.slice(i + 1).match(/^([A-Za-z_][A-Za-z0-9_]*)/);
               if (plainVarMatch && dynamicVarNames.has(plainVarMatch[1])) {
-                hasUnquotedAlias = true;
+                if (!arrInDouble) {
+                  hasUnquotedAlias = true;
+                }
+                if (BASH_CALLER_SNAPSHOT_VARS.has(plainVarMatch[1])) {
+                  const varName = plainVarMatch[1];
+                  const aliasName = allocateEnvAlias(varName, `__atc_var_${varName}`);
+                  rewrittenArrBody += `\${${aliasName}}`;
+                  i += varName.length;
+                  continue;
+                }
               }
             }
             rewrittenArrBody += ch;
@@ -4048,17 +4102,27 @@ function rewriteCompoundCommand(
                   i + startOffset,
                   isBracketArith ? j : j - 1,
                 );
-                const rewrittenArithInner = rawArithInner.replace(
-                  /(?<![${A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]/g,
-                  (full, arrName, subscript) => {
-                    if (!dynamicVarNames.has(arrName)) return full;
-                    const expr = `${arrName}[${subscript}]`;
-                    const preferredAlias = /^[A-Za-z0-9_]+$/.test(subscript)
-                      ? `__atc_arr_${arrName}_${subscript}`
-                      : `__atc_arr_${arrName}_arith_${arithAliasSeq++}`;
-                    return allocateEnvAlias(expr, preferredAlias);
-                  },
-                );
+                const rewrittenArithInner = rawArithInner
+                  .replace(
+                    /(?<![${A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]/g,
+                    (full, arrName, subscript) => {
+                      if (!dynamicVarNames.has(arrName)) return full;
+                      const expr = `${arrName}[${subscript}]`;
+                      const preferredAlias = /^[A-Za-z0-9_]+$/.test(subscript)
+                        ? `__atc_arr_${arrName}_${subscript}`
+                        : `__atc_arr_${arrName}_arith_${arithAliasSeq++}`;
+                      return allocateEnvAlias(expr, preferredAlias);
+                    },
+                  )
+                  .replace(
+                    /(?<![${A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\[)/g,
+                    (full, varName) => {
+                      if (!dynamicVarNames.has(varName) || !BASH_CALLER_SNAPSHOT_VARS.has(varName)) {
+                        return full;
+                      }
+                      return allocateEnvAlias(varName, `__atc_var_${varName}`);
+                    },
+                  );
                 for (const idMatch of rewrittenArithInner.matchAll(
                   /\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\[)/g,
                 )) {
@@ -4090,8 +4154,11 @@ function rewriteCompoundCommand(
           .join("");
         const usedDynamicVars = Array.from(dynamicVarNames).filter(
           (k) =>
-            bareArithVarNames.has(k) ||
-            new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}\\[][^}]*\\})|${k}\\b)`).test(cmdBody),
+            !BASH_CALLER_SNAPSHOT_VARS.has(k) &&
+            (bareArithVarNames.has(k) ||
+              new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}\\[][^}]*\\})|${k}\\b)`).test(
+                cmdBody,
+              )),
         );
         const preserveDynamicUnset = (k) =>
           Boolean(shellVars.__atc_nounset_seen) ||
@@ -4115,7 +4182,6 @@ function rewriteCompoundCommand(
           : "";
         const statusEnv = hasExitStatus ? '__atc_status="$?" ' : "";
         const statusPrelude = hasExitStatus ? '(exit "$__atc_status"); ' : "";
-        const specialBashRefs = extractReferencedBashSpecialVars(cmdBody);
         const specialVarEnvParts = [];
         const specialVarPreludeParts = [];
         if (specialBashRefs.vars.has("RANDOM")) {

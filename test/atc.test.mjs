@@ -9428,6 +9428,28 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
           "Bash special variable $RANDOM must be preserved across wrapped stage",
         );
 
+        const outPipestatus = path.join(noglobExecDir, "out-pipestatus.txt");
+        const rewrittenPipestatusExec = evaluateCommandGuard(
+          `false | true; for x in 1; do adb shell echo "\${PIPESTATUS[*]}" "\${PIPESTATUS[@]}" "\${PIPESTATUS[0]}" "$PIPESTATUS" > "${outPipestatus}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenPipestatusExec.allowed, true);
+        const pipestatusRes = spawnSync("bash", ["-c", rewrittenPipestatusExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(pipestatusRes.status, 0, pipestatusRes.stderr);
+        assert.equal(
+          fs.readFileSync(outPipestatus, "utf8").trim(),
+          "shell echo 1 0 1 0 1 1",
+          "Caller PIPESTATUS array must be forwarded into wrapped stage",
+        );
+
         const outNullglob = path.join(noglobExecDir, "out-nullglob.txt");
         const rewrittenNullglobExec = evaluateCommandGuard(
           `shopt -s nullglob; for x in 1; do adb install *.missing_apk > "${outNullglob}"; done`,
