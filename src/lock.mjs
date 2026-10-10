@@ -450,6 +450,16 @@ export function isProcessGroupAlive(
 
 export const hasAliveProcessInGroup = isProcessGroupAlive;
 
+function withTerminatedPgids(arr, terminatedPgids) {
+  Object.defineProperty(arr, "terminatedPgids", {
+    value: terminatedPgids,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  return arr;
+}
+
 export function killProcessGroupTree(
   pgidOrLease,
   signalOrOptions = "SIGTERM",
@@ -478,19 +488,26 @@ export function killProcessGroupTree(
           ? [lease.workerPid]
           : [];
     const killed = [];
+    const confirmedPgids = [];
     for (const p of pgids) {
-      killed.push(
-        ...killProcessGroupTree(Number(p), signal, {
-          ...options,
-          knownDescendants: knownDescendants || lease.workerDescendants || null,
-        }),
-      );
+      const sub = killProcessGroupTree(Number(p), signal, {
+        ...options,
+        knownDescendants: knownDescendants || lease.workerDescendants || null,
+      });
+      killed.push(...sub);
+      if (Array.isArray(sub.terminatedPgids)) {
+        confirmedPgids.push(...sub.terminatedPgids);
+      } else if (sub.length > 0) {
+        confirmedPgids.push(Number(p));
+      }
     }
-    return killed;
+    return withTerminatedPgids(killed, confirmedPgids);
   }
 
   const childPid = Number(pgidOrLease);
-  if (!Number.isInteger(childPid) || childPid <= 0) return [];
+  if (!Number.isInteger(childPid) || childPid <= 0) {
+    return withTerminatedPgids([], []);
+  }
 
   if (platform === "win32") {
     if (knownDescendants) {
@@ -508,10 +525,10 @@ export function killProcessGroupTree(
     }
     if (refreshedAlive === false) {
       winKnownTreeDescendants.delete(childPid);
-      return [];
+      return withTerminatedPgids([], [childPid]);
     }
     if (refreshedAlive !== true) {
-      return [];
+      return withTerminatedPgids([], []);
     }
     const liveKnownPids = getKnownWindowsTreePids(childPid, { liveOnly: true });
     const pidsToKill = [];
@@ -524,29 +541,43 @@ export function killProcessGroupTree(
     }
     if (pidsToKill.length === 0) {
       winKnownTreeDescendants.delete(childPid);
-      return [];
+      return withTerminatedPgids([], [childPid]);
     }
     const pidArgs = [];
     for (const p of pidsToKill) {
       pidArgs.push("/PID", String(p));
     }
+    let taskkillConfirmed = false;
     try {
-      spawnSyncFn("taskkill", ["/T", "/F", ...pidArgs], {
+      const tkRes = spawnSyncFn("taskkill", ["/T", "/F", ...pidArgs], {
         stdio: "ignore",
         timeout: 3000,
         windowsHide: true,
       });
+      taskkillConfirmed =
+        !tkRes ||
+        tkRes.status === null ||
+        tkRes.status === undefined ||
+        tkRes.status === 0 ||
+        tkRes.status === 128;
     } catch {
+      let allSignaled = true;
       for (const p of pidsToKill) {
         try {
           process.kill(p, signal);
-        } catch {
-          // Ignore
+        } catch (err) {
+          if (err && err.code !== "ESRCH") {
+            allSignaled = false;
+          }
         }
       }
+      taskkillConfirmed = allSignaled;
+    }
+    if (!taskkillConfirmed) {
+      return withTerminatedPgids([], []);
     }
     winKnownTreeDescendants.delete(childPid);
-    return pidsToKill;
+    return withTerminatedPgids(pidsToKill, [childPid]);
   }
 
   try {
@@ -558,7 +589,7 @@ export function killProcessGroupTree(
       // Ignore
     }
   }
-  return [childPid];
+  return withTerminatedPgids([childPid], [childPid]);
 }
 
 export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {

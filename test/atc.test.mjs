@@ -7714,6 +7714,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         },
       });
       assert.deepEqual(resFailedRefresh, []);
+      assert.deepEqual(resFailedRefresh.terminatedPgids, []);
       assert.deepEqual(
         killedOnFailedRefresh,
         [],
@@ -7723,6 +7724,55 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         getKnownWindowsTreeDescendants(failedRefreshPgid).length,
         2,
         "Cached descendants must remain tracked when refresh fails so a subsequent retry can verify CreationDate",
+      );
+
+      const failedGcState = createDefaultState();
+      failedGcState.leases["serial:emulator-5560"] = {
+        leaseId: "lease_failed_refresh_gc",
+        deviceKey: "serial:emulator-5560",
+        kind: "emulator",
+        avd: "Pixel_Failed_Refresh_GC",
+        serial: "emulator-5560",
+        profile: { apiLevel: "android-35", deviceType: "phone" },
+        sessionId: "failed-gc-sess",
+        anchorPid: 999999,
+        workerPid: failedRefreshPgid,
+        workerPids: [failedRefreshPgid],
+        workerPgids: [failedRefreshPgid],
+        workerDescendants: {
+          [String(failedRefreshPgid)]: [
+            { pid: failedRefreshPgid, creationDate: "20261010190000.000000+000" },
+            { pid: 750002, creationDate: "20261010190001.000000+000" },
+          ],
+        },
+        releaseOnWorkerExit: true,
+        state: "active",
+        claimedAtMs: now - 600_000,
+        activatedAtMs: now - 599_000,
+        renewedAtMs: now - 500_000,
+        expiresAtMs: now - 10_000,
+      };
+      withLock(dir, (h) => commitState(dir, failedGcState, h));
+      const failedGcRes = cmdGc(dir, {
+        platform: "win32",
+        livenessCheck: () => false,
+        runner: (cmd) => {
+          if (cmd === "powershell.exe") {
+            return { status: 1, stdout: "", stderr: "PowerShell timed out" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(failedGcRes.exitCode, 0);
+      const preservedLease = readState(dir).leases["serial:emulator-5560"];
+      assert.ok(
+        preservedLease,
+        "cmdGc must not drop a lease when Windows tree termination could not be verified",
+      );
+      assert.equal(
+        preservedLease.workerDescendants?.[String(failedRefreshPgid)]?.length,
+        2,
+        "cmdGc must preserve workerDescendants when Windows tree termination could not be verified",
       );
     } finally {
       clearKnownWindowsTreeDescendants(failedRefreshPgid);

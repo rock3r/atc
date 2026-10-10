@@ -2815,11 +2815,13 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           return num !== options.callerWorkerPid && preLiveness(num);
         });
         if (parseBoolFlag(flags.force) || (!hasLiveWrapperPid && !hasLiveLeaderPid)) {
-          killProcessGroupTree(l, "SIGKILL", {
+          const killedRes = killProcessGroupTree(l, "SIGKILL", {
             spawnSyncFn: options.spawnSyncFn || options.runner,
             platform: options.platform,
           });
-          terminatedPgids.push(...l.workerPgids.map(Number));
+          if (Array.isArray(killedRes?.terminatedPgids)) {
+            terminatedPgids.push(...killedRes.terminatedPgids);
+          }
         }
       }
     } catch {
@@ -4131,11 +4133,13 @@ export function cmdGc(stateDir, options = {}) {
         lease.anchorPid !== undefined &&
         !preLiveness(lease.anchorPid);
       if (isExpired || isDeadAnchor || Boolean(lease.releaseOnWorkerExit)) {
-        killProcessGroupTree(lease, "SIGKILL", {
+        const killedRes = killProcessGroupTree(lease, "SIGKILL", {
           spawnSyncFn: options.spawnSyncFn || options.runner,
           platform: options.platform,
         });
-        terminatedPgids.push(...lease.workerPgids.map(Number));
+        if (Array.isArray(killedRes?.terminatedPgids)) {
+          terminatedPgids.push(...killedRes.terminatedPgids);
+        }
       }
     }
   } catch {
