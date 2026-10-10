@@ -383,42 +383,29 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
-  let stopped = false;
-  let worker = null;
-  const spawnDelayMs = Math.max(
-    250,
-    Math.min(2000, Math.floor((Number(timeoutMs) || 15_000) / 4)),
-  );
-  const timer = setTimeout(() => {
-    if (stopped) return;
-    const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
-    worker = new Worker(workerUrl, {
-      workerData: {
-        stateDir,
-        deviceKey,
-        leaseId,
-        timeoutMs,
-        workerPid: process.pid,
-      },
-    });
-    worker.on("error", () => {});
-    if (typeof worker.unref === "function") {
-      worker.unref();
-    }
-  }, spawnDelayMs);
-  if (typeof timer.unref === "function") {
-    timer.unref();
+  const stopFlag = new Int32Array(new SharedArrayBuffer(4));
+  const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
+  const worker = new Worker(workerUrl, {
+    workerData: {
+      stateDir,
+      deviceKey,
+      leaseId,
+      timeoutMs,
+      workerPid: process.pid,
+      stopFlag,
+    },
+  });
+  worker.on("error", () => {});
+  if (typeof worker.unref === "function") {
+    worker.unref();
   }
   return {
     stop() {
-      stopped = true;
-      clearTimeout(timer);
-      if (worker) {
-        try {
-          worker.terminate();
-        } catch {
-          // Ignore termination error
-        }
+      Atomics.store(stopFlag, 0, 1);
+      try {
+        worker.terminate();
+      } catch {
+        // Ignore termination error
       }
     },
   };

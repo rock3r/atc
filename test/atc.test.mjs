@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   acquireLock,
   releaseLock,
+  sleepSync,
   verifyLockOwnership,
   withLock,
   writeFileAtomic,
@@ -4912,6 +4913,56 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         repeatedHalfSeparateName.map((a) => a.avd),
         ["abcdefghijklmnopabcdefghijklmnop"],
       );
+
+      // 13. Background worker heartbeat renews reservation deadline while main thread is blocked in synchronous boot
+      const hbSyncDir = makeTempStateDir();
+      try {
+        withStateTransaction(hbSyncDir, (s) => {
+          s.config.bootTimeoutSec = 1;
+          return { mutated: true };
+        });
+        const hbSyncClaim = cmdClaim(
+          hbSyncDir,
+          {
+            session: "hb-sync-sess",
+            avd: "Pixel_Heartbeat_AVD",
+            wait: 0,
+            force: true,
+          },
+          {
+            platform: "darwin",
+            avdHome,
+            runner: (cmd, args) => {
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                sleepSync(1350);
+                // Another process running GC after 1.35s must see the heartbeat-renewed deadline
+                withStateTransaction(hbSyncDir, () => ({ mutated: false }));
+                return { status: 0, stdout: "Started on emulator-5578\n", stderr: "" };
+              }
+              return { status: 0, stdout: "OK\n", stderr: "" };
+            },
+            inventory: {
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Heartbeat_AVD",
+                  kind: "emulator",
+                  avd: "Pixel_Heartbeat_AVD",
+                  serial: null,
+                  online: false,
+                  profile: { deviceType: "phone", apiLevel: "android-35" },
+                },
+              ],
+              creatable: [],
+            },
+          },
+        );
+        assert.equal(hbSyncClaim.exitCode, 0);
+        assert.equal(hbSyncClaim.lease?.serial, "emulator-5578");
+      } finally {
+        fs.rmSync(hbSyncDir, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
     }
