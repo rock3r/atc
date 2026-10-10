@@ -2505,6 +2505,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           let arrInSingle = false;
           let arrInDouble = false;
           let aliasSeq = 0;
+          let hasUnquotedAlias = false;
           const exprToAlias = new Map();
           for (let i = 0; i < cmdBody.length; i++) {
             const ch = cmdBody[i];
@@ -2559,6 +2560,9 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                     i = closeIdx;
                     continue;
                   }
+                  if (!arrInDouble && prefixOp !== "#") {
+                    hasUnquotedAlias = true;
+                  }
                   let aliasName = exprToAlias.get(inner);
                   if (!aliasName) {
                     if (prefixOp === "#" && (subscript === "@" || subscript === "*")) {
@@ -2586,6 +2590,9 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                   (scalarModMatch[1] !== "" || scalarModMatch[3] !== "")
                 ) {
                   const [, prefixOp, varName, modifier] = scalarModMatch;
+                  if (!arrInDouble && prefixOp !== "#") {
+                    hasUnquotedAlias = true;
+                  }
                   let aliasName = exprToAlias.get(inner);
                   if (!aliasName) {
                     aliasName =
@@ -2604,7 +2611,9 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
             rewrittenArrBody += ch;
           }
           cmdBody = rewrittenArrBody;
+          arrayEnvEntries.hasUnquotedAlias = hasUnquotedAlias;
         }
+        const hasUnquotedAlias = Boolean(arrayEnvEntries.hasUnquotedAlias);
         const arrayEnvAssigns = Array.from(arrayEnvEntries.entries())
           .map(([alias, expr]) => `${alias}="\${${expr}}" `)
           .join("");
@@ -2617,7 +2626,8 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         const singleAtExpr =
           atArrayExprs.length === 1 && !atArrayExprs[0].hasDistinctModifier;
         if (atArrayExprs.length > 0 && !singleAtExpr) {
-          const needsOuterIfs = atArrayExprs.some((entry) => entry.hasUnquoted);
+          const needsOuterIfs =
+            atArrayExprs.some((entry) => entry.hasUnquoted) || hasUnquotedAlias;
           const ifsPrelude = needsOuterIfs
             ? 'if [ -n "$1" ]; then IFS=$2; else unset IFS; fi; shift 2; '
             : "";
@@ -2639,13 +2649,17 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
               .join(" ");
           return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- bash -c ${escaped} bash ${trailingArrays}${suffix}`;
         }
-        const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;
+        const shIfsEnv = hasUnquotedAlias ? '__atc_ifs_set="${IFS+1}" __atc_ifs="${IFS-}" ' : "";
+        const shIfsPrelude = hasUnquotedAlias
+          ? 'if [ -n "$__atc_ifs_set" ]; then IFS=$__atc_ifs; else unset IFS; fi; '
+          : "";
+        const escaped = `'${String(shIfsPrelude + cmdBody).replace(/'/g, `'\\''`)}'`;
         const trailingAtArgs = singleAtExpr
           ? atArrayExprs[0].quoted
             ? ` sh "\${${atArrayExprs[0].inner}}"`
             : ` sh \${${atArrayExprs[0].inner}}`
           : "";
-        return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${trailingAtArgs}${suffix}`;
+        return `${prefix}${arrayEnvAssigns}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =

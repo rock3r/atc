@@ -207,33 +207,29 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
 
         const rootCreation =
           prevRootEntry?.creationDate ?? creationByPid.get(pgid) ?? null;
-        const rootReused =
-          alivePids.has(pgid) &&
-          Boolean(prevRootEntry) &&
-          !isSameProcessInstance(pgid, prevRootEntry.creationDate, prevRootEntry.alive);
-        if (rootReused) {
+        if (isSameProcessInstance(pgid, prevRootEntry?.creationDate, prevRootEntry?.alive)) {
+          queue.push(pgid);
+          visited.add(pgid);
+          liveMembers.add(pgid);
+          nextKnown.set(pgid, {
+            pid: pgid,
+            creationDate: creationByPid.get(pgid) ?? rootCreation,
+            alive: true,
+          });
+        } else if (!prevRootEntry) {
+          queue.push(pgid);
+          visited.add(pgid);
+          nextKnown.set(pgid, {
+            pid: pgid,
+            creationDate: "__exited__",
+            alive: false,
+          });
+        } else {
           nextKnown.set(pgid, {
             pid: pgid,
             creationDate: prevRootEntry.creationDate ?? "__exited__",
             alive: false,
           });
-        } else {
-          queue.push(pgid);
-          visited.add(pgid);
-          if (isSameProcessInstance(pgid, prevRootEntry?.creationDate, prevRootEntry?.alive)) {
-            liveMembers.add(pgid);
-            nextKnown.set(pgid, {
-              pid: pgid,
-              creationDate: creationByPid.get(pgid) ?? rootCreation,
-              alive: true,
-            });
-          } else {
-            nextKnown.set(pgid, {
-              pid: pgid,
-              creationDate: prevRootEntry?.creationDate ?? "__exited__",
-              alive: false,
-            });
-          }
         }
 
         for (const [kPid, prevMeta] of prevKnown.entries()) {
@@ -250,20 +246,9 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
               visited.add(kPid);
               queue.push(kPid);
             }
-          } else if (!alivePids.has(kPid)) {
-            // Intermediate shell/process exited (and PID was not reused); retain in BFS queue
-            // so surviving multi-hop children with ParentProcessId === kPid are discovered.
-            nextKnown.set(kPid, {
-              pid: kPid,
-              creationDate: expectedCreation ?? "__exited__",
-              alive: false,
-            });
-            if (!visited.has(kPid)) {
-              visited.add(kPid);
-              queue.push(kPid);
-            }
           } else {
-            // PID was reused by an unrelated process; keep tombstone without traversing children.
+            // Exited or reused intermediate PID: keep tombstone without traversing children,
+            // since any legitimate descendant observed while kPid was alive is already in prevKnown.
             nextKnown.set(kPid, {
               pid: kPid,
               creationDate: expectedCreation ?? "__exited__",

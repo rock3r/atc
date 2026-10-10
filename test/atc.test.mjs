@@ -8063,6 +8063,61 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       [],
       "POSIX killProcessGroupTree must not confirm termination when kill(-pgid) returns EPERM and group remains alive",
     );
+
+    // 3h. Unquoted modified scalar expansion (${x^^}) preserves outer IFS inside sh -c
+    const unquotedScalarModIfs = evaluateCommandGuard(
+      "IFS=,; for x in 'a b,c'; do adb shell echo ${x^^} > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(unquotedScalarModIfs.allowed, true);
+    assert.match(
+      unquotedScalarModIfs.rewrittenCommand,
+      /do __atc_var_x_0="\$\{x\^\^\}" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$\{__atc_var_x_0\} > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 1l. Exited tracked intermediate PID is not traversed for new children after unobserved PID reuse + exit
+    const unobservedReusePgid = 790001;
+    seedWindowsKnownDescendants({
+      [String(unobservedReusePgid)]: [
+        { pid: unobservedReusePgid, creationDate: "20261010220000.000000+000" },
+        { pid: 790002, creationDate: "20261010220001.000000+000" },
+      ],
+    });
+    try {
+      const unobservedKilled = [];
+      const unobservedRes = killProcessGroupTree(unobservedReusePgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                // 790002 exited, was briefly reused by an unrelated parent that spawned 790099 and exited before this snapshot
+                { ProcessId: 790099, ParentProcessId: 790002, CreationDate: "20261010220500.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            unobservedKilled.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(unobservedRes, []);
+      assert.deepEqual(
+        unobservedKilled,
+        [],
+        "killProcessGroupTree must not adopt or kill children of an already-exited intermediate PID after unobserved reuse",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(unobservedReusePgid);
+    }
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
