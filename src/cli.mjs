@@ -33,6 +33,7 @@ import {
   archiveWindowsProcessGroupGeneration,
   avdHasRuntimeLockFiles,
   canJumpAhead,
+  commitState,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
   getKnownPosixPgidStartToken,
@@ -3442,6 +3443,7 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       };
     }
 
+    delete lease.gcReapingAtMs;
     lease.renewedAtMs = now;
     lease.expiresAtMs =
       rawExplicitTtl !== undefined ? now + ttlMs : Math.max(lease.expiresAtMs || 0, now + ttlMs);
@@ -4207,13 +4209,15 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
 
 export function cmdGc(stateDir, options = {}) {
   const terminatedPgids = [];
+  let confirmedKillTargets = [];
   try {
     const preLiveness = options.livenessCheck || isPidAlive;
-    const preState = readState(stateDir);
+    const preState = readState(stateDir, { quarantine: false });
     const now = options.now ?? Date.now();
     const cfg = preState.config || DEFAULT_CONFIG;
     const maxTtlMs = (cfg.maxTtlSec || 3600) * 1000;
-    for (const lease of Object.values(preState.leases || {})) {
+    const candidates = [];
+    for (const [deviceKey, lease] of Object.entries(preState.leases || {})) {
       if (!lease || typeof lease !== "object") continue;
       if (!Array.isArray(lease.workerPgids) || lease.workerPgids.length === 0) continue;
       const pgidSet = new Set(
@@ -4223,10 +4227,7 @@ export function cmdGc(stateDir, options = {}) {
         const num = Number(p);
         return !pgidSet.has(num) && preLiveness(num);
       });
-      const hasLiveLeaderPid = (lease.workerPgids || []).some((p) =>
-        isWorkerGroupLeaderAlive(p, lease, preLiveness, options),
-      );
-      if (hasLiveWrapperPid || hasLiveLeaderPid) continue;
+      if (hasLiveWrapperPid) continue;
       const lastRenewedMs =
         typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;
       const isExpired =
@@ -4237,8 +4238,71 @@ export function cmdGc(stateDir, options = {}) {
         lease.anchorPid !== null &&
         lease.anchorPid !== undefined &&
         !preLiveness(lease.anchorPid);
-      if (isExpired || isDeadAnchor || Boolean(lease.releaseOnWorkerExit)) {
-        const killedRes = killProcessGroupTree(lease, "SIGKILL", {
+      if (!isExpired && !isDeadAnchor && !lease.releaseOnWorkerExit) continue;
+      const hasLiveLeaderPid = (lease.workerPgids || []).some((p) =>
+        isWorkerGroupLeaderAlive(p, lease, preLiveness, options),
+      );
+      if (hasLiveLeaderPid) continue;
+      candidates.push({
+        deviceKey,
+        leaseId: lease.leaseId,
+        expectedPgids: new Set(lease.workerPgids.map((p) => String(p).trim())),
+      });
+    }
+    if (candidates.length > 0) {
+      confirmedKillTargets = withLock(
+        stateDir,
+        (lockHandle) => {
+          const lockedNow = options.now ?? Date.now();
+          const lockedState = readState(stateDir, { lockHandle });
+          const lockedCfg = lockedState.config || DEFAULT_CONFIG;
+          const lockedMaxTtlMs = (lockedCfg.maxTtlSec || 3600) * 1000;
+          const targets = [];
+          let mutated = false;
+          for (const cand of candidates) {
+            const cur = lockedState.leases?.[cand.deviceKey];
+            if (!cur || typeof cur !== "object" || cur.leaseId !== cand.leaseId) continue;
+            if (!Array.isArray(cur.workerPgids) || cur.workerPgids.length === 0) continue;
+            const hasNewPgid = cur.workerPgids.some(
+              (p) => !cand.expectedPgids.has(String(p).trim()),
+            );
+            if (hasNewPgid) continue;
+            const curPgidSet = new Set(
+              cur.workerPgids.map((p) => Number(String(p).split("@")[0])),
+            );
+            const curLiveWrapper = (cur.workerPids || []).some((p) => {
+              const num = Number(p);
+              return !curPgidSet.has(num) && preLiveness(num);
+            });
+            if (curLiveWrapper) continue;
+            const curLastRenewedMs =
+              typeof cur.renewedAtMs === "number" ? cur.renewedAtMs : cur.claimedAtMs;
+            const curExpired =
+              lockedNow >= cur.expiresAtMs ||
+              lockedNow < cur.claimedAtMs ||
+              (typeof curLastRenewedMs === "number" &&
+                lockedNow > curLastRenewedMs + lockedMaxTtlMs);
+            const curDeadAnchor =
+              cur.anchorPid !== null &&
+              cur.anchorPid !== undefined &&
+              !preLiveness(cur.anchorPid);
+            if (!curExpired && !curDeadAnchor && !cur.releaseOnWorkerExit) continue;
+            cur.gcReapingAtMs = lockedNow;
+            targets.push(structuredClone(cur));
+            mutated = true;
+          }
+          if (mutated) {
+            commitState(stateDir, lockedState, lockHandle);
+          }
+          return targets;
+        },
+        options.lockTimeoutMs,
+        "atc.lock",
+        undefined,
+        options,
+      );
+      for (const targetLease of confirmedKillTargets) {
+        const killedRes = killProcessGroupTree(targetLease, "SIGKILL", {
           spawnSyncFn: options.spawnSyncFn || options.runner,
           platform: options.platform,
           livenessCheck: preLiveness,
@@ -4254,7 +4318,19 @@ export function cmdGc(stateDir, options = {}) {
   }
   return withStateTransaction(
     stateDir,
-    (_state, { pruned }) => {
+    (state, { now, pruned }) => {
+      for (const lease of Object.values(state.leases || {})) {
+        if (lease && typeof lease === "object" && "gcReapingAtMs" in lease) {
+          const matchedOwnTarget = confirmedKillTargets.some(
+            (t) =>
+              t.leaseId === lease.leaseId && t.gcReapingAtMs === lease.gcReapingAtMs,
+          );
+          const ageMs = now - Number(lease.gcReapingAtMs);
+          if (matchedOwnTarget || !Number.isFinite(ageMs) || ageMs < 0 || ageMs >= 30_000) {
+            delete lease.gcReapingAtMs;
+          }
+        }
+      }
       return { mutated: true, value: { exitCode: 0, pruned } };
     },
     terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options,

@@ -791,7 +791,13 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
         pruned.workersMutated = true;
       }
       const workerAlive = aliveWorkers.length > 0;
-      if (workerAlive) {
+      const gcReapingAgeMs =
+        typeof lease.gcReapingAtMs === "number" &&
+        Number.isFinite(lease.gcReapingAtMs)
+          ? now - lease.gcReapingAtMs
+          : -1;
+      const isGcReaping = gcReapingAgeMs >= 0 && gcReapingAgeMs < 30_000;
+      if (workerAlive && !isGcReaping) {
         const defaultTtlMs = (cfg.defaultTtlSec || 600) * 1000;
         lease.renewedAtMs = Math.max(lease.renewedAtMs || 0, now);
         lease.expiresAtMs = Math.max(

@@ -8943,7 +8943,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(extglobLoopRedir.allowed, true);
     assert.match(
       extglobLoopRedir.rewrittenCommand,
-      /__atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
+      /__atc_flags="\$-\" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; eval "\$__atc_shopts" 2>\/dev\/null; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
     );
 
     const arithMultLoopRedir = evaluateCommandGuard(
@@ -9197,7 +9197,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       }
     }
 
-    // 3t. `set -f` / `set -o noglob` and `set -u` / `set -o nounset` and caller-shell `$-` state are preserved across `sh -c` / `bash -c` loop stage rewrites
+    // 3t. `set -f` / `set -o noglob`, `set -u` / `set -o nounset`, `shopt` glob options, `$?`, and caller-shell `$-` state are preserved across `sh -c` / `bash -c` loop stage rewrites
     const noglobExplicitLoopRedir = evaluateCommandGuard(
       "set -f; for x in 1; do adb install *.apk > /tmp/out.txt; done",
       {
@@ -9209,7 +9209,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(noglobExplicitLoopRedir.allowed, true);
     assert.match(
       noglobExplicitLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+      /do __atc_flags="\$-\" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
     );
 
     const noglobCallerGlobLoopRedir = evaluateCommandGuard(
@@ -9223,7 +9223,7 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(noglobCallerGlobLoopRedir.allowed, true);
     assert.match(
       noglobCallerGlobLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+      /do __atc_flags="\$-\" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
     );
 
     const noglobOptionLoopRedir = evaluateCommandGuard(
@@ -9253,6 +9253,92 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       nounsetExplicitLoopRedir.rewrittenCommand,
       /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell rm -rf "\$MISSING" > \/tmp\/out\.txt' ; done$/,
     );
+
+    // Concurrent lease renewal between cmdGc unlocked read and lock revalidation prevents killing active detached group
+    const concurrentRenewPgid = 890001;
+    clearKnownWindowsTreeDescendants(concurrentRenewPgid);
+    try {
+      const gcRaceState = readState(dir);
+      gcRaceState.leases["serial:emulator-5578"] = {
+        leaseId: "lease_gc_race_renew",
+        deviceKey: "serial:emulator-5578",
+        kind: "emulator",
+        avd: "Pixel_GC_Race",
+        serial: "emulator-5578",
+        profile: { apiLevel: "android-35", deviceType: "phone" },
+        sessionId: "gc-race-sess",
+        anchorPid: process.pid,
+        workerPid: concurrentRenewPgid,
+        workerPids: [concurrentRenewPgid],
+        workerPgids: [concurrentRenewPgid],
+        workerDescendants: {
+          [String(concurrentRenewPgid)]: [
+            { pid: concurrentRenewPgid, creationDate: "__exited__", alive: false },
+            { pid: 890002, creationDate: "20261011000001.000000+000", alive: true },
+          ],
+        },
+        state: "active",
+        claimedAtMs: now - 600_000,
+        activatedAtMs: now - 599_000,
+        renewedAtMs: now - 500_000,
+        expiresAtMs: now - 10_000,
+      };
+      withLock(dir, (h) => commitState(dir, gcRaceState, h));
+      let simulatedConcurrentRenew = false;
+      const raceKilledPids = [];
+      const gcRaceRes = cmdGc(dir, {
+        platform: "win32",
+        now,
+        livenessCheck: (pid) => {
+          if (pid === process.pid && !simulatedConcurrentRenew) {
+            simulatedConcurrentRenew = true;
+            // Simulate a concurrent renewal landing after cmdGc's unlocked readState but before its locked revalidation
+            withLock(dir, (h) => {
+              const s = readState(dir, { lockHandle: h });
+              if (s.leases["serial:emulator-5578"]) {
+                s.leases["serial:emulator-5578"].renewedAtMs = now;
+                s.leases["serial:emulator-5578"].expiresAtMs = now + 300_000;
+                commitState(dir, s, h);
+              }
+            });
+          }
+          return pid === process.pid || pid === 890002;
+        },
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                { ProcessId: 890002, ParentProcessId: concurrentRenewPgid, CreationDate: "20261011000001.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            raceKilledPids.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(gcRaceRes.exitCode, 0);
+      assert.deepEqual(
+        raceKilledPids,
+        [],
+        "cmdGc must not kill detached descendants when lease was concurrently renewed before lock revalidation",
+      );
+      assert.ok(
+        readState(dir).leases["serial:emulator-5578"],
+        "Concurrently renewed lease must remain active after cmdGc",
+      );
+      withLock(dir, (h) => {
+        const s = readState(dir, { lockHandle: h });
+        delete s.leases["serial:emulator-5578"];
+        commitState(dir, s, h);
+      });
+    } finally {
+      clearKnownWindowsTreeDescendants(concurrentRenewPgid);
+    }
 
     if (process.platform !== "win32") {
       const noglobExecDir = makeTempStateDir();
@@ -9289,6 +9375,50 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         assert.equal(execRes.status, 0, execRes.stderr);
         assert.equal(fs.readFileSync(outWithNoglob, "utf8").trim(), "install *.apk");
         assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk");
+
+        const outNullglob = path.join(noglobExecDir, "out-nullglob.txt");
+        const rewrittenNullglobExec = evaluateCommandGuard(
+          `shopt -s nullglob; for x in 1; do adb install *.missing_apk > "${outNullglob}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenNullglobExec.allowed, true);
+        const nullglobRes = spawnSync("bash", ["-c", rewrittenNullglobExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(nullglobRes.status, 0, nullglobRes.stderr);
+        assert.equal(
+          fs.readFileSync(outNullglob, "utf8").trim(),
+          "install",
+          "shopt -s nullglob must expand non-matching *.missing_apk to empty argument list inside wrapped stage",
+        );
+
+        const outExitStatus = path.join(noglobExecDir, "out-exit-status.txt");
+        const rewrittenExitStatusExec = evaluateCommandGuard(
+          `for x in 1; do false; adb shell echo "$?" > "${outExitStatus}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenExitStatusExec.allowed, true);
+        const exitStatusRes = spawnSync("sh", ["-c", rewrittenExitStatusExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(exitStatusRes.status, 0, exitStatusRes.stderr);
+        assert.equal(
+          fs.readFileSync(outExitStatus, "utf8").trim(),
+          "shell echo 1",
+          "Caller last exit status ($?) must be forwarded into wrapped stage",
+        );
 
         const outNounset = path.join(noglobExecDir, "out-nounset.txt");
         const rewrittenNounsetExec = evaluateCommandGuard(
