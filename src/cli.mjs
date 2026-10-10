@@ -493,7 +493,7 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
       }
     }
     let unmappedOnlineEmulatorMatchesAvd = false;
-    if (resolvedAvd && !avdStillOnline && !serialStillOnline && adbDevicesOk) {
+    if (!serial && resolvedAvd && !avdStillOnline && !serialStillOnline && adbDevicesOk) {
       const mappedSerials = new Set(
         listedAvds.map((item) => item.serial).filter(Boolean),
       );
@@ -536,14 +536,16 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
       }
     }
     if (!stillRunning && !hasLockFiles && Date.now() <= deadline) {
-      return true;
+      return resolvedAvd || true;
     }
     if (Date.now() + 250 >= deadline) break;
     sleepSync(250);
   }
-  throw new Error(
+  const timeoutErr = new Error(
     `Timed out waiting for emulator ${resolvedAvd || serial} to shut down.`,
   );
+  timeoutErr.resolvedAvd = resolvedAvd;
+  throw timeoutErr;
 }
 
 export function selectCandidateUnderLock(
@@ -2683,6 +2685,22 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           );
         } else {
           const isWin = (options.platform || process.platform) === "win32";
+          if (isWin && !lease.avd && lease.serial) {
+            try {
+              const nameRes = runner("adb", ["-s", lease.serial, "emu", "avd", "name"], {
+                timeoutMs: Math.min(3000, stopTimeoutMs),
+              });
+              const avdId =
+                nameRes.status === 0 && nameRes.stdout
+                  ? nameRes.stdout.split(/\r?\n/)[0].trim()
+                  : "";
+              if (avdId && avdId !== "OK") {
+                lease.avd = avdId;
+              }
+            } catch {
+              // Best-effort pre-kill AVD mapping
+            }
+          }
           const stopRes =
             isWin && lease.serial
               ? runner("adb", ["-s", lease.serial, "emu", "kill"], {
@@ -2700,13 +2718,19 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             );
           } else if (isWin && lease.serial) {
             try {
-              waitForEmulatorOffline(
+              const maybeResolvedAvd = waitForEmulatorOffline(
                 runner,
                 avdHome,
                 { serial: lease.serial, avd: lease.avd },
                 stopTimeoutMs,
               );
+              if (typeof maybeResolvedAvd === "string" && !lease.avd) {
+                lease.avd = maybeResolvedAvd;
+              }
             } catch (err) {
+              if (typeof err?.resolvedAvd === "string" && !lease.avd) {
+                lease.avd = err.resolvedAvd;
+              }
               itemFailed = true;
               windowsStopWaitTimedOut = true;
               actionErrors.push(err.message);
@@ -2724,6 +2748,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         (state, { now }) => {
           const cur = state.leases[lease.deviceKey];
           if (cur && cur.leaseId === lease.leaseId) {
+            if (lease.avd && !cur.avd) {
+              cur.avd = lease.avd;
+            }
             if (itemFailed) {
               const livenessCheck = options.livenessCheck || isPidAlive;
               removeLeaseWorker(cur, process.pid, livenessCheck);

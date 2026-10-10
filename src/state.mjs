@@ -6,6 +6,7 @@ import {
   canSweepBreakClaimDir,
   isPidAlive,
   randomNonce,
+  trySweepBreakClaimDir,
   verifyLockOwnership,
   withLock,
   writeFileAtomic,
@@ -287,19 +288,17 @@ export function sweepOrphanFiles(stateDir, now = Date.now()) {
   try {
     const entries = fs.readdirSync(stateDir);
     for (const name of entries) {
-      if (
-        !name.startsWith("state.json.tmp.") &&
-        !/^atc\.(?:create\.)?lock(?:\.break)?\.stale\./.test(name)
-      ) {
+      const fullPath = path.join(stateDir, name);
+      if (/^atc\.(?:create\.)?lock(?:\.break)?\.stale\./.test(name)) {
+        trySweepBreakClaimDir(fullPath, now);
         continue;
       }
-      const fullPath = path.join(stateDir, name);
+      if (!name.startsWith("state.json.tmp.")) {
+        continue;
+      }
       try {
         const st = fs.lstatSync(fullPath);
-        if (
-          now - st.mtimeMs > 60_000 &&
-          (!st.isDirectory() || canSweepBreakClaimDir(fullPath, now))
-        ) {
+        if (now - st.mtimeMs > 60_000) {
           fs.rmSync(fullPath, { recursive: true, force: true });
         }
       } catch {
@@ -655,14 +654,23 @@ export function reconcileOfflineLeases(
         lease.avd && (inventory.running || []).some((d) => d.kind === "emulator" && !d.avd),
       );
       if (avdOnline || serialOnline || hasUnmappedEmulator) continue;
+      const otherActiveAvds = new Set([
+        ...onlineAvds,
+        ...Object.values(state.leases || {})
+          .filter((l) => l && l.leaseId !== lease.leaseId && l.avd)
+          .map((l) => l.avd),
+      ]);
       const offlineEntry = lease.avd
         ? (inventory.offline || []).find((d) => d.avd === lease.avd || d.deviceKey === deviceKey)
         : null;
-      const hasLocks = Boolean(
-        lease.avd &&
-          (offlineEntry?.hasLockFiles ||
-            (avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))),
-      );
+      const hasLocks = lease.avd
+        ? Boolean(offlineEntry?.hasLockFiles) ||
+          Boolean(avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))
+        : Boolean(
+            (inventory.offline || []).some(
+              (d) => d?.hasLockFiles && (!d.avd || !otherActiveAvds.has(d.avd)),
+            ),
+          ) || Boolean(avdHome && offlineAvdHasRuntimeLockFiles(avdHome, otherActiveAvds));
       if (hasLocks) continue;
       recordDeviceStoppedInState(state, lease, now);
       delete state.leases[deviceKey];

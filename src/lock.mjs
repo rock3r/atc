@@ -192,6 +192,16 @@ function inspectUnownedLockDir(lockDir) {
   }
 }
 
+function getClaimDirIdentity(claimDir) {
+  try {
+    const st = fs.lstatSync(claimDir);
+    if (!st.isDirectory()) return null;
+    return `${st.ino || 0}_${Math.trunc(st.birthtimeMs || st.ctimeMs || st.mtimeMs || 0)}`;
+  } catch {
+    return null;
+  }
+}
+
 export function canSweepBreakClaimDir(claimDir, now = Date.now()) {
   let entries;
   try {
@@ -245,23 +255,66 @@ export function canSweepBreakClaimDir(claimDir, now = Date.now()) {
   return true;
 }
 
+export function trySweepBreakClaimDir(claimDir, now = Date.now()) {
+  try {
+    const st = fs.lstatSync(claimDir);
+    const dirAgeMs = now - (st.mtimeMs || st.ctimeMs || 0);
+    if (!st.isDirectory()) {
+      if (dirAgeMs > 60_000) {
+        fs.unlinkSync(claimDir);
+        return true;
+      }
+      return false;
+    }
+    if (dirAgeMs <= 60_000) {
+      return false;
+    }
+    const state = inspectAndCleanBreakClaimDir(claimDir, now);
+    if (state.active) {
+      return false;
+    }
+    const entries = fs.readdirSync(claimDir);
+    if (entries.some((n) => n !== "done" && !n.startsWith("moved."))) {
+      return false;
+    }
+    if (entries.length === 0) {
+      fs.rmdirSync(claimDir);
+      return true;
+    }
+    for (const name of entries) {
+      const entrySt = fs.lstatSync(path.join(claimDir, name));
+      if (now - (entrySt.mtimeMs || entrySt.ctimeMs || 0) <= 60_000) {
+        return false;
+      }
+    }
+    const retiringDir = `${claimDir}.retiring.${process.pid}.${randomNonce()}`;
+    fs.renameSync(claimDir, retiringDir);
+    for (const name of fs.readdirSync(retiringDir)) {
+      const target = path.join(retiringDir, name);
+      try {
+        const entrySt = fs.lstatSync(target);
+        if (entrySt.isDirectory()) {
+          fs.rmSync(target, { recursive: true, force: true });
+        } else {
+          fs.unlinkSync(target);
+        }
+      } catch {
+        // Ignore cleanup error inside retired dir
+      }
+    }
+    fs.rmdirSync(retiringDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function sweepStaleLockClaims(stateDir, lockName, now = Date.now()) {
   const prefix = `${lockName}.stale.`;
   try {
     for (const name of fs.readdirSync(stateDir)) {
       if (!name.startsWith(prefix)) continue;
-      const fullPath = path.join(stateDir, name);
-      try {
-        const st = fs.lstatSync(fullPath);
-        if (
-          now - (st.mtimeMs || st.ctimeMs || 0) > 60_000 &&
-          (!st.isDirectory() || canSweepBreakClaimDir(fullPath, now))
-        ) {
-          fs.rmSync(fullPath, { recursive: true, force: true });
-        }
-      } catch {
-        // Ignore concurrent deletion
-      }
+      trySweepBreakClaimDir(path.join(stateDir, name), now);
     }
   } catch {
     // Ignore directory read errors
@@ -273,14 +326,15 @@ function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
   try {
     entries = fs.readdirSync(claimDir);
   } catch {
-    return { done: false, active: true };
+    return { done: false, active: true, cleanedAny: false };
   }
   for (const name of entries) {
     if (name === "done" || name.startsWith("moved.")) {
-      return { done: true, active: false };
+      return { done: true, active: false, cleanedAny: false };
     }
   }
   let hasActive = false;
+  let cleanedAny = false;
   for (const name of entries) {
     const fullPath = path.join(claimDir, name);
     if (name.startsWith("breaker.") && name.endsWith(".json")) {
@@ -298,6 +352,7 @@ function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
         } else {
           try {
             fs.unlinkSync(fullPath);
+            cleanedAny = true;
           } catch {
             // Ignore concurrent unlink
           }
@@ -308,6 +363,7 @@ function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
             const st = fs.lstatSync(fullPath);
             if (now - (st.mtimeMs || st.ctimeMs || 0) >= MISSING_OWNER_STALE_MS) {
               fs.unlinkSync(fullPath);
+              cleanedAny = true;
             } else {
               hasActive = true;
             }
@@ -329,26 +385,69 @@ function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
           hasActive = true;
         } else {
           fs.unlinkSync(fullPath);
+          cleanedAny = true;
         }
       } catch {
         // Ignore concurrent removal
       }
     }
   }
-  return { done: false, active: hasActive };
+  return { done: false, active: hasActive, cleanedAny };
+}
+
+function tryRecoverAbandonedClaimDir(claimDir, now = Date.now()) {
+  try {
+    const dirSt = fs.lstatSync(claimDir);
+    if (!dirSt.isDirectory()) return false;
+    const state = inspectAndCleanBreakClaimDir(claimDir, now);
+    if (state.done || state.active) {
+      return false;
+    }
+    const dirAgeMs = now - (dirSt.mtimeMs || dirSt.ctimeMs || 0);
+    if (!state.cleanedAny && dirAgeMs < MISSING_OWNER_STALE_MS) {
+      return false;
+    }
+    fs.rmdirSync(claimDir);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
   if (!candidateBreakToken) return false;
   const claimDir = path.join(stateDir, `${lockName}.stale.${candidateBreakToken}`);
+  let createdFreshDir = false;
+  let mkdirStartMs = Date.now();
   try {
-    fs.mkdirSync(claimDir, { recursive: true, mode: 0o700 });
-  } catch {
+    fs.mkdirSync(claimDir, { mode: 0o700 });
+    createdFreshDir = true;
+  } catch (err) {
+    if (!err || err.code !== "EEXIST") {
+      return false;
+    }
+    if (!tryRecoverAbandonedClaimDir(claimDir, Date.now())) {
+      return false;
+    }
+    mkdirStartMs = Date.now();
+    try {
+      fs.mkdirSync(claimDir, { mode: 0o700 });
+      createdFreshDir = true;
+    } catch {
+      return false;
+    }
+  }
+  if (!createdFreshDir) {
     return false;
   }
 
-  const initialState = inspectAndCleanBreakClaimDir(claimDir, Date.now());
-  if (initialState.done || initialState.active) {
+  const myClaimDirId = getClaimDirIdentity(claimDir);
+  if (!myClaimDirId || Date.now() - mkdirStartMs >= Math.floor(MISSING_OWNER_STALE_MS / 2)) {
+    try {
+      fs.rmdirSync(claimDir);
+    } catch {
+      // Ignore
+    }
     return false;
   }
 
@@ -356,8 +455,9 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
   const myClaimStartMs = Date.now();
   const myBreakerName = `breaker.${myClaimNonce}.json`;
   const myBreakerPath = path.join(claimDir, myBreakerName);
+  let completed = false;
   try {
-    writeFileAtomic(
+    publishOwnerFileExclusive(
       myBreakerPath,
       JSON.stringify({
         pid: process.pid,
@@ -365,9 +465,13 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
         nonce: myClaimNonce,
       }),
       myClaimNonce,
+      () =>
+        getClaimDirIdentity(claimDir) === myClaimDirId &&
+        Date.now() - mkdirStartMs < Math.floor(MISSING_OWNER_STALE_MS / 2),
     );
     const verifyEntries = fs.readdirSync(claimDir);
     if (
+      getClaimDirIdentity(claimDir) !== myClaimDirId ||
       verifyEntries.some((n) => n === "done" || n.startsWith("moved.")) ||
       verifyEntries.some((n) => n !== myBreakerName)
     ) {
@@ -376,6 +480,9 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
 
     const canProceed = () => {
       try {
+        if (getClaimDirIdentity(claimDir) !== myClaimDirId) {
+          return false;
+        }
         const curEntries = fs.readdirSync(claimDir);
         return (
           curEntries.includes(myBreakerName) &&
@@ -387,7 +494,7 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
       }
     };
 
-    const completed = Boolean(fn({ claimDir, myClaimNonce, canProceed }));
+    completed = Boolean(fn({ claimDir, myClaimNonce, canProceed }));
     if (completed) {
       try {
         fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
@@ -403,6 +510,16 @@ function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
       fs.unlinkSync(myBreakerPath);
     } catch {
       // Ignore if already removed
+    }
+    if (!completed) {
+      try {
+        const rem = fs.readdirSync(claimDir);
+        if (rem.length === 0) {
+          fs.rmdirSync(claimDir);
+        }
+      } catch {
+        // Ignore if already removed or non-empty
+      }
     }
   }
 }

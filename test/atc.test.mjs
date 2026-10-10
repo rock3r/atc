@@ -5343,6 +5343,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         );
         fs.writeFileSync(path.join(doneClaimPath, "done"), "1", "utf8");
         const oldSec = Math.floor((Date.now() - 120_000) / 1000);
+        fs.utimesSync(path.join(doneClaimPath, "done"), oldSec, oldSec);
         fs.utimesSync(liveClaimPath, oldSec, oldSec);
         fs.utimesSync(doneClaimPath, oldSec, oldSec);
 
@@ -5536,6 +5537,105 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         );
         assert.equal(unmappedFreeRes.exitCode, 0);
         assert.ok(listPolls >= 2, "Expected waitForEmulatorOffline to wait for listed serial to go offline");
+
+        // Unmapped serial-only stopping lease with awaitOfflineReconcile retains reservation while an unleased offline AVD holds lock files, while ignoring lock files of another leased/online AVD
+        const otherOnlineAvdDir = path.join(avdHome, "Pixel_Other_Online.avd");
+        fs.mkdirSync(otherOnlineAvdDir, { recursive: true });
+        fs.writeFileSync(path.join(otherOnlineAvdDir, "hardware-qemu.ini.lock"), "locked", "utf8");
+        fs.writeFileSync(qemuLockPath, "locked", "utf8");
+
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          s.fleetEpoch = 5;
+          s.leases["serial:emulator-5592"] = {
+            leaseId: "lease_unmapped_stopping",
+            deviceKey: "serial:emulator-5592",
+            kind: "emulator",
+            avd: null,
+            serial: "emulator-5592",
+            state: "stopping",
+            awaitOfflineReconcile: true,
+            stoppingAtMs: now - 1000,
+            reconcileAfterMs: now - 1000,
+            stoppingEpoch: 5,
+            workerPid: null,
+            workerPids: [],
+            sessionId: "unmapped-stop-sess",
+            claimedAtMs: now - 120_000,
+            deadlineMs: now - 60_000,
+          };
+          return { mutated: true };
+        });
+
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          reconcileOfflineLeases(
+            s,
+            {
+              avdHome,
+              discoveredAtMs: now + 10,
+              fleetEpoch: 5,
+              running: [
+                {
+                  deviceKey: "avd:Pixel_Other_Online",
+                  kind: "emulator",
+                  avd: "Pixel_Other_Online",
+                  serial: "emulator-5554",
+                  online: true,
+                },
+              ],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Win_Reconcile",
+                  kind: "emulator",
+                  avd: "Pixel_Win_Reconcile",
+                  online: false,
+                },
+              ],
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            "other-sess",
+            now + 10,
+          );
+          return { mutated: true };
+        });
+        assert.ok(
+          readState(winReconcileDir).leases["serial:emulator-5592"],
+          "Unmapped stopping lease must remain held while an offline AVD still holds lock files",
+        );
+
+        // Once the offline AVD's lock file is removed (even though Pixel_Other_Online still has its lock file), the unmapped stopping lease clears
+        fs.rmSync(qemuLockPath, { force: true });
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          reconcileOfflineLeases(
+            s,
+            {
+              avdHome,
+              discoveredAtMs: now + 20,
+              fleetEpoch: 5,
+              running: [
+                {
+                  deviceKey: "avd:Pixel_Other_Online",
+                  kind: "emulator",
+                  avd: "Pixel_Other_Online",
+                  serial: "emulator-5554",
+                  online: true,
+                },
+              ],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Win_Reconcile",
+                  kind: "emulator",
+                  avd: "Pixel_Win_Reconcile",
+                  online: false,
+                },
+              ],
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            "other-sess",
+            now + 20,
+          );
+          return { mutated: true };
+        });
+        assert.equal(readState(winReconcileDir).leases["serial:emulator-5592"], undefined);
       } finally {
         fs.rmSync(winReconcileDir, { recursive: true, force: true });
       }
