@@ -607,16 +607,9 @@ export function killProcessGroupTree(
     groupSignaled = true;
   } catch (groupErr) {
     groupMissing = Boolean(groupErr && groupErr.code === "ESRCH");
-    try {
-      killFn(childPid, signal);
-      if (groupMissing) {
-        groupSignaled = true;
-      }
-    } catch (pidErr) {
-      if (groupMissing && pidErr && pidErr.code === "ESRCH") {
-        groupSignaled = true;
-      }
-    }
+  }
+  if (groupMissing) {
+    return withTerminatedPgids([], [childPid]);
   }
   if (
     !groupSignaled &&
@@ -624,7 +617,7 @@ export function killProcessGroupTree(
   ) {
     return withTerminatedPgids([], []);
   }
-  return withTerminatedPgids([childPid], [childPid]);
+  return withTerminatedPgids(groupSignaled ? [childPid] : [], [childPid]);
 }
 
 export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {

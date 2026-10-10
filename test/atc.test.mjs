@@ -8200,6 +8200,41 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       prefixNameUnquotedStarRedir.rewrittenCommand,
       /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell printf "%s\\n" "\$@" > \/tmp\/out\.txt' sh \$\{!x\*\} ; done$/,
     );
+
+    // 1n. POSIX killProcessGroupTree does not signal positive childPid when kill(-childPid) returns ESRCH
+    const posixEsrchPgid = 810001;
+    const posixSignaledTargets = [];
+    const posixEsrchRes = killProcessGroupTree(posixEsrchPgid, "SIGKILL", {
+      platform: "darwin",
+      killFn: (target) => {
+        posixSignaledTargets.push(target);
+        const esrch = new Error("No such process");
+        esrch.code = "ESRCH";
+        throw esrch;
+      },
+    });
+    assert.deepEqual(
+      posixSignaledTargets,
+      [-posixEsrchPgid],
+      "POSIX killProcessGroupTree must not fall back to signaling positive childPid when process group -childPid is gone",
+    );
+    assert.deepEqual(posixEsrchRes, []);
+    assert.deepEqual(posixEsrchRes.terminatedPgids, [posixEsrchPgid]);
+
+    // 3j. Unquoted ordinary dynamic variables ($x and ${x}) preserve outer IFS inside sh -c
+    const unquotedPlainVarIfs = evaluateCommandGuard(
+      "IFS=,; for x in 'a b,c'; do adb shell echo $x > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(unquotedPlainVarIfs.allowed, true);
+    assert.match(
+      unquotedPlainVarIfs.rewrittenCommand,
+      /do __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$x > \/tmp\/out\.txt' ; done$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

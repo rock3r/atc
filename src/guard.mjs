@@ -2424,7 +2424,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         );
         const arrayEnvEntries = new Map();
         const atArrayExprs = [];
-        if (dynamicVarNames.size > 0 && cmdBody.includes("${")) {
+        if (dynamicVarNames.size > 0 && cmdBody.includes("$")) {
           const atExprMap = new Map();
           let scanInSingle = false;
           let scanInDouble = false;
@@ -2619,42 +2619,48 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                   continue;
                 }
                 const scalarModMatch = inner.match(/^([#!]?)([A-Za-z_][A-Za-z0-9_]*)(.*)$/s);
-                if (
-                  scalarModMatch &&
-                  dynamicVarNames.has(scalarModMatch[2]) &&
-                  (scalarModMatch[1] !== "" || scalarModMatch[3] !== "")
-                ) {
-                  const [, prefixOp, varName, modifier] = scalarModMatch;
-                  const isPositionalPrefix =
-                    prefixOp === "!" &&
-                    (modifier === "@" || (modifier === "*" && !arrInDouble));
-                  if (isPositionalPrefix) {
-                    if (singleAtExpr) {
-                      rewrittenArrBody += arrInDouble ? "$@" : '"$@"';
-                    } else {
-                      const baseKey = `${prefixOp}${varName}@`;
-                      const entry = atExprMap.get(baseKey);
-                      rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
+                if (scalarModMatch && dynamicVarNames.has(scalarModMatch[2])) {
+                  if (scalarModMatch[1] !== "" || scalarModMatch[3] !== "") {
+                    const [, prefixOp, varName, modifier] = scalarModMatch;
+                    const isPositionalPrefix =
+                      prefixOp === "!" &&
+                      (modifier === "@" || (modifier === "*" && !arrInDouble));
+                    if (isPositionalPrefix) {
+                      if (singleAtExpr) {
+                        rewrittenArrBody += arrInDouble ? "$@" : '"$@"';
+                      } else {
+                        const baseKey = `${prefixOp}${varName}@`;
+                        const entry = atExprMap.get(baseKey);
+                        rewrittenArrBody += `\${__atc_arr_at_${entry.idx}[${modifier}]}`;
+                      }
+                      i = closeIdx;
+                      continue;
                     }
+                    if (!arrInDouble && prefixOp !== "#") {
+                      hasUnquotedAlias = true;
+                    }
+                    let aliasName = exprToAlias.get(inner);
+                    if (!aliasName) {
+                      aliasName =
+                        prefixOp === "#" && !modifier
+                          ? `__atc_var_${varName}_len`
+                          : `__atc_var_${varName}_${aliasSeq++}`;
+                      exprToAlias.set(inner, aliasName);
+                    }
+                    arrayEnvEntries.set(aliasName, inner);
+                    rewrittenArrBody += `\${${aliasName}}`;
                     i = closeIdx;
                     continue;
                   }
-                  if (!arrInDouble && prefixOp !== "#") {
+                  if (!arrInDouble) {
                     hasUnquotedAlias = true;
                   }
-                  let aliasName = exprToAlias.get(inner);
-                  if (!aliasName) {
-                    aliasName =
-                      prefixOp === "#" && !modifier
-                        ? `__atc_var_${varName}_len`
-                        : `__atc_var_${varName}_${aliasSeq++}`;
-                    exprToAlias.set(inner, aliasName);
-                  }
-                  arrayEnvEntries.set(aliasName, inner);
-                  rewrittenArrBody += `\${${aliasName}}`;
-                  i = closeIdx;
-                  continue;
                 }
+              }
+            } else if (!arrInSingle && !arrInDouble && ch === "$") {
+              const plainVarMatch = cmdBody.slice(i + 1).match(/^([A-Za-z_][A-Za-z0-9_]*)/);
+              if (plainVarMatch && dynamicVarNames.has(plainVarMatch[1])) {
+                hasUnquotedAlias = true;
               }
             }
             rewrittenArrBody += ch;
