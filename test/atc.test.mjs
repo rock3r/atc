@@ -3396,6 +3396,27 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             );
             assert.equal(execWithoutSerial.exitCode, 3);
             assert.match(execWithoutSerial.error, /has no active adb serial/);
+            // 36. `atc free --snapshot-save` or `--snapshot-load` on a lease with `serial: null` fails and retains the lease
+            const freeSnapSaveWithoutSerial = cmdFree(
+              coldRediscoverDir,
+              l2.lease.leaseId,
+              { session: "target-sess", snapshotSave: "must-not-skip" },
+              { avdHome, host: { freeDiskMb: 16384 } },
+            );
+            assert.equal(freeSnapSaveWithoutSerial.exitCode, 1);
+            assert.match(freeSnapSaveWithoutSerial.error, /has no active adb serial/);
+            assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]);
+
+            const freeSnapLoadWithoutSerial = cmdFree(
+              coldRediscoverDir,
+              l2.lease.leaseId,
+              { session: "target-sess", snapshotLoad: "clean" },
+              { avdHome },
+            );
+            assert.equal(freeSnapLoadWithoutSerial.exitCode, 1);
+            assert.match(freeSnapLoadWithoutSerial.error, /has no active adb serial/);
+            assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]);
+
             const recoverStoppedOwnLease = cmdClaim(
               coldRediscoverDir,
               { session: "target-sess", avd: "Pixel_9_API_36", wait: 0 },
@@ -3428,6 +3449,108 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(recoverStoppedOwnLease.exitCode, 0);
             assert.equal(recoverStoppedOwnLease.lease.serial, "emulator-5558");
             assert.equal(recoverStoppedOwnLease.lease.leaseId, l2.lease.leaseId);
+
+            // 37. Idempotent re-claim preparation marks the lease non-active ("starting") while running outside lock
+            let stateDuringIdempotentPrep = null;
+            const idempotentPrepRes = cmdClaim(
+              coldRediscoverDir,
+              {
+                session: "target-sess",
+                avd: "Pixel_9_API_36",
+                resetApp: "com.example.app",
+                wait: 0,
+              },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  host: singleMatchInv.host,
+                  running: [
+                    {
+                      deviceKey: "avd:Pixel_9_API_36",
+                      avd: "Pixel_9_API_36",
+                      serial: "emulator-5558",
+                      kind: "emulator",
+                      online: true,
+                      profile: { deviceType: "phone", apiLevel: "android-36" },
+                    },
+                  ],
+                  offline: [],
+                  creatable: [],
+                },
+                runner: (cmd, args) => {
+                  if (cmd === "adb" && args.includes("clear")) {
+                    stateDuringIdempotentPrep =
+                      readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]?.state;
+                  }
+                  return { status: 0, stdout: "Success\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(idempotentPrepRes.exitCode, 0);
+            assert.equal(idempotentPrepRes.idempotent, true);
+            assert.equal(stateDuringIdempotentPrep, "starting");
+            assert.equal(idempotentPrepRes.lease.state, "active");
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"].state,
+              "active",
+            );
+
+            // 38. Source `serial:<serial>` lease with live worker wins over `starting` destination AVD lease on collision
+            const liveWorkerCollisionState = {
+              config: {},
+              leases: {
+                "serial:emulator-5564": {
+                  leaseId: "lease_src_live",
+                  deviceKey: "serial:emulator-5564",
+                  kind: "emulator",
+                  avd: null,
+                  serial: "emulator-5564",
+                  sessionId: "src-live-sess",
+                  state: "active",
+                  workerPid: 777001,
+                  workerPids: [777001],
+                  claimedAtMs: 5000,
+                },
+                "avd:Pixel_9_API_36": {
+                  leaseId: "lease_dest_starting",
+                  deviceKey: "avd:Pixel_9_API_36",
+                  kind: "emulator",
+                  avd: "Pixel_9_API_36",
+                  serial: null,
+                  sessionId: "dest-boot-sess",
+                  state: "starting",
+                  workerPid: 777002,
+                  claimedAtMs: 1000,
+                },
+              },
+              queue: [],
+            };
+            reconcileOfflineLeases(
+              liveWorkerCollisionState,
+              {
+                probes: { emulatorListOk: true, adbDevicesOk: true },
+                running: [
+                  {
+                    deviceKey: "avd:Pixel_9_API_36",
+                    avd: "Pixel_9_API_36",
+                    serial: "emulator-5564",
+                    kind: "emulator",
+                    online: true,
+                    profile: { deviceType: "phone", apiLevel: "android-36" },
+                  },
+                ],
+                offline: [],
+              },
+              "any-sess",
+              6000,
+              (pid) => pid === 777001 || pid === 777002,
+            );
+            assert.equal(liveWorkerCollisionState.leases["serial:emulator-5564"], undefined);
+            assert.equal(
+              liveWorkerCollisionState.leases["avd:Pixel_9_API_36"]?.leaseId,
+              "lease_src_live",
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

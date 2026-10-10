@@ -490,12 +490,16 @@ export function reconcileOfflineLeases(
             destLease.state === "starting" || destLease.state === "stopping"
               ? Boolean(destLease.workerPid && livenessCheck(destLease.workerPid))
               : syncLeaseWorkers(destLease, livenessCheck).length > 0;
-          const srcHasLiveWorker = syncLeaseWorkers(lease, livenessCheck).length > 0;
+          const srcHasLiveWorker =
+            lease.state === "starting" || lease.state === "stopping"
+              ? Boolean(lease.workerPid && livenessCheck(lease.workerPid))
+              : syncLeaseWorkers(lease, livenessCheck).length > 0;
           const destWins =
-            destLease.state === "starting" ||
-            destLease.state === "stopping" ||
-            (destHasLiveWorker && !srcHasLiveWorker) ||
-            (destLease.claimedAtMs || 0) <= (lease.claimedAtMs || Infinity);
+            !srcHasLiveWorker &&
+            (destLease.state === "starting" ||
+              destLease.state === "stopping" ||
+              destHasLiveWorker ||
+              (destLease.claimedAtMs || 0) <= (lease.claimedAtMs || Infinity));
           delete state.leases[deviceKey];
           if (!destWins) {
             lease.avd = mappedDev.avd;

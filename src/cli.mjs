@@ -842,6 +842,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             const livenessCheck = options.livenessCheck || isPidAlive;
             if (needsPrep) {
               addLeaseWorker(lease, process.pid, livenessCheck);
+              lease.state = "starting";
+              lease.deadlineMs = now + stopTimeoutMs;
             } else {
               syncLeaseWorkers(lease, livenessCheck);
             }
@@ -1077,11 +1079,18 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
     if (txOutcome.status === "claimed_immediate") {
       if (txOutcome.idempotent && txOutcome.needsPrep && txOutcome.lease?.serial) {
+        const snapTimeoutMs = txOutcome.stopTimeoutMs || 60_000;
+        const prepHb = startWorkerDeadlineHeartbeat(
+          stateDir,
+          txOutcome.lease.deviceKey,
+          txOutcome.lease.leaseId,
+          snapTimeoutMs,
+        );
         let loadedSnap = null;
         let prepUpdatedSnap = false;
+        let prepError = null;
         try {
           if (txOutcome.needsSnapLoad && req.snapshotLoad) {
-            const snapTimeoutMs = txOutcome.stopTimeoutMs || 60_000;
             const snapRes = runner(
               "adb",
               [
@@ -1096,50 +1105,82 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               { strictInternal: true, timeoutMs: snapTimeoutMs },
             );
             if (snapRes.status !== 0) {
-              return {
-                exitCode: 1,
-                error: `Failed to load snapshot "${req.snapshotLoad}" on ${txOutcome.lease.serial}: ${snapRes.stderr || snapRes.stdout}`,
-              };
+              loadedSnap = null;
+              prepUpdatedSnap = true;
+              prepError = `Failed to load snapshot "${req.snapshotLoad}" on ${txOutcome.lease.serial}: ${snapRes.stderr || snapRes.stdout}`;
+            } else {
+              try {
+                waitForEmulatorReady(runner, txOutcome.lease.serial, snapTimeoutMs);
+                loadedSnap = req.snapshotLoad;
+                prepUpdatedSnap = true;
+              } catch (err) {
+                loadedSnap = null;
+                prepUpdatedSnap = true;
+                prepError = err.message;
+              }
             }
-            waitForEmulatorReady(runner, txOutcome.lease.serial, snapTimeoutMs);
-            loadedSnap = req.snapshotLoad;
-            prepUpdatedSnap = true;
           }
-          if (req.resetApp) {
+          if (!prepError && req.resetApp) {
             const resetRes = runner(
               "adb",
               ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
               { strictInternal: true },
             );
             if (resetRes.status !== 0) {
-              return {
-                exitCode: 1,
-                error: `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`,
-              };
+              prepError = `Failed to reset app "${req.resetApp}" on ${txOutcome.lease.serial}: ${resetRes.stderr || resetRes.stdout}`;
+            } else {
+              loadedSnap = null;
+              prepUpdatedSnap = true;
             }
-            loadedSnap = null;
-            prepUpdatedSnap = true;
           }
         } catch (err) {
-          return { exitCode: 1, error: err.message };
+          prepError = err.message;
         } finally {
-          const fallbackTtlMs = clampTtlSec(rawTtl) * 1000;
-          finishLeaseWorker(
-            stateDir,
-            txOutcome.lease.deviceKey,
-            txOutcome.lease.leaseId,
-            fallbackTtlMs,
-            options,
-            (cur, state, now) => {
-              if (prepUpdatedSnap) {
-                cur.loadedSnapshot = loadedSnap;
-                txOutcome.lease.loadedSnapshot = loadedSnap;
-              }
-              const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
-              cur.renewedAtMs = now;
-              cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
-            },
-          );
+          prepHb.stop();
+        }
+        const reactivated = withStateTransaction(
+          stateDir,
+          (state, { now }) => {
+            const cur = state.leases[txOutcome.lease.deviceKey];
+            if (!cur || cur.leaseId !== txOutcome.lease.leaseId) {
+              return { mutated: false, value: false };
+            }
+            const livenessCheck = options.livenessCheck || isPidAlive;
+            cur.state = "active";
+            removeLeaseWorker(cur, process.pid, livenessCheck);
+            if (
+              cur.anchorPid !== null &&
+              cur.anchorPid !== undefined &&
+              !livenessCheck(cur.anchorPid)
+            ) {
+              cur.anchorPid = null;
+            }
+            cur.deadlineMs = null;
+            if (prepUpdatedSnap) {
+              cur.loadedSnapshot = loadedSnap;
+              txOutcome.lease.loadedSnapshot = loadedSnap;
+            }
+            const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
+            cur.renewedAtMs = now;
+            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
+            txOutcome.lease.state = "active";
+            txOutcome.lease.workerPid = cur.workerPid;
+            txOutcome.lease.workerPids = cur.workerPids;
+            txOutcome.lease.deadlineMs = null;
+            txOutcome.lease.renewedAtMs = cur.renewedAtMs;
+            txOutcome.lease.expiresAtMs = cur.expiresAtMs;
+            return { mutated: true, value: true };
+          },
+          options,
+        );
+        if (prepError) {
+          return { exitCode: 1, error: prepError };
+        }
+        if (!reactivated) {
+          return {
+            exitCode: 1,
+            error: `Lease reservation ${txOutcome.lease.leaseId} was lost during preparation.`,
+          };
         }
       }
       return { exitCode: 0, lease: txOutcome.lease, idempotent: txOutcome.idempotent };
@@ -1525,32 +1566,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         // Ignore discovery failure during rollback
       }
     }
-    if (bootedNewEmulator && !previousLease) {
-      try {
-        if (isWin) {
-          let cleanupSerial = resolvedSerial;
-          if (!cleanupSerial) {
-            const refreshed = discoverFleet({ runner, avdHome });
-            const booted = (refreshed.running || []).find(
-              (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
-            );
-            cleanupSerial = booted?.serial || null;
-          }
-          if (cleanupSerial) {
-            runner("adb", ["-s", cleanupSerial, "emu", "kill"], { strictInternal: true });
-          }
-        } else {
-          runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
-            strictInternal: true,
-          });
-        }
-      } catch {
-        // Best-effort cleanup of newly booted emulator
-      }
-    }
-    withStateTransaction(stateDir, (state, { now }) => {
+    const stillOwned = withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
-      if (current && current.leaseId === lease.leaseId) {
+      const owned = Boolean(current && current.leaseId === lease.leaseId);
+      if (owned) {
         if (previousLease) {
           state.leases[lease.deviceKey] = {
             ...previousLease,
@@ -1576,8 +1595,31 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
           delete state.leases[selection.victim.deviceKey];
         }
       }
-      return { mutated: true };
+      return { mutated: true, value: owned };
     });
+    if (bootedNewEmulator && !previousLease && stillOwned) {
+      try {
+        if (isWin) {
+          let cleanupSerial = resolvedSerial;
+          if (!cleanupSerial) {
+            const refreshed = discoverFleet({ runner, avdHome });
+            const booted = (refreshed.running || []).find(
+              (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
+            );
+            cleanupSerial = booted?.serial || null;
+          }
+          if (cleanupSerial) {
+            runner("adb", ["-s", cleanupSerial, "emu", "kill"], { strictInternal: true });
+          }
+        } else {
+          runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
+            strictInternal: true,
+          });
+        }
+      } catch {
+        // Best-effort cleanup of newly booted emulator
+      }
+    }
     return { exitCode: 1, error: err.message };
   }
 }
@@ -1810,8 +1852,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
     let itemFailed = false;
     try {
-      withStateTransaction(stateDir, (state, { now }) => {
+      const stillStopping = withStateTransaction(stateDir, (state, { now }) => {
         let mutated = false;
+        let currentItemActive = false;
         for (const rem of stoppingItems) {
           const cur = state.leases[rem.lease.deviceKey];
           if (
@@ -1822,40 +1865,63 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           ) {
             cur.deadlineMs = now + rem.stopTimeoutMs;
             mutated = true;
+            if (rem.lease.leaseId === lease.leaseId) {
+              currentItemActive = true;
+            }
           }
         }
-        return { mutated };
+        return { mutated, value: currentItemActive };
       });
-      if (saveSnap && lease.serial) {
-        const saveRes = runner(
-          "adb",
-          ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap],
-          { strictInternal: true, timeoutMs: stopTimeoutMs },
+      if (!stillStopping) {
+        itemFailed = true;
+        actionErrors.push(
+          `Lease ${lease.leaseId} (${lease.deviceKey}) was superseded before cleanup could run.`,
         );
-        if (saveRes.status !== 0) {
-          itemFailed = true;
-          actionErrors.push(
-            `Failed to save snapshot "${saveSnap}" on ${lease.serial}: ${saveRes.stderr || saveRes.stdout}`,
-          );
-        }
       }
-      if (!itemFailed && loadSnap && !doStop && lease.serial) {
-        const loadRes = runner(
-          "adb",
-          ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap],
-          { strictInternal: true, timeoutMs: stopTimeoutMs },
-        );
-        if (loadRes.status !== 0) {
+      if (!itemFailed && saveSnap) {
+        if (!lease.serial) {
           itemFailed = true;
           actionErrors.push(
-            `Failed to load snapshot "${loadSnap}" on ${lease.serial}: ${loadRes.stderr || loadRes.stdout}`,
+            `Failed to save snapshot "${saveSnap}" on ${lease.avd || lease.deviceKey}: emulator has no active adb serial.`,
           );
         } else {
-          try {
-            waitForEmulatorReady(runner, lease.serial, stopTimeoutMs);
-          } catch (err) {
+          const saveRes = runner(
+            "adb",
+            ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap],
+            { strictInternal: true, timeoutMs: stopTimeoutMs },
+          );
+          if (saveRes.status !== 0) {
             itemFailed = true;
-            actionErrors.push(err.message);
+            actionErrors.push(
+              `Failed to save snapshot "${saveSnap}" on ${lease.serial}: ${saveRes.stderr || saveRes.stdout}`,
+            );
+          }
+        }
+      }
+      if (!itemFailed && loadSnap && !doStop) {
+        if (!lease.serial) {
+          itemFailed = true;
+          actionErrors.push(
+            `Failed to load snapshot "${loadSnap}" on ${lease.avd || lease.deviceKey}: emulator has no active adb serial.`,
+          );
+        } else {
+          const loadRes = runner(
+            "adb",
+            ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap],
+            { strictInternal: true, timeoutMs: stopTimeoutMs },
+          );
+          if (loadRes.status !== 0) {
+            itemFailed = true;
+            actionErrors.push(
+              `Failed to load snapshot "${loadSnap}" on ${lease.serial}: ${loadRes.stderr || loadRes.stdout}`,
+            );
+          } else {
+            try {
+              waitForEmulatorReady(runner, lease.serial, stopTimeoutMs);
+            } catch (err) {
+              itemFailed = true;
+              actionErrors.push(err.message);
+            }
           }
         }
       }
