@@ -32,7 +32,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs",
-    "check": "node --check bin/atc.mjs && node --test test/*.test.mjs"
+    "test": "node --test",
+    "check": "node -e \"import('node:fs').then(async({readdirSync})=>{const{spawnSync}=await import('node:child_process');for(const d of['bin','src','test'])for(const f of readdirSync(d))if(f.endsWith('.mjs')){const r=spawnSync(process.execPath,['--check',d+'/'+f],{stdio:'inherit'});if(r.status!==0)process.exit(r.status)}})\" && node --test"
   }
 }

@@ -1,0 +1,8 @@
+{
+  "name": "atc",
+  "version": "0.1.0",
+  "description": "Android Traffic Control — multi-agent Android emulator and device coordinator",
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}
