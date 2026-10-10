@@ -1089,8 +1089,29 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         let loadedSnap = null;
         let prepUpdatedSnap = false;
         let prepError = null;
+        const assertIdempotentPrepOwned = () => {
+          const owned = withStateTransaction(
+            stateDir,
+            (state) => {
+              const cur = state.leases[txOutcome.lease.deviceKey];
+              return {
+                mutated: false,
+                value: Boolean(
+                  cur && cur.leaseId === txOutcome.lease.leaseId && cur.state === "starting",
+                ),
+              };
+            },
+            options,
+          );
+          if (!owned) {
+            throw new Error(
+              `Lease reservation ${txOutcome.lease.leaseId} was lost during preparation.`,
+            );
+          }
+        };
         try {
           if (txOutcome.needsSnapLoad && req.snapshotLoad) {
+            assertIdempotentPrepOwned();
             const snapRes = runner(
               "adb",
               [
@@ -1110,6 +1131,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               prepError = `Failed to load snapshot "${req.snapshotLoad}" on ${txOutcome.lease.serial}: ${snapRes.stderr || snapRes.stdout}`;
             } else {
               try {
+                assertIdempotentPrepOwned();
                 waitForEmulatorReady(runner, txOutcome.lease.serial, snapTimeoutMs);
                 loadedSnap = req.snapshotLoad;
                 prepUpdatedSnap = true;
@@ -1121,6 +1143,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             }
           }
           if (!prepError && req.resetApp) {
+            assertIdempotentPrepOwned();
             const resetRes = runner(
               "adb",
               ["-s", txOutcome.lease.serial, "shell", "pm", "clear", req.resetApp],
@@ -1270,10 +1293,25 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
   let stoppedExistingEmulator = false;
 
   const isWin = (platform || process.platform) === "win32";
+  const assertReservationStillOwned = () => {
+    const owned = withStateTransaction(stateDir, (state) => {
+      const current = state.leases[lease.deviceKey];
+      return {
+        mutated: false,
+        value: Boolean(
+          current && current.leaseId === lease.leaseId && current.state === "starting",
+        ),
+      };
+    });
+    if (!owned) {
+      throw new Error(`Lease reservation ${lease.leaseId} was lost during boot`);
+    }
+  };
 
   try {
     // 1. Evict victim if replacingAvd is set
     if (selection.victim) {
+      assertReservationStillOwned();
       const effectiveStopTimeoutMs = stopTimeoutMs || 60_000;
       const stopRes =
         isWin && selection.victim.serial
@@ -1304,6 +1342,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
 
     // 2. Auto-create missing AVD if Priority 4
     if (selection.createAvd) {
+      assertReservationStillOwned();
       const createRes = runner(
         "android",
         ["emulator", "create", candidate.profile.deviceName],
@@ -1403,6 +1442,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     // 3. Warm state preparation vs Cold/Wipe boot
     if (selection.priority === 1 && selection.needsWarmPrep) {
       if (req.snapshotLoad) {
+        assertReservationStillOwned();
         const snapRes = runner(
           "adb",
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
@@ -1413,9 +1453,11 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
             `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
           );
         }
+        assertReservationStillOwned();
         waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
       }
       if (req.resetApp) {
+        assertReservationStillOwned();
         const resetRes = runner(
           "adb",
           ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp],
@@ -1429,6 +1471,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       }
     } else {
       if (candidate.online && (req.wipeData || req.coldBoot)) {
+        assertReservationStillOwned();
         const rebootStopRes =
           isWin && candidate.serial
             ? runner("adb", ["-s", candidate.serial, "emu", "kill"], {
@@ -1452,8 +1495,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         resolvedSerial = null;
       }
       if (req.wipeData) {
+        assertReservationStillOwned();
         wipeAvdUserData(candidate.avd, avdHome);
       }
+      assertReservationStillOwned();
       let bootRes;
       if (isWin) {
         const winArgs = ["-avd", candidate.avd];
@@ -1499,10 +1544,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         );
       }
       if (isWin) {
+        assertReservationStillOwned();
         waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
       }
 
       if (req.snapshotLoad) {
+        assertReservationStillOwned();
         const snapRes = runner(
           "adb",
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
@@ -1513,10 +1560,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
             `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
           );
         }
+        assertReservationStillOwned();
         waitForEmulatorReady(runner, resolvedSerial, bootTimeoutMs);
       }
 
       if (req.resetApp) {
+        assertReservationStillOwned();
         const resetRes = runner(
           "adb",
           ["-s", resolvedSerial, "shell", "pm", "clear", req.resetApp],
@@ -1717,7 +1766,10 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         matches.push(found);
       } else {
         for (const l of leasesList) {
-          if (l.sessionId === identity.sessionId && l.state === "active") {
+          if (
+            l.sessionId === identity.sessionId &&
+            (l.state === "active" || (l.state === "starting" && l.activatedAtMs !== null))
+          ) {
             matches.push(l);
           }
         }
@@ -1736,12 +1788,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       let cumulativeSnapshotMb = 0;
 
       for (const lease of matches) {
-        const activeWorkers =
-          lease.state === "active"
-            ? syncLeaseWorkers(lease, livenessCheck).filter((p) => p !== process.pid)
-            : lease.workerPid && lease.workerPid !== process.pid && livenessCheck(lease.workerPid)
-              ? [lease.workerPid]
-              : [];
+        const activeWorkers = syncLeaseWorkers(lease, livenessCheck).filter(
+          (p) => p !== process.pid,
+        );
         if (activeWorkers.length > 0 && !isForced) {
           lease.releaseOnWorkerExit = true;
           if (flags.snapshotSave) {
@@ -1851,8 +1900,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   for (const item of stoppingItems) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
     let itemFailed = false;
-    try {
-      const stillStopping = withStateTransaction(stateDir, (state, { now }) => {
+    const checkAndRefreshStopping = () =>
+      withStateTransaction(stateDir, (state, { now }) => {
         let mutated = false;
         let currentItemActive = false;
         for (const rem of stoppingItems) {
@@ -1872,7 +1921,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
         return { mutated, value: currentItemActive };
       });
-      if (!stillStopping) {
+    try {
+      if (!checkAndRefreshStopping()) {
         itemFailed = true;
         actionErrors.push(
           `Lease ${lease.leaseId} (${lease.deviceKey}) was superseded before cleanup could run.`,
@@ -1899,7 +1949,12 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
       }
       if (!itemFailed && loadSnap && !doStop) {
-        if (!lease.serial) {
+        if (saveSnap && !checkAndRefreshStopping()) {
+          itemFailed = true;
+          actionErrors.push(
+            `Lease ${lease.leaseId} (${lease.deviceKey}) was superseded before cleanup could run.`,
+          );
+        } else if (!lease.serial) {
           itemFailed = true;
           actionErrors.push(
             `Failed to load snapshot "${loadSnap}" on ${lease.avd || lease.deviceKey}: emulator has no active adb serial.`,
@@ -1917,6 +1972,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             );
           } else {
             try {
+              if (!checkAndRefreshStopping()) {
+                throw new Error(
+                  `Lease ${lease.leaseId} (${lease.deviceKey}) was superseded before cleanup could run.`,
+                );
+              }
               waitForEmulatorReady(runner, lease.serial, stopTimeoutMs);
             } catch (err) {
               itemFailed = true;
@@ -1926,22 +1986,29 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         }
       }
       if (!itemFailed && doStop) {
-        const isWin = (options.platform || process.platform) === "win32";
-        const stopRes =
-          isWin && lease.serial
-            ? runner("adb", ["-s", lease.serial, "emu", "kill"], {
-                strictInternal: true,
-                timeoutMs: stopTimeoutMs,
-              })
-            : runner("android", ["emulator", "stop", lease.serial || lease.avd], {
-                strictInternal: true,
-                timeoutMs: stopTimeoutMs,
-              });
-        if (stopRes.status !== 0) {
+        if ((saveSnap || loadSnap) && !checkAndRefreshStopping()) {
           itemFailed = true;
           actionErrors.push(
-            `Failed to stop emulator ${lease.avd || lease.serial}: ${stopRes.stderr || stopRes.stdout}`,
+            `Lease ${lease.leaseId} (${lease.deviceKey}) was superseded before cleanup could run.`,
           );
+        } else {
+          const isWin = (options.platform || process.platform) === "win32";
+          const stopRes =
+            isWin && lease.serial
+              ? runner("adb", ["-s", lease.serial, "emu", "kill"], {
+                  strictInternal: true,
+                  timeoutMs: stopTimeoutMs,
+                })
+              : runner("android", ["emulator", "stop", lease.serial || lease.avd], {
+                  strictInternal: true,
+                  timeoutMs: stopTimeoutMs,
+                });
+          if (stopRes.status !== 0) {
+            itemFailed = true;
+            actionErrors.push(
+              `Failed to stop emulator ${lease.avd || lease.serial}: ${stopRes.stderr || stopRes.stdout}`,
+            );
+          }
         }
       }
     } catch (err) {
@@ -2213,9 +2280,22 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         };
       }
     }
+    if (!lease.serial) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 1,
+          error: `Cannot ${effectiveAction} snapshot "${effectiveName}" on ${lease.avd || lease.deviceKey}: emulator has no active adb serial.`,
+        },
+      };
+    }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
     addLeaseWorker(lease, process.pid, options.livenessCheck || isPidAlive);
+    if (effectiveAction === "load") {
+      lease.state = "starting";
+      lease.deadlineMs = now + stopTimeoutMs;
+    }
     lease.renewedAtMs = now;
     lease.expiresAtMs = Math.max(lease.expiresAtMs, now + Math.max(ttlMs, stopTimeoutMs * 2));
     return { mutated: true, value: { exitCode: 0, lease: { ...lease }, ttlMs, stopTimeoutMs } };
@@ -2225,7 +2305,18 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     return leaseCheck;
   }
 
+  const loadHb =
+    effectiveAction === "load"
+      ? startWorkerDeadlineHeartbeat(
+          stateDir,
+          leaseCheck.lease.deviceKey,
+          leaseCheck.lease.leaseId,
+          leaseCheck.stopTimeoutMs,
+        )
+      : null;
+
   const clearSnapshotWorker = (markLoaded = false) => {
+    loadHb?.stop();
     const updated = finishLeaseWorker(
       stateDir,
       leaseCheck.lease.deviceKey,
@@ -2233,8 +2324,10 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       leaseCheck.ttlMs,
       options,
       (cur) => {
-        if (markLoaded && effectiveAction === "load") {
-          cur.loadedSnapshot = effectiveName;
+        if (effectiveAction === "load") {
+          cur.state = "active";
+          cur.deadlineMs = null;
+          cur.loadedSnapshot = markLoaded ? effectiveName : null;
         } else if (
           markLoaded &&
           effectiveAction === "delete" &&
@@ -2244,7 +2337,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         }
       },
     );
-    return updated || leaseCheck.lease;
+    return updated;
   };
 
   let res;
@@ -2268,6 +2361,22 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 
   if (effectiveAction === "load") {
     try {
+      const stillOwnedBeforeWait = withStateTransaction(
+        stateDir,
+        (state) => {
+          const cur = state.leases[leaseCheck.lease.deviceKey];
+          return {
+            mutated: false,
+            value: Boolean(
+              cur && cur.leaseId === leaseCheck.lease.leaseId && cur.state === "starting",
+            ),
+          };
+        },
+        options,
+      );
+      if (!stillOwnedBeforeWait) {
+        throw new Error(`Lease ${leaseCheck.lease.leaseId} was lost during snapshot load.`);
+      }
       waitForEmulatorReady(runner, leaseCheck.lease.serial, leaseCheck.stopTimeoutMs);
     } catch (err) {
       clearSnapshotWorker(false);
@@ -2276,6 +2385,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   }
 
   const finalLease = clearSnapshotWorker(true);
+  if (!finalLease) {
+    return {
+      exitCode: 1,
+      error: `Lease ${leaseCheck.lease.leaseId} was lost during snapshot ${effectiveAction}.`,
+    };
+  }
 
   return { exitCode: 0, lease: finalLease, snapshot: effectiveName, action: effectiveAction };
 }

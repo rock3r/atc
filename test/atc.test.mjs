@@ -3551,6 +3551,147 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               liveWorkerCollisionState.leases["avd:Pixel_9_API_36"]?.leaseId,
               "lease_src_live",
             );
+
+            // 39. Displaced transition worker aborts before executing post-boot prep against another session's device
+            const displacedCommands = [];
+            const displacedClaimRes = cmdClaim(
+              coldRediscoverDir,
+              {
+                session: "displaced-sess",
+                avd: "Pixel_8_API_35",
+                snapshotLoad: "clean",
+                resetApp: "com.example.app",
+                wait: 0,
+              },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  host: singleMatchInv.host,
+                  running: [],
+                  offline: [
+                    {
+                      deviceKey: "avd:Pixel_8_API_35",
+                      avd: "Pixel_8_API_35",
+                      serial: null,
+                      kind: "emulator",
+                      online: false,
+                      snapshots: ["clean"],
+                      profile: { deviceType: "phone", apiLevel: "android-35" },
+                    },
+                  ],
+                  creatable: [],
+                },
+                runner: (cmd, args) => {
+                  displacedCommands.push([cmd, ...args].join(" "));
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    withStateTransaction(coldRediscoverDir, (state, { now }) => {
+                      state.leases["avd:Pixel_8_API_35"] = {
+                        leaseId: "lease_reconciled_winner",
+                        deviceKey: "avd:Pixel_8_API_35",
+                        kind: "emulator",
+                        avd: "Pixel_8_API_35",
+                        serial: "emulator-5554",
+                        sessionId: "winner-sess",
+                        state: "active",
+                        workerPid: 888001,
+                        workerPids: [888001],
+                        claimedAtMs: now - 5000,
+                        activatedAtMs: now - 5000,
+                        renewedAtMs: now,
+                        expiresAtMs: now + 600_000,
+                      };
+                      return { mutated: true };
+                    });
+                    return { status: 0, stdout: "Started on emulator-5554\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(displacedClaimRes.exitCode, 1);
+            assert.match(displacedClaimRes.error, /was lost during boot/);
+            assert.equal(
+              displacedCommands.some((c) => c.includes("snapshot load") || c.includes("pm clear")),
+              false,
+            );
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"]?.leaseId,
+              "lease_reconciled_winner",
+            );
+
+            // 40. Dynamically assembled tool names (variable expansion, quotes, backslashes) do not bypass guard fast-path
+            const dynKillVar = evaluateCommandGuard("x=ad; ${x}b kill-server", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(dynKillVar.allowed, false);
+            assert.match(dynKillVar.reason, /adb kill-server/);
+
+            const dynEmuVar = evaluateCommandGuard("x=emul; ${x}ator -avd Evil", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(dynEmuVar.allowed, false);
+            assert.match(dynEmuVar.reason, /Direct emulator launch is disabled/);
+
+            const dynQuotedKill = evaluateCommandGuard('"ad"b kill-server', {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(dynQuotedKill.allowed, false);
+            assert.match(dynQuotedKill.reason, /adb kill-server/);
+
+            const dynEscapedKill = evaluateCommandGuard("a\\db kill-server", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+            });
+            assert.equal(dynEscapedKill.allowed, false);
+            assert.match(dynEscapedKill.reason, /adb kill-server/);
+
+            const dynDeviceRewrite = evaluateCommandGuard("x=ad; ${x}b shell getprop", {
+              sessionId: "target-sess",
+              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
+              runningCount: 1,
+              platform: "darwin",
+            });
+            assert.equal(dynDeviceRewrite.allowed, true);
+            assert.equal(dynDeviceRewrite.fastPath, false);
+            assert.equal(
+              dynDeviceRewrite.rewrittenCommand,
+              "x=ad ; ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop",
+            );
+
+            // 41. cmdSnapshot("load") transitions the lease to "starting" during restoration and restores "active" afterward
+            let stateDuringSnapshotLoad = null;
+            const snapLoadRes = cmdSnapshot(
+              coldRediscoverDir,
+              "load",
+              "clean_boot",
+              { session: "target-sess", avd: "Pixel_9_API_36" },
+              {
+                avdHome,
+                runner: (cmd, args) => {
+                  if (cmd === "adb" && args.includes("load")) {
+                    stateDuringSnapshotLoad =
+                      readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]?.state;
+                    return { status: 0, stdout: "OK\n", stderr: "" };
+                  }
+                  if (cmd === "adb" && args.includes("sys.boot_completed")) {
+                    return { status: 0, stdout: "1\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(snapLoadRes.exitCode, 0);
+            assert.equal(stateDuringSnapshotLoad, "starting");
+            assert.equal(snapLoadRes.lease.state, "active");
+            assert.equal(snapLoadRes.lease.loadedSnapshot, "clean_boot");
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]?.state,
+              "active",
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

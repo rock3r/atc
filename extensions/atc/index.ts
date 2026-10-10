@@ -5,6 +5,37 @@ import path from "node:path";
 
 const FAST_PATH_REGEX = /\b(android|adb|emulator|gradlew|gradle|atc)\b/i;
 
+function expandVariables(str: string, vars: Record<string, string> = {}): string {
+  if (!str || Object.keys(vars).length === 0) return str;
+  return str.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (full, k1, k2) => {
+      const key = k1 || k2;
+      return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : full;
+    }
+  );
+}
+
+export function hasAndroidOrAtcTokens(command: string): boolean {
+  if (!command || typeof command !== "string") return false;
+  if (FAST_PATH_REGEX.test(command)) return true;
+  const normalizedVars = command.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const collapsed = normalizedVars.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+  if (FAST_PATH_REGEX.test(collapsed)) return true;
+  if (collapsed.includes("$")) {
+    const vars: Record<string, string> = {};
+    const assignRe = /\b([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&)]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = assignRe.exec(collapsed)) !== null) {
+      vars[m[1]] = expandVariables(m[2], vars);
+    }
+    let expanded = expandVariables(collapsed, vars);
+    expanded = expandVariables(expanded, vars);
+    if (FAST_PATH_REGEX.test(expanded)) return true;
+  }
+  return false;
+}
+
 export function resolveAtcExecutable(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
@@ -110,7 +141,7 @@ export default function atcExtension(pi: any) {
     const toolName = String(event.toolName ?? event.name ?? "").toLowerCase();
     if (toolName !== "bash" && toolName !== "shell") return;
     const command = event.input?.command ?? event.arguments?.command ?? "";
-    if (!command || !FAST_PATH_REGEX.test(command)) return;
+    if (!command || !hasAndroidOrAtcTokens(command)) return;
 
     const handleDecision = (rawStdout: string) => {
       const decision = JSON.parse(rawStdout);

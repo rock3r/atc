@@ -112,9 +112,44 @@ const READ_ONLY_ADB_SUBCOMMANDS = new Set([
   "--help",
 ]);
 
+function matchesAndroidOrAtcText(str, inheritedVars = {}) {
+  if (!str || typeof str !== "string") return false;
+  if (FAST_PATH_REGEX.test(str)) return true;
+  const normalizedVars = str.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+  const collapsed = normalizedVars.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+  if (FAST_PATH_REGEX.test(collapsed)) return true;
+  if (collapsed.includes("$")) {
+    const vars = { ...inheritedVars };
+    const assignRe = /\b([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&)]+)/g;
+    let m;
+    while ((m = assignRe.exec(collapsed)) !== null) {
+      vars[m[1]] = expandVariables(m[2], vars);
+    }
+    let expanded = expandVariables(collapsed, vars);
+    expanded = expandVariables(expanded, vars);
+    if (FAST_PATH_REGEX.test(expanded)) return true;
+  }
+  return false;
+}
+
 export function hasAndroidOrAtcTokens(command) {
   if (!command || typeof command !== "string") return false;
-  return FAST_PATH_REGEX.test(command);
+  if (matchesAndroidOrAtcText(command)) return true;
+  if (command.includes("$")) {
+    const shellVars = {};
+    for (const seg of splitShellSegments(command)) {
+      const parsed = parseSegment(seg, shellVars);
+      Object.assign(shellVars, parsed.envVars || {});
+      if (
+        matchesAndroidOrAtcText(parsed.baseCmd, shellVars) ||
+        matchesAndroidOrAtcText(parsed.raw, shellVars) ||
+        parsed.args.some((a) => matchesAndroidOrAtcText(a, shellVars))
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function splitOutsideQuotes(str, sepType) {
@@ -205,7 +240,7 @@ export function splitShellSegments(command) {
         segments.push(stage);
       }
       for (const arg of parsedStage.args) {
-        if (!/^-[A-Za-z0-9]+$/.test(arg) || FAST_PATH_REGEX.test(arg)) {
+        if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
           upstreamArgs.push(arg);
         }
       }
@@ -216,14 +251,66 @@ export function splitShellSegments(command) {
 
 export function tokenizeSegment(segment) {
   const tokens = [];
-  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|(\S+)/g;
-  let m;
-  while ((m = re.exec(segment)) !== null) {
-    if (m[1] !== undefined) {
-      tokens.push(m[1].replace(/\\(["\\])/g, "$1"));
-    } else {
-      tokens.push(m[2] ?? m[3]);
+  const str = String(segment || "");
+  const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
+  let i = 0;
+  while (i < str.length) {
+    while (i < str.length && /\s/.test(str[i])) i++;
+    if (i >= str.length) break;
+    const start = i;
+    let end = i;
+    while (end < str.length && !/\s/.test(str[end])) {
+      if (str[end] === '"') {
+        end++;
+        while (end < str.length && str[end] !== '"') {
+          if (str[end] === "\\" && end + 1 < str.length) end += 2;
+          else end++;
+        }
+        if (end < str.length) end++;
+      } else if (str[end] === "'") {
+        end++;
+        while (end < str.length && str[end] !== "'") end++;
+        if (end < str.length) end++;
+      } else if (str[end] === "\\" && end + 1 < str.length) {
+        end += 2;
+      } else {
+        end++;
+      }
     }
+    const rawWord = str
+      .slice(start, end)
+      .replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+    const keepBackslashes = isWinPathLike(rawWord) || rawWord === "\\;";
+    let tok = "";
+    let j = 0;
+    while (j < rawWord.length) {
+      const ch = rawWord[j];
+      if (ch === '"') {
+        j++;
+        while (j < rawWord.length && rawWord[j] !== '"') {
+          if (rawWord[j] === "\\" && j + 1 < rawWord.length && /["\\$`]/.test(rawWord[j + 1])) {
+            tok += rawWord[j + 1];
+            j += 2;
+          } else {
+            tok += rawWord[j++];
+          }
+        }
+        if (j < rawWord.length) j++;
+      } else if (ch === "'") {
+        j++;
+        while (j < rawWord.length && rawWord[j] !== "'") {
+          tok += rawWord[j++];
+        }
+        if (j < rawWord.length) j++;
+      } else if (ch === "\\" && j + 1 < rawWord.length && !keepBackslashes) {
+        tok += rawWord[j + 1];
+        j += 2;
+      } else {
+        tok += rawWord[j++];
+      }
+    }
+    tokens.push(tok);
+    i = end;
   }
   return tokens;
 }
@@ -882,9 +969,9 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`, `eval adb shell ...`)
-  if (SHELL_WRAPPERS.has(baseCmd) && FAST_PATH_REGEX.test(effectiveSegment)) {
+  if (SHELL_WRAPPERS.has(baseCmd) && matchesAndroidOrAtcText(effectiveSegment, parsed.envVars)) {
     const nonFlagArgs = args.filter((a) => !a.startsWith("-") && a !== "<<<" && a !== "<<");
-    const innerStrings = [...args.filter((a) => FAST_PATH_REGEX.test(a))];
+    const innerStrings = [...args.filter((a) => matchesAndroidOrAtcText(a, parsed.envVars))];
     if (nonFlagArgs.length > 1) {
       innerStrings.push(nonFlagArgs.join(" "));
     }
@@ -943,7 +1030,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
 
   if (
     (!PASSIVE_NON_EXEC_COMMANDS.has(baseCmd) || isExecutablePassive) &&
-    FAST_PATH_REGEX.test(effectiveSegment)
+    matchesAndroidOrAtcText(effectiveSegment, parsed.envVars)
   ) {
     const startSearchIdx = execFlagIdx !== -1 ? execFlagIdx + 1 : 0;
     const nestedRelIdx = args.slice(startSearchIdx).findIndex((a) => {
@@ -1014,7 +1101,7 @@ function extractEmbeddedCommands(args) {
   const candidates = [];
   const toolNames = new Set(["atc", "emulator", "adb", "android", "gradlew", "gradle"]);
   for (const rawArg of args) {
-    if (!rawArg || !FAST_PATH_REGEX.test(rawArg)) continue;
+    if (!rawArg || !matchesAndroidOrAtcText(rawArg)) continue;
     const arg = String(rawArg).replace(/\\(["'`\\])/g, "$1");
     const literals = [];
     const litRe = /"([^"]*)"|'([^']*)'|`([^`]*)`/g;
@@ -1024,7 +1111,7 @@ function extractEmbeddedCommands(args) {
       if (lit) literals.push(lit);
     }
     for (const lit of literals) {
-      if (FAST_PATH_REGEX.test(lit) && /\s/.test(lit.trim())) {
+      if (matchesAndroidOrAtcText(lit) && /\s/.test(lit.trim())) {
         candidates.push(lit.trim());
       }
     }
@@ -1146,6 +1233,13 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         if (trailMatch) {
           suffix = trailMatch[1];
           cmdBody = cmdBody.slice(0, -suffix.length).trim();
+        }
+        if (Object.keys(shellVars).length > 0 && cmdBody.includes("$")) {
+          const normalizedBody = cmdBody.replace(
+            /\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g,
+            (m, k) => (Object.prototype.hasOwnProperty.call(shellVars, k) ? `\${${k}}` : m),
+          );
+          cmdBody = expandVariables(normalizedBody, shellVars);
         }
         if (isWin) {
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
