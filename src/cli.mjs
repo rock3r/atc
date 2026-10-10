@@ -1527,7 +1527,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
   const assertReservationStillOwned = () => {
     const targetSerial = resolvedSerial || candidate.serial || null;
     const targetAvd = candidate.avd || lease.avd || null;
-    const status = withStateTransaction(stateDir, (state) => {
+    const status = withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
       const owned = Boolean(
         current &&
@@ -1548,12 +1548,20 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
       if (conflictingLease) {
         return { mutated: false, value: "conflict" };
       }
-      let mutated = false;
+      current.deadlineMs = Math.max(current.deadlineMs || 0, now + (bootTimeoutMs || 180_000));
+      if (selection.victim && victimLeaseId) {
+        const vLease = state.leases[selection.victim.deviceKey];
+        if (vLease && vLease.leaseId === victimLeaseId && vLease.workerPid === process.pid) {
+          vLease.deadlineMs = Math.max(
+            vLease.deadlineMs || 0,
+            now + (stopTimeoutMs || 60_000),
+          );
+        }
+      }
       if (targetSerial && current.serial !== targetSerial) {
         current.serial = targetSerial;
-        mutated = true;
       }
-      return { mutated, value: "ok" };
+      return { mutated: true, value: "ok" };
     });
     if (status !== "ok") {
       throw new Error(`Lease reservation ${lease.leaseId} was lost during boot`);
@@ -2098,6 +2106,16 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               }
             }
           }
+        } else if (rebootStopWaitTimedOut && !current) {
+          state.leases[lease.deviceKey] = {
+            ...lease,
+            state: "stopping",
+            workerPid: null,
+            workerPids: [],
+            replacingAvd: null,
+            serial: candidate.serial || lease.serial || null,
+            deadlineMs: now + effectiveStopTimeoutMs,
+          };
         }
         if (selection.victim) {
           const vCurrent = state.leases[selection.victim.deviceKey];
@@ -2109,6 +2127,24 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             } else {
               delete state.leases[selection.victim.deviceKey];
             }
+          } else if (victimStopWaitTimedOut && !vCurrent && victimLeaseId) {
+            state.leases[selection.victim.deviceKey] = {
+              leaseId: victimLeaseId,
+              deviceKey: selection.victim.deviceKey,
+              kind: "emulator",
+              avd: selection.victim.avd,
+              serial: selection.victim.serial || null,
+              profile: selection.victim.profile,
+              sessionId: lease.sessionId,
+              anchorPid: lease.anchorPid ?? null,
+              state: "stopping",
+              workerPid: null,
+              workerPids: [],
+              replacingAvd: null,
+              requiredRamMb: 0,
+              claimedAtMs: now,
+              deadlineMs: now + effectiveStopTimeoutMs,
+            };
           }
         }
         const otherLeaseOwnsDevice = Object.values(state.leases || {}).some(
@@ -2228,6 +2264,16 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               removeLeaseWorker(cur, process.pid, livenessCheck);
               cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
               cur.deadlineMs = now + effectiveStopTimeoutMs;
+            } else if (!cur) {
+              state.leases[lease.deviceKey] = {
+                ...lease,
+                state: "stopping",
+                workerPid: null,
+                workerPids: [],
+                replacingAvd: null,
+                serial: cleanupSerial || resolvedSerial || lease.serial || null,
+                deadlineMs: now + effectiveStopTimeoutMs,
+              };
             }
             return { mutated: true };
           },
@@ -2628,6 +2674,16 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               }
               delete state.leases[lease.deviceKey];
             }
+            return { mutated: true };
+          }
+          if (itemFailed && windowsStopWaitTimedOut && !cur) {
+            state.leases[lease.deviceKey] = {
+              ...lease,
+              state: "stopping",
+              workerPid: null,
+              workerPids: [],
+              deadlineMs: now + stopTimeoutMs,
+            };
             return { mutated: true };
           }
           return { mutated: false };

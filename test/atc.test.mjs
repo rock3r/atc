@@ -5009,31 +5009,39 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
           );
 
           const workerCount = 5;
-          const sab = new SharedArrayBuffer(16);
+          const sab = new SharedArrayBuffer(20);
           const syncView = new Int32Array(sab);
-          // syncView[0] = ready count, syncView[1] = go flag, syncView[2] = active holders, syncView[3] = max concurrent holders
+          // syncView[0] = ready count, syncView[1] = go flag, syncView[2] = active holders, syncView[3] = max concurrent holders, syncView[4] = error count
           const workerCode = `
-            import { workerData, parentPort } from "node:worker_threads";
-            const { acquireLock, verifyLockOwnership, releaseLock, sleepSync } = await import(workerData.lockModUrl);
+            const { workerData, parentPort } = require("node:worker_threads");
             const view = new Int32Array(workerData.sab);
-            Atomics.add(view, 0, 1);
-            Atomics.notify(view, 0);
-            while (Atomics.load(view, 1) === 0) {
-              Atomics.wait(view, 1, 0, 50);
-            }
-            const handle = acquireLock(workerData.stateDir, 6000);
-            const activeNow = Atomics.add(view, 2, 1) + 1;
-            let prevMax = Atomics.load(view, 3);
-            while (activeNow > prevMax) {
-              Atomics.compareExchange(view, 3, prevMax, activeNow);
-              prevMax = Atomics.load(view, 3);
-            }
-            const ownedStart = verifyLockOwnership(handle);
-            sleepSync(60);
-            const ownedEnd = verifyLockOwnership(handle);
-            Atomics.sub(view, 2, 1);
-            releaseLock(handle);
-            parentPort.postMessage({ ownedStart, ownedEnd, nonce: handle.nonce });
+            import(workerData.lockModUrl)
+              .then(({ acquireLock, verifyLockOwnership, releaseLock, sleepSync }) => {
+                Atomics.add(view, 0, 1);
+                Atomics.notify(view, 0);
+                const waitStart = Date.now();
+                while (Atomics.load(view, 1) === 0 && Date.now() - waitStart < 5000) {
+                  Atomics.wait(view, 1, 0, 50);
+                }
+                const handle = acquireLock(workerData.stateDir, 6000);
+                const activeNow = Atomics.add(view, 2, 1) + 1;
+                let prevMax = Atomics.load(view, 3);
+                while (activeNow > prevMax) {
+                  Atomics.compareExchange(view, 3, prevMax, activeNow);
+                  prevMax = Atomics.load(view, 3);
+                }
+                const ownedStart = verifyLockOwnership(handle);
+                sleepSync(60);
+                const ownedEnd = verifyLockOwnership(handle);
+                Atomics.sub(view, 2, 1);
+                releaseLock(handle);
+                parentPort.postMessage({ ownedStart, ownedEnd, nonce: handle.nonce });
+              })
+              .catch((err) => {
+                Atomics.add(view, 4, 1);
+                Atomics.notify(view, 0);
+                throw err;
+              });
           `;
 
           const workers = [];
@@ -5060,7 +5068,12 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
             }),
           );
 
-          while (Atomics.load(syncView, 0) < workerCount) {
+          const readyDeadlineMs = Date.now() + 5000;
+          while (
+            Atomics.load(syncView, 0) < workerCount &&
+            Atomics.load(syncView, 4) === 0 &&
+            Date.now() < readyDeadlineMs
+          ) {
             Atomics.wait(syncView, 0, Atomics.load(syncView, 0), 20);
           }
           Atomics.store(syncView, 1, 1);
@@ -5077,6 +5090,47 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         }
       } finally {
         fs.rmSync(raceLockDir, { recursive: true, force: true });
+      }
+
+      // 16. Abandoned breaker claim (terminated between claim creation and lock removal) is recovered
+      const abandonedClaimStateDir = makeTempStateDir();
+      try {
+        const staleLockPath = path.join(abandonedClaimStateDir, "atc.lock");
+        fs.mkdirSync(staleLockPath, { recursive: true, mode: 0o700 });
+        const staleOwnerPath = path.join(staleLockPath, "owner.json");
+        const staleCreatedAtMs = Date.now() - 60_000;
+        const staleNonce = "abandoned-claim-target";
+        fs.writeFileSync(
+          staleOwnerPath,
+          JSON.stringify({
+            pid: 99999999,
+            createdAtMs: staleCreatedAtMs,
+            staleAfterMs: 10_000,
+            nonce: staleNonce,
+          }),
+          "utf8",
+        );
+        const dirSt = fs.lstatSync(staleLockPath);
+        const ownerSt = fs.lstatSync(staleOwnerPath);
+        const token = `nonce.${dirSt.ino || 0}.${ownerSt.ino || 0}.${Math.trunc(staleCreatedAtMs)}.${staleNonce}`;
+        const claimDir = path.join(abandonedClaimStateDir, `atc.lock.stale.${token}`);
+        fs.mkdirSync(claimDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(
+          path.join(claimDir, "breaker.dead-breaker.json"),
+          JSON.stringify({
+            pid: 99999998,
+            createdAtMs: Date.now() - 10_000,
+            nonce: "dead-breaker",
+          }),
+          "utf8",
+        );
+
+        const recoveredAfterDeadBreaker = acquireLock(abandonedClaimStateDir, 2000);
+        assert.equal(verifyLockOwnership(recoveredAfterDeadBreaker), true);
+        assert.notEqual(recoveredAfterDeadBreaker.nonce, staleNonce);
+        releaseLock(recoveredAfterDeadBreaker);
+      } finally {
+        fs.rmSync(abandonedClaimStateDir, { recursive: true, force: true });
       }
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });

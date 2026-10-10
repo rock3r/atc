@@ -212,6 +212,146 @@ function sweepStaleLockClaims(stateDir, lockName, now = Date.now()) {
   }
 }
 
+function inspectAndCleanBreakClaimDir(claimDir, now = Date.now()) {
+  let entries;
+  try {
+    entries = fs.readdirSync(claimDir);
+  } catch {
+    return { done: false, active: true };
+  }
+  for (const name of entries) {
+    if (name === "done" || name.startsWith("moved.")) {
+      return { done: true, active: false };
+    }
+  }
+  let hasActive = false;
+  for (const name of entries) {
+    const fullPath = path.join(claimDir, name);
+    if (name.startsWith("breaker.") && name.endsWith(".json")) {
+      try {
+        const raw = fs.readFileSync(fullPath, "utf8");
+        const parsed = JSON.parse(raw);
+        const alive = parsed && isPidAlive(parsed.pid);
+        const fresh =
+          parsed &&
+          typeof parsed.createdAtMs === "number" &&
+          now - parsed.createdAtMs < MISSING_OWNER_STALE_MS;
+        if (alive && fresh) {
+          hasActive = true;
+        } else {
+          try {
+            fs.unlinkSync(fullPath);
+          } catch {
+            // Ignore concurrent unlink
+          }
+        }
+      } catch (err) {
+        if (!err || err.code !== "ENOENT") {
+          try {
+            const st = fs.lstatSync(fullPath);
+            if (now - (st.mtimeMs || st.ctimeMs || 0) >= MISSING_OWNER_STALE_MS) {
+              fs.unlinkSync(fullPath);
+            } else {
+              hasActive = true;
+            }
+          } catch {
+            // Ignore concurrent removal
+          }
+        }
+      }
+    } else if (name.includes(".tmp.")) {
+      const m = name.match(/\.tmp\.(\d+)\./);
+      const tmpPid = m ? Number(m[1]) : 0;
+      try {
+        const st = fs.lstatSync(fullPath);
+        const alive = tmpPid > 0 && isPidAlive(tmpPid);
+        const fresh = now - (st.mtimeMs || st.ctimeMs || 0) < MISSING_OWNER_STALE_MS;
+        if (alive && fresh) {
+          hasActive = true;
+        } else {
+          fs.unlinkSync(fullPath);
+        }
+      } catch {
+        // Ignore concurrent removal
+      }
+    }
+  }
+  return { done: false, active: hasActive };
+}
+
+function tryWithBreakClaim(stateDir, lockName, candidateBreakToken, fn) {
+  if (!candidateBreakToken) return false;
+  const claimDir = path.join(stateDir, `${lockName}.stale.${candidateBreakToken}`);
+  try {
+    fs.mkdirSync(claimDir, { recursive: true, mode: 0o700 });
+  } catch {
+    return false;
+  }
+
+  const initialState = inspectAndCleanBreakClaimDir(claimDir, Date.now());
+  if (initialState.done || initialState.active) {
+    return false;
+  }
+
+  const myClaimNonce = randomNonce();
+  const myClaimStartMs = Date.now();
+  const myBreakerName = `breaker.${myClaimNonce}.json`;
+  const myBreakerPath = path.join(claimDir, myBreakerName);
+  try {
+    writeFileAtomic(
+      myBreakerPath,
+      JSON.stringify({
+        pid: process.pid,
+        createdAtMs: myClaimStartMs,
+        nonce: myClaimNonce,
+      }),
+      myClaimNonce,
+    );
+    const verifyEntries = fs.readdirSync(claimDir);
+    if (
+      verifyEntries.some((n) => n === "done" || n.startsWith("moved.")) ||
+      verifyEntries.some((n) => n !== myBreakerName) ||
+      Date.now() - myClaimStartMs >= Math.floor(MISSING_OWNER_STALE_MS / 2)
+    ) {
+      return false;
+    }
+
+    const canProceed = () => {
+      if (Date.now() - myClaimStartMs >= Math.floor(MISSING_OWNER_STALE_MS / 2)) {
+        return false;
+      }
+      try {
+        const curEntries = fs.readdirSync(claimDir);
+        return (
+          curEntries.includes(myBreakerName) &&
+          !curEntries.some((n) => n === "done" || n.startsWith("moved.")) &&
+          !curEntries.some((n) => n !== myBreakerName)
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    const completed = Boolean(fn({ claimDir, myClaimNonce, canProceed }));
+    if (completed) {
+      try {
+        fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+      } catch {
+        // Best-effort completion marker
+      }
+    }
+    return completed;
+  } catch {
+    return false;
+  } finally {
+    try {
+      fs.unlinkSync(myBreakerPath);
+    } catch {
+      // Ignore if already removed
+    }
+  }
+}
+
 function publishOwnerFileExclusive(targetPath, content, nonce, canPublish = null) {
   const dir = path.dirname(targetPath);
   const base = path.basename(targetPath);
@@ -415,17 +555,11 @@ export function acquireLock(
     }
 
     if (candidateStale && candidateBreakToken && Date.now() - now < 30_000) {
-      const claimDir = path.join(stateDir, `${lockName}.stale.${candidateBreakToken}`);
-      let wonClaim = false;
-      try {
-        fs.mkdirSync(claimDir, { mode: 0o700 });
-        wonClaim = true;
-      } catch {
-        // Another breaker or releaseLock already claimed this lock instance
-      }
-
-      if (wonClaim) {
-        try {
+      const brokeLock = tryWithBreakClaim(
+        stateDir,
+        lockName,
+        candidateBreakToken,
+        ({ claimDir, myClaimNonce, canProceed }) => {
           if (info.missing) {
             const verifyInfo = inspectOwnerFile(
               ownerPath,
@@ -434,51 +568,65 @@ export function acquireLock(
               allowLivePidExpiry,
             );
             const verifyUnowned = verifyInfo.missing ? inspectUnownedLockDir(lockDir) : null;
-            if (verifyUnowned && verifyUnowned.token === candidateBreakToken) {
-              for (const entryName of candidateMissingEntries || []) {
-                if (entryName === "owner.json") continue;
-                try {
-                  fs.unlinkSync(path.join(lockDir, entryName));
-                } catch {
-                  // Ignore if already removed
-                }
-              }
-              fs.rmdirSync(lockDir);
-              observedUnownedAtMs.clear();
-              sweepStaleLockClaims(stateDir, lockName);
-              continue;
+            if (!verifyUnowned || verifyUnowned.token !== candidateBreakToken || !canProceed()) {
+              return false;
             }
-          } else {
-            const verifyInfo = inspectOwnerFile(
-              ownerPath,
-              Date.now(),
-              effectiveStaleMs,
-              allowLivePidExpiry,
-            );
-            const verifiedStale = info.valid
-              ? verifyInfo.valid &&
-                verifyInfo.stale &&
-                getValidOwnerToken(lockDir, verifyInfo) === candidateBreakToken
-              : !verifyInfo.valid &&
-                !verifyInfo.missing &&
-                getInvalidOwnerToken(lockDir, ownerPath, verifyInfo.raw) === candidateBreakToken;
-
-            if (verifiedStale) {
-              const movedLockDir = path.join(claimDir, "lock");
-              fs.renameSync(lockDir, movedLockDir);
-              observedUnownedAtMs.clear();
+            for (const entryName of candidateMissingEntries || []) {
+              if (entryName === "owner.json") continue;
               try {
-                fs.rmSync(movedLockDir, { recursive: true, force: true });
+                fs.unlinkSync(path.join(lockDir, entryName));
               } catch {
-                // Swept later by orphan sweep
+                // Ignore if already removed
               }
-              sweepStaleLockClaims(stateDir, lockName);
-              continue;
             }
+            if (!canProceed()) {
+              return false;
+            }
+            fs.rmdirSync(lockDir);
+            try {
+              fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+            } catch {
+              // Ignore
+            }
+            return true;
           }
-        } catch {
-          // Another process updated or removed the lock concurrently
-        }
+
+          const verifyInfo = inspectOwnerFile(
+            ownerPath,
+            Date.now(),
+            effectiveStaleMs,
+            allowLivePidExpiry,
+          );
+          const verifiedStale = info.valid
+            ? verifyInfo.valid &&
+              verifyInfo.stale &&
+              getValidOwnerToken(lockDir, verifyInfo) === candidateBreakToken
+            : !verifyInfo.valid &&
+              !verifyInfo.missing &&
+              getInvalidOwnerToken(lockDir, ownerPath, verifyInfo.raw) === candidateBreakToken;
+
+          if (!verifiedStale || !canProceed()) {
+            return false;
+          }
+          const movedLockDir = path.join(claimDir, `moved.${myClaimNonce}`);
+          fs.renameSync(lockDir, movedLockDir);
+          try {
+            fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+          } catch {
+            // Ignore
+          }
+          try {
+            fs.rmSync(movedLockDir, { recursive: true, force: true });
+          } catch {
+            // Swept later by orphan sweep
+          }
+          return true;
+        },
+      );
+      if (brokeLock) {
+        observedUnownedAtMs.clear();
+        sweepStaleLockClaims(stateDir, lockName);
+        continue;
       }
     }
 
@@ -515,73 +663,87 @@ export function releaseLock(lockHandle) {
   }
   const stateDir = path.dirname(lockHandle.lockDir);
   const lockName = path.basename(lockHandle.lockDir);
-  const claimDir = path.join(stateDir, `${lockName}.stale.${token}`);
-  try {
-    fs.mkdirSync(claimDir, { mode: 0o700 });
-  } catch {
-    // A stale-lock breaker already claimed this lock instance; do not touch lockDir
-    return;
-  }
 
-  const verifyInfo = inspectOwnerFile(lockHandle.ownerPath, Date.now(), STALE_LOCK_MS, false);
-  if (
-    !verifyInfo.valid ||
-    verifyInfo.nonce !== lockHandle.nonce ||
-    getValidOwnerToken(lockHandle.lockDir, verifyInfo) !== token
-  ) {
-    return;
-  }
+  tryWithBreakClaim(stateDir, lockName, token, ({ claimDir, myClaimNonce, canProceed }) => {
+    const verifyInfo = inspectOwnerFile(lockHandle.ownerPath, Date.now(), STALE_LOCK_MS, false);
+    if (
+      !verifyInfo.valid ||
+      verifyInfo.nonce !== lockHandle.nonce ||
+      getValidOwnerToken(lockHandle.lockDir, verifyInfo) !== token ||
+      !canProceed()
+    ) {
+      return false;
+    }
 
-  const movedLockDir = path.join(claimDir, "lock");
-  let renamedLockDir = false;
-  try {
-    fs.renameSync(lockHandle.lockDir, movedLockDir);
-    renamedLockDir = true;
-  } catch {
-    // Fallback to in-place unlink + rmdir
-  }
-
-  if (renamedLockDir) {
+    const movedLockDir = path.join(claimDir, `moved.${myClaimNonce}`);
+    let renamedLockDir = false;
     try {
-      fs.rmSync(movedLockDir, { recursive: true, force: true });
+      fs.renameSync(lockHandle.lockDir, movedLockDir);
+      renamedLockDir = true;
     } catch {
-      // Swept later by orphan sweep
+      // Fallback to in-place unlink + rmdir
     }
-    sweepStaleLockClaims(stateDir, lockName);
-    return;
-  }
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      fs.unlinkSync(lockHandle.ownerPath);
-      break;
-    } catch (err) {
-      if (err && err.code === "ENOENT") break;
-      if (attempt < 4) {
-        sleepSync(10);
+    if (renamedLockDir) {
+      try {
+        fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+      } catch {
+        // Ignore
       }
+      try {
+        fs.rmSync(movedLockDir, { recursive: true, force: true });
+      } catch {
+        // Swept later by orphan sweep
+      }
+      return true;
     }
-  }
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      fs.rmdirSync(lockHandle.lockDir);
-      break;
-    } catch (err) {
-      if (err && err.code === "ENOENT") break;
-      if (
-        process.platform === "win32" &&
-        err &&
-        (err.code === "EBUSY" || err.code === "EPERM" || err.code === "ENOTEMPTY")
-      ) {
+
+    let unlinkedOwner = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.unlinkSync(lockHandle.ownerPath);
+        unlinkedOwner = true;
+        break;
+      } catch (err) {
+        if (err && err.code === "ENOENT") {
+          unlinkedOwner = true;
+          break;
+        }
         if (attempt < 4) {
           sleepSync(10);
-          continue;
         }
-        return;
       }
-      break;
     }
-  }
+    if (!unlinkedOwner) {
+      return false;
+    }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.rmdirSync(lockHandle.lockDir);
+        break;
+      } catch (err) {
+        if (err && err.code === "ENOENT") break;
+        if (
+          process.platform === "win32" &&
+          err &&
+          (err.code === "EBUSY" || err.code === "EPERM" || err.code === "ENOTEMPTY")
+        ) {
+          if (attempt < 4) {
+            sleepSync(10);
+            continue;
+          }
+          break;
+        }
+        break;
+      }
+    }
+    try {
+      fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+    } catch {
+      // Ignore
+    }
+    return true;
+  });
   sweepStaleLockClaims(stateDir, lockName);
 }
 

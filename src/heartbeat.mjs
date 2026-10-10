@@ -4,10 +4,9 @@ import { withStateTransaction } from "./state.mjs";
 const { stateDir, deviceKey, leaseId, timeoutMs, workerPid, stopFlag } = workerData;
 const intervalMs = Math.max(250, Math.min(15_000, Math.floor((Number(timeoutMs) || 15_000) / 3)));
 
-const timer = setInterval(() => {
+function beat() {
   if (stopFlag && Atomics.load(stopFlag, 0) !== 0) {
-    clearInterval(timer);
-    return;
+    return false;
   }
   try {
     withStateTransaction(stateDir, (state, { now }) => {
@@ -31,4 +30,13 @@ const timer = setInterval(() => {
   } catch {
     // Ignore transient lock contention during background heartbeat
   }
-}, intervalMs);
+  return true;
+}
+
+if (beat()) {
+  const timer = setInterval(() => {
+    if (!beat()) {
+      clearInterval(timer);
+    }
+  }, intervalMs);
+}
