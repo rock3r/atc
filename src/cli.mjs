@@ -28,13 +28,16 @@ import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spaw
 import {
   DEFAULT_CONFIG,
   addLeaseWorker,
+  avdHasRuntimeLockFiles,
   canJumpAhead,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
   isTicketStarvationProtected,
   matchesProfile,
+  offlineAvdHasRuntimeLockFiles,
   readState,
   reconcileOfflineLeases,
+  recordDeviceStoppedInState,
   removeLeaseWorker,
   resolveSessionIdentity,
   resolveStableParentPid,
@@ -249,29 +252,6 @@ export function parseCliArgs(argv) {
   };
 }
 
-function recordDeviceStoppedInState(state, deviceInfo, now = Date.now()) {
-  if (!state || !deviceInfo) return;
-  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
-  if (!state.stoppedDevices || typeof state.stoppedDevices !== "object") {
-    state.stoppedDevices = {};
-  }
-  const entry = {
-    epoch: state.fleetEpoch,
-    stoppedAtMs: now,
-    avd: deviceInfo.avd || null,
-    serial: deviceInfo.serial || null,
-  };
-  if (deviceInfo.deviceKey) {
-    state.stoppedDevices[deviceInfo.deviceKey] = entry;
-  }
-  if (deviceInfo.avd) {
-    state.stoppedDevices[`avd:${deviceInfo.avd}`] = entry;
-  }
-  if (deviceInfo.serial) {
-    state.stoppedDevices[`serial:${deviceInfo.serial}`] = entry;
-  }
-}
-
 function clearDeviceStoppedInState(state, deviceInfo) {
   if (!state?.stoppedDevices || !deviceInfo) return;
   if (deviceInfo.deviceKey) delete state.stoppedDevices[deviceInfo.deviceKey];
@@ -458,6 +438,7 @@ function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
 
 function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
+  let resolvedAvd = avd || null;
   while (Date.now() < deadline) {
     const remainingForListMs = deadline - Date.now();
     if (remainingForListMs <= 0) break;
@@ -469,6 +450,11 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
       emulatorListOk && listRes.stdout
         ? parseAndroidEmulatorListOutput(listRes.stdout)
         : [];
+    for (const item of listedAvds) {
+      if (!resolvedAvd && serial && item.serial === serial && item.avd) {
+        resolvedAvd = item.avd;
+      }
+    }
 
     const remainingForAdbMs = deadline - Date.now();
     if (remainingForAdbMs <= 0) break;
@@ -481,18 +467,33 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
 
     const probesOk = Boolean(adbDevicesOk && emulatorListOk);
     const avdStillOnline = Boolean(
-      avd &&
-        listedAvds.some(
-          (item) =>
-            item.online &&
-            (item.avd === avd || (serial && item.serial === serial)),
-        ),
+      listedAvds.some(
+        (item) =>
+          item.online &&
+          ((resolvedAvd && item.avd === resolvedAvd) ||
+            (serial && item.serial === serial)),
+      ),
     );
     const serialStillOnline = Boolean(
       serial && adbDevices.some((dev) => dev.serial === serial),
     );
+    if (!resolvedAvd && serial && serialStillOnline) {
+      const remMs = deadline - Date.now();
+      if (remMs > 0) {
+        const nameRes = runner("adb", ["-s", serial, "emu", "avd", "name"], {
+          timeoutMs: Math.min(2000, Math.max(500, remMs)),
+        });
+        const avdId =
+          nameRes.status === 0 && nameRes.stdout
+            ? nameRes.stdout.split(/\r?\n/)[0].trim()
+            : "";
+        if (avdId && avdId !== "OK") {
+          resolvedAvd = avdId;
+        }
+      }
+    }
     let unmappedOnlineEmulatorMatchesAvd = false;
-    if (avd && !avdStillOnline && !serialStillOnline && adbDevicesOk) {
+    if (resolvedAvd && !avdStillOnline && !serialStillOnline && adbDevicesOk) {
       const mappedSerials = new Set(
         listedAvds.map((item) => item.serial).filter(Boolean),
       );
@@ -512,7 +513,7 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
           nameRes.status === 0 && nameRes.stdout
             ? nameRes.stdout.split(/\r?\n/)[0].trim()
             : "";
-        if (!avdId || avdId === "OK" || avdId === avd) {
+        if (!avdId || avdId === "OK" || avdId === resolvedAvd) {
           unmappedOnlineEmulatorMatchesAvd = true;
           break;
         }
@@ -524,22 +525,14 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
       serialStillOnline ||
       unmappedOnlineEmulatorMatchesAvd;
     let hasLockFiles = false;
-    if (avd && avdHome) {
-      try {
-        const meta = readLocalAvdMetadata(avd, avdHome);
-        const avdDir = meta.avdPath || path.join(avdHome, `${avd}.avd`);
-        if (fs.existsSync(avdDir)) {
-          hasLockFiles = fs
-            .readdirSync(avdDir)
-            .some(
-              (entry) =>
-                entry === "hardware-qemu.ini.lock" ||
-                entry === "snapshot.lock" ||
-                entry === "modem-nv-ram-5554.lock",
-            );
-        }
-      } catch {
-        hasLockFiles = true;
+    if (avdHome) {
+      if (resolvedAvd) {
+        hasLockFiles = avdHasRuntimeLockFiles(resolvedAvd, avdHome);
+      } else {
+        const onlineListedAvds = new Set(
+          listedAvds.filter((item) => item.online && item.avd).map((item) => item.avd),
+        );
+        hasLockFiles = offlineAvdHasRuntimeLockFiles(avdHome, onlineListedAvds);
       }
     }
     if (!stillRunning && !hasLockFiles && Date.now() <= deadline) {
@@ -549,7 +542,7 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
     sleepSync(250);
   }
   throw new Error(
-    `Timed out waiting for emulator ${avd || serial} to shut down.`,
+    `Timed out waiting for emulator ${resolvedAvd || serial} to shut down.`,
   );
 }
 

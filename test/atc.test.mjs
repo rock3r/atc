@@ -5468,7 +5468,74 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
           );
           return { mutated: true };
         });
-        assert.equal(readState(winReconcileDir).leases["avd:Pixel_Win_Reconcile"], undefined);
+        const postReconcileState = readState(winReconcileDir);
+        assert.equal(postReconcileState.leases["avd:Pixel_Win_Reconcile"], undefined);
+        assert.ok(postReconcileState.fleetEpoch > 2);
+        assert.equal(
+          postReconcileState.stoppedDevices?.["avd:Pixel_Win_Reconcile"]?.epoch,
+          postReconcileState.fleetEpoch,
+        );
+        assert.equal(
+          postReconcileState.stoppedDevices?.["serial:emulator-5582"]?.epoch,
+          postReconcileState.fleetEpoch,
+        );
+
+        // Unmapped serial-only Windows stop waits for android emulator list --long serial to go offline even after adb devices drops it
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          s.leases["serial:emulator-5590"] = {
+            leaseId: "lease_unmapped_win",
+            deviceKey: "serial:emulator-5590",
+            kind: "emulator",
+            avd: null,
+            serial: "emulator-5590",
+            state: "active",
+            workerPid: null,
+            workerPids: [],
+            sessionId: "unmapped-win-sess",
+            claimedAtMs: now,
+            renewedAtMs: now,
+            expiresAtMs: now + 600_000,
+          };
+          return { mutated: true };
+        });
+        let listPolls = 0;
+        const unmappedFreeRes = cmdFree(
+          winReconcileDir,
+          "lease_unmapped_win",
+          { session: "unmapped-win-sess", stop: true },
+          {
+            platform: "win32",
+            avdHome,
+            runner: (cmd, args) => {
+              if (cmd === "adb" && args.includes("emu") && args.includes("kill")) {
+                return { status: 0, stdout: "OK\n", stderr: "" };
+              }
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+                listPolls += 1;
+                if (listPolls === 1) {
+                  return {
+                    status: 0,
+                    stdout:
+                      "AVD ID                   AVD Name                      API Level      Status         Serial\nPixel_Win_Reconcile      Pixel Win Reconcile           android-35     Online         emulator-5590\n",
+                    stderr: "",
+                  };
+                }
+                return {
+                  status: 0,
+                  stdout:
+                    "AVD ID                   AVD Name                      API Level      Status         Serial\nPixel_Win_Reconcile      Pixel Win Reconcile           android-35     Offline\n",
+                  stderr: "",
+                };
+              }
+              if (cmd === "adb" && args[0] === "devices") {
+                return { status: 0, stdout: "List of devices attached\n", stderr: "" };
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            },
+          },
+        );
+        assert.equal(unmappedFreeRes.exitCode, 0);
+        assert.ok(listPolls >= 2, "Expected waitForEmulatorOffline to wait for listed serial to go offline");
       } finally {
         fs.rmSync(winReconcileDir, { recursive: true, force: true });
       }

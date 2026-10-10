@@ -497,12 +497,13 @@ export function avdHasRuntimeLockFiles(avdId, avdHome) {
   }
 }
 
-export function anyAvdHasRuntimeLockFiles(avdHome) {
+export function offlineAvdHasRuntimeLockFiles(avdHome, excludedAvds = new Set()) {
   if (!avdHome || !fs.existsSync(avdHome)) return false;
   try {
     for (const entry of fs.readdirSync(avdHome)) {
       if (entry.endsWith(".ini") || entry.endsWith(".avd")) {
         const avdId = entry.slice(0, -4);
+        if (excludedAvds && excludedAvds.has(avdId)) continue;
         if (avdHasRuntimeLockFiles(avdId, avdHome)) {
           return true;
         }
@@ -511,6 +512,29 @@ export function anyAvdHasRuntimeLockFiles(avdHome) {
     return false;
   } catch {
     return true;
+  }
+}
+
+export function recordDeviceStoppedInState(state, deviceInfo, now = Date.now()) {
+  if (!state || !deviceInfo) return;
+  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
+  if (!state.stoppedDevices || typeof state.stoppedDevices !== "object") {
+    state.stoppedDevices = {};
+  }
+  const entry = {
+    epoch: state.fleetEpoch,
+    stoppedAtMs: now,
+    avd: deviceInfo.avd || null,
+    serial: deviceInfo.serial || null,
+  };
+  if (deviceInfo.deviceKey) {
+    state.stoppedDevices[deviceInfo.deviceKey] = entry;
+  }
+  if (deviceInfo.avd) {
+    state.stoppedDevices[`avd:${deviceInfo.avd}`] = entry;
+  }
+  if (deviceInfo.serial) {
+    state.stoppedDevices[`serial:${deviceInfo.serial}`] = entry;
   }
 }
 
@@ -634,12 +658,13 @@ export function reconcileOfflineLeases(
       const offlineEntry = lease.avd
         ? (inventory.offline || []).find((d) => d.avd === lease.avd || d.deviceKey === deviceKey)
         : null;
-      const hasLocks = lease.avd
-        ? Boolean(offlineEntry?.hasLockFiles) ||
-          Boolean(avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))
-        : Boolean((inventory.offline || []).some((d) => d?.hasLockFiles)) ||
-          Boolean(avdHome && anyAvdHasRuntimeLockFiles(avdHome));
+      const hasLocks = Boolean(
+        lease.avd &&
+          (offlineEntry?.hasLockFiles ||
+            (avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))),
+      );
       if (hasLocks) continue;
+      recordDeviceStoppedInState(state, lease, now);
       delete state.leases[deviceKey];
       mutated = true;
       continue;
