@@ -223,6 +223,22 @@ const ANDROID_VALUE_GLOBAL_FLAGS = new Set([
   "--output",
   "--log-level",
   "--config",
+  "--project",
+  "-p",
+  "--duration",
+]);
+
+const REMOTE_LIFECYCLE_VERBS = new Set([
+  "remove",
+  "delete",
+  "disconnect",
+  "stop",
+  "release",
+  "create",
+  "reserve",
+  "connect",
+  "add",
+  "extend",
 ]);
 
 function findAndroidSubcommand(args) {
@@ -278,20 +294,29 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         );
       }
     } else if (androidParsed.sub === "device" && androidParsed.action === "remote") {
-      const remoteActions = args
+      let remIdx = androidParsed.actIdx + 1;
+      while (remIdx < args.length) {
+        const a = String(args[remIdx]);
+        if (ANDROID_VALUE_GLOBAL_FLAGS.has(a) && remIdx + 1 < args.length) {
+          remIdx += 2;
+        } else if (a.startsWith("-")) {
+          remIdx += 1;
+        } else {
+          break;
+        }
+      }
+      const remoteAction = String(args[remIdx] || "");
+      const fallbackVerb = args
         .slice(androidParsed.actIdx + 1)
         .map(String)
-        .filter((a) => !a.startsWith("-"));
-      const remoteAction = remoteActions[0] || "";
-      if (
-        ["remove", "delete", "disconnect", "stop", "release", "create", "reserve", "connect", "add"].includes(
-          remoteAction,
-        ) &&
-        !args.includes("--help") &&
-        !args.includes("-h")
-      ) {
+        .find((t) => REMOTE_LIFECYCLE_VERBS.has(t));
+      const deniedAction = REMOTE_LIFECYCLE_VERBS.has(remoteAction)
+        ? remoteAction
+        : fallbackVerb ||
+          (remoteAction && remoteAction !== "list" && remoteAction !== "status" ? remoteAction : "");
+      if (deniedAction && !args.includes("--help") && !args.includes("-h")) {
         throw new Error(
-          `Direct "android device remote ${remoteAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
+          `Direct "android device remote ${deniedAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
         );
       }
     }

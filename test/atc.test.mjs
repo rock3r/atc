@@ -2968,6 +2968,46 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             );
             assert.equal(missingAvdSnap.exitCode, 1);
             assert.match(missingAvdSnap.error, /No emulator found matching AVD "Does_Not_Exist_AVD"/);
+
+            // 21. `android device remote --project ... remove` and `android device remote extend` are rejected in guard and buildChildInvocation
+            const guardRemoteProjectRemove = evaluateCommandGuard(
+              "android device remote --project my-project remove victim-res",
+              {
+                sessionId: "target-sess",
+                activeLeases: [l2.lease],
+              },
+            );
+            assert.equal(guardRemoteProjectRemove.allowed, false);
+            assert.match(guardRemoteProjectRemove.reason, /android device remote remove/);
+
+            const guardRemoteExtend = evaluateCommandGuard(
+              "android device remote extend res-1 --duration=30",
+              {
+                sessionId: "target-sess",
+                activeLeases: [l2.lease],
+              },
+            );
+            assert.equal(guardRemoteExtend.allowed, false);
+            assert.match(guardRemoteExtend.reason, /android device remote extend/);
+
+            assert.throws(
+              () =>
+                buildChildInvocation(
+                  "android",
+                  ["device", "remote", "--project", "my-project", "remove", "victim-res"],
+                  l2.lease,
+                ),
+              /android device remote remove/,
+            );
+            assert.throws(
+              () =>
+                buildChildInvocation(
+                  "android",
+                  ["device", "remote", "extend", "res-1", "--duration=30"],
+                  l2.lease,
+                ),
+              /android device remote extend/,
+            );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

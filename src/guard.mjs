@@ -598,6 +598,9 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       "--output",
       "--log-level",
       "--config",
+      "--project",
+      "-p",
+      "--duration",
     ]);
     let subIdx = 0;
     while (subIdx < args.length) {
@@ -627,7 +630,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       }
     }
     const action = String(args[actIdx] || args[subIdx + 1] || "");
-    return { subIdx, sub, actIdx, action };
+    return { subIdx, sub, actIdx, action, valueFlags };
   })();
 
   if (baseCmd === "emulator" || (baseCmd === "android" && androidSubInfo.sub === "emulator")) {
@@ -659,31 +662,48 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   if (baseCmd === "android" && androidSubInfo.sub === "device" && androidSubInfo.action === "remote") {
-    const remoteRest = args
+    const remoteLifecycleVerbs = new Set([
+      "remove",
+      "delete",
+      "disconnect",
+      "stop",
+      "release",
+      "create",
+      "reserve",
+      "connect",
+      "add",
+      "extend",
+    ]);
+    let remIdx = androidSubInfo.actIdx + 1;
+    while (remIdx < args.length) {
+      const a = String(args[remIdx]);
+      if (androidSubInfo.valueFlags.has(a) && remIdx + 1 < args.length) {
+        remIdx += 2;
+      } else if (a.startsWith("-")) {
+        remIdx += 1;
+      } else {
+        break;
+      }
+    }
+    const remoteAction = String(args[remIdx] || "");
+    const fallbackVerb = args
       .slice(androidSubInfo.actIdx + 1)
       .map(String)
-      .filter((a) => !a.startsWith("-"));
-    const remoteAction = remoteRest[0] || "";
-    if (
-      args.includes("--help") ||
-      args.includes("-h") ||
-      remoteAction === "list" ||
-      remoteAction === "status" ||
-      !remoteAction
-    ) {
+      .find((t) => remoteLifecycleVerbs.has(t));
+    if (args.includes("--help") || args.includes("-h")) {
       return { kind: "read_only", parsed };
     }
-    if (
-      ["remove", "delete", "disconnect", "stop", "release", "create", "reserve", "connect", "add"].includes(
-        remoteAction,
-      )
-    ) {
+    const deniedAction = remoteLifecycleVerbs.has(remoteAction)
+      ? remoteAction
+      : fallbackVerb || (remoteAction && remoteAction !== "list" && remoteAction !== "status" ? remoteAction : "");
+    if (deniedAction) {
       return {
         kind: "deny_lifecycle",
-        reason: `Direct "android device remote ${remoteAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
+        reason: `Direct "android device remote ${deniedAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
         parsed,
       };
     }
+    return { kind: "read_only", parsed };
   }
 
   if (baseCmd === "adb") {
