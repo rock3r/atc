@@ -135,10 +135,31 @@ function camelToFlagName(key) {
 
 function validateCommandFlags(flags, allowedSet, subcommand) {
   if (!flags || typeof flags !== "object") return null;
+  const selfValidatedKeys = new Set([
+    "ttl",
+    "ttlSec",
+    "wait",
+    "waitSec",
+    "reorderWindow",
+    "reorderWindowSec",
+    "target",
+    "snapshotSave",
+    "snapshotLoad",
+    "snapshotSaveOnFree",
+    "resetApp",
+  ]);
   for (const [key, val] of Object.entries(flags)) {
     if (val === undefined) continue;
     if (!allowedSet.has(key)) {
       return `Unknown option "${camelToFlagName(key)}" for "atc ${subcommand}".`;
+    }
+    if (
+      !BOOLEAN_FLAG_KEYS.has(key) &&
+      key !== "h" &&
+      !selfValidatedKeys.has(key) &&
+      typeof val === "boolean"
+    ) {
+      return `Option "${camelToFlagName(key)}" requires a value.`;
     }
   }
   return null;
@@ -364,17 +385,35 @@ function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
   throw new Error(`Timed out waiting for emulator ${serial} to finish restoring snapshot.`);
 }
 
-export function selectCandidateUnderLock(state, inventory, req, callerTicket, now = Date.now()) {
+export function selectCandidateUnderLock(
+  state,
+  inventory,
+  req,
+  callerTicket,
+  now = Date.now(),
+  callerSessionId = callerTicket?.sessionId || null,
+  livenessCheck = isPidAlive,
+) {
   const cfg = state.config || DEFAULT_CONFIG;
   const effectiveMax = computeEffectiveMaxEmulators(cfg, inventory.host);
   const usedSlots = computeUsedEmulatorSlots(state, inventory);
-  const leasedSerials = new Set(
-    Object.values(state.leases || {})
-      .map((l) => l.serial)
-      .filter(Boolean),
-  );
-  const isDeviceOccupied = (d) =>
-    Boolean(state.leases[d.deviceKey] || (d.serial && leasedSerials.has(d.serial)));
+  const getOccupyingLease = (d) =>
+    state.leases[d.deviceKey] ||
+    (d.serial
+      ? Object.values(state.leases || {}).find((l) => l.serial === d.serial)
+      : null) ||
+    null;
+  const isDeviceOccupied = (d) => Boolean(getOccupyingLease(d));
+  const isCallerOwnedResettable = (d) => {
+    if (!callerSessionId || (!req.wipeData && !req.coldBoot)) return false;
+    const l = getOccupyingLease(d);
+    return Boolean(
+      l &&
+        l.state === "active" &&
+        l.sessionId === callerSessionId &&
+        syncLeaseWorkers(l, livenessCheck).length === 0,
+    );
+  };
 
   const earlierTickets = [];
   for (const t of state.queue) {
@@ -507,7 +546,9 @@ export function selectCandidateUnderLock(state, inventory, req, callerTicket, no
       ? (inventory.running || []).filter((d) => d.kind === "emulator" && d.avd)
       : []),
     ...(hasUnmappedRunningEmulator ? [] : inventory.offline || []),
-  ].filter((d) => !isDeviceOccupied(d) && matchesProfile(d, req));
+  ]
+    .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, req))
+    .sort((a, b) => Number(isCallerOwnedResettable(b)) - Number(isCallerOwnedResettable(a)));
 
   let firstResourceErr = null;
 
@@ -666,22 +707,35 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     reason: flags.reason || null,
   };
 
-  if (req.snapshotLoad && !/^[A-Za-z0-9._-]{1,64}$/.test(String(req.snapshotLoad))) {
+  if (
+    flags.snapshotLoad !== undefined &&
+    flags.snapshotLoad !== null &&
+    (typeof flags.snapshotLoad !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(flags.snapshotLoad))
+  ) {
     return {
       exitCode: 1,
-      error: `Invalid snapshot name "${req.snapshotLoad}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+      error: `Invalid snapshot name "${flags.snapshotLoad}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
     };
   }
-  if (req.snapshotSaveOnFree && !/^[A-Za-z0-9._-]{1,64}$/.test(String(req.snapshotSaveOnFree))) {
+  if (
+    flags.snapshotSaveOnFree !== undefined &&
+    flags.snapshotSaveOnFree !== null &&
+    (typeof flags.snapshotSaveOnFree !== "string" ||
+      !/^[A-Za-z0-9._-]{1,64}$/.test(flags.snapshotSaveOnFree))
+  ) {
     return {
       exitCode: 1,
-      error: `Invalid snapshot name "${req.snapshotSaveOnFree}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+      error: `Invalid snapshot name "${flags.snapshotSaveOnFree}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
     };
   }
-  if (req.resetApp && !/^[A-Za-z0-9._]{1,128}$/.test(String(req.resetApp))) {
+  if (
+    flags.resetApp !== undefined &&
+    flags.resetApp !== null &&
+    (typeof flags.resetApp !== "string" || !/^[A-Za-z0-9._]{1,128}$/.test(flags.resetApp))
+  ) {
     return {
       exitCode: 1,
-      error: `Invalid package name "${req.resetApp}" for --reset-app.`,
+      error: `Invalid package name "${flags.resetApp}" for --reset-app.`,
     };
   }
   const rawWait = flags.wait ?? flags.waitSec;
@@ -782,7 +836,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             !req.wipeData &&
             !req.coldBoot
           ) {
-            const needsPrep = Boolean(req.resetApp || req.snapshotLoad);
+            const needsSnapLoad = Boolean(
+              req.snapshotLoad && lease.loadedSnapshot !== req.snapshotLoad,
+            );
+            const needsPrep = Boolean(req.resetApp || needsSnapLoad);
             const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
             const livenessCheck = options.livenessCheck || isPidAlive;
             if (needsPrep) {
@@ -811,6 +868,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                 status: "claimed_immediate",
                 lease,
                 idempotent: true,
+                needsPrep,
+                needsSnapLoad,
                 stopTimeoutMs,
               },
             };
@@ -818,7 +877,15 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         }
 
         const existingTicket = state.queue.find((t) => t.sessionId === identity.sessionId) || null;
-        const selection = selectCandidateUnderLock(state, inventory, req, existingTicket, now);
+        const selection = selectCandidateUnderLock(
+          state,
+          inventory,
+          req,
+          existingTicket,
+          now,
+          identity.sessionId,
+          options.livenessCheck || isPidAlive,
+        );
 
         if (selection.priority === 1 && !selection.needsWarmPrep) {
           const dev = selection.candidate;
@@ -860,7 +927,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 
         if (selection.priority !== null) {
           const dev = selection.candidate;
-          const leaseId = `lease_${randomNonce().slice(0, 12)}`;
+          const existingOwnLease =
+            state.leases[dev.deviceKey]?.sessionId === identity.sessionId
+              ? state.leases[dev.deviceKey]
+              : null;
+          const leaseId = existingOwnLease?.leaseId || `lease_${randomNonce().slice(0, 12)}`;
           const bootTimeoutMs = (state.config.bootTimeoutSec || 180) * 1000;
           const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
           let victimLeaseId = null;
@@ -1005,11 +1076,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     }
 
     if (txOutcome.status === "claimed_immediate") {
-      if (txOutcome.idempotent && (req.snapshotLoad || req.resetApp) && txOutcome.lease?.serial) {
+      if (txOutcome.idempotent && txOutcome.needsPrep && txOutcome.lease?.serial) {
         let loadedSnap = null;
         let prepUpdatedSnap = false;
         try {
-          if (req.snapshotLoad) {
+          if (txOutcome.needsSnapLoad && req.snapshotLoad) {
             const snapTimeoutMs = txOutcome.stopTimeoutMs || 60_000;
             const snapRes = runner(
               "adb",
@@ -1499,14 +1570,22 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
-  if (flags.snapshotSave && !/^[A-Za-z0-9._-]{1,64}$/.test(String(flags.snapshotSave))) {
+  if (
+    flags.snapshotSave !== undefined &&
+    flags.snapshotSave !== null &&
+    (typeof flags.snapshotSave !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(flags.snapshotSave))
+  ) {
     return {
       exitCode: 1,
       error: `Invalid snapshot name "${flags.snapshotSave}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
       freed: [],
     };
   }
-  if (flags.snapshotLoad && !/^[A-Za-z0-9._-]{1,64}$/.test(String(flags.snapshotLoad))) {
+  if (
+    flags.snapshotLoad !== undefined &&
+    flags.snapshotLoad !== null &&
+    (typeof flags.snapshotLoad !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(flags.snapshotLoad))
+  ) {
     return {
       exitCode: 1,
       error: `Invalid snapshot name "${flags.snapshotLoad}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,

@@ -3155,6 +3155,99 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(omittedConfigVal.exitCode, 1);
             assert.match(omittedConfigVal.error, /Missing value for config key "minFreeDiskMb"/);
             assert.equal(readState(coldRediscoverDir).config.minFreeDiskMb, 2048);
+
+            // 27. Omitted snapshot option values (boolean true from parseCliArgs) are rejected
+            const omittedFreeSnapSave = cmdFree(coldRediscoverDir, l2.lease.leaseId, {
+              session: "target-sess",
+              snapshotSave: true,
+            });
+            assert.equal(omittedFreeSnapSave.exitCode, 1);
+            assert.match(omittedFreeSnapSave.error, /Invalid snapshot name "true"/);
+
+            const omittedFreeSnapLoad = cmdFree(coldRediscoverDir, l2.lease.leaseId, {
+              session: "target-sess",
+              snapshotLoad: true,
+            });
+            assert.equal(omittedFreeSnapLoad.exitCode, 1);
+            assert.match(omittedFreeSnapLoad.error, /Invalid snapshot name "true"/);
+
+            // 28. Idempotent re-claim with already-loaded snapshot skips reloading, while a new snapshot loads
+            const singleMatchInv = {
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+              running: [
+                {
+                  deviceKey: "avd:Pixel_9_API_36",
+                  avd: "Pixel_9_API_36",
+                  serial: "emulator-5556",
+                  kind: "emulator",
+                  online: true,
+                  snapshots: ["clean", "other"],
+                  profile: { deviceType: "phone", apiLevel: "android-36" },
+                },
+              ],
+              offline: [],
+              creatable: [],
+            };
+            const snapLoadCmds = [];
+            const firstIdempotentLoad = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", snapshotLoad: "clean" },
+              {
+                inventory: singleMatchInv,
+                runner: (cmd, args) => {
+                  const full = [cmd, ...args].join(" ");
+                  snapLoadCmds.push(full);
+                  if (full.includes("sys.boot_completed")) {
+                    return { status: 0, stdout: "1\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(firstIdempotentLoad.exitCode, 0);
+            assert.equal(firstIdempotentLoad.idempotent, true);
+            assert.ok(snapLoadCmds.some((c) => c.includes("emu avd snapshot load clean")));
+
+            snapLoadCmds.length = 0;
+            const secondIdempotentLoad = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", snapshotLoad: "clean" },
+              {
+                inventory: singleMatchInv,
+                runner: (cmd, args) => {
+                  const full = [cmd, ...args].join(" ");
+                  snapLoadCmds.push(full);
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(secondIdempotentLoad.exitCode, 0);
+            assert.equal(secondIdempotentLoad.idempotent, true);
+            assert.equal(snapLoadCmds.length, 0);
+
+            // 29. State-reset reclaim (--cold) on caller's own active lease reboots in-place instead of returning busy
+            const coldReclaimCmds = [];
+            const coldReclaimRes = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", cold: true, wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: singleMatchInv,
+                runner: (cmd, args) => {
+                  const full = [cmd, ...args].join(" ");
+                  coldReclaimCmds.push(full);
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    return { status: 0, stdout: "Started on emulator-5556\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(coldReclaimRes.exitCode, 0);
+            assert.equal(coldReclaimRes.lease.leaseId, l2.lease.leaseId);
+            assert.ok(coldReclaimCmds.some((c) => c.includes("android emulator stop")));
+            assert.ok(coldReclaimCmds.some((c) => c.includes("android emulator start Pixel_9_API_36 --cold")));
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
