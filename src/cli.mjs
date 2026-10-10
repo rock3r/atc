@@ -2371,22 +2371,8 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     default: {
-      process.stdout.write(
-        `Android Traffic Control (atc)\n\n` +
-          `Usage:\n` +
-          `  atc claim [--type <type>] [--api <spec>] [--play|--no-play] [--snapshot-load <name>] [--ttl <sec>] [--wait <sec>]\n` +
-          `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
-          `  atc renew [<target>] [--ttl <sec>]\n` +
-          `  atc snapshot <list|save|load|delete> [<name>]\n` +
-          `  atc exec -- <command> [args...]\n` +
-          `  atc status [--type <type>] [--api <spec>] [--json]\n` +
-          `  atc config <get|set> [key] [val]\n` +
-          `  atc gc\n` +
-          `  atc guard [--format=json] <command>\n` +
-          `  atc hook <pre-tool-use|stop>\n` +
-          `  atc mcp\n`,
-      );
-      return 0;
+      process.stderr.write(`[atc] Unknown subcommand "${parsed.subcommand}". Run "atc --help" for usage.\n`);
+      return 1;
     }
   }
 }

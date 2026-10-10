@@ -2596,6 +2596,12 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               ATC_SESSION_ID: "help-sess",
             });
             assert.equal(helpExit2, 0);
+            const unknownExit = await runCli(["fre", "--stop"], {
+              ...process.env,
+              ATC_STATE_DIR: helpDir,
+              ATC_SESSION_ID: "help-sess",
+            });
+            assert.equal(unknownExit, 1);
             assert.ok(readState(helpDir).leases["avd:Pixel_8_API_35"]);
           } finally {
             fs.rmSync(helpDir, { recursive: true, force: true });
