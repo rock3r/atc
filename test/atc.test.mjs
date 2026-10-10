@@ -2074,20 +2074,53 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         assert.equal(wc2.idempotent, true);
         assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
 
-        // Even when anchor exits and an idempotent re-claim with --reset-app runs, lease survives while 71002 is alive
+        // Even when anchor exits, plain idempotent re-claim keeps the lease alive while 71002 is alive,
+        // whereas destructive prep (--reset-app / snapshot load) refuses to run while 71002 is active
         anchorAlive = false;
-        const wc3 = cmdClaim(
+        const wc3Plain = cmdClaim(
           workerKeepDir,
-          { session: "worker-keep-sess", anchorPid: 71001, api: "35", resetApp: "com.example.app" },
+          { session: "worker-keep-sess", anchorPid: 71001, api: "35" },
+          { inventory: workerInv, livenessCheck: liveness },
+        );
+        assert.equal(wc3Plain.exitCode, 0);
+        assert.ok(readState(workerKeepDir).leases["avd:Pixel_8_API_35"]);
+        assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
+
+        const wc3BusyPrep = cmdClaim(
+          workerKeepDir,
+          {
+            session: "worker-keep-sess",
+            anchorPid: 71001,
+            api: "35",
+            resetApp: "com.example.app",
+            wait: 0,
+          },
           {
             inventory: workerInv,
             livenessCheck: liveness,
-            runner: () => ({ status: 0, stdout: "Success", stderr: "" }),
+            runner: () => {
+              throw new Error("Should not reset app while worker 71002 is alive");
+            },
           },
         );
-        assert.equal(wc3.exitCode, 0);
+        assert.equal(wc3BusyPrep.exitCode, 2);
         assert.ok(readState(workerKeepDir).leases["avd:Pixel_8_API_35"]);
         assert.equal(readState(workerKeepDir).leases["avd:Pixel_8_API_35"].workerPid, 71002);
+
+        const snapBusyLoad = cmdSnapshot(
+          workerKeepDir,
+          "load",
+          "clean_boot",
+          { session: "worker-keep-sess" },
+          {
+            livenessCheck: liveness,
+            runner: () => {
+              throw new Error("Should not load snapshot while worker 71002 is alive");
+            },
+          },
+        );
+        assert.equal(snapBusyLoad.exitCode, 3);
+        assert.match(snapBusyLoad.error, /active in-flight worker/);
 
         // cmdFree (both plain and with --stop) preserves the lease while registered worker 71002 is alive
         const freeWhileBusy = cmdFree(
@@ -3691,6 +3724,61 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(
               readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]?.state,
               "active",
+            );
+
+            // 42. Forced release takeover during boot (same leaseId, state changed to "stopping") blocks activation
+            cmdFree(coldRediscoverDir, "Pixel_8_API_35", { force: true });
+            const forcedTakeoverRes = cmdClaim(
+              coldRediscoverDir,
+              {
+                session: "boot-takeover-sess",
+                avd: "Pixel_8_API_35",
+                wait: 0,
+              },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  host: singleMatchInv.host,
+                  running: [],
+                  offline: [
+                    {
+                      deviceKey: "avd:Pixel_8_API_35",
+                      avd: "Pixel_8_API_35",
+                      serial: null,
+                      kind: "emulator",
+                      online: false,
+                      profile: { deviceType: "phone", apiLevel: "android-35" },
+                    },
+                  ],
+                  creatable: [],
+                },
+                runner: (cmd, args) => {
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    withStateTransaction(coldRediscoverDir, (state, { now }) => {
+                      const cur = state.leases["avd:Pixel_8_API_35"];
+                      if (cur) {
+                        cur.state = "stopping";
+                        cur.workerPid = 999888;
+                        cur.deadlineMs = now + 60_000;
+                      }
+                      return { mutated: true };
+                    });
+                    return { status: 0, stdout: "Started on emulator-5554\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(forcedTakeoverRes.exitCode, 1);
+            assert.match(forcedTakeoverRes.error, /was lost during boot/);
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"]?.state,
+              "stopping",
+            );
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"]?.workerPid,
+              999888,
             );
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });

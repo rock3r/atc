@@ -260,7 +260,12 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
     stateDir,
     (state, { now }) => {
       const cur = state.leases[deviceKey];
-      if (!cur || cur.leaseId !== leaseId) {
+      if (
+        !cur ||
+        cur.leaseId !== leaseId ||
+        cur.state === "stopping" ||
+        (cur.state === "starting" && cur.workerPid !== process.pid)
+      ) {
         return { mutated: false, value: { lease: null, deferredFree: false } };
       }
       if (onBeforeRelease) {
@@ -840,12 +845,19 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             const needsPrep = Boolean(req.resetApp || needsSnapLoad);
             const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
             const livenessCheck = options.livenessCheck || isPidAlive;
+            const activeWorkers = syncLeaseWorkers(lease, livenessCheck).filter(
+              (p) => p !== process.pid,
+            );
+            if (needsPrep && activeWorkers.length > 0) {
+              lease.renewedAtMs = now;
+              lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
+              continue;
+            }
             if (needsPrep) {
               addLeaseWorker(lease, process.pid, livenessCheck);
+              lease.workerPid = process.pid;
               lease.state = "starting";
               lease.deadlineMs = now + stopTimeoutMs;
-            } else {
-              syncLeaseWorkers(lease, livenessCheck);
             }
             lease.releaseOnWorkerExit = false;
             delete lease.pendingSnapshotSave;
@@ -1097,7 +1109,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               return {
                 mutated: false,
                 value: Boolean(
-                  cur && cur.leaseId === txOutcome.lease.leaseId && cur.state === "starting",
+                  cur &&
+                    cur.leaseId === txOutcome.lease.leaseId &&
+                    cur.state === "starting" &&
+                    cur.workerPid === process.pid,
                 ),
               };
             },
@@ -1165,7 +1180,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           stateDir,
           (state, { now }) => {
             const cur = state.leases[txOutcome.lease.deviceKey];
-            if (!cur || cur.leaseId !== txOutcome.lease.leaseId) {
+            if (
+              !cur ||
+              cur.leaseId !== txOutcome.lease.leaseId ||
+              cur.state !== "starting" ||
+              cur.workerPid !== process.pid
+            ) {
               return { mutated: false, value: false };
             }
             const livenessCheck = options.livenessCheck || isPidAlive;
@@ -1299,7 +1319,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       return {
         mutated: false,
         value: Boolean(
-          current && current.leaseId === lease.leaseId && current.state === "starting",
+          current &&
+            current.leaseId === lease.leaseId &&
+            current.state === "starting" &&
+            current.workerPid === process.pid,
         ),
       };
     });
@@ -1402,7 +1425,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         const newKey = `avd:${createdAvdName}`;
         const migrationConflict = withStateTransaction(stateDir, (state) => {
           const current = state.leases[oldKey];
-          if (!current || current.leaseId !== lease.leaseId) {
+          if (
+            !current ||
+            current.leaseId !== lease.leaseId ||
+            current.state !== "starting" ||
+            current.workerPid !== process.pid
+          ) {
             return {
               mutated: false,
               value: `Lease reservation ${lease.leaseId} was lost during AVD creation.`,
@@ -1584,7 +1612,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     // 4. Activate lease under atc.lock
     const activeLease = withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
-      if (!current || current.leaseId !== lease.leaseId) {
+      if (
+        !current ||
+        current.leaseId !== lease.leaseId ||
+        current.state !== "starting" ||
+        current.workerPid !== process.pid
+      ) {
         throw new Error(`Lease reservation ${lease.leaseId} was lost during boot`);
       }
       current.state = "active";
@@ -1617,7 +1650,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
     }
     const stillOwned = withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
-      const owned = Boolean(current && current.leaseId === lease.leaseId);
+      const owned = Boolean(
+        current &&
+          current.leaseId === lease.leaseId &&
+          current.state === "starting" &&
+          current.workerPid === process.pid,
+      );
       if (owned) {
         if (previousLease) {
           state.leases[lease.deviceKey] = {
@@ -2291,9 +2329,23 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     }
     const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
     const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
-    addLeaseWorker(lease, process.pid, options.livenessCheck || isPidAlive);
+    const livenessCheck = options.livenessCheck || isPidAlive;
+    const activeWorkers = syncLeaseWorkers(lease, livenessCheck).filter(
+      (p) => p !== process.pid,
+    );
+    if (effectiveAction === "load" && activeWorkers.length > 0 && !parseBoolFlag(flags.force)) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Lease ${lease.leaseId} (${lease.deviceKey}) has active in-flight worker(s) (${activeWorkers.join(", ")}); wait for completion or pass --force.`,
+        },
+      };
+    }
+    addLeaseWorker(lease, process.pid, livenessCheck);
     if (effectiveAction === "load") {
       lease.state = "starting";
+      lease.workerPid = process.pid;
       lease.deadlineMs = now + stopTimeoutMs;
     }
     lease.renewedAtMs = now;
@@ -2368,7 +2420,10 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           return {
             mutated: false,
             value: Boolean(
-              cur && cur.leaseId === leaseCheck.lease.leaseId && cur.state === "starting",
+              cur &&
+                cur.leaseId === leaseCheck.lease.leaseId &&
+                cur.state === "starting" &&
+                cur.workerPid === process.pid,
             ),
           };
         },
