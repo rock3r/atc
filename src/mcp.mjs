@@ -95,8 +95,15 @@ function resolveMcpCallOptions(sessionOptions = {}) {
   const hostAgentPid = sessionOptions.ppid ?? process.ppid;
   const mcpPid = sessionOptions.pid ?? process.pid;
   const baseEnv = sessionOptions.env || process.env;
-  const defaultSessionId =
+  const explicitSession =
     sessionOptions.sessionId ||
+    sessionOptions.flags?.session ||
+    sessionOptions.flags?.role ||
+    null;
+  const explicitAnchorPid =
+    sessionOptions.anchorPid ?? sessionOptions.flags?.anchorPid ?? null;
+  const defaultSessionId =
+    explicitSession ||
     baseEnv.ATC_SESSION_ID ||
     baseEnv.CODEX_SESSION_ID ||
     baseEnv.PI_SESSION_ID ||
@@ -110,11 +117,15 @@ function resolveMcpCallOptions(sessionOptions = {}) {
   const mcpEnv = {
     ...baseEnv,
     ATC_SESSION_ID: defaultSessionId,
-    ATC_ANCHOR_PID: baseEnv.ATC_ANCHOR_PID || String(mcpPid),
+    ATC_ANCHOR_PID:
+      explicitAnchorPid !== null && explicitAnchorPid !== undefined
+        ? String(explicitAnchorPid)
+        : baseEnv.ATC_ANCHOR_PID || String(mcpPid),
   };
   return {
     ...sessionOptions,
     sessionId: defaultSessionId,
+    anchorPid: explicitAnchorPid,
     env: mcpEnv,
     ppid: hostAgentPid,
   };
@@ -255,7 +266,7 @@ export function startMcpServer(stateDir, sessionOptions = {}) {
         cmdFree(
           stateDir,
           null,
-          sessionOptions.sessionId ? { session: sessionOptions.sessionId } : {},
+          serverOptions.sessionId ? { session: serverOptions.sessionId } : {},
           serverOptions,
         );
       } catch {

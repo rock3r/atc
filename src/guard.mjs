@@ -37,6 +37,24 @@ const SHELL_WRAPPERS = new Set([
   "source",
   ".",
 ]);
+const SHELL_BUILTIN_WRAPPERS = new Set([
+  "command",
+  "builtin",
+  "eval",
+  "source",
+  ".",
+  "time",
+  "exec",
+]);
+
+function requiresShellExecution(cmdStr) {
+  const firstTok = tokenizeSegment(cmdStr)[0] || "";
+  return (
+    firstTok.includes("=") ||
+    SHELL_BUILTIN_WRAPPERS.has(firstTok.toLowerCase())
+  );
+}
+
 const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "echo",
   "printf",
@@ -333,7 +351,24 @@ function splitOutsideQuotes(str, sepType) {
           i++;
           continue;
         }
-        if (ch === ";" || ch === "\n" || ch === "&") {
+        if (ch === ";") {
+          if (cur.trim()) parts.push(cur.trim());
+          cur = "";
+          if (str[i + 1] === ";" && str[i + 2] === "&") {
+            i += 2;
+          } else if (str[i + 1] === ";" || str[i + 1] === "&") {
+            i += 1;
+          }
+          continue;
+        }
+        if (
+          ch === "\n" ||
+          (ch === "&" &&
+            str[i + 1] !== ">" &&
+            str[i - 1] !== ">" &&
+            str[i - 1] !== "<" &&
+            str[i - 1] !== "|")
+        ) {
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
           continue;
@@ -346,6 +381,9 @@ function splitOutsideQuotes(str, sepType) {
         ) {
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
+          if (str[i + 1] === "&") {
+            i++;
+          }
           continue;
         }
       }
@@ -486,7 +524,7 @@ export function splitShellSegments(command) {
   return segments;
 }
 
-export function tokenizeSegment(segment) {
+export function tokenizeSegment(segment, { preserveLiteralDollar = false } = {}) {
   const tokens = [];
   const str = String(segment || "");
   const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
@@ -514,9 +552,7 @@ export function tokenizeSegment(segment) {
         end++;
       }
     }
-    const rawWord = str
-      .slice(start, end)
-      .replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+    const rawWord = str.slice(start, end);
     const keepBackslashes = isWinPathLike(rawWord) || rawWord === "\\;";
     let tok = "";
     let j = 0;
@@ -526,7 +562,8 @@ export function tokenizeSegment(segment) {
         j++;
         while (j < rawWord.length && rawWord[j] !== '"') {
           if (rawWord[j] === "\\" && j + 1 < rawWord.length && /["\\$`]/.test(rawWord[j + 1])) {
-            tok += rawWord[j + 1];
+            const escapedCh = rawWord[j + 1];
+            tok += preserveLiteralDollar && escapedCh === "$" ? "\uE000" : escapedCh;
             j += 2;
           } else {
             tok += rawWord[j++];
@@ -545,16 +582,27 @@ export function tokenizeSegment(segment) {
           }
         }
         if (j < rawWord.length) j++;
-        tok += decodeShellEscapes(ansiInner);
+        const decoded = decodeShellEscapes(ansiInner);
+        tok += preserveLiteralDollar ? decoded.replace(/\$/g, "\uE000") : decoded;
       } else if (ch === "'") {
         j++;
         while (j < rawWord.length && rawWord[j] !== "'") {
-          tok += rawWord[j++];
+          const sqCh = rawWord[j++];
+          tok += preserveLiteralDollar && sqCh === "$" ? "\uE000" : sqCh;
         }
         if (j < rawWord.length) j++;
       } else if (ch === "\\" && j + 1 < rawWord.length && !keepBackslashes) {
-        tok += rawWord[j + 1];
+        const escapedCh = rawWord[j + 1];
+        tok += preserveLiteralDollar && escapedCh === "$" ? "\uE000" : escapedCh;
         j += 2;
+      } else if (ch === "$") {
+        const m = rawWord.slice(j).match(/^\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/);
+        if (m) {
+          tok += `\${${m[1]}}`;
+          j += m[0].length;
+        } else {
+          tok += rawWord[j++];
+        }
       } else {
         tok += rawWord[j++];
       }
@@ -602,6 +650,9 @@ function expandSingleBraceExpression(full, inner, vars, opaqueFallback) {
   }
   const key = m[1];
   const hasKey = Object.prototype.hasOwnProperty.call(vars, key);
+  if (!hasKey && opaqueFallback === null) {
+    return failValue;
+  }
   const val = hasKey ? String(vars[key]) : "";
   const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, (rawRef, k) =>
     Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : rawRef,
@@ -726,12 +777,10 @@ function expandSingleBraceExpression(full, inner, vars, opaqueFallback) {
   return failValue;
 }
 
-export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_sub__" } = {}) {
-  if (!str || typeof str !== "string" || !str.includes("$")) {
-    return str;
-  }
-  const safeVars = vars || {};
-  let out = str;
+function expandUnquotedChunk(str, safeVars, opaqueFallback) {
+  let out = str.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\.]|$)/g, (m, k) =>
+    Object.prototype.hasOwnProperty.call(safeVars, k) ? `\${${k}}` : m,
+  );
   for (let pass = 0; pass < 4 && out.includes("${"); pass++) {
     const next = out.replace(/\$\{([^{}]+)\}/g, (full, inner) =>
       expandSingleBraceExpression(full, inner, safeVars, opaqueFallback),
@@ -750,6 +799,76 @@ export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_su
   });
 }
 
+export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_sub__" } = {}) {
+  if (!str || typeof str !== "string") {
+    return str;
+  }
+  if (!str.includes("$")) {
+    return str.replace(/\uE000/g, "$");
+  }
+  const safeVars = vars || {};
+  let out = "";
+  let chunk = "";
+  let inSingle = false;
+  let inDouble = false;
+  const flushChunk = () => {
+    if (chunk) {
+      out += expandUnquotedChunk(chunk, safeVars, opaqueFallback);
+      chunk = "";
+    }
+  };
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (!inSingle && ch === "\\" && i + 1 < str.length) {
+      if (str[i + 1] === "$") {
+        flushChunk();
+        out += "\\$";
+        i++;
+        continue;
+      }
+      chunk += ch + str[i + 1];
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === "$" && str[i + 1] === "'") {
+      flushChunk();
+      out += "$'";
+      i += 2;
+      while (i < str.length && str[i] !== "'") {
+        if (str[i] === "\\" && i + 1 < str.length) {
+          out += str[i] + str[i + 1];
+          i += 2;
+        } else {
+          out += str[i++];
+        }
+      }
+      if (i < str.length && str[i] === "'") {
+        out += "'";
+      }
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      flushChunk();
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (inSingle) {
+      out += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = !inDouble;
+      chunk += ch;
+      continue;
+    }
+    chunk += ch;
+  }
+  flushChunk();
+  return out.replace(/\uE000/g, "$");
+}
+
 export function parseSegment(segment, inheritedVars = {}) {
   const rawStripped = String(segment || "")
     .trimStart()
@@ -761,7 +880,7 @@ export function parseSegment(segment, inheritedVars = {}) {
     rawStripped.includes("`")
       ? extractCommandSubstitutions(rawStripped, [])
       : rawStripped;
-  const tokens = tokenizeSegment(strippedSegment);
+  const tokens = tokenizeSegment(strippedSegment, { preserveLiteralDollar: true });
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
@@ -994,34 +1113,54 @@ export function parseSegment(segment, inheritedVars = {}) {
 export function extractTargetSerial(parsed) {
   const { baseCmd, args } = parsed;
   if (baseCmd === "adb") {
+    const selectors = [];
     let subIdx = 0;
     while (subIdx < args.length) {
       const a = String(args[subIdx]);
       if (a === "-d" || a === "-e" || a === "-t" || a.startsWith("-t")) {
-        return a === "-t" && subIdx + 1 < args.length ? `-t ${args[subIdx + 1]}` : a;
+        selectors.push(a === "-t" && subIdx + 1 < args.length ? `-t ${args[subIdx + 1]}` : a);
+        subIdx += a === "-t" && subIdx + 1 < args.length ? 2 : 1;
+        continue;
       }
       if (a === "-s" && subIdx + 1 < args.length) {
-        return String(args[subIdx + 1]);
+        selectors.push(String(args[subIdx + 1]));
+        subIdx += 2;
+        continue;
       }
       if (a.startsWith("-s") && a.length > 2) {
-        return a.slice(2);
+        selectors.push(a.slice(2));
+        subIdx += 1;
+        continue;
       }
       if (a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
         subIdx += 1;
+      } else if (a.startsWith("wait-for-") && subIdx + 1 < args.length) {
+        subIdx += 1;
       } else {
         break;
       }
     }
-  }
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--device=")) {
-      return a.slice("--device=".length);
+    if (selectors.length > 0) {
+      const unique = Array.from(new Set(selectors));
+      return unique.length === 1 ? unique[0] : unique.join(",");
     }
-    if ((a === "--device" || a === "-s") && i + 1 < args.length) {
-      return args[i + 1];
+  } else {
+    const selectors = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--") break;
+      if (a.startsWith("--device=")) {
+        selectors.push(a.slice("--device=".length));
+      } else if ((a === "--device" || a === "-s") && i + 1 < args.length) {
+        selectors.push(args[i + 1]);
+        i += 1;
+      }
+    }
+    if (selectors.length > 0) {
+      const unique = Array.from(new Set(selectors));
+      return unique.length === 1 ? unique[0] : unique.join(",");
     }
   }
   if (parsed.envVars.ANDROID_SERIAL) {
@@ -1312,13 +1451,24 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         parsed,
       };
     }
-    if (adbSub === "reconnect" && adbRest.includes("offline")) {
-      return {
-        kind: "deny_lifecycle",
-        reason:
-          'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
-        parsed,
-      };
+    if (adbSub === "reconnect") {
+      const reconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (reconnectTargets.includes("offline")) {
+        return {
+          kind: "deny_lifecycle",
+          reason:
+            'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
+          parsed,
+        };
+      }
+      if (reconnectTargets.length !== 1 || reconnectTargets[0] !== "device") {
+        return {
+          kind: "deny_lifecycle",
+          reason:
+            'Bare "adb reconnect" is disabled under ATC because it resets host-side ADB connections across the host; use "adb reconnect device" inside "atc exec --" instead.',
+          parsed,
+        };
+      }
     }
     if (adbSub === "emu" && adbRest[0] === "kill") {
       return {
@@ -1888,12 +2038,31 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         cur = "";
         continue;
       }
+      if (ch === "\n") {
+        tokens.push({ type: "stage", text: cur });
+        tokens.push({ type: "sep", text: "\n" });
+        cur = "";
+        continue;
+      }
+      if (ch === "|" && !isCasePatternAlternationPipe(cur, command.slice(i + 1))) {
+        tokens.push({ type: "stage", text: cur });
+        if (command[i + 1] === "&") {
+          tokens.push({ type: "sep", text: " |& " });
+          i += 1;
+        } else {
+          tokens.push({ type: "sep", text: " | " });
+        }
+        cur = "";
+        continue;
+      }
       if (
-        ch === "\n" ||
-        (ch === "|" && !isCasePatternAlternationPipe(cur, command.slice(i + 1)))
+        ch === "&" &&
+        command[i + 1] !== ">" &&
+        command[i - 1] !== ">" &&
+        command[i - 1] !== "<"
       ) {
         tokens.push({ type: "stage", text: cur });
-        tokens.push({ type: "sep", text: ch === "\n" ? "\n" : ` ${ch} ` });
+        tokens.push({ type: "sep", text: " & " });
         cur = "";
         continue;
       }
@@ -1905,17 +2074,48 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
   }
 
   const shellVars = {};
+  let pipeUpstreamArgs = [];
+  let inPipeline = false;
   return tokens
     .map((tok) => {
-      if (tok.type !== "stage") return tok.text;
+      if (tok.type !== "stage") {
+        const sepTrimmed = tok.text.trim();
+        if (sepTrimmed === "|" || sepTrimmed === "|&") {
+          inPipeline = true;
+        } else {
+          pipeUpstreamArgs = [];
+          inPipeline = false;
+        }
+        return tok.text;
+      }
       let trimmed = tok.text.trim();
       if (!trimmed) return tok.text;
       const subRewrite = rewriteStageCommandSubstitutions(trimmed, rewriteOpts);
-      const c = classifySegment(
-        subRewrite.changed ? subRewrite.maskedStage : trimmed,
-        shellVars,
-      );
+      const stageForClassify = subRewrite.changed ? subRewrite.maskedStage : trimmed;
+      const parsedStage = parseSegment(stageForClassify, shellVars);
+      let classifyInput = stageForClassify;
+      if (inPipeline && pipeUpstreamArgs.length > 0) {
+        if (SHELL_WRAPPERS.has(parsedStage.baseCmd)) {
+          classifyInput = `${stageForClassify} ${pipeUpstreamArgs.map((a) => JSON.stringify(a)).join(" ")}`;
+        } else if (parsedStage.baseCmd === "xargs" || parsedStage.baseCmd === "parallel") {
+          classifyInput = `${stageForClassify} ${pipeUpstreamArgs.join(" ")}`;
+        }
+      }
+      const c = classifySegment(classifyInput, shellVars);
       Object.assign(shellVars, c.parsed?.envVars || {});
+      const forVarMatch = trimmed.match(/^(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+      if (forVarMatch) {
+        shellVars[forVarMatch[1]] = "__atc_cmd_sub__";
+      }
+      const readVarMatch = trimmed.match(/(?:^|\b)read\s+(?:-[A-Za-z0-9]+\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*$/);
+      if (readVarMatch) {
+        shellVars[readVarMatch[1]] = "__atc_cmd_sub__";
+      }
+      for (const arg of parsedStage.args) {
+        if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
+          pipeUpstreamArgs.push(arg);
+        }
+      }
       if (subRewrite.changed) {
         trimmed = subRewrite.rewrittenStage;
         if (c.kind !== "device_action" && c.kind !== "atc") {
@@ -1932,23 +2132,38 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         }
         const { body: strippedBody, suffix } = splitTrailingControlClosers(cmdBody);
         cmdBody = strippedBody;
-        if (Object.keys(shellVars).length > 0 && cmdBody.includes("$")) {
-          const normalizedBody = cmdBody.replace(
-            /\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g,
-            (m, k) => (Object.prototype.hasOwnProperty.call(shellVars, k) ? `\${${k}}` : m),
-          );
-          cmdBody = expandVariables(normalizedBody, shellVars, { opaqueFallback: null });
+        const staticShellVars = Object.fromEntries(
+          Object.entries(shellVars).filter(
+            ([k, v]) =>
+              !k.startsWith("__atc_") &&
+              typeof v === "string" &&
+              !v.includes("__atc_cmd_sub__") &&
+              /^[A-Za-z0-9._:/@=-]+$/.test(v),
+          ),
+        );
+        if (Object.keys(staticShellVars).length > 0 && cmdBody.includes("$")) {
+          cmdBody = expandVariables(cmdBody, staticShellVars, { opaqueFallback: null });
         }
         if (isWin) {
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
         const isSimpleStage =
-          !/[<>|&;`$()\r\n]/.test(cmdBody) && !tokenizeSegment(cmdBody)[0]?.includes("=");
+          !/[<>|&;`()\r\n]/.test(cmdBody) && !requiresShellExecution(cmdBody);
         if (isSimpleStage) {
           return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
+        const dynamicEnvAssigns = Object.entries(shellVars)
+          .filter(
+            ([k]) =>
+              !k.startsWith("__atc_") &&
+              /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) &&
+              !Object.prototype.hasOwnProperty.call(staticShellVars, k) &&
+              new RegExp(`\\$(?:\\{${k}[^}]*\\}|${k}\\b)`).test(cmdBody),
+          )
+          .map(([k]) => `${k}="$${k}" `)
+          .join("");
         const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;
-        return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
+        return `${prefix}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =
@@ -2100,8 +2315,8 @@ export function evaluateCommandGuard(
     const isSimpleSingleCommand =
       segments.length === 1 &&
       !needsAtcRewrite &&
-      !/[<>|&;`$()\r\n]/.test(command) &&
-      !tokenizeSegment(command)[0]?.includes("=");
+      !/[<>|&;`()\r\n]/.test(command) &&
+      !requiresShellExecution(command);
     if (isWin) {
       rewrittenCommand = rewriteCompoundCommand(command, {
         sessionId,

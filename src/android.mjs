@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runCommandSync } from "./spawn.mjs";
-import { DEFAULT_CONFIG, normalizeApiLevel } from "./state.mjs";
+import { DEFAULT_CONFIG, avdHasRuntimeLockFiles, normalizeApiLevel } from "./state.mjs";
 
 export class ResourceError extends Error {
   constructor(exitCode, message) {
@@ -43,9 +43,16 @@ export function parseIniFile(content) {
 export function inferDeviceType(deviceName = "", sysDir = "", tagId = "") {
   const combined = `${deviceName} ${sysDir} ${tagId}`.toLowerCase();
   if (combined.includes("xr") || combined.includes("glasses")) return "xr";
-  if (combined.includes("wear")) return "wear";
+  if (
+    combined.includes("wear") ||
+    /(?:^|[\s,/_\\-])watch(?:$|[\s,/_\\-])/.test(combined)
+  ) {
+    return "wear";
+  }
   if (combined.includes("tv") || combined.includes("atv")) return "tv";
-  if (combined.includes("auto") || combined.includes("car")) return "automotive";
+  if (/(?:^|[\s,/_\\-])(automotive|auto|car)(?:$|[\s,/_\\-])/.test(combined)) {
+    return "automotive";
+  }
   if (combined.includes("desktop")) return "desktop";
   if (combined.includes("fold")) return "foldable";
   if (combined.includes("tablet") || combined.includes("pixel_c")) return "tablet";
@@ -86,8 +93,10 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   if (fs.existsSync(iniPath)) {
     try {
       const rootIni = parseIniFile(fs.readFileSync(iniPath, "utf8"));
-      if (rootIni.path && fs.existsSync(rootIni.path)) {
+      if (rootIni.path && (fs.existsSync(rootIni.path) || !fs.existsSync(avdPath))) {
         avdPath = rootIni.path;
+      } else if (rootIni["path.rel"] && !fs.existsSync(avdPath)) {
+        avdPath = path.resolve(avdHome, rootIni["path.rel"]);
       }
       if (rootIni.target) {
         targetApi = normalizeApiLevel(rootIni.target);
@@ -121,6 +130,7 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   const sdcardMb = parseSizeMb(configIni["sdcard.size"], 512, "B");
   const dataDiskMb = dataPartitionMb + sdcardMb;
   const requiredRamMb = ramSizeMb + (cfg.qemuOverheadRamMb ?? 1024);
+  const diskInfo = readDiskVolumeInfo(avdPath, avdHome);
 
   let snapshots = [];
   const snapDir = path.join(avdPath, "snapshots");
@@ -140,6 +150,7 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
     avd: avdId,
     avdPath,
     exists: fs.existsSync(avdPath) || fs.existsSync(iniPath),
+    hasLockFiles: avdHasRuntimeLockFiles(avdId, avdHome),
     profile: {
       deviceType,
       deviceName,
@@ -152,6 +163,8 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
     requiredRamMb,
     cpuCores,
     dataDiskMb,
+    freeDiskMb: diskInfo.freeDiskMb,
+    fsDev: diskInfo.fsDev,
     snapshots,
   };
 }
@@ -161,6 +174,11 @@ export function wipeAvdUserData(avdId, avdHome = resolveAvdHome(), cfg = DEFAULT
   const avdPath = meta.avdPath;
   if (!avdPath || !fs.existsSync(avdPath)) {
     return;
+  }
+  if (avdHasRuntimeLockFiles(avdId, avdHome)) {
+    throw new Error(
+      `Cannot wipe AVD ${avdId}: emulator runtime lock files are still present in ${avdPath}`,
+    );
   }
   const filesToRemove = [
     "userdata-qemu.img",
@@ -209,8 +227,13 @@ export function parseAdbGetpropOutput(stdout) {
 export function parseAndroidEmulatorListOutput(stdout) {
   const avds = [];
   const lines = String(stdout).split(/\r?\n/);
+  let hasLongHeader = false;
   for (const raw of lines) {
     const line = raw.trim();
+    if (/^AVD\s+ID\s+AVD\s+NAME\b/i.test(line)) {
+      hasLongHeader = true;
+      continue;
+    }
     if (
       !line ||
       /^AVD(?:\s+(?:ID|NAME))*\s+(?:AVD\s+NAME\s+)?(?:API(?:\s+LEVEL)?|STATUS|STATE|SERIAL)\b/i.test(line) ||
@@ -221,12 +244,38 @@ export function parseAndroidEmulatorListOutput(stdout) {
       continue;
     }
     const tokens = line.split(/\s+/).filter(Boolean);
+    if (
+      /^\s+/.test(raw) &&
+      avds.length > 0 &&
+      /^(online|offline)$/i.test(tokens[0] || "")
+    ) {
+      const prev = avds[avds.length - 1];
+      prev.online = tokens[0].toLowerCase() === "online";
+      const serialMatch = line.match(/\b(emulator-\d+)\b/);
+      if (serialMatch) {
+        prev.serial = serialMatch[1];
+      }
+      continue;
+    }
     if (tokens.length === 1 && /^[A-Za-z0-9._-]+$/.test(tokens[0])) {
       avds.push({ avd: tokens[0], online: false, serial: null, apiLevel: null });
       continue;
     }
     if (tokens.length >= 2) {
-      const avd = tokens[0];
+      let avd = tokens[0];
+      const secondIsApiOrStatus =
+        /^(?:online|offline|android-[A-Za-z0-9._-]+|\d{2})$/i.test(tokens[1] || "");
+      if (
+        hasLongHeader &&
+        secondIsApiOrStatus &&
+        avd.length % 2 === 0 &&
+        avd.length >= 50
+      ) {
+        const half = avd.length / 2;
+        if (avd.slice(0, half) === avd.slice(half)) {
+          avd = avd.slice(0, half);
+        }
+      }
       const secondLast =
         tokens.length >= 4 ? tokens[tokens.length - 2].toLowerCase() : "";
       const second = tokens[1].toLowerCase();
@@ -355,16 +404,41 @@ export function parseCreatableProfilesOutput(stdout) {
   return profiles;
 }
 
-export function readFreeDiskMb(avdHome = resolveAvdHome()) {
+function resolveExistingDiskTarget(targetPath, fallbackDir = os.homedir()) {
+  let cur = targetPath ? path.resolve(String(targetPath)) : "";
+  while (cur) {
+    if (fs.existsSync(cur)) {
+      return cur;
+    }
+    const parent = path.dirname(cur);
+    if (!parent || parent === cur) break;
+    cur = parent;
+  }
+  if (fallbackDir && fs.existsSync(fallbackDir)) {
+    return fallbackDir;
+  }
+  return os.homedir();
+}
+
+export function readDiskVolumeInfo(targetPath = resolveAvdHome(), fallbackDir = os.homedir()) {
   let freeDiskMb = 16384;
+  let fsDev = null;
   try {
-    const targetDir = fs.existsSync(avdHome) ? avdHome : os.homedir();
+    const targetDir = resolveExistingDiskTarget(targetPath, fallbackDir);
     const stat = fs.statfsSync(targetDir);
     freeDiskMb = Math.round((Number(stat.bavail) * Number(stat.bsize)) / (1024 * 1024));
+    const dirStat = fs.statSync(targetDir);
+    if (dirStat && (typeof dirStat.dev === "number" || typeof dirStat.dev === "bigint")) {
+      fsDev = String(dirStat.dev);
+    }
   } catch {
     // Fallback
   }
-  return freeDiskMb;
+  return { freeDiskMb, fsDev };
+}
+
+export function readFreeDiskMb(avdHome = resolveAvdHome()) {
+  return readDiskVolumeInfo(avdHome).freeDiskMb;
 }
 
 export function readHostResources(avdHome = resolveAvdHome()) {
@@ -405,10 +479,12 @@ export function readHostResources(avdHome = resolveAvdHome()) {
     }
   }
 
+  const diskInfo = readDiskVolumeInfo(avdHome);
   return {
     totalRamMb,
     availableRamMb,
-    freeDiskMb: readFreeDiskMb(avdHome),
+    freeDiskMb: diskInfo.freeDiskMb,
+    fsDev: diskInfo.fsDev,
     cpuCores: os.availableParallelism(),
   };
 }
@@ -429,10 +505,19 @@ export function checkResourceAdmission(
       : candidate.requiredRamMb || 2048 + overheadMb;
   const neededDiskMb = wipeOrCreate ? candidate.dataDiskMb || 6656 : candidate.ramSizeMb || 2048;
 
+  const candidateDiskInfo =
+    typeof candidate.freeDiskMb === "number"
+      ? { freeDiskMb: candidate.freeDiskMb, fsDev: candidate.fsDev ?? host?.fsDev ?? null }
+      : candidate.avdPath
+        ? readDiskVolumeInfo(candidate.avdPath, inventory?.avdHome || resolveAvdHome())
+        : { freeDiskMb: host?.freeDiskMb ?? 16384, fsDev: candidate.fsDev ?? host?.fsDev ?? null };
+  const candidateFsKey = candidateDiskInfo.fsDev || candidate.avdPath || "default";
+
   const onlineAvds = new Set(
     (inventory?.running || []).filter((d) => d.kind === "emulator").map((d) => d.avd),
   );
   let unaccountedRamMb = 0;
+  let unaccountedDiskMb = 0;
   for (const lease of Object.values(state.leases || {})) {
     if (lease.kind !== "emulator" || lease.avd === candidate.avd) continue;
     const isStarting = lease.state === "starting" && !onlineAvds.has(lease.avd);
@@ -443,6 +528,17 @@ export function checkResourceAdmission(
       now - lease.activatedAtMs < 30_000;
     if (isStarting || isRecentlyActivated) {
       unaccountedRamMb += lease.requiredRamMb || 2048 + overheadMb;
+    }
+    const leaseFsKey = lease.fsDev || host?.fsDev || lease.avdPath || "default";
+    if (leaseFsKey === candidateFsKey) {
+      if (isStarting && typeof lease.requiredDiskMb === "number" && lease.requiredDiskMb > 0) {
+        unaccountedDiskMb += lease.requiredDiskMb;
+      } else if (
+        typeof lease.pendingSnapshotDiskMb === "number" &&
+        lease.pendingSnapshotDiskMb > 0
+      ) {
+        unaccountedDiskMb += lease.pendingSnapshotDiskMb;
+      }
     }
   }
 
@@ -461,21 +557,45 @@ export function checkResourceAdmission(
     );
   }
 
-  if ((host.freeDiskMb ?? 16384) < neededDiskMb + (cfg.minFreeDiskMb ?? 2048)) {
+  const projectedFreeDiskMb = (candidateDiskInfo.freeDiskMb ?? 16384) - unaccountedDiskMb;
+  if (projectedFreeDiskMb < neededDiskMb + (cfg.minFreeDiskMb ?? 2048)) {
     throw new ResourceError(
       5,
-      `Insufficient disk space for AVD "${candidate.avd}": needs ${neededDiskMb}MB (+${cfg.minFreeDiskMb ?? 2048}MB reserve), only ${host.freeDiskMb}MB free. Pass --force to bypass.`,
+      `Insufficient disk space for AVD "${candidate.avd}": needs ${neededDiskMb}MB (+${cfg.minFreeDiskMb ?? 2048}MB reserve), only ${projectedFreeDiskMb}MB free. Pass --force to bypass.`,
     );
   }
 
-  return { ok: true, projectedAvailableRamMb };
+  return { ok: true, projectedAvailableRamMb, projectedFreeDiskMb };
+}
+
+export function isAndroidEmulatorCliUnavailable(res, platform = process.platform) {
+  if (!res || res.status === 0) return false;
+  if (platform === "win32") return true;
+  if (res.error && res.error.code === "ENOENT") return true;
+  if (res.status === 127 || res.status === 9009) return true;
+  const combined = `${res.stderr || ""} ${res.stdout || ""}`;
+  return /(?:not recognized|command not found|not supported|unsupported|unknown command|no such file)/i.test(
+    combined,
+  );
 }
 
 export function discoverFleet({
   avdHome = resolveAvdHome(),
   cfg = DEFAULT_CONFIG,
   runner = runCommandSync,
+  platform = process.platform,
+  onProgress = null,
 } = {}) {
+  const notifyProgress = () => {
+    if (typeof onProgress === "function") {
+      try {
+        onProgress();
+      } catch {
+        // Ignore progress callback failure
+      }
+    }
+  };
+  const discoveredAtMs = Date.now();
   const host = readHostResources(avdHome);
   const knownAvds = new Map();
 
@@ -499,9 +619,11 @@ export function discoverFleet({
     }
   }
 
-  // 2. Query android emulator list --long
+  // 2. Query android emulator list --long (or SDK emulator -list-avds fallback when android CLI emulator subcommand is unavailable)
+  notifyProgress();
   const emuListRes = runner("android", ["emulator", "list", "--long"], { timeoutMs: 8000 });
-  const emulatorListOk = emuListRes.status === 0;
+  notifyProgress();
+  let emulatorListOk = emuListRes.status === 0;
   const onlineSerials = new Set();
   if (emulatorListOk && emuListRes.stdout) {
     for (const item of parseAndroidEmulatorListOutput(emuListRes.stdout)) {
@@ -520,12 +642,32 @@ export function discoverFleet({
       }
       knownAvds.set(item.avd, existing);
     }
+  } else if (isAndroidEmulatorCliUnavailable(emuListRes, platform)) {
+    const sdkListRes = runner("emulator", ["-list-avds"], { timeoutMs: 8000 });
+    notifyProgress();
+    if (sdkListRes.status === 0) {
+      emulatorListOk = true;
+      for (const rawLine of String(sdkListRes.stdout || "").split(/\r?\n/)) {
+        const avdId = rawLine.trim();
+        if (!avdId || !/^[A-Za-z0-9._-]+$/.test(avdId)) continue;
+        if (!knownAvds.has(avdId)) {
+          knownAvds.set(avdId, {
+            ...readLocalAvdMetadata(avdId, avdHome, cfg),
+            deviceKey: `avd:${avdId}`,
+            kind: "emulator",
+            online: false,
+            serial: null,
+          });
+        }
+      }
+    }
   }
 
   // 3. Query adb devices for online emulators and physical USB/Wi-Fi devices
   const physicalDevices = [];
   const unmappedEmulators = [];
   const adbRes = runner("adb", ["devices"], { timeoutMs: 8000 });
+  notifyProgress();
   const adbDevicesOk = adbRes.status === 0;
   if (adbDevicesOk && adbRes.stdout) {
     for (const dev of parseAdbDevicesOutput(adbRes.stdout)) {
@@ -537,6 +679,7 @@ export function discoverFleet({
           continue;
         }
         const nameRes = runner("adb", ["-s", dev.serial, "emu", "avd", "name"], { timeoutMs: 4000 });
+        notifyProgress();
         const avdId =
           nameRes.status === 0 && nameRes.stdout
             ? nameRes.stdout.split(/\r?\n/)[0].trim()
@@ -574,6 +717,7 @@ export function discoverFleet({
         }
       } else {
         const propRes = runner("adb", ["-s", dev.serial, "shell", "getprop"], { timeoutMs: 4000 });
+        notifyProgress();
         const props =
           propRes.status === 0 && propRes.stdout ? parseAdbGetpropOutput(propRes.stdout) : {};
         const sdk = props["ro.build.version.sdk"];
@@ -581,7 +725,13 @@ export function discoverFleet({
           props["ro.product.cpu.abi"] || props["ro.product.cpu.abilist"]?.split(",")[0];
         const model = props["ro.product.model"] || "";
         const characteristics = props["ro.build.characteristics"] || "";
-        const gmsVersion = props["ro.com.google.gmsversion"] || "";
+        const gmsVersion =
+          props["ro.com.google.gmsversion"] ||
+          props["ro.com.google.clientidbase"] ||
+          (props["ro.error.receiver.system.apps"]?.includes("com.google.android.gms")
+            ? "gms"
+            : "") ||
+          (props["ro.atrace.core.services"]?.includes("com.google.android.gms") ? "gms" : "");
         const hasProps = Object.keys(props).length > 0;
         physicalDevices.push({
           deviceKey: `serial:${dev.serial}`,
@@ -628,6 +778,8 @@ export function discoverFleet({
 
   return {
     host,
+    avdHome,
+    discoveredAtMs,
     running,
     offline,
     creatable,

@@ -3,10 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  canSweepBreakClaimDir,
   isPidAlive,
+  isProcessGroupAlive,
   randomNonce,
+  sleepSync,
+  snapshotProcessGroupsOutsideLock,
+  trySweepBreakClaimDir,
   verifyLockOwnership,
   withLock,
+  withProcessGroupSnapshot,
   writeFileAtomic,
 } from "./lock.mjs";
 
@@ -244,49 +250,113 @@ export function validateTopLevelState(obj) {
   );
 }
 
-export function readState(stateDir) {
+function readStateFileRaw(statePath, hasLock = false) {
+  const maxAttempts = hasLock ? 1 : 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return fs.readFileSync(statePath, "utf8");
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        return null;
+      }
+      if (
+        !hasLock &&
+        attempt + 1 < maxAttempts &&
+        err &&
+        (err.code === "EBUSY" || err.code === "EPERM" || err.code === "EACCES")
+      ) {
+        sleepSync(5);
+        continue;
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
+function parseStateContent(raw) {
+  const parsed = JSON.parse(raw);
+  if (!validateTopLevelState(parsed)) {
+    throw new Error("Invalid state.json top-level schema");
+  }
+  parsed.config = { ...DEFAULT_CONFIG, ...parsed.config };
+  return parsed;
+}
+
+function quarantineCorruptStateUnderLock(stateDir, statePath, reasonMessage, lockHandle) {
+  if (!lockHandle || !verifyLockOwnership(lockHandle)) {
+    return createDefaultState();
+  }
+  const corruptPath = path.join(stateDir, `state.json.corrupt.${Date.now()}`);
+  try {
+    fs.renameSync(statePath, corruptPath);
+    process.stderr.write(
+      `[atc] Quarantined corrupt state.json to ${corruptPath} (${reasonMessage})\n`,
+    );
+  } catch {
+    // Ignore rename error if already removed
+  }
+  return createDefaultState();
+}
+
+export function readState(stateDir, options = {}) {
   const statePath = path.join(stateDir, "state.json");
-  if (!fs.existsSync(statePath)) {
+  const holdsLock = Boolean(options.lockHandle && verifyLockOwnership(options.lockHandle));
+  const raw = readStateFileRaw(statePath, holdsLock);
+  if (raw === null) {
     return createDefaultState();
   }
   try {
-    const raw = fs.readFileSync(statePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!validateTopLevelState(parsed)) {
-      throw new Error("Invalid state.json top-level schema");
+    return parseStateContent(raw);
+  } catch (parseErr) {
+    if (options.quarantine === false) {
+      return createDefaultState();
     }
-    parsed.config = { ...DEFAULT_CONFIG, ...parsed.config };
-    return parsed;
-  } catch (err) {
-    const corruptPath = path.join(stateDir, `state.json.corrupt.${Date.now()}`);
-    try {
-      fs.renameSync(statePath, corruptPath);
-      process.stderr.write(
-        `[atc] Quarantined corrupt state.json to ${corruptPath} (${err.message})\n`,
+    if (holdsLock) {
+      return quarantineCorruptStateUnderLock(
+        stateDir,
+        statePath,
+        parseErr.message,
+        options.lockHandle,
       );
-    } catch {
-      // Ignore rename error
     }
-    return createDefaultState();
+    return withLock(stateDir, (lh) => {
+      const lockedRaw = readStateFileRaw(statePath, true);
+      if (lockedRaw === null) {
+        return createDefaultState();
+      }
+      try {
+        return parseStateContent(lockedRaw);
+      } catch (lockedParseErr) {
+        return quarantineCorruptStateUnderLock(stateDir, statePath, lockedParseErr.message, lh);
+      }
+    });
   }
 }
 
 export function commitState(stateDir, state, lockHandle) {
-  if (!verifyLockOwnership(lockHandle)) {
-    throw new Error("Lock ownership nonce lost before state.json commit; aborting write");
-  }
+  const assertOwned = () => {
+    if (!verifyLockOwnership(lockHandle)) {
+      throw new Error("Lock ownership nonce lost before state.json commit; aborting write");
+    }
+  };
+  assertOwned();
   const statePath = path.join(stateDir, "state.json");
-  writeFileAtomic(statePath, JSON.stringify(state, null, 2) + "\n", lockHandle.nonce);
+  writeFileAtomic(statePath, JSON.stringify(state, null, 2) + "\n", lockHandle.nonce, assertOwned);
 }
 
 export function sweepOrphanFiles(stateDir, now = Date.now()) {
   try {
     const entries = fs.readdirSync(stateDir);
     for (const name of entries) {
-      if (!name.startsWith("state.json.tmp.") && !name.startsWith("atc.lock.stale.")) {
+      const fullPath = path.join(stateDir, name);
+      if (/^atc\.(?:create\.)?lock(?:\.break)?\.stale\./.test(name)) {
+        trySweepBreakClaimDir(fullPath, now);
         continue;
       }
-      const fullPath = path.join(stateDir, name);
+      if (!name.startsWith("state.json.tmp.")) {
+        continue;
+      }
       try {
         const st = fs.lstatSync(fullPath);
         if (now - st.mtimeMs > 60_000) {
@@ -310,13 +380,22 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
   if (lease.workerPid !== null && lease.workerPid !== undefined) {
     raw.push(lease.workerPid);
   }
+  const pgidSet = new Set(
+    Array.isArray(lease.workerPgids)
+      ? lease.workerPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
+      : [],
+  );
   const seen = new Set();
   const alive = [];
   for (const val of raw) {
     const pid = Number(val);
     if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
     seen.add(pid);
-    if (livenessCheck(pid)) {
+    const isAlive =
+      livenessCheck === isPidAlive && pgidSet.has(pid)
+        ? isProcessGroupAlive(pid, { allowSubprocess: false })
+        : livenessCheck(pid);
+    if (isAlive) {
       alive.push(pid);
     }
   }
@@ -326,15 +405,31 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
 export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   lease.workerPids = alive;
+  if (Array.isArray(lease.workerPgids)) {
+    const aliveSet = new Set(alive);
+    lease.workerPgids = lease.workerPgids
+      .map(Number)
+      .filter((p) => aliveSet.has(p));
+    if (lease.workerPgids.length === 0) {
+      delete lease.workerPgids;
+    }
+  }
   lease.workerPid = alive[0] ?? null;
   return alive;
 }
 
-export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
+export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options = {}) {
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck);
   const numericPid = Number(pid);
   if (Number.isInteger(numericPid) && numericPid > 0 && !alive.includes(numericPid)) {
     alive.push(numericPid);
+  }
+  if (options.isProcessGroup && Number.isInteger(numericPid) && numericPid > 1) {
+    const pgids = Array.isArray(lease.workerPgids) ? [...lease.workerPgids] : [];
+    if (!pgids.includes(numericPid)) {
+      pgids.push(numericPid);
+    }
+    lease.workerPgids = pgids;
   }
   lease.workerPids = alive;
   lease.workerPid = alive[0] ?? null;
@@ -343,6 +438,12 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
 
 export function removeLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
   const numericPid = Number(pid);
+  if (Array.isArray(lease.workerPgids)) {
+    lease.workerPgids = lease.workerPgids.filter((p) => Number(p) !== numericPid);
+    if (lease.workerPgids.length === 0) {
+      delete lease.workerPgids;
+    }
+  }
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck).filter((p) => p !== numericPid);
   lease.workerPids = alive;
   lease.workerPid = alive[0] ?? null;
@@ -398,6 +499,9 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       }
     } else if (lease.state === "starting" || lease.state === "stopping") {
       const deadWorker = !lease.workerPid || !livenessCheck(lease.workerPid);
+      if (lease.state === "stopping" && lease.awaitOfflineReconcile && deadWorker) {
+        continue;
+      }
       const hasDeadline = typeof lease.deadlineMs === "number" && Number.isFinite(lease.deadlineMs);
       const pastDeadline =
         (hasDeadline && now >= lease.deadlineMs) ||
@@ -442,6 +546,30 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
     }
   }
 
+  const markerRetentionMs = Math.max(maxTtlMs, 3_600_000);
+  if (state.stoppedDevices && typeof state.stoppedDevices === "object") {
+    for (const [k, entry] of Object.entries(state.stoppedDevices)) {
+      if (
+        !entry ||
+        typeof entry.stoppedAtMs !== "number" ||
+        now - entry.stoppedAtMs > markerRetentionMs
+      ) {
+        delete state.stoppedDevices[k];
+      }
+    }
+  }
+  if (state.bootedDevices && typeof state.bootedDevices === "object") {
+    for (const [k, entry] of Object.entries(state.bootedDevices)) {
+      if (
+        !entry ||
+        typeof entry.bootedAtMs !== "number" ||
+        now - entry.bootedAtMs > markerRetentionMs
+      ) {
+        delete state.bootedDevices[k];
+      }
+    }
+  }
+
   if (stateDir && (!state.lastOrphanSweepAtMs || now - state.lastOrphanSweepAtMs > 60_000)) {
     state.lastOrphanSweepAtMs = now;
     sweepOrphanFiles(stateDir, now);
@@ -450,12 +578,127 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
   return pruned;
 }
 
+export function avdHasRuntimeLockFiles(avdId, avdHome) {
+  if (!avdId || !avdHome) return false;
+  try {
+    let avdDir = path.join(avdHome, `${avdId}.avd`);
+    const iniPath = path.join(avdHome, `${avdId}.ini`);
+    if (fs.existsSync(iniPath)) {
+      const content = fs.readFileSync(iniPath, "utf8");
+      for (const rawLine of String(content).split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+        const eqIdx = line.indexOf("=");
+        if (eqIdx === -1) continue;
+        const key = line.slice(0, eqIdx).trim();
+        const val = line.slice(eqIdx + 1).trim();
+        if (key === "path" && val && fs.existsSync(val)) {
+          avdDir = val;
+          break;
+        }
+      }
+    }
+    if (!fs.existsSync(avdDir)) return false;
+    return fs
+      .readdirSync(avdDir)
+      .some(
+        (entry) =>
+          entry === "hardware-qemu.ini.lock" ||
+          entry === "snapshot.lock" ||
+          entry === "modem-nv-ram-5554.lock",
+      );
+  } catch {
+    return true;
+  }
+}
+
+export function offlineAvdHasRuntimeLockFiles(avdHome, excludedAvds = new Set()) {
+  if (!avdHome || !fs.existsSync(avdHome)) return false;
+  try {
+    for (const entry of fs.readdirSync(avdHome)) {
+      if (entry.endsWith(".ini") || entry.endsWith(".avd")) {
+        const avdId = entry.slice(0, -4);
+        if (excludedAvds && excludedAvds.has(avdId)) continue;
+        if (avdHasRuntimeLockFiles(avdId, avdHome)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export function recordDeviceStoppedInState(state, deviceInfo, now = Date.now()) {
+  if (!state || !deviceInfo) return;
+  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
+  if (!state.stoppedDevices || typeof state.stoppedDevices !== "object") {
+    state.stoppedDevices = {};
+  }
+  const entry = {
+    epoch: state.fleetEpoch,
+    stoppedAtMs: now,
+    avd: deviceInfo.avd || null,
+    serial: deviceInfo.serial || null,
+  };
+  if (deviceInfo.deviceKey) {
+    state.stoppedDevices[deviceInfo.deviceKey] = entry;
+  }
+  if (deviceInfo.avd) {
+    state.stoppedDevices[`avd:${deviceInfo.avd}`] = entry;
+  }
+  if (deviceInfo.serial) {
+    state.stoppedDevices[`serial:${deviceInfo.serial}`] = entry;
+  }
+  if (state.bootedDevices && typeof state.bootedDevices === "object") {
+    if (deviceInfo.deviceKey) delete state.bootedDevices[deviceInfo.deviceKey];
+    if (deviceInfo.avd) delete state.bootedDevices[`avd:${deviceInfo.avd}`];
+    if (deviceInfo.serial) delete state.bootedDevices[`serial:${deviceInfo.serial}`];
+  }
+}
+
+export function recordDeviceBootedInState(state, deviceInfo, now = Date.now()) {
+  if (!state || !deviceInfo || deviceInfo.kind === "physical") return;
+  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
+  if (!state.bootedDevices || typeof state.bootedDevices !== "object") {
+    state.bootedDevices = {};
+  }
+  const entry = {
+    epoch: state.fleetEpoch,
+    bootedAtMs: now,
+    deviceKey:
+      deviceInfo.deviceKey ||
+      (deviceInfo.avd ? `avd:${deviceInfo.avd}` : deviceInfo.serial ? `serial:${deviceInfo.serial}` : null),
+    avd: deviceInfo.avd || null,
+    serial: deviceInfo.serial || null,
+    profile: deviceInfo.profile || null,
+    ramSizeMb: deviceInfo.ramSizeMb || 2048,
+    requiredRamMb: deviceInfo.requiredRamMb || 0,
+  };
+  if (entry.deviceKey) {
+    state.bootedDevices[entry.deviceKey] = entry;
+  }
+  if (deviceInfo.avd) {
+    state.bootedDevices[`avd:${deviceInfo.avd}`] = entry;
+  }
+  if (deviceInfo.serial) {
+    state.bootedDevices[`serial:${deviceInfo.serial}`] = entry;
+  }
+  if (state.stoppedDevices && typeof state.stoppedDevices === "object") {
+    if (deviceInfo.deviceKey) delete state.stoppedDevices[deviceInfo.deviceKey];
+    if (deviceInfo.avd) delete state.stoppedDevices[`avd:${deviceInfo.avd}`];
+    if (deviceInfo.serial) delete state.stoppedDevices[`serial:${deviceInfo.serial}`];
+  }
+}
+
 export function reconcileOfflineLeases(
   state,
   inventory,
   callerSessionId,
   now = Date.now(),
   livenessCheck = isPidAlive,
+  avdHome = inventory?.avdHome || null,
 ) {
   if (!inventory) return false;
   let mutated = false;
@@ -525,7 +768,94 @@ export function reconcileOfflineLeases(
         }
       }
     }
+    if (lease.state === "stopping") {
+      if (!lease.awaitOfflineReconcile) continue;
+      if (lease.workerPid && livenessCheck(lease.workerPid)) continue;
+      const requiredFreshAfterMs = Math.max(
+        typeof lease.stoppingAtMs === "number" && Number.isFinite(lease.stoppingAtMs)
+          ? lease.stoppingAtMs
+          : 0,
+        typeof lease.reconcileAfterMs === "number" && Number.isFinite(lease.reconcileAfterMs)
+          ? lease.reconcileAfterMs
+          : 0,
+      );
+      if (
+        typeof lease.stoppingEpoch === "number" &&
+        typeof inventory.fleetEpoch === "number" &&
+        inventory.fleetEpoch < lease.stoppingEpoch
+      ) {
+        continue;
+      }
+      const hasFreshEpoch =
+        typeof lease.stoppingEpoch === "number" &&
+        typeof inventory.fleetEpoch === "number" &&
+        inventory.fleetEpoch >= lease.stoppingEpoch;
+      const hasFreshTimestamp =
+        typeof inventory.discoveredAtMs === "number" &&
+        Number.isFinite(inventory.discoveredAtMs) &&
+        (hasFreshEpoch
+          ? inventory.discoveredAtMs >= requiredFreshAfterMs
+          : inventory.discoveredAtMs > requiredFreshAfterMs);
+      if (requiredFreshAfterMs > 0 && !hasFreshTimestamp) {
+        continue;
+      }
+      if (requiredFreshAfterMs > 0 && now < requiredFreshAfterMs) {
+        continue;
+      }
+      if (!emulatorListOk || !adbDevicesOk) continue;
+      const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
+      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
+      const hasUnmappedEmulator = Boolean(
+        lease.avd && (inventory.running || []).some((d) => d.kind === "emulator" && !d.avd),
+      );
+      if (avdOnline || serialOnline || hasUnmappedEmulator) continue;
+      const otherActiveAvds = new Set([
+        ...onlineAvds,
+        ...Object.values(state.leases || {})
+          .filter((l) => l && l.leaseId !== lease.leaseId && l.avd)
+          .map((l) => l.avd),
+      ]);
+      const offlineEntry = lease.avd
+        ? (inventory.offline || []).find((d) => d.avd === lease.avd || d.deviceKey === deviceKey)
+        : null;
+      const hasLocks = lease.avd
+        ? Boolean(offlineEntry?.hasLockFiles) ||
+          Boolean(avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))
+        : Boolean(
+            (inventory.offline || []).some(
+              (d) => d?.hasLockFiles && (!d.avd || !otherActiveAvds.has(d.avd)),
+            ),
+          ) || Boolean(avdHome && offlineAvdHasRuntimeLockFiles(avdHome, otherActiveAvds));
+      if (hasLocks) continue;
+      recordDeviceStoppedInState(state, lease, now);
+      delete state.leases[deviceKey];
+      mutated = true;
+      continue;
+    }
     if (lease.state !== "active") continue;
+    const leaseActiveSinceMs = Math.max(
+      typeof lease.activatedAtMs === "number" && Number.isFinite(lease.activatedAtMs)
+        ? lease.activatedAtMs
+        : 0,
+      typeof lease.claimedAtMs === "number" && Number.isFinite(lease.claimedAtMs)
+        ? lease.claimedAtMs
+        : 0,
+    );
+    if (
+      typeof lease.activatedEpoch === "number" &&
+      typeof inventory.fleetEpoch === "number" &&
+      inventory.fleetEpoch < lease.activatedEpoch
+    ) {
+      continue;
+    }
+    if (
+      typeof inventory.discoveredAtMs === "number" &&
+      Number.isFinite(inventory.discoveredAtMs) &&
+      leaseActiveSinceMs > 0 &&
+      inventory.discoveredAtMs < leaseActiveSinceMs
+    ) {
+      continue;
+    }
     if (lease.kind === "physical") {
       const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
       if (serialOnline) {
@@ -539,8 +869,39 @@ export function reconcileOfflineLeases(
         continue;
       }
     } else {
+      const runningForAvd = lease.avd
+        ? (inventory.running || []).find((d) => d.kind === "emulator" && d.avd === lease.avd)
+        : null;
+      const runningForSerial = lease.serial
+        ? (inventory.running || []).find((d) => d.kind === "emulator" && d.serial === lease.serial)
+        : null;
+      const serialTakenByOtherAvd = Boolean(
+        lease.avd &&
+          runningForSerial &&
+          runningForSerial.avd &&
+          runningForSerial.avd !== lease.avd,
+      );
+      if (
+        runningForAvd &&
+        runningForAvd.serial &&
+        runningForAvd.serial !== lease.serial
+      ) {
+        lease.serial = runningForAvd.serial;
+        mutated = true;
+      } else if (serialTakenByOtherAvd && (!runningForAvd || !runningForAvd.serial)) {
+        lease.serial = null;
+        mutated = true;
+      }
       const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
-      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
+      const serialOnline = Boolean(
+        lease.serial &&
+          onlineSerials.has(lease.serial) &&
+          !serialTakenByOtherAvd &&
+          (!lease.avd ||
+            !emulatorListOk ||
+            runningForSerial?.unknownAvd ||
+            runningForSerial?.avd === lease.avd),
+      );
       if (avdOnline || serialOnline) {
         if (lease.firstSeenOfflineAtMs !== null) {
           lease.firstSeenOfflineAtMs = null;
@@ -581,21 +942,45 @@ export function withStateTransaction(stateDir, fn, options = {}) {
   if (!options.ancestorPids) {
     getAncestorPids(options.ppid ?? process.ppid);
   }
+  let pgidSnapshot = null;
+  if (!options.livenessCheck) {
+    try {
+      const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
+      if (preRaw) {
+        const preParsed = JSON.parse(preRaw);
+        const pgids = [];
+        for (const lease of Object.values(preParsed?.leases || {})) {
+          if (lease && Array.isArray(lease.workerPgids)) {
+            pgids.push(...lease.workerPgids);
+          }
+        }
+        if (pgids.length > 0) {
+          pgidSnapshot = snapshotProcessGroupsOutsideLock(pgids);
+        }
+      }
+    } catch {
+      // Ignore pre-lock snapshot parse errors
+    }
+  }
   return withLock(
     stateDir,
-    (lockHandle) => {
-      const now = options.now ?? Date.now();
-      const state = readState(stateDir);
-      const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
-      const result = fn(state, { now, pruned, lockHandle });
-      const gcMutated =
-        pruned.leases.length > 0 || pruned.queue.length > 0 || pruned.hookSessions.length > 0;
-      if ((result && result.mutated !== false) || gcMutated) {
-        commitState(stateDir, state, lockHandle);
-      }
-      return result?.value !== undefined ? result.value : result;
-    },
+    (lockHandle) =>
+      withProcessGroupSnapshot(pgidSnapshot, () => {
+        const now = options.now ?? Date.now();
+        const state = readState(stateDir, { lockHandle });
+        const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
+        const result = fn(state, { now, pruned, lockHandle });
+        const gcMutated =
+          pruned.leases.length > 0 || pruned.queue.length > 0 || pruned.hookSessions.length > 0;
+        if ((result && result.mutated !== false) || gcMutated) {
+          commitState(stateDir, state, lockHandle);
+        }
+        return result?.value !== undefined ? result.value : result;
+      }),
     options.lockTimeoutMs,
+    "atc.lock",
+    undefined,
+    options,
   );
 }
 
@@ -732,6 +1117,18 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
         inventoryEmulatorSerials.add(dev.serial);
       }
       const key = dev.avd || serialToLeasedAvd.get(dev.serial) || (dev.serial ? `serial:${dev.serial}` : null);
+      if (key) {
+        runningOrStopping.add(key);
+      }
+    }
+  }
+  for (const dev of inventory.offline || []) {
+    if (
+      dev.kind === "emulator" &&
+      (dev.hasLockFiles ||
+        (inventory.avdHome && dev.avd && avdHasRuntimeLockFiles(dev.avd, inventory.avdHome)))
+    ) {
+      const key = dev.avd || dev.deviceKey;
       if (key) {
         runningOrStopping.add(key);
       }

@@ -2,19 +2,66 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getKnownWindowsTreePids, isProcessGroupAlive, sleepSync } from "./lock.mjs";
 
 const SAFE_TOKEN_REGEX = /^[A-Za-z0-9._:/@=-]+$/;
+
+function isPosixExecutableFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return false;
+    }
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function resolveExecutable(
   command,
   env = process.env,
   cwd = process.cwd(),
   platform = process.platform,
+  defaultPosixPath = "/usr/bin:/bin",
 ) {
   if (!command || typeof command !== "string") {
     throw new Error("Command must be a non-empty string");
   }
   if (platform !== "win32") {
+    if (
+      (command === "android" || command === "adb" || command === "emulator") &&
+      !command.includes("/")
+    ) {
+      const rawPath = env.PATH;
+      const effectivePath =
+        typeof rawPath === "string" ? rawPath : defaultPosixPath;
+      const posixPathDirs = effectivePath.split(":");
+      const inPath = posixPathDirs.some((dir) =>
+        isPosixExecutableFile(path.resolve(cwd, dir || ".", command)),
+      );
+      if (!inPath) {
+        const home = env.HOME || os.homedir();
+        const sdkRoot =
+          env.ANDROID_HOME ||
+          env.ANDROID_SDK_ROOT ||
+          (platform === "darwin"
+            ? path.join(home, "Library", "Android", "sdk")
+            : path.join(home, "Android", "Sdk"));
+        const fallbackDirs = [
+          path.join(home, ".local", "bin"),
+          path.join(sdkRoot, "platform-tools"),
+          path.join(sdkRoot, "emulator"),
+          path.join(sdkRoot, "cmdline-tools", "latest", "bin"),
+        ];
+        for (const dir of fallbackDirs) {
+          const candidate = path.join(dir, command);
+          if (isPosixExecutableFile(candidate)) {
+            return { executable: candidate, isBatch: false };
+          }
+        }
+      }
+    }
     return { executable: command, isBatch: false };
   }
 
@@ -27,28 +74,39 @@ export function resolveExecutable(
   const hasPathSep = command.includes("/") || command.includes("\\");
   const normalizedCommand = hasPathSep ? command.replace(/\//g, path.sep) : command;
   const lower = normalizedCommand.toLowerCase();
-  if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
-    const resolvedCmd = hasPathSep ? path.resolve(cwd, normalizedCommand) : normalizedCommand;
-    return { executable: resolvedCmd, isBatch: true };
+  const isGradlew =
+    lower === "gradlew" || lower === "gradlew.bat" || lower === "gradlew.cmd";
+  if (hasPathSep && (lower.endsWith(".cmd") || lower.endsWith(".bat"))) {
+    return { executable: path.resolve(cwd, normalizedCommand), isBatch: true };
   }
-  if (lower.endsWith(".exe") || lower.endsWith(".com")) {
-    const resolvedCmd = hasPathSep ? path.resolve(cwd, normalizedCommand) : normalizedCommand;
-    return { executable: resolvedCmd, isBatch: false };
+  if (hasPathSep && (lower.endsWith(".exe") || lower.endsWith(".com"))) {
+    return { executable: path.resolve(cwd, normalizedCommand), isBatch: false };
   }
 
   // Check relative / project-local candidates in cwd first only for explicit path separators or gradlew
-  if (hasPathSep || lower === "gradlew") {
-    for (const ext of extensions) {
-      const localCandidate = path.resolve(cwd, normalizedCommand + ext);
+  if (hasPathSep || isGradlew) {
+    if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
+      const localBatch = path.resolve(cwd, normalizedCommand);
       try {
-        if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
-          return {
-            executable: localCandidate,
-            isBatch: ext === ".cmd" || ext === ".bat",
-          };
+        if (fs.existsSync(localBatch) && fs.statSync(localBatch).isFile()) {
+          return { executable: localBatch, isBatch: true };
         }
       } catch {
         // Ignore inaccessible local entry
+      }
+    } else {
+      for (const ext of extensions) {
+        const localCandidate = path.resolve(cwd, normalizedCommand + ext);
+        try {
+          if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
+            return {
+              executable: localCandidate,
+              isBatch: ext === ".cmd" || ext === ".bat",
+            };
+          }
+        } catch {
+          // Ignore inaccessible local entry
+        }
       }
     }
   }
@@ -60,14 +118,46 @@ export function resolveExecutable(
   const pathDirs = (env.PATH || env.Path || "").split(path.delimiter).filter(Boolean);
   const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
   const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  const userHome = env.USERPROFILE || env.HOME || os.homedir();
+  const sdkRoots = Array.from(
+    new Set(
+      [
+        env.ANDROID_HOME,
+        env.ANDROID_SDK_ROOT,
+        path.join(localAppData, "Android", "Sdk"),
+      ].filter(Boolean),
+    ),
+  );
+  for (const sdkRoot of sdkRoots) {
+    pathDirs.push(
+      path.join(sdkRoot, "platform-tools"),
+      path.join(sdkRoot, "emulator"),
+      path.join(sdkRoot, "cmdline-tools", "latest", "bin"),
+    );
+  }
   pathDirs.push(
-    path.join(localAppData, "Android", "Sdk", "platform-tools"),
-    path.join(localAppData, "Android", "Sdk", "emulator"),
     path.join(appData, "npm"),
-    path.join(os.homedir(), ".local", "bin"),
+    path.join(userHome, ".local", "bin"),
   );
 
+  const hasExplicitBatchExt = lower.endsWith(".cmd") || lower.endsWith(".bat");
+  const hasExplicitBinExt = lower.endsWith(".exe") || lower.endsWith(".com");
+
   for (const dir of pathDirs) {
+    if (hasExplicitBatchExt || hasExplicitBinExt) {
+      const candidate = path.join(dir, normalizedCommand);
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return {
+            executable: candidate,
+            isBatch: hasExplicitBatchExt,
+          };
+        }
+      } catch {
+        // Ignore inaccessible PATH entry
+      }
+      continue;
+    }
     for (const ext of extensions) {
       const candidate = path.join(dir, normalizedCommand + ext);
       try {
@@ -83,8 +173,17 @@ export function resolveExecutable(
     }
   }
 
-  if (lower === "atc") {
-    return { executable: "atc.cmd", isBatch: true };
+  const bareBase = lower.replace(/\.(exe|cmd|bat|com)$/, "");
+  if (
+    hasExplicitBatchExt ||
+    bareBase === "atc" ||
+    bareBase === "adb" ||
+    bareBase === "android" ||
+    bareBase === "emulator"
+  ) {
+    const err = new Error(`Executable not found in PATH: ${command}`);
+    err.code = "ENOENT";
+    throw err;
   }
 
   return { executable: command, isBatch: false };
@@ -106,9 +205,16 @@ export function buildSpawnConfig(command, args = [], options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || process.cwd();
   const platform = options.platform || process.platform;
+  const effectiveEnv =
+    platform === "win32" ? { NoDefaultCurrentDirectoryInExePath: "1", ...env } : env;
   const resolved = resolveExecutable(command, env, cwd, platform);
 
   if (platform === "win32" && resolved.isBatch) {
+    if (!path.win32.isAbsolute(resolved.executable)) {
+      const err = new Error(`Executable not found in PATH: ${command}`);
+      err.code = "ENOENT";
+      throw err;
+    }
     validateBatchArgs(args, Boolean(options.strictInternal));
     const comspec = env.ComSpec || "cmd.exe";
     const quotedCmd = `"${resolved.executable}" ${args.map((a) => `"${String(a).replace(/"/g, '""')}"`).join(" ")}`;
@@ -117,7 +223,7 @@ export function buildSpawnConfig(command, args = [], options = {}) {
       args: ["/d", "/s", "/c", `"${quotedCmd}"`],
       options: {
         ...options,
-        env,
+        env: effectiveEnv,
         shell: false,
         windowsVerbatimArguments: true,
       },
@@ -129,7 +235,7 @@ export function buildSpawnConfig(command, args = [], options = {}) {
     args: args.map(String),
     options: {
       ...options,
-      env,
+      env: effectiveEnv,
       shell: false,
     },
   };
@@ -137,12 +243,26 @@ export function buildSpawnConfig(command, args = [], options = {}) {
 
 export function runCommandSync(command, args = [], options = {}) {
   if (options.detached) {
-    const cfg = buildSpawnConfig(command, args, {
-      ...options,
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    let cfg;
+    try {
+      cfg = buildSpawnConfig(command, args, {
+        ...options,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        return {
+          status: 1,
+          signal: null,
+          stdout: "",
+          stderr: `ENOENT: ${err.message}`,
+          error: err,
+        };
+      }
+      throw err;
+    }
     const launcherScript = [
       'const { spawn } = require("node:child_process");',
       "const payload = JSON.parse(process.argv[1]);",
@@ -200,11 +320,25 @@ export function runCommandSync(command, args = [], options = {}) {
       error: launchRes.error || null,
     };
   }
-  const cfg = buildSpawnConfig(command, args, {
-    encoding: "utf8",
-    timeout: options.timeoutMs ?? 15_000,
-    ...options,
-  });
+  let cfg;
+  try {
+    cfg = buildSpawnConfig(command, args, {
+      encoding: "utf8",
+      timeout: options.timeoutMs ?? 15_000,
+      ...options,
+    });
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return {
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: `ENOENT: ${err.message}`,
+        error: err,
+      };
+    }
+    throw err;
+  }
   const res = spawnSync(cfg.command, cfg.args, cfg.options);
   return {
     status: res.status ?? (res.error || res.signal ? 1 : 0),
@@ -274,6 +408,43 @@ function findAndroidSubcommand(args) {
 }
 
 export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
+  let effectiveCmd = cmd;
+  let effectiveArgs = [...args];
+  let useDefaultStandardPath = false;
+  while (
+    path.basename(effectiveCmd, path.extname(effectiveCmd)).toLowerCase() === "command"
+  ) {
+    let idx = 0;
+    let queryMode = false;
+    while (idx < effectiveArgs.length) {
+      const a = String(effectiveArgs[idx]);
+      if (a === "--") {
+        idx++;
+        break;
+      }
+      if (a === "-p") {
+        useDefaultStandardPath = true;
+        idx++;
+        continue;
+      }
+      if (a.startsWith("-") && /[vV]/.test(a)) {
+        queryMode = true;
+        break;
+      }
+      if (a.startsWith("-")) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+    if (queryMode || idx >= effectiveArgs.length) {
+      break;
+    }
+    effectiveCmd = String(effectiveArgs[idx]);
+    effectiveArgs = effectiveArgs.slice(idx + 1);
+  }
+  cmd = effectiveCmd;
+  args = effectiveArgs;
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
   const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
   if (base === "emulator") {
@@ -344,6 +515,16 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         subIdx += 1;
         continue;
       }
+      if (a === "-s" && subIdx + 1 < args.length) {
+        const explicitSerial = String(args[subIdx + 1]);
+        if (lease.serial && explicitSerial !== lease.serial) {
+          throw new Error(
+            `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          );
+        }
+        subIdx += 2;
+        continue;
+      }
       if (a === "-s" || a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
@@ -361,10 +542,18 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
       );
     }
-    if (adbSub === "reconnect" && adbRest.includes("offline")) {
-      throw new Error(
-        'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
-      );
+    if (adbSub === "reconnect") {
+      const reconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (reconnectTargets.includes("offline")) {
+        throw new Error(
+          'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
+        );
+      }
+      if (reconnectTargets.length !== 1 || reconnectTargets[0] !== "device") {
+        throw new Error(
+          'Bare "adb reconnect" is disabled under ATC because it resets host-side ADB connections across the host; use "adb reconnect device" instead.',
+        );
+      }
     }
     if (adbSub === "emu" && adbRest[0] === "kill") {
       throw new Error(
@@ -406,15 +595,16 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     }
   }
 
-  if (base === "adb" || base === "android") {
+  if (base === "android") {
     for (let i = 0; i < args.length; i++) {
       const a = String(args[i]);
+      if (a === "--") break;
       let explicitSerial = null;
-      if (base === "android" && a.startsWith("--device=")) {
+      if (a.startsWith("--device=")) {
         explicitSerial = a.slice("--device=".length);
-      } else if (base === "android" && a === "--device" && i + 1 < args.length) {
+      } else if (a === "--device" && i + 1 < args.length) {
         explicitSerial = String(args[i + 1]);
-      } else if (base === "adb" && a === "-s" && i + 1 < args.length) {
+      } else if (a === "-s" && i + 1 < args.length) {
         explicitSerial = String(args[i + 1]);
       }
       if (explicitSerial && lease.serial && explicitSerial !== lease.serial) {
@@ -426,6 +616,9 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   }
   const env = {
     ...baseEnv,
+    ...(useDefaultStandardPath && process.platform !== "win32"
+      ? { PATH: "/usr/bin:/bin" }
+      : {}),
     ANDROID_SERIAL: lease.serial,
     ATC_LEASE_ID: lease.leaseId,
     ATC_SESSION_ID: sessionId,
@@ -453,16 +646,103 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   return { cmd, args: nextArgs, env };
 }
 
+function terminateChildTree(childPid, signal = "SIGTERM") {
+  if (!Number.isInteger(childPid) || childPid <= 0) return;
+  if (process.platform === "win32") {
+    const pids = Array.from(new Set([childPid, ...getKnownWindowsTreePids(childPid)]));
+    const pidArgs = [];
+    for (const p of pids) {
+      if (Number.isInteger(p) && p > 0) {
+        pidArgs.push("/PID", String(p));
+      }
+    }
+    try {
+      spawnSync("taskkill", ["/T", "/F", ...pidArgs], {
+        stdio: "ignore",
+        timeout: 3000,
+        windowsHide: true,
+      });
+    } catch {
+      try {
+        process.kill(childPid, signal);
+      } catch {
+        // Ignore
+      }
+    }
+    return;
+  }
+  try {
+    process.kill(-childPid, signal);
+  } catch {
+    try {
+      process.kill(childPid, signal);
+    } catch {
+      // Ignore
+    }
+  }
+}
+
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
   const invocation = buildChildInvocation(cmd, args, lease, sessionId, options.env);
+  const detachChild = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
     stdio: options.stdio || "inherit",
     env: invocation.env,
+    detached: detachChild,
   });
 
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
+    const childPid = child.pid || null;
+    if (childPid && typeof options.onChildSpawn === "function") {
+      try {
+        options.onChildSpawn(childPid, { isProcessGroup: true });
+      } catch {
+        // Best-effort worker registration
+      }
+    }
+
+    let wrapperSignal = null;
+    let killEscalationTimer = null;
+    const forwardedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
+    const signalHandlers = new Map();
+
+    const cleanupListenersAndTimers = () => {
+      clearInterval(timer);
+      if (killEscalationTimer) {
+        clearTimeout(killEscalationTimer);
+        killEscalationTimer = null;
+      }
+      for (const [sig, handler] of signalHandlers.entries()) {
+        process.removeListener(sig, handler);
+      }
+      signalHandlers.clear();
+    };
+
+    for (const sig of forwardedSignals) {
+      const handler = () => {
+        if (!wrapperSignal) {
+          wrapperSignal = sig;
+        }
+        if (childPid) {
+          terminateChildTree(childPid, sig);
+          if (!killEscalationTimer) {
+            killEscalationTimer = setTimeout(() => {
+              if (isProcessGroupAlive(childPid)) {
+                terminateChildTree(childPid, "SIGKILL");
+              }
+            }, 1500);
+            if (typeof killEscalationTimer.unref === "function") {
+              killEscalationTimer.unref();
+            }
+          }
+        }
+      };
+      signalHandlers.set(sig, handler);
+      process.on(sig, handler);
+    }
+
     const timer = setInterval(() => {
       try {
         onHeartbeat();
@@ -475,27 +755,73 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     }
 
     child.on("error", (err) => {
-      clearInterval(timer);
+      cleanupListenersAndTimers();
       reject(err);
     });
 
     child.on("close", (code, signal) => {
-      clearInterval(timer);
-      try {
-        onHeartbeat();
-      } catch {
-        // Ignore final heartbeat error
-      }
-      if (typeof code === "number") {
-        resolve(code);
+      const effectiveSignal = signal || wrapperSignal;
+      const finishClose = () => {
+        cleanupListenersAndTimers();
+        try {
+          onHeartbeat();
+        } catch {
+          // Ignore final heartbeat error
+        }
+        if (wrapperSignal) {
+          const sigNum = os.constants?.signals?.[wrapperSignal];
+          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
+          return;
+        }
+        if (typeof code === "number") {
+          resolve(code);
+          return;
+        }
+        if (effectiveSignal) {
+          const sigNum = os.constants?.signals?.[effectiveSignal];
+          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
+          return;
+        }
+        resolve(1);
+      };
+
+      if (childPid && isProcessGroupAlive(childPid)) {
+        if (effectiveSignal) {
+          terminateChildTree(childPid, "SIGTERM");
+          const killDeadline = Date.now() + 500;
+          while (isProcessGroupAlive(childPid) && Date.now() < killDeadline) {
+            sleepSync(25);
+          }
+          if (isProcessGroupAlive(childPid)) {
+            terminateChildTree(childPid, "SIGKILL");
+            const forceDeadline = Date.now() + 300;
+            while (isProcessGroupAlive(childPid) && Date.now() < forceDeadline) {
+              sleepSync(25);
+            }
+          }
+          finishClose();
+          return;
+        }
+        let pollDelayMs = process.platform === "win32" ? 200 : 50;
+        const maxPollDelayMs = process.platform === "win32" ? 1500 : 1000;
+        const scheduleNextGroupPoll = () => {
+          const t = setTimeout(() => {
+            if (wrapperSignal) {
+              terminateChildTree(childPid, wrapperSignal);
+            }
+            if (!isProcessGroupAlive(childPid)) {
+              finishClose();
+              return;
+            }
+            pollDelayMs = Math.min(maxPollDelayMs, pollDelayMs * 2);
+            scheduleNextGroupPoll();
+          }, pollDelayMs);
+        };
+        scheduleNextGroupPoll();
         return;
       }
-      if (signal) {
-        const sigNum = os.constants?.signals?.[signal];
-        resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
-        return;
-      }
-      resolve(1);
+
+      finishClose();
     });
   });
 }
