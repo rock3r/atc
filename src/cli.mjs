@@ -555,7 +555,7 @@ export function selectCandidateUnderLock(
   for (const dev of bootPool) {
     const slotAvailable = dev.online || usedSlots < effectiveMax;
     if (!slotAvailable) continue;
-    if (isReservedForEarlierTicket(dev, true)) continue;
+    if (!isCallerOwnedResettable(dev) && isReservedForEarlierTicket(dev, true)) continue;
     try {
       checkResourceAdmission(dev, inventory.host, state, inventory, {
         replacingAvd: dev.online ? dev : null,
@@ -1618,7 +1618,14 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         const byAvd = !byId && !bySerial && leasesList.find((l) => l.avd === effectiveTarget);
         const found = byId || bySerial || byAvd;
         if (!found) {
-          return { mutated: false, value: { status: "not_found", freed: [] } };
+          return {
+            mutated: false,
+            value: {
+              status: "not_found",
+              error: `No matching active lease found for "${effectiveTarget}".`,
+              freed: [],
+            },
+          };
         }
         const isOwner =
           found.sessionId === identity.sessionId ||
@@ -1738,6 +1745,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
     return { exitCode: 1, error: err.message };
   }
 
+  if (outcome.status === "not_found") {
+    return { exitCode: 3, error: outcome.error, freed: [] };
+  }
   if (outcome.status === "forbidden") {
     return { exitCode: 3, error: outcome.error };
   }

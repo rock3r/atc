@@ -3225,7 +3225,23 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(secondIdempotentLoad.idempotent, true);
             assert.equal(snapLoadCmds.length, 0);
 
-            // 29. State-reset reclaim (--cold) on caller's own active lease reboots in-place instead of returning busy
+            // 29. State-reset reclaim (--cold) on caller's own active lease reboots in-place instead of returning busy, even when an earlier ticket is queued
+            withStateTransaction(coldRediscoverDir, (state, { now }) => {
+              state.queue.push({
+                ticketId: "q_earlier_waiter",
+                sessionId: "other-waiter-sess",
+                waiterPid: process.pid,
+                requestedKind: "emulator",
+                requestedAvd: "Pixel_9_API_36",
+                requestedSerial: null,
+                requestedProfile: { deviceType: "phone", apiSpec: "36" },
+                enqueuedAtMs: now - 10_000,
+                starvationDeadlineMs: now - 1000,
+                lastHeartbeatAtMs: now,
+                waitExpiresAtMs: now + 60_000,
+              });
+              return { mutated: true };
+            });
             const coldReclaimCmds = [];
             const coldReclaimRes = cmdClaim(
               coldRediscoverDir,
@@ -3248,6 +3264,13 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(coldReclaimRes.lease.leaseId, l2.lease.leaseId);
             assert.ok(coldReclaimCmds.some((c) => c.includes("android emulator stop")));
             assert.ok(coldReclaimCmds.some((c) => c.includes("android emulator start Pixel_9_API_36 --cold")));
+
+            // 30. Explicit non-existent target in cmdFree returns nonzero (exitCode 3)
+            const missingFreeRes = cmdFree(coldRediscoverDir, "lease_does_not_exist", {
+              session: "target-sess",
+            });
+            assert.equal(missingFreeRes.exitCode, 3);
+            assert.match(missingFreeRes.error, /No matching active lease found for "lease_does_not_exist"/);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
