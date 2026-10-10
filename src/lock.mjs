@@ -24,7 +24,9 @@ export function isPidAlive(pid) {
   }
 }
 
-export function isProcessGroupAlive(pgid) {
+let activePgidLivenessSnapshot = null;
+
+export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
   if (process.platform === "win32" || !Number.isInteger(pgid) || pgid <= 1) {
     return false;
   }
@@ -32,6 +34,9 @@ export function isProcessGroupAlive(pgid) {
     process.kill(-pgid, 0);
   } catch (err) {
     if (!err || err.code !== "EPERM") return false;
+  }
+  if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgid)) {
+    return activePgidLivenessSnapshot.get(pgid);
   }
   if (process.platform === "linux") {
     try {
@@ -62,6 +67,9 @@ export function isProcessGroupAlive(pgid) {
       // Fall back to ps below if /proc is unavailable
     }
   }
+  if (!allowSubprocess) {
+    return true;
+  }
   try {
     const res = spawnSync("ps", ["-axo", "pgid=,stat="], {
       encoding: "utf8",
@@ -86,6 +94,101 @@ export function isProcessGroupAlive(pgid) {
     // Ignore ps failures and fall back to kill(-pgid, 0) result
   }
   return true;
+}
+
+export function snapshotProcessGroupsOutsideLock(pgids) {
+  const snapshot = new Map();
+  if (process.platform === "win32" || !Array.isArray(pgids) || pgids.length === 0) {
+    return snapshot;
+  }
+  const candidates = [];
+  for (const raw of pgids) {
+    const pgid = Number(raw);
+    if (!Number.isInteger(pgid) || pgid <= 1 || snapshot.has(pgid)) continue;
+    try {
+      process.kill(-pgid, 0);
+      candidates.push(pgid);
+      snapshot.set(pgid, false);
+    } catch (err) {
+      if (err && err.code === "EPERM") {
+        candidates.push(pgid);
+        snapshot.set(pgid, false);
+      } else {
+        snapshot.set(pgid, false);
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    return snapshot;
+  }
+  const candidateSet = new Set(candidates);
+  if (process.platform === "linux") {
+    try {
+      const entries = fs.readdirSync("/proc");
+      let inspectedAny = false;
+      for (const name of entries) {
+        if (!/^\d+$/.test(name)) continue;
+        try {
+          const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
+          const closeParen = stat.lastIndexOf(")");
+          if (closeParen === -1) continue;
+          const fields = stat.slice(closeParen + 1).trim().split(/\s+/);
+          const state = fields[0];
+          const pgrp = Number(fields[2]);
+          if (!Number.isInteger(pgrp)) continue;
+          inspectedAny = true;
+          if (candidateSet.has(pgrp) && state && !state.toUpperCase().startsWith("Z")) {
+            snapshot.set(pgrp, true);
+          }
+        } catch {
+          // Process exited or unreadable
+        }
+      }
+      if (inspectedAny) {
+        return snapshot;
+      }
+    } catch {
+      // Fall back to ps below
+    }
+  }
+  try {
+    const res = spawnSync("ps", ["-axo", "pgid=,stat="], {
+      encoding: "utf8",
+      timeout: 1500,
+    });
+    if (res && res.status === 0 && typeof res.stdout === "string") {
+      for (const line of res.stdout.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const [pgidStr, statStr] = trimmed.split(/\s+/, 2);
+        const pgrp = Number(pgidStr);
+        if (
+          candidateSet.has(pgrp) &&
+          statStr &&
+          !statStr.toUpperCase().startsWith("Z")
+        ) {
+          snapshot.set(pgrp, true);
+        }
+      }
+      return snapshot;
+    }
+  } catch {
+    // Ignore ps failures
+  }
+  for (const pgid of candidates) {
+    snapshot.set(pgid, true);
+  }
+  return snapshot;
+}
+
+export function withProcessGroupSnapshot(snapshot, fn) {
+  const prev = activePgidLivenessSnapshot;
+  activePgidLivenessSnapshot = snapshot instanceof Map ? snapshot : null;
+  try {
+    return fn();
+  } finally {
+    activePgidLivenessSnapshot = prev;
+  }
 }
 
 export function resolveStateDir(overrideDir = process.env.ATC_STATE_DIR) {

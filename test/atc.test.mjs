@@ -6543,7 +6543,7 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         assert.equal(bgGuard.allowed, true);
         assert.match(
           bgGuard.rewrittenCommand,
-          /^echo ready & .*atc exec --serial emulator-5554 -- adb shell pm clear com\.example$/,
+          /^echo ready & .*atc exec(?: --session bg-sess)? --serial emulator-5554 -- adb shell pm clear com\.example$/,
         );
 
         // Astra #22 Finding 5: Cold reclaim without explicit --ttl preserves a longer existing lease expiration
@@ -6655,6 +6655,34 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
               false,
               "Zombie-only process group must not be reported alive",
             );
+            // Astra #23 Finding 1: withStateTransaction snapshots process-group liveness outside atc.lock and prunes zombie-only workerPgids
+            withStateTransaction(r21Dir, (s, { now }) => {
+              s.leases["avd:Pixel_Zombie_Group"] = {
+                leaseId: "lease_zombie_pg",
+                deviceKey: "avd:Pixel_Zombie_Group",
+                kind: "emulator",
+                avd: "Pixel_Zombie_Group",
+                serial: "emulator-5574",
+                profile: { apiLevel: "android-35", deviceType: "phone" },
+                sessionId: "zombie-pg-sess",
+                anchorPid: 999999,
+                state: "active",
+                workerPid: childPgid,
+                workerPids: [childPgid],
+                workerPgids: [childPgid],
+                claimedAtMs: now - 10_000,
+                activatedAtMs: now - 9_000,
+                renewedAtMs: now - 5_000,
+                expiresAtMs: now - 1_000,
+              };
+              return { mutated: true };
+            });
+            withStateTransaction(r21Dir, () => ({ mutated: false }));
+            assert.equal(
+              readState(r21Dir).leases["avd:Pixel_Zombie_Group"],
+              undefined,
+              "Zombie-only workerPgids must be snapshotted outside lock and pruned during GC",
+            );
           } finally {
             try {
               process.kill(parentHolder.pid, "SIGKILL");
@@ -6662,6 +6690,57 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
               // Ignore
             }
           }
+        }
+
+        // Astra #23 Finding 2: Command rewriting preserves single-quoted and backslash-escaped $ literals
+        const singleQuotedVarGuard = evaluateCommandGuard("FILE=other.apk; adb install '$FILE'", {
+          sessionId: "sq-var-sess",
+          activeLeases: [{ leaseId: "lease_sq", serial: "emulator-5554" }],
+        });
+        assert.equal(singleQuotedVarGuard.allowed, true);
+        assert.doesNotMatch(singleQuotedVarGuard.rewrittenCommand, /adb install.*other\.apk/);
+        assert.match(singleQuotedVarGuard.rewrittenCommand, /\$FILE/);
+        const escapedVarGuard = evaluateCommandGuard("FILE=other.apk; adb install \\$FILE", {
+          sessionId: "sq-var-sess",
+          activeLeases: [{ leaseId: "lease_sq", serial: "emulator-5554" }],
+        });
+        assert.equal(escapedVarGuard.allowed, true);
+        assert.doesNotMatch(escapedVarGuard.rewrittenCommand, /adb install.*other\.apk/);
+        assert.match(escapedVarGuard.rewrittenCommand, /\\\$FILE/);
+
+        // Astra #23 Finding 3: Windows resolveExecutable honors ANDROID_HOME / ANDROID_SDK_ROOT before default %LOCALAPPDATA%\Android\Sdk
+        const winCustomSdkDir = makeTempStateDir();
+        try {
+          const customSdk = path.join(winCustomSdkDir, "custom-sdk");
+          const defaultAppData = path.join(winCustomSdkDir, "local-appdata");
+          fs.mkdirSync(path.join(customSdk, "platform-tools"), { recursive: true });
+          fs.mkdirSync(path.join(defaultAppData, "Android", "Sdk", "platform-tools"), {
+            recursive: true,
+          });
+          const customAdb = path.join(customSdk, "platform-tools", "adb.exe");
+          const defaultAdb = path.join(
+            defaultAppData,
+            "Android",
+            "Sdk",
+            "platform-tools",
+            "adb.exe",
+          );
+          fs.writeFileSync(customAdb, "MZ");
+          fs.writeFileSync(defaultAdb, "MZ");
+          const resolvedWinSdkAdb = resolveExecutable(
+            "adb",
+            {
+              PATH: "",
+              ANDROID_HOME: customSdk,
+              LOCALAPPDATA: defaultAppData,
+              APPDATA: winCustomSdkDir,
+            },
+            winCustomSdkDir,
+            "win32",
+          );
+          assert.equal(resolvedWinSdkAdb.executable, customAdb);
+        } finally {
+          fs.rmSync(winCustomSdkDir, { recursive: true, force: true });
         }
       } finally {
         fs.rmSync(r21Dir, { recursive: true, force: true });

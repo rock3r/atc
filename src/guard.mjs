@@ -506,7 +506,7 @@ export function splitShellSegments(command) {
   return segments;
 }
 
-export function tokenizeSegment(segment) {
+export function tokenizeSegment(segment, { preserveLiteralDollar = false } = {}) {
   const tokens = [];
   const str = String(segment || "");
   const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
@@ -534,9 +534,7 @@ export function tokenizeSegment(segment) {
         end++;
       }
     }
-    const rawWord = str
-      .slice(start, end)
-      .replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g, "${$1}");
+    const rawWord = str.slice(start, end);
     const keepBackslashes = isWinPathLike(rawWord) || rawWord === "\\;";
     let tok = "";
     let j = 0;
@@ -546,7 +544,8 @@ export function tokenizeSegment(segment) {
         j++;
         while (j < rawWord.length && rawWord[j] !== '"') {
           if (rawWord[j] === "\\" && j + 1 < rawWord.length && /["\\$`]/.test(rawWord[j + 1])) {
-            tok += rawWord[j + 1];
+            const escapedCh = rawWord[j + 1];
+            tok += preserveLiteralDollar && escapedCh === "$" ? "\uE000" : escapedCh;
             j += 2;
           } else {
             tok += rawWord[j++];
@@ -565,16 +564,27 @@ export function tokenizeSegment(segment) {
           }
         }
         if (j < rawWord.length) j++;
-        tok += decodeShellEscapes(ansiInner);
+        const decoded = decodeShellEscapes(ansiInner);
+        tok += preserveLiteralDollar ? decoded.replace(/\$/g, "\uE000") : decoded;
       } else if (ch === "'") {
         j++;
         while (j < rawWord.length && rawWord[j] !== "'") {
-          tok += rawWord[j++];
+          const sqCh = rawWord[j++];
+          tok += preserveLiteralDollar && sqCh === "$" ? "\uE000" : sqCh;
         }
         if (j < rawWord.length) j++;
       } else if (ch === "\\" && j + 1 < rawWord.length && !keepBackslashes) {
-        tok += rawWord[j + 1];
+        const escapedCh = rawWord[j + 1];
+        tok += preserveLiteralDollar && escapedCh === "$" ? "\uE000" : escapedCh;
         j += 2;
+      } else if (ch === "$") {
+        const m = rawWord.slice(j).match(/^\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/);
+        if (m) {
+          tok += `\${${m[1]}}`;
+          j += m[0].length;
+        } else {
+          tok += rawWord[j++];
+        }
       } else {
         tok += rawWord[j++];
       }
@@ -746,12 +756,10 @@ function expandSingleBraceExpression(full, inner, vars, opaqueFallback) {
   return failValue;
 }
 
-export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_sub__" } = {}) {
-  if (!str || typeof str !== "string" || !str.includes("$")) {
-    return str;
-  }
-  const safeVars = vars || {};
-  let out = str;
+function expandUnquotedChunk(str, safeVars, opaqueFallback) {
+  let out = str.replace(/\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\.]|$)/g, (m, k) =>
+    Object.prototype.hasOwnProperty.call(safeVars, k) ? `\${${k}}` : m,
+  );
   for (let pass = 0; pass < 4 && out.includes("${"); pass++) {
     const next = out.replace(/\$\{([^{}]+)\}/g, (full, inner) =>
       expandSingleBraceExpression(full, inner, safeVars, opaqueFallback),
@@ -770,6 +778,76 @@ export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_su
   });
 }
 
+export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_sub__" } = {}) {
+  if (!str || typeof str !== "string") {
+    return str;
+  }
+  if (!str.includes("$")) {
+    return str.replace(/\uE000/g, "$");
+  }
+  const safeVars = vars || {};
+  let out = "";
+  let chunk = "";
+  let inSingle = false;
+  let inDouble = false;
+  const flushChunk = () => {
+    if (chunk) {
+      out += expandUnquotedChunk(chunk, safeVars, opaqueFallback);
+      chunk = "";
+    }
+  };
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (!inSingle && ch === "\\" && i + 1 < str.length) {
+      if (str[i + 1] === "$") {
+        flushChunk();
+        out += "\\$";
+        i++;
+        continue;
+      }
+      chunk += ch + str[i + 1];
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === "$" && str[i + 1] === "'") {
+      flushChunk();
+      out += "$'";
+      i += 2;
+      while (i < str.length && str[i] !== "'") {
+        if (str[i] === "\\" && i + 1 < str.length) {
+          out += str[i] + str[i + 1];
+          i += 2;
+        } else {
+          out += str[i++];
+        }
+      }
+      if (i < str.length && str[i] === "'") {
+        out += "'";
+      }
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      flushChunk();
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (inSingle) {
+      out += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = !inDouble;
+      chunk += ch;
+      continue;
+    }
+    chunk += ch;
+  }
+  flushChunk();
+  return out.replace(/\uE000/g, "$");
+}
+
 export function parseSegment(segment, inheritedVars = {}) {
   const rawStripped = String(segment || "")
     .trimStart()
@@ -781,7 +859,7 @@ export function parseSegment(segment, inheritedVars = {}) {
     rawStripped.includes("`")
       ? extractCommandSubstitutions(rawStripped, [])
       : rawStripped;
-  const tokens = tokenizeSegment(strippedSegment);
+  const tokens = tokenizeSegment(strippedSegment, { preserveLiteralDollar: true });
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
@@ -2026,11 +2104,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         const { body: strippedBody, suffix } = splitTrailingControlClosers(cmdBody);
         cmdBody = strippedBody;
         if (Object.keys(shellVars).length > 0 && cmdBody.includes("$")) {
-          const normalizedBody = cmdBody.replace(
-            /\$([A-Za-z_][A-Za-z0-9_]*)(?=["'\\].)/g,
-            (m, k) => (Object.prototype.hasOwnProperty.call(shellVars, k) ? `\${${k}}` : m),
-          );
-          cmdBody = expandVariables(normalizedBody, shellVars, { opaqueFallback: null });
+          cmdBody = expandVariables(cmdBody, shellVars, { opaqueFallback: null });
         }
         if (isWin) {
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;

@@ -8,9 +8,11 @@ import {
   isProcessGroupAlive,
   randomNonce,
   sleepSync,
+  snapshotProcessGroupsOutsideLock,
   trySweepBreakClaimDir,
   verifyLockOwnership,
   withLock,
+  withProcessGroupSnapshot,
   writeFileAtomic,
 } from "./lock.mjs";
 
@@ -390,8 +392,9 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
     if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
     seen.add(pid);
     const isAlive =
-      livenessCheck(pid) ||
-      (livenessCheck === isPidAlive && pgidSet.has(pid) && isProcessGroupAlive(pid));
+      livenessCheck === isPidAlive && pgidSet.has(pid)
+        ? isProcessGroupAlive(pid, { allowSubprocess: false })
+        : livenessCheck(pid);
     if (isAlive) {
       alive.push(pid);
     }
@@ -930,20 +933,41 @@ export function withStateTransaction(stateDir, fn, options = {}) {
   if (!options.ancestorPids) {
     getAncestorPids(options.ppid ?? process.ppid);
   }
+  let pgidSnapshot = null;
+  if (!options.livenessCheck && process.platform !== "win32") {
+    try {
+      const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
+      if (preRaw) {
+        const preParsed = JSON.parse(preRaw);
+        const pgids = [];
+        for (const lease of Object.values(preParsed?.leases || {})) {
+          if (lease && Array.isArray(lease.workerPgids)) {
+            pgids.push(...lease.workerPgids);
+          }
+        }
+        if (pgids.length > 0) {
+          pgidSnapshot = snapshotProcessGroupsOutsideLock(pgids);
+        }
+      }
+    } catch {
+      // Ignore pre-lock snapshot parse errors
+    }
+  }
   return withLock(
     stateDir,
-    (lockHandle) => {
-      const now = options.now ?? Date.now();
-      const state = readState(stateDir, { lockHandle });
-      const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
-      const result = fn(state, { now, pruned, lockHandle });
-      const gcMutated =
-        pruned.leases.length > 0 || pruned.queue.length > 0 || pruned.hookSessions.length > 0;
-      if ((result && result.mutated !== false) || gcMutated) {
-        commitState(stateDir, state, lockHandle);
-      }
-      return result?.value !== undefined ? result.value : result;
-    },
+    (lockHandle) =>
+      withProcessGroupSnapshot(pgidSnapshot, () => {
+        const now = options.now ?? Date.now();
+        const state = readState(stateDir, { lockHandle });
+        const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
+        const result = fn(state, { now, pruned, lockHandle });
+        const gcMutated =
+          pruned.leases.length > 0 || pruned.queue.length > 0 || pruned.hookSessions.length > 0;
+        if ((result && result.mutated !== false) || gcMutated) {
+          commitState(stateDir, state, lockHandle);
+        }
+        return result?.value !== undefined ? result.value : result;
+      }),
     options.lockTimeoutMs,
     "atc.lock",
     undefined,

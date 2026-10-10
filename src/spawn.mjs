@@ -118,11 +118,26 @@ export function resolveExecutable(
   const pathDirs = (env.PATH || env.Path || "").split(path.delimiter).filter(Boolean);
   const localAppData = env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
   const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  const userHome = env.USERPROFILE || env.HOME || os.homedir();
+  const sdkRoots = Array.from(
+    new Set(
+      [
+        env.ANDROID_HOME,
+        env.ANDROID_SDK_ROOT,
+        path.join(localAppData, "Android", "Sdk"),
+      ].filter(Boolean),
+    ),
+  );
+  for (const sdkRoot of sdkRoots) {
+    pathDirs.push(
+      path.join(sdkRoot, "platform-tools"),
+      path.join(sdkRoot, "emulator"),
+      path.join(sdkRoot, "cmdline-tools", "latest", "bin"),
+    );
+  }
   pathDirs.push(
-    path.join(localAppData, "Android", "Sdk", "platform-tools"),
-    path.join(localAppData, "Android", "Sdk", "emulator"),
     path.join(appData, "npm"),
-    path.join(os.homedir(), ".local", "bin"),
+    path.join(userHome, ".local", "bin"),
   );
 
   const hasExplicitBatchExt = lower.endsWith(".cmd") || lower.endsWith(".bat");
