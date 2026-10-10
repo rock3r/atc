@@ -8387,6 +8387,35 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         clearKnownWindowsTreeDescendants(gen1ArchiveKey);
       }
     }
+
+    // 3m. `printf -v` scalar and array-element destinations in loop bodies are tracked and forwarded
+    const printfVLoopRedir = evaluateCommandGuard(
+      'for x in a b; do printf -v y "%s" "$x"; adb shell echo "$y" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(printfVLoopRedir.allowed, true);
+    assert.match(
+      printfVLoopRedir.rewrittenCommand,
+      /y="\$y" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$y" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const printfVArrayLoopRedir = evaluateCommandGuard(
+      'for x in a b; do printf -v "arr[0]" "%s" "$x"; adb shell echo "${arr[0]}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(printfVArrayLoopRedir.allowed, true);
+    assert.match(
+      printfVArrayLoopRedir.rewrittenCommand,
+      /__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt' ; done$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

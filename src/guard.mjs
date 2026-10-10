@@ -2196,6 +2196,63 @@ function extractStageLoopVariables(stageText) {
         vars.add(mv);
       }
     }
+  } else if (idx < tokens.length && tokens[idx] === "printf") {
+    idx++;
+    while (idx < tokens.length) {
+      const tok = tokens[idx++];
+      if (
+        tok === "<" ||
+        tok === "<<" ||
+        tok === "<<<" ||
+        tok === ">" ||
+        tok === ">>" ||
+        tok === "<&" ||
+        tok === ">&" ||
+        tok === "<>" ||
+        tok === "&>" ||
+        tok === "&>>"
+      ) {
+        if (idx < tokens.length) idx++;
+        continue;
+      }
+      if (/^[0-9]*[<>]/.test(tok) || tok.startsWith("&>") || tok.startsWith("&>>")) {
+        continue;
+      }
+      if (tok === "--") {
+        break;
+      }
+      if (tok === "-v") {
+        if (idx < tokens.length) {
+          const dest = tokens[idx++].replace(/^['"]|['"]$/g, "").replace(/\[.*$/, "");
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(dest)) {
+            vars.add(dest);
+          }
+        }
+        continue;
+      }
+      if (tok.startsWith("-v") && tok.length > 2) {
+        const dest = tok.slice(2).replace(/^['"]|['"]$/g, "").replace(/\[.*$/, "");
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(dest)) {
+          vars.add(dest);
+        }
+        continue;
+      }
+      break;
+    }
+  } else if (idx < tokens.length && tokens[idx] === "let") {
+    idx++;
+    while (idx < tokens.length) {
+      const expr = tokens[idx++].replace(/^['"]|['"]$/g, "");
+      const postRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\+\+|--|(?:<<|>>|[+\-*/%&|^])?=(?!=))/g;
+      let pm;
+      while ((pm = postRe.exec(expr)) !== null) {
+        vars.add(pm[1]);
+      }
+      const preRe = /(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)\b/g;
+      while ((pm = preRe.exec(expr)) !== null) {
+        vars.add(pm[1]);
+      }
+    }
   }
 
   for (const tok of tokens) {
@@ -2359,7 +2416,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
     for (const [k, v] of Object.entries(p.envVars)) {
       if (k.startsWith("__atc_")) continue;
       stageAssignedCounts.set(k, (stageAssignedCounts.get(k) || 0) + 1);
-      if (typeof v === "string" && v.includes("__atc_cmd_sub__")) {
+      if (typeof v === "string" && (v.includes("__atc_cmd_sub__") || v.includes("$"))) {
         loopDynamicVars.add(k);
       }
     }
@@ -2393,9 +2450,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       }
       if (loopDepth > 0) {
         for (const dv of loopDynamicVars) {
-          if (Object.prototype.hasOwnProperty.call(shellVars, dv)) {
-            shellVars[dv] = "__atc_cmd_sub__";
-          }
+          shellVars[dv] = "__atc_cmd_sub__";
         }
       }
       for (const lv of extractStageLoopVariables(trimmed)) {
@@ -2419,9 +2474,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       }
       if (loopDepth > 0) {
         for (const dv of loopDynamicVars) {
-          if (Object.prototype.hasOwnProperty.call(shellVars, dv)) {
-            shellVars[dv] = "__atc_cmd_sub__";
-          }
+          shellVars[dv] = "__atc_cmd_sub__";
         }
       }
       for (const arg of parsedStage.args) {
