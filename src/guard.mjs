@@ -153,27 +153,55 @@ function resolveStaticSubValue(expandedInner, prefixWord = "", suffixWord = "") 
     let idx = 0;
     if (args[idx] === "--") idx++;
     if (args[idx] === "-v") {
-      return "";
+      return "__atc_cmd_sub__";
     }
     const rawFmt = decodeShellEscapes(args[idx] ?? "");
     const fmtArgs = args.slice(idx + 1).map((a) => decodeShellEscapes(a));
-    if (fmtArgs.length === 0) {
-      return rawFmt;
+    const strippedFmt = rawFmt
+      .replace(/%%/g, "")
+      .replace(/%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[sbc]/g, "");
+    if (strippedFmt.includes("%")) {
+      return "__atc_cmd_sub__";
     }
-    if (!/%[-+ #0]*\d*(?:\.\d+)?[sbc]/.test(rawFmt)) {
-      return rawFmt + fmtArgs.join("");
+    if (!/%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[sbc]/.test(rawFmt)) {
+      return rawFmt.replace(/%%/g, "%");
     }
     let out = "";
     let argIdx = 0;
-    while (argIdx < fmtArgs.length) {
+    let invalidDynamicWidth = false;
+    do {
       const prevIdx = argIdx;
-      out += rawFmt.replace(/%[-+ #0]*\d*(?:\.\d+)?([sbc])/g, (_m, spec) => {
-        if (argIdx >= fmtArgs.length) return "";
-        const val = fmtArgs[argIdx++];
-        return spec === "c" ? val.slice(0, 1) : val;
-      });
+      out += rawFmt.replace(
+        /%(%|([-+ #0]*)(\d+|\*)?(?:\.(\d+|\*))?([sbc]))/g,
+        (_full, body, _flags, widthTok, precTok, spec) => {
+          if (body === "%") return "%";
+          if (widthTok === "*") {
+            const w = parseInt(fmtArgs[argIdx++] ?? "", 10);
+            if (Number.isNaN(w)) {
+              invalidDynamicWidth = true;
+              return "";
+            }
+          }
+          let prec;
+          if (precTok === "*") {
+            const p = parseInt(fmtArgs[argIdx++] ?? "", 10);
+            if (Number.isNaN(p)) {
+              invalidDynamicWidth = true;
+              return "";
+            }
+            prec = p;
+          } else if (precTok !== undefined) {
+            prec = parseInt(precTok, 10);
+          }
+          const val = fmtArgs[argIdx++] ?? "";
+          if (spec === "c") return val.slice(0, 1);
+          if (prec !== undefined && prec >= 0) return val.slice(0, prec);
+          return val;
+        },
+      );
+      if (invalidDynamicWidth) return "__atc_cmd_sub__";
       if (argIdx === prevIdx) break;
-    }
+    } while (argIdx < fmtArgs.length);
     return out;
   }
 
@@ -239,7 +267,7 @@ function matchesAndroidOrAtcText(str, inheritedVars = {}) {
         .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
       while (
         tokens.length > 0 &&
-        /^(?:env|command|nohup|timeout|sudo|nice|time|then|else|do|if|elif|while|until|!|\{|\()+$/i.test(
+        /^(?:env|command|nohup|timeout|sudo|nice|time|sh|bash|zsh|dash|ksh|fish|csh|tcsh|eval|-[A-Za-z]+|then|else|do|if|elif|while|until|!|\{|\()+$/i.test(
           tokens[0],
         )
       ) {
@@ -555,32 +583,55 @@ function shellPatToRegExpStr(pat, greedy = true) {
 }
 
 function expandSingleBraceExpression(full, inner, vars, opaqueFallback) {
-  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(inner)) {
-    return Object.prototype.hasOwnProperty.call(vars, inner) ? vars[inner] : full;
-  }
   const failValue = opaqueFallback !== null ? opaqueFallback : full;
-  if (/^#[A-Za-z_][A-Za-z0-9_]*$/.test(inner)) {
+  if (/^(?:[A-Za-z_][A-Za-z0-9_]*|\d+|[@*#?$!-])$/.test(inner)) {
+    if (Object.prototype.hasOwnProperty.call(vars, inner)) {
+      return vars[inner];
+    }
+    return /^(?:\d+|[@*#?$!-])$/.test(inner) ? failValue : full;
+  }
+  if (/^#(?:[A-Za-z_][A-Za-z0-9_]*|\d+|[@*])$/.test(inner)) {
     const key = inner.slice(1);
     return Object.prototype.hasOwnProperty.call(vars, key)
       ? String(vars[key]).length.toString()
       : failValue;
   }
-  const m = inner.match(/^([A-Za-z_][A-Za-z0-9_]*)(.+)$/s);
+  const m = inner.match(/^([A-Za-z_][A-Za-z0-9_]*|\d+|[@*])(.+)$/s);
   if (!m) {
     return failValue;
   }
   const key = m[1];
   const hasKey = Object.prototype.hasOwnProperty.call(vars, key);
   const val = hasKey ? String(vars[key]) : "";
-  const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (rawRef, k) =>
+  const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, (rawRef, k) =>
     Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : rawRef,
   );
 
-  // Substring expansion: ${var:offset} or ${var:offset:length}
+  // Substring / positional-slice expansion: ${var:offset} or ${var:offset:length}
   const subSliceMatch = rest.match(/^:(?:\s+(-?\d+)|(\d+))(?::\s*(-?\d+))?$/);
   if (subSliceMatch) {
     if (!hasKey) return failValue;
     const offset = parseInt(subSliceMatch[1] ?? subSliceMatch[2], 10);
+    if ((key === "@" || key === "*") && Object.prototype.hasOwnProperty.call(vars, "#")) {
+      const count = parseInt(vars["#"], 10) || 0;
+      const posList = [
+        vars["0"] ?? "",
+        ...Array.from({ length: count }, (_, i) => vars[String(i + 1)] ?? ""),
+      ];
+      const baseList = offset === 0 ? posList : posList.slice(1);
+      const start =
+        offset === 0
+          ? 0
+          : offset < 0
+            ? Math.max(0, baseList.length + offset)
+            : Math.max(0, offset - 1);
+      if (subSliceMatch[3] === undefined) {
+        return baseList.slice(start).join(" ");
+      }
+      const len = parseInt(subSliceMatch[3], 10);
+      if (len < 0) return failValue;
+      return baseList.slice(start, start + len).join(" ");
+    }
     const start = offset < 0 ? Math.max(0, val.length + offset) : offset;
     if (subSliceMatch[3] === undefined) {
       return val.slice(start);
@@ -688,9 +739,15 @@ export function expandVariables(str, vars = {}, { opaqueFallback = "__atc_cmd_su
     if (next === out) break;
     out = next;
   }
-  return out.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (full, key) =>
-    Object.prototype.hasOwnProperty.call(safeVars, key) ? safeVars[key] : full,
-  );
+  return out.replace(/\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, (full, key) => {
+    if (Object.prototype.hasOwnProperty.call(safeVars, key)) {
+      return safeVars[key];
+    }
+    if (/^[0-9@*#?$!-]$/.test(key) && opaqueFallback !== null) {
+      return opaqueFallback;
+    }
+    return full;
+  });
 }
 
 export function parseSegment(segment, inheritedVars = {}) {
@@ -896,7 +953,14 @@ export function parseSegment(segment, inheritedVars = {}) {
   }
 
   const allVars = { ...baseVars, ...envVars };
-  const remaining = tokens.slice(idx).map((t) => expandVariables(t, allVars));
+  const rawTokens = tokens.slice(idx);
+  const remaining = rawTokens.map((t) => expandVariables(t, allVars));
+  if (remaining.length > 0 && rawTokens[0]?.includes("$") && /\s/.test(remaining[0])) {
+    const splitCmdTokens = remaining[0].trim().split(/\s+/).filter(Boolean);
+    if (splitCmdTokens.length > 0) {
+      remaining.splice(0, 1, ...splitCmdTokens);
+    }
+  }
   while (
     remaining.length > 1 &&
     (["fi", "done", "esac", "}"].includes(remaining[remaining.length - 1]) ||
@@ -1361,17 +1425,70 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   }
 
   // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`, `eval adb shell ...`)
-  if (SHELL_WRAPPERS.has(baseCmd) && matchesAndroidOrAtcText(effectiveSegment, parsed.envVars)) {
-    const nonFlagArgs = args.filter((a) => !a.startsWith("-") && a !== "<<<" && a !== "<<");
-    const innerStrings = [...args.filter((a) => matchesAndroidOrAtcText(a, parsed.envVars))];
-    if (nonFlagArgs.length > 1) {
-      innerStrings.push(nonFlagArgs.join(" "));
+  if (SHELL_WRAPPERS.has(baseCmd)) {
+    const cShells = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"]);
+    const innerEntries = [];
+    let handledCWrapper = false;
+    if (cShells.has(baseCmd)) {
+      let hasCFlag = false;
+      let scriptIdx = -1;
+      for (let i = 0; i < args.length; i++) {
+        const a = String(args[i]);
+        if (a === "--") {
+          if (i + 1 < args.length) scriptIdx = i + 1;
+          break;
+        }
+        if (
+          (a === "-o" || a === "+o" || a === "--rcfile" || a === "--init-file") &&
+          i + 1 < args.length
+        ) {
+          i++;
+          continue;
+        }
+        if (a === "-c" || /^-[A-Za-z]*c[A-Za-z]*$/.test(a)) {
+          hasCFlag = true;
+          continue;
+        }
+        if ((a.startsWith("-") || a.startsWith("+")) && a.length > 1) {
+          continue;
+        }
+        scriptIdx = i;
+        break;
+      }
+      if (hasCFlag && scriptIdx !== -1 && scriptIdx < args.length) {
+        handledCWrapper = true;
+        const rawScript = String(args[scriptIdx]);
+        const posArgs = args.slice(scriptIdx + 1).map((a) => String(a));
+        const wrapperVars = { ...parsed.envVars };
+        for (let i = 0; i < posArgs.length; i++) {
+          wrapperVars[String(i)] = posArgs[i];
+        }
+        wrapperVars["@"] = posArgs.slice(1).join(" ");
+        wrapperVars["*"] = posArgs.slice(1).join(" ");
+        wrapperVars["#"] = String(Math.max(0, posArgs.length - 1));
+        const normalizedScript = rawScript.replace(
+          /"(\$(?:[@*]|\{[@*](?::[^}]+)?\}))"/g,
+          "$1",
+        );
+        innerEntries.push({ script: normalizedScript, vars: wrapperVars });
+      }
     }
-    if (innerStrings.length > 0) {
+    if (!handledCWrapper && matchesAndroidOrAtcText(effectiveSegment, parsed.envVars)) {
+      const nonFlagArgs = args.filter((a) => !a.startsWith("-") && a !== "<<<" && a !== "<<");
+      for (const a of args) {
+        if (matchesAndroidOrAtcText(a, parsed.envVars)) {
+          innerEntries.push({ script: a, vars: { ...parsed.envVars } });
+        }
+      }
+      if (nonFlagArgs.length > 1) {
+        innerEntries.push({ script: nonFlagArgs.join(" "), vars: { ...parsed.envVars } });
+      }
+    }
+    if (innerEntries.length > 0) {
       let chosen = { kind: "ignore", parsed };
       const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
-      for (const inner of innerStrings) {
-        const innerVars = { ...parsed.envVars };
+      for (const { script: inner, vars: baseInnerVars } of innerEntries) {
+        const innerVars = { ...baseInnerVars };
         for (const subSeg of splitShellSegments(inner)) {
           if (subSeg.trim() === effectiveSegment.trim()) continue;
           const subClass = classifySegment(subSeg, innerVars, depth + 1);
@@ -1404,6 +1521,9 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       }
       if (chosen.kind !== "ignore") {
         return chosen;
+      }
+      if (handledCWrapper) {
+        return { kind: "ignore", parsed };
       }
     }
   }

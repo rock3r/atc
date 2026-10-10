@@ -4146,7 +4146,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               fs.rmSync(staleRaceDir, { recursive: true, force: true });
             }
 
-            // 51. Parameter-expansion executables (`${x:2}`, `${x#xx}`, `${x%xx}`, `${x/x/}`, `${!p}`) are caught and blocked
+            // 51. Parameter-expansion executables (`${x:2}`, `${x#xx}`, `${x%xx}`, `${x/x/}`, `${!p}`) and printf/sh -c positional forms are caught and blocked
             for (const cmd of [
               "x=xxadb; ${x:2} kill-server",
               "x=xxadb; ${x#xx} kill-server",
@@ -4155,6 +4155,13 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               "x=ADB; ${x,,} kill-server",
               "${x:-adb} kill-server",
               "p=x; x=adb; ${!p} kill-server",
+              "$(printf '%.*s' 3 adb) kill-server",
+              "$(printf '%x' 173)b kill-server",
+              "sh -c '$0 kill-server' adb",
+              "sh -c '$1 kill-server' _ adb",
+              "sh -c '\"$@\"' _ adb kill-server",
+              "sh -c '$0$1 kill-server' ad b",
+              "atc exec -- sh -c '$0 kill-server' adb",
             ]) {
               const res = evaluateCommandGuard(cmd, {
                 sessionId: "target-sess",

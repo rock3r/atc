@@ -28,24 +28,27 @@ function expandSingleBraceExpression(
   inner: string,
   vars: Record<string, string>
 ): string {
-  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(inner)) {
-    return Object.prototype.hasOwnProperty.call(vars, inner) ? vars[inner] : full;
-  }
   const failValue = "__atc_cmd_sub__";
-  if (/^#[A-Za-z_][A-Za-z0-9_]*$/.test(inner)) {
+  if (/^(?:[A-Za-z_][A-Za-z0-9_]*|\d+|[@*#?$!-])$/.test(inner)) {
+    if (Object.prototype.hasOwnProperty.call(vars, inner)) {
+      return vars[inner];
+    }
+    return /^(?:\d+|[@*#?$!-])$/.test(inner) ? failValue : full;
+  }
+  if (/^#(?:[A-Za-z_][A-Za-z0-9_]*|\d+|[@*])$/.test(inner)) {
     const key = inner.slice(1);
     return Object.prototype.hasOwnProperty.call(vars, key)
       ? String(vars[key]).length.toString()
       : failValue;
   }
-  const m = inner.match(/^([A-Za-z_][A-Za-z0-9_]*)(.+)$/s);
+  const m = inner.match(/^([A-Za-z_][A-Za-z0-9_]*|\d+|[@*])(.+)$/s);
   if (!m) {
     return failValue;
   }
   const key = m[1];
   const hasKey = Object.prototype.hasOwnProperty.call(vars, key);
   const val = hasKey ? String(vars[key]) : "";
-  const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (rawRef, k) =>
+  const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, (rawRef, k) =>
     Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : rawRef
   );
 
@@ -153,9 +156,15 @@ function expandVariables(str: string, vars: Record<string, string> = {}): string
     if (next === out) break;
     out = next;
   }
-  return out.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (full, key) =>
-    Object.prototype.hasOwnProperty.call(safeVars, key) ? safeVars[key] : full
-  );
+  return out.replace(/\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, (full, key) => {
+    if (Object.prototype.hasOwnProperty.call(safeVars, key)) {
+      return safeVars[key];
+    }
+    if (/^[0-9@*#?$!-]$/.test(key)) {
+      return "__atc_cmd_sub__";
+    }
+    return full;
+  });
 }
 
 function decodeShellEscapes(str: string): string {
@@ -197,24 +206,54 @@ function resolveStaticSubValue(expandedInner: string, prefixWord = "", suffixWor
   if (cmd === "printf") {
     let idx = 0;
     if (args[idx] === "--") idx++;
-    if (args[idx] === "-v") return "";
+    if (args[idx] === "-v") return "__atc_cmd_sub__";
     const rawFmt = decodeShellEscapes(args[idx] ?? "");
     const fmtArgs = args.slice(idx + 1).map((a) => decodeShellEscapes(a));
-    if (fmtArgs.length === 0) return rawFmt;
-    if (!/%[-+ #0]*\d*(?:\.\d+)?[sbc]/.test(rawFmt)) {
-      return rawFmt + fmtArgs.join("");
+    const strippedFmt = rawFmt
+      .replace(/%%/g, "")
+      .replace(/%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[sbc]/g, "");
+    if (strippedFmt.includes("%")) {
+      return "__atc_cmd_sub__";
+    }
+    if (!/%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[sbc]/.test(rawFmt)) {
+      return rawFmt.replace(/%%/g, "%");
     }
     let out = "";
     let argIdx = 0;
-    while (argIdx < fmtArgs.length) {
+    let invalidDynamicWidth = false;
+    do {
       const prevIdx = argIdx;
-      out += rawFmt.replace(/%[-+ #0]*\d*(?:\.\d+)?([sbc])/g, (_m, spec) => {
-        if (argIdx >= fmtArgs.length) return "";
-        const val = fmtArgs[argIdx++];
-        return spec === "c" ? val.slice(0, 1) : val;
-      });
+      out += rawFmt.replace(
+        /%(%|([-+ #0]*)(\d+|\*)?(?:\.(\d+|\*))?([sbc]))/g,
+        (_full, body, _flags, widthTok, precTok, spec) => {
+          if (body === "%") return "%";
+          if (widthTok === "*") {
+            const w = parseInt(fmtArgs[argIdx++] ?? "", 10);
+            if (Number.isNaN(w)) {
+              invalidDynamicWidth = true;
+              return "";
+            }
+          }
+          let prec: number | undefined;
+          if (precTok === "*") {
+            const p = parseInt(fmtArgs[argIdx++] ?? "", 10);
+            if (Number.isNaN(p)) {
+              invalidDynamicWidth = true;
+              return "";
+            }
+            prec = p;
+          } else if (precTok !== undefined) {
+            prec = parseInt(precTok, 10);
+          }
+          const val = fmtArgs[argIdx++] ?? "";
+          if (spec === "c") return val.slice(0, 1);
+          if (prec !== undefined && prec >= 0) return val.slice(0, prec);
+          return val;
+        }
+      );
+      if (invalidDynamicWidth) return "__atc_cmd_sub__";
       if (argIdx === prevIdx) break;
-    }
+    } while (argIdx < fmtArgs.length);
     return out;
   }
 
@@ -379,7 +418,7 @@ export function hasAndroidOrAtcTokens(command: string): boolean {
         .filter((t) => Boolean(t) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
       while (
         tokens.length > 0 &&
-        /^(?:env|command|nohup|timeout|sudo|nice|time|then|else|do|if|elif|while|until|!|\{|\()+$/i.test(
+        /^(?:env|command|nohup|timeout|sudo|nice|time|sh|bash|zsh|dash|ksh|fish|csh|tcsh|eval|-[A-Za-z]+|then|else|do|if|elif|while|until|!|\{|\()+$/i.test(
           tokens[0]
         )
       ) {
