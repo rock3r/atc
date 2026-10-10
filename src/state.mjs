@@ -476,18 +476,36 @@ export function reconcileOfflineLeases(
       const mappedDev = (inventory.running || []).find(
         (d) => d.kind === "emulator" && d.serial === lease.serial && d.avd,
       );
-      if (
-        mappedDev &&
-        mappedDev.deviceKey &&
-        mappedDev.deviceKey !== deviceKey &&
-        !state.leases[mappedDev.deviceKey]
-      ) {
-        delete state.leases[deviceKey];
-        lease.avd = mappedDev.avd;
-        lease.deviceKey = mappedDev.deviceKey;
-        lease.profile = mappedDev.profile || lease.profile;
-        state.leases[mappedDev.deviceKey] = lease;
-        mutated = true;
+      if (mappedDev && mappedDev.deviceKey && mappedDev.deviceKey !== deviceKey) {
+        const destLease = state.leases[mappedDev.deviceKey];
+        if (!destLease) {
+          delete state.leases[deviceKey];
+          lease.avd = mappedDev.avd;
+          lease.deviceKey = mappedDev.deviceKey;
+          lease.profile = mappedDev.profile || lease.profile;
+          state.leases[mappedDev.deviceKey] = lease;
+          mutated = true;
+        } else {
+          const destHasLiveWorker =
+            destLease.state === "starting" || destLease.state === "stopping"
+              ? Boolean(destLease.workerPid && livenessCheck(destLease.workerPid))
+              : syncLeaseWorkers(destLease, livenessCheck).length > 0;
+          const srcHasLiveWorker = syncLeaseWorkers(lease, livenessCheck).length > 0;
+          const destWins =
+            destLease.state === "starting" ||
+            destLease.state === "stopping" ||
+            (destHasLiveWorker && !srcHasLiveWorker) ||
+            (destLease.claimedAtMs || 0) <= (lease.claimedAtMs || Infinity);
+          delete state.leases[deviceKey];
+          if (!destWins) {
+            lease.avd = mappedDev.avd;
+            lease.deviceKey = mappedDev.deviceKey;
+            lease.profile = mappedDev.profile || lease.profile;
+            state.leases[mappedDev.deviceKey] = lease;
+          }
+          mutated = true;
+          if (destWins) continue;
+        }
       }
     }
     if (lease.state !== "active") continue;
@@ -523,6 +541,9 @@ export function reconcileOfflineLeases(
     }
 
     if (lease.sessionId === callerSessionId) {
+      if (lease.kind === "emulator" && lease.avd && !lease.serial) {
+        continue;
+      }
       delete state.leases[deviceKey];
       mutated = true;
       continue;

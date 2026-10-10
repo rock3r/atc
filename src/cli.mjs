@@ -405,14 +405,11 @@ export function selectCandidateUnderLock(
     null;
   const isDeviceOccupied = (d) => Boolean(getOccupyingLease(d));
   const isCallerOwnedResettable = (d) => {
-    if (!callerSessionId || (!req.wipeData && !req.coldBoot)) return false;
+    if (!callerSessionId) return false;
     const l = getOccupyingLease(d);
-    return Boolean(
-      l &&
-        l.state === "active" &&
-        l.sessionId === callerSessionId &&
-        syncLeaseWorkers(l, livenessCheck).length === 0,
-    );
+    if (!l || l.state !== "active" || l.sessionId !== callerSessionId) return false;
+    if (syncLeaseWorkers(l, livenessCheck).length > 0) return false;
+    return Boolean(!l.serial || req.wipeData || req.coldBoot);
   };
 
   const earlierTickets = [];
@@ -826,6 +823,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             : lease;
           if (
             lease.state === "active" &&
+            Boolean(lease.serial) &&
             lease.sessionId === identity.sessionId &&
             matchesProfile(candidateForMatch, { ...req, snapshotLoad: null }) &&
             (!req.snapshotLoad ||
@@ -1516,6 +1514,17 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
   } catch (err) {
     hbTimer.stop();
     victimHbTimer?.stop();
+    if (stoppedExistingEmulator && !resolvedSerial && previousLease) {
+      try {
+        const refreshed = discoverFleet({ runner, avdHome });
+        const booted = (refreshed.running || []).find(
+          (d) => d.kind === "emulator" && d.avd === candidate.avd && d.serial,
+        );
+        resolvedSerial = booted?.serial || null;
+      } catch {
+        // Ignore discovery failure during rollback
+      }
+    }
     if (bootedNewEmulator && !previousLease) {
       try {
         if (isWin) {
@@ -1545,7 +1554,9 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         if (previousLease) {
           state.leases[lease.deviceKey] = {
             ...previousLease,
-            serial: resolvedSerial || previousLease.serial,
+            serial: stoppedExistingEmulator
+              ? resolvedSerial || null
+              : resolvedSerial || previousLease.serial,
             state: "active",
             workerPid: null,
             workerPids: [],
@@ -2158,6 +2169,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       (cur) => {
         if (markLoaded && effectiveAction === "load") {
           cur.loadedSnapshot = effectiveName;
+        } else if (
+          markLoaded &&
+          effectiveAction === "delete" &&
+          cur.loadedSnapshot === effectiveName
+        ) {
+          cur.loadedSnapshot = null;
         }
       },
     );
@@ -2241,6 +2258,15 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       };
     }
     const lease = owned[0];
+    if (!lease.serial) {
+      return {
+        mutated: false,
+        value: {
+          exitCode: 3,
+          error: `Lease ${lease.leaseId} (${lease.avd || lease.deviceKey}) has no active adb serial because its last restart failed; run "atc claim" to restart it.`,
+        },
+      };
+    }
     const [cmd, ...args] = commandArgs;
     const wrappedClass = classifySegment(
       [cmd, ...args]

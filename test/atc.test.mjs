@@ -2911,7 +2911,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               Date.now(),
             );
             assert.equal(reconcileCollisionState.leases["avd:Pixel_8_API_35"].leaseId, "lease_dest");
-            assert.equal(reconcileCollisionState.leases["serial:emulator-5558"].leaseId, "lease_src");
+            assert.equal(reconcileCollisionState.leases["serial:emulator-5558"], undefined);
 
             // 19. `atc free --target <lease>` honors `--target` instead of freeing all session leases
             const twoLeaseInv = {
@@ -3333,6 +3333,101 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               /Config key "autoStopIdleOnContention" requires a boolean value/,
             );
             assert.equal(readState(coldRediscoverDir).config.autoStopIdleOnContention, true);
+
+            // 34. Deleting the currently loaded snapshot clears lease.loadedSnapshot
+            const snapLoadBeforeDel = cmdSnapshot(
+              coldRediscoverDir,
+              "load",
+              "clean",
+              { session: "target-sess" },
+              {
+                avdHome,
+                runner: () => ({ status: 0, stdout: "1\n", stderr: "" }),
+              },
+            );
+            assert.equal(snapLoadBeforeDel.exitCode, 0);
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"].loadedSnapshot,
+              "clean",
+            );
+            const snapDelCurrent = cmdSnapshot(
+              coldRediscoverDir,
+              "delete",
+              "clean",
+              { session: "target-sess" },
+              {
+                avdHome,
+                runner: () => ({ status: 0, stdout: "OK\n", stderr: "" }),
+              },
+            );
+            assert.equal(snapDelCurrent.exitCode, 0);
+            assert.equal(
+              readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"].loadedSnapshot,
+              null,
+            );
+
+            // 35. Failed restart after stopping emulator clears stale serial, blocks cmdExec, and allows owner reclaim
+            const failedBootAfterStop = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", cold: true, wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: singleMatchInv,
+                runner: (cmd, args) => {
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                    return { status: 0, stdout: "Stopped\n", stderr: "" };
+                  }
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    return { status: 1, stdout: "", stderr: "Failed to start" };
+                  }
+                  return { status: 0, stdout: "", stderr: "" };
+                },
+              },
+            );
+            assert.equal(failedBootAfterStop.exitCode, 1);
+            const postStopFailLease = readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"];
+            assert.ok(postStopFailLease);
+            assert.equal(postStopFailLease.serial, null);
+            const execWithoutSerial = await cmdExec(
+              coldRediscoverDir,
+              ["adb", "shell", "getprop"],
+              { session: "target-sess" },
+            );
+            assert.equal(execWithoutSerial.exitCode, 3);
+            assert.match(execWithoutSerial.error, /has no active adb serial/);
+            const recoverStoppedOwnLease = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  host: singleMatchInv.host,
+                  running: [],
+                  offline: [
+                    {
+                      deviceKey: "avd:Pixel_9_API_36",
+                      avd: "Pixel_9_API_36",
+                      serial: null,
+                      kind: "emulator",
+                      online: false,
+                      profile: { deviceType: "phone", apiLevel: "android-36" },
+                    },
+                  ],
+                  creatable: [],
+                },
+                runner: (cmd, args) => {
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    return { status: 0, stdout: "Started on emulator-5558\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "1\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(recoverStoppedOwnLease.exitCode, 0);
+            assert.equal(recoverStoppedOwnLease.lease.serial, "emulator-5558");
+            assert.equal(recoverStoppedOwnLease.lease.leaseId, l2.lease.leaseId);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
