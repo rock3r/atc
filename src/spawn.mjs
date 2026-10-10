@@ -36,18 +36,20 @@ export function resolveExecutable(
     return { executable: resolvedCmd, isBatch: false };
   }
 
-  // Check relative / project-local candidates in cwd first (handles `./gradlew`, `.\gradlew`, and `gradlew`)
-  for (const ext of extensions) {
-    const localCandidate = path.resolve(cwd, normalizedCommand + ext);
-    try {
-      if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
-        return {
-          executable: localCandidate,
-          isBatch: ext === ".cmd" || ext === ".bat",
-        };
+  // Check relative / project-local candidates in cwd first only for explicit path separators or gradlew
+  if (hasPathSep || lower === "gradlew") {
+    for (const ext of extensions) {
+      const localCandidate = path.resolve(cwd, normalizedCommand + ext);
+      try {
+        if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
+          return {
+            executable: localCandidate,
+            isBatch: ext === ".cmd" || ext === ".bat",
+          };
+        }
+      } catch {
+        // Ignore inaccessible local entry
       }
-    } catch {
-      // Ignore inaccessible local entry
     }
   }
 

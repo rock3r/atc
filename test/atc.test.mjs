@@ -2849,6 +2849,125 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               `Expected deferred emulator stop, got: ${JSON.stringify(deferredCalls)}`,
             );
             assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"], undefined);
+
+            // 17. resolveExecutable("atc", ...) does not execute a repository-local atc.cmd in cwd on Windows
+            const untrustedRepoDir = makeTempStateDir();
+            try {
+              const repoAtcCmd = path.join(untrustedRepoDir, "atc.cmd");
+              fs.writeFileSync(repoAtcCmd, "@echo off\r\necho hacked\r\n");
+              const resolvedAtcWin = resolveExecutable(
+                "atc",
+                { PATH: "", APPDATA: untrustedRepoDir, LOCALAPPDATA: untrustedRepoDir },
+                untrustedRepoDir,
+                "win32",
+              );
+              assert.notEqual(resolvedAtcWin.executable, repoAtcCmd);
+            } finally {
+              fs.rmSync(untrustedRepoDir, { recursive: true, force: true });
+            }
+
+            // 18. reconcileOfflineLeases preserves destination lease when serial:<serial> maps to an occupied avd:<name>
+            const reconcileCollisionState = createDefaultState();
+            reconcileCollisionState.leases["avd:Pixel_8_API_35"] = {
+              leaseId: "lease_dest",
+              deviceKey: "avd:Pixel_8_API_35",
+              kind: "emulator",
+              avd: "Pixel_8_API_35",
+              serial: null,
+              sessionId: "dest-sess",
+              state: "starting",
+              workerPid: process.pid,
+              deadlineMs: Date.now() + 60_000,
+            };
+            reconcileCollisionState.leases["serial:emulator-5558"] = {
+              leaseId: "lease_src",
+              deviceKey: "serial:emulator-5558",
+              kind: "emulator",
+              avd: null,
+              serial: "emulator-5558",
+              sessionId: "src-sess",
+              state: "active",
+              claimedAtMs: Date.now(),
+              renewedAtMs: Date.now(),
+              expiresAtMs: Date.now() + 60_000,
+              firstSeenOfflineAtMs: null,
+            };
+            reconcileOfflineLeases(
+              reconcileCollisionState,
+              {
+                running: [
+                  {
+                    deviceKey: "avd:Pixel_8_API_35",
+                    kind: "emulator",
+                    avd: "Pixel_8_API_35",
+                    serial: "emulator-5558",
+                    online: true,
+                    profile: { deviceType: "phone", apiLevel: "android-35" },
+                  },
+                ],
+                offline: [],
+              },
+              "other-sess",
+              Date.now(),
+            );
+            assert.equal(reconcileCollisionState.leases["avd:Pixel_8_API_35"].leaseId, "lease_dest");
+            assert.equal(reconcileCollisionState.leases["serial:emulator-5558"].leaseId, "lease_src");
+
+            // 19. `atc free --target <lease>` honors `--target` instead of freeing all session leases
+            const twoLeaseInv = {
+              running: [
+                {
+                  deviceKey: "avd:Pixel_8_API_35",
+                  kind: "emulator",
+                  avd: "Pixel_8_API_35",
+                  serial: "emulator-5554",
+                  online: true,
+                  profile: { deviceType: "phone", apiLevel: "android-35" },
+                },
+                {
+                  deviceKey: "avd:Pixel_9_API_36",
+                  kind: "emulator",
+                  avd: "Pixel_9_API_36",
+                  serial: "emulator-5556",
+                  online: true,
+                  profile: { deviceType: "phone", apiLevel: "android-36" },
+                },
+              ],
+              offline: [],
+              creatable: [],
+              host: { totalRamMb: 16384, availableRamMb: 8192, freeDiskMb: 16384 },
+            };
+            const l1 = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_8_API_35" },
+              { inventory: twoLeaseInv },
+            );
+            const l2 = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36" },
+              { inventory: twoLeaseInv },
+            );
+            assert.equal(l1.exitCode, 0);
+            assert.equal(l2.exitCode, 0);
+            const freeTargetCode = await runCli(["free", "--target", l1.lease.leaseId], {
+              ...process.env,
+              ATC_STATE_DIR: coldRediscoverDir,
+              ATC_SESSION_ID: "target-sess",
+            });
+            assert.equal(freeTargetCode, 0);
+            assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"], undefined);
+            assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"]);
+
+            // 20. `atc snapshot list --avd <nonexistent>` fails instead of returning an empty snapshot list
+            const missingAvdSnap = cmdSnapshot(
+              coldRediscoverDir,
+              "list",
+              null,
+              { avd: "Does_Not_Exist_AVD" },
+              { avdHome, inventory: twoLeaseInv },
+            );
+            assert.equal(missingAvdSnap.exitCode, 1);
+            assert.match(missingAvdSnap.error, /No emulator found matching AVD "Does_Not_Exist_AVD"/);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }

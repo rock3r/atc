@@ -476,7 +476,12 @@ export function reconcileOfflineLeases(
       const mappedDev = (inventory.running || []).find(
         (d) => d.kind === "emulator" && d.serial === lease.serial && d.avd,
       );
-      if (mappedDev && mappedDev.deviceKey && mappedDev.deviceKey !== deviceKey) {
+      if (
+        mappedDev &&
+        mappedDev.deviceKey &&
+        mappedDev.deviceKey !== deviceKey &&
+        !state.leases[mappedDev.deviceKey]
+      ) {
         delete state.leases[deviceKey];
         lease.avd = mappedDev.avd;
         lease.deviceKey = mappedDev.deviceKey;

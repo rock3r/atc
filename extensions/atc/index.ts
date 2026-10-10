@@ -20,21 +20,11 @@ export function resolveAtcExecutable(
     .filter((e) => e.startsWith("."));
   const extensions = Array.from(new Set([".exe", ".cmd", ".bat", ".com", ...rawExts]));
 
-  for (const ext of extensions) {
-    const localCandidate = path.resolve(cwd, "atc" + ext);
-    try {
-      if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
-        return {
-          executable: localCandidate,
-          isBatch: ext === ".cmd" || ext === ".bat",
-        };
-      }
-    } catch {
-      // Ignore inaccessible local entry
-    }
-  }
-
-  const pathDirs = (env.PATH || env.Path || "").split(path.delimiter).filter(Boolean);
+  const resolvedCwd = path.resolve(cwd);
+  const pathDirs = (env.PATH || env.Path || "")
+    .split(path.delimiter)
+    .map((d) => d.trim())
+    .filter((d) => Boolean(d) && path.isAbsolute(d) && path.resolve(d) !== resolvedCwd);
   const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   pathDirs.push(path.join(appData, "npm"), path.join(os.homedir(), ".local", "bin"));
 

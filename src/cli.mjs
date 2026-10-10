@@ -666,21 +666,25 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       error: `Invalid package name "${req.resetApp}" for --reset-app.`,
     };
   }
-  if (flags.wait !== undefined) {
-    const parsedWait = Number(flags.wait);
+  const rawWait = flags.wait ?? flags.waitSec;
+  const rawReorderWindow = flags.reorderWindow ?? flags.reorderWindowSec;
+  const rawTtl = flags.ttl ?? flags.ttlSec;
+
+  if (rawWait !== undefined) {
+    const parsedWait = Number(rawWait);
     if (!Number.isFinite(parsedWait) || parsedWait < 0) {
       return {
         exitCode: 1,
-        error: `Invalid --wait duration "${flags.wait}". Expected a non-negative number of seconds.`,
+        error: `Invalid --wait duration "${rawWait}". Expected a non-negative number of seconds.`,
       };
     }
   }
-  if (flags.reorderWindow !== undefined) {
-    const rw = Number(flags.reorderWindow);
+  if (rawReorderWindow !== undefined) {
+    const rw = Number(rawReorderWindow);
     if (!Number.isFinite(rw) || rw < 0) {
       return {
         exitCode: 1,
-        error: `Invalid --reorder-window duration "${flags.reorderWindow}". Expected a non-negative number of seconds.`,
+        error: `Invalid --reorder-window duration "${rawReorderWindow}". Expected a non-negative number of seconds.`,
       };
     }
   }
@@ -695,8 +699,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     try {
       txOutcome = withStateTransaction(stateDir, (state, { now }) => {
         const waitSec =
-          flags.wait !== undefined
-            ? Number(flags.wait)
+          rawWait !== undefined
+            ? Number(rawWait)
             : (state.config?.defaultWaitSec ?? DEFAULT_CONFIG.defaultWaitSec);
         const identity = resolveSessionIdentity({
           flags,
@@ -707,7 +711,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           ancestorPids: options.ancestorPids,
           processChain: options.processChain,
         });
-        const ttlSec = clampTtlSec(flags.ttl, state.config);
+        const ttlSec = clampTtlSec(rawTtl, state.config);
         const ttlMs = ttlSec * 1000;
 
         const reconciledMutated = reconcileOfflineLeases(
@@ -910,8 +914,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         }
 
         const reorderWindowMs =
-          (flags.reorderWindow !== undefined
-            ? Number(flags.reorderWindow)
+          (rawReorderWindow !== undefined
+            ? Number(rawReorderWindow)
             : (state.config?.reorderWindowSec ?? DEFAULT_CONFIG.reorderWindowSec ?? 120)) * 1000;
         const waitExpiresAtMs = startWaitMs + waitSec * 1000;
         if (now >= waitExpiresAtMs) {
@@ -1011,7 +1015,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         } catch (err) {
           return { exitCode: 1, error: err.message };
         } finally {
-          const fallbackTtlMs = clampTtlSec(flags.ttl) * 1000;
+          const fallbackTtlMs = clampTtlSec(rawTtl) * 1000;
           finishLeaseWorker(
             stateDir,
             txOutcome.lease.deviceKey,
@@ -1023,7 +1027,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                 cur.loadedSnapshot = loadedSnap;
                 txOutcome.lease.loadedSnapshot = loadedSnap;
               }
-              const ttlMs = clampTtlSec(flags.ttl, state.config) * 1000;
+              const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
               cur.renewedAtMs = now;
               cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
             },
@@ -1443,6 +1447,18 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   if (unknownFlagErr) {
     return { exitCode: 1, error: unknownFlagErr, freed: [] };
   }
+  if (
+    flags.target !== undefined &&
+    flags.target !== null &&
+    (typeof flags.target !== "string" || !flags.target.trim())
+  ) {
+    return {
+      exitCode: 1,
+      error: 'Option "--target" requires a non-empty lease ID, serial, or AVD name.',
+      freed: [],
+    };
+  }
+  const effectiveTarget = target || (typeof flags.target === "string" ? flags.target.trim() : null);
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
@@ -1480,17 +1496,17 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
 
       const matches = [];
       const leasesList = Object.values(state.leases);
-      if (target) {
-        const byId = leasesList.find((l) => l.leaseId === target);
-        const bySerial = !byId && leasesList.find((l) => l.serial === target);
-        const byAvd = !byId && !bySerial && leasesList.find((l) => l.avd === target);
+      if (effectiveTarget) {
+        const byId = leasesList.find((l) => l.leaseId === effectiveTarget);
+        const bySerial = !byId && leasesList.find((l) => l.serial === effectiveTarget);
+        const byAvd = !byId && !bySerial && leasesList.find((l) => l.avd === effectiveTarget);
         const found = byId || bySerial || byAvd;
         if (!found) {
           return { mutated: false, value: { status: "not_found", freed: [] } };
         }
         const isOwner =
           found.sessionId === identity.sessionId ||
-          found.leaseId === target ||
+          found.leaseId === effectiveTarget ||
           parseBoolFlag(flags.force);
         if (!isOwner) {
           return {
@@ -1748,6 +1764,17 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
   if (unknownFlagErr) {
     return { exitCode: 1, error: unknownFlagErr };
   }
+  if (
+    flags.target !== undefined &&
+    flags.target !== null &&
+    (typeof flags.target !== "string" || !flags.target.trim())
+  ) {
+    return {
+      exitCode: 1,
+      error: 'Option "--target" requires a non-empty lease ID, serial, or AVD name.',
+    };
+  }
+  const effectiveTarget = target || (typeof flags.target === "string" ? flags.target.trim() : null);
   return withStateTransaction(stateDir, (state, { now }) => {
     const identity = resolveSessionIdentity({
       flags,
@@ -1758,16 +1785,16 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       ancestorPids: options.ancestorPids,
       processChain: options.processChain,
     });
-    const ttlSec = clampTtlSec(flags.ttl, state.config);
+    const ttlSec = clampTtlSec(flags.ttl ?? flags.ttlSec, state.config);
     const ttlMs = ttlSec * 1000;
 
     const leasesList = Object.values(state.leases).filter((l) => l.state === "active");
     let lease = null;
-    if (target) {
+    if (effectiveTarget) {
       lease =
-        leasesList.find((l) => l.leaseId === target) ||
-        leasesList.find((l) => l.serial === target) ||
-        leasesList.find((l) => l.avd === target);
+        leasesList.find((l) => l.leaseId === effectiveTarget) ||
+        leasesList.find((l) => l.serial === effectiveTarget) ||
+        leasesList.find((l) => l.avd === effectiveTarget);
     } else {
       const owned = leasesList.filter((l) => l.sessionId === identity.sessionId);
       if (owned.length > 1) {
@@ -1788,7 +1815,7 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
         value: { exitCode: 3, error: "No matching active lease found to renew." },
       };
     }
-    if (lease.sessionId !== identity.sessionId && lease.leaseId !== target) {
+    if (lease.sessionId !== identity.sessionId && lease.leaseId !== effectiveTarget) {
       return {
         mutated: false,
         value: {
@@ -1812,15 +1839,19 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   if (unknownFlagErr) {
     return { exitCode: 1, error: unknownFlagErr };
   }
+  const effectiveAction = action || (typeof flags.action === "string" ? flags.action : null);
+  const effectiveName = name || (typeof flags.name === "string" ? flags.name : null);
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
 
-  if (action === "list") {
+  if (effectiveAction === "list") {
     const targetAvd = flags.avd || null;
     const targetSerial = flags.serial || null;
     if (targetAvd && !targetSerial) {
       const meta = readLocalAvdMetadata(targetAvd, avdHome);
-      return { exitCode: 0, snapshots: meta.snapshots };
+      if (meta.exists) {
+        return { exitCode: 0, snapshots: meta.snapshots };
+      }
     }
     const fleet = options.inventory || discoverFleet({ avdHome, runner });
     if (targetSerial || targetAvd) {
@@ -1831,12 +1862,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           (!targetSerial || d.serial === targetSerial) &&
           (!targetAvd || d.avd === targetAvd),
       );
-      if (!matched && targetSerial) {
+      if (!matched) {
         const state = readState(stateDir);
         const leased = Object.values(state.leases || {}).find(
           (l) =>
             l.kind === "emulator" &&
-            l.serial === targetSerial &&
+            (!targetSerial || l.serial === targetSerial) &&
             (!targetAvd || l.avd === targetAvd) &&
             l.avd,
         );
@@ -1865,23 +1896,23 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     return { exitCode: 0, snapshots: byAvd };
   }
 
-  if (!["save", "load", "delete"].includes(action)) {
+  if (!["save", "load", "delete"].includes(effectiveAction)) {
     return {
       exitCode: 1,
-      error: `Unknown snapshot action "${action}". Expected list, save, load, or delete.`,
+      error: `Unknown snapshot action "${effectiveAction}". Expected list, save, load, or delete.`,
     };
   }
 
-  if (!name || !/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+  if (!effectiveName || !/^[A-Za-z0-9._-]{1,64}$/.test(effectiveName)) {
     return {
       exitCode: 1,
-      error: `Invalid snapshot name "${name}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
+      error: `Invalid snapshot name "${effectiveName}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
     };
   }
 
   const freeDiskMb =
     options.host?.freeDiskMb ??
-    (action === "save" && !flags.force ? readFreeDiskMb(avdHome) : 16384);
+    (effectiveAction === "save" && !flags.force ? readFreeDiskMb(avdHome) : 16384);
 
   const leaseCheck = withStateTransaction(stateDir, (state, { now }) => {
     const identity = resolveSessionIdentity({
@@ -1917,7 +1948,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       };
     }
     const lease = owned[0];
-    if (action === "save" && !parseBoolFlag(flags.force)) {
+    if (effectiveAction === "save" && !parseBoolFlag(flags.force)) {
       const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
       const minDisk = state.config.minFreeDiskMb ?? 2048;
       if (freeDiskMb < meta.ramSizeMb + minDisk) {
@@ -1925,7 +1956,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           mutated: false,
           value: {
             exitCode: 5,
-            error: `Insufficient disk space (${freeDiskMb}MB free) to save snapshot "${name}" on ${lease.avd}: needs ${meta.ramSizeMb + minDisk}MB free. Pass --force to bypass.`,
+            error: `Insufficient disk space (${freeDiskMb}MB free) to save snapshot "${effectiveName}" on ${lease.avd}: needs ${meta.ramSizeMb + minDisk}MB free. Pass --force to bypass.`,
           },
         };
       }
@@ -1950,8 +1981,8 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       leaseCheck.ttlMs,
       options,
       (cur) => {
-        if (markLoaded && action === "load") {
-          cur.loadedSnapshot = name;
+        if (markLoaded && effectiveAction === "load") {
+          cur.loadedSnapshot = effectiveName;
         }
       },
     );
@@ -1962,7 +1993,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   try {
     res = runner(
       "adb",
-      ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", action, name],
+      ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", effectiveAction, effectiveName],
       { strictInternal: true, timeoutMs: leaseCheck.stopTimeoutMs },
     );
   } catch (err) {
@@ -1973,11 +2004,11 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     clearSnapshotWorker(false);
     return {
       exitCode: 1,
-      error: `adb snapshot ${action} "${name}" failed: ${res.stderr || res.stdout}`,
+      error: `adb snapshot ${effectiveAction} "${effectiveName}" failed: ${res.stderr || res.stdout}`,
     };
   }
 
-  if (action === "load") {
+  if (effectiveAction === "load") {
     try {
       waitForEmulatorReady(runner, leaseCheck.lease.serial, leaseCheck.stopTimeoutMs);
     } catch (err) {
@@ -1988,7 +2019,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 
   const finalLease = clearSnapshotWorker(true);
 
-  return { exitCode: 0, lease: finalLease, snapshot: name, action };
+  return { exitCode: 0, lease: finalLease, snapshot: effectiveName, action: effectiveAction };
 }
 
 export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
@@ -2411,7 +2442,10 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "free": {
-      const res = cmdFree(stateDir, parsed.positionals[0] || null, parsed.flags, { env });
+      const targetArg =
+        parsed.positionals[0] ||
+        (typeof parsed.flags.target === "string" ? parsed.flags.target : null);
+      const res = cmdFree(stateDir, targetArg, parsed.flags, { env });
       if (res.exitCode !== 0) {
         process.stderr.write(`[atc] ${res.error}\n`);
         return res.exitCode;
@@ -2429,7 +2463,10 @@ export async function runCli(argv = process.argv.slice(2), env = process.env) {
     }
 
     case "renew": {
-      const res = cmdRenew(stateDir, parsed.positionals[0] || null, parsed.flags, { env });
+      const targetArg =
+        parsed.positionals[0] ||
+        (typeof parsed.flags.target === "string" ? parsed.flags.target : null);
+      const res = cmdRenew(stateDir, targetArg, parsed.flags, { env });
       if (res.exitCode !== 0) {
         process.stderr.write(`[atc] ${res.error}\n`);
         return res.exitCode;

@@ -139,6 +139,7 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   return {
     avd: avdId,
     avdPath,
+    exists: fs.existsSync(avdPath) || fs.existsSync(iniPath),
     profile: {
       deviceType,
       deviceName,
