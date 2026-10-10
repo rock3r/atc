@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  canSweepBreakClaimDir,
   isPidAlive,
   randomNonce,
   verifyLockOwnership,
@@ -295,7 +296,10 @@ export function sweepOrphanFiles(stateDir, now = Date.now()) {
       const fullPath = path.join(stateDir, name);
       try {
         const st = fs.lstatSync(fullPath);
-        if (now - st.mtimeMs > 60_000) {
+        if (
+          now - st.mtimeMs > 60_000 &&
+          (!st.isDirectory() || canSweepBreakClaimDir(fullPath, now))
+        ) {
           fs.rmSync(fullPath, { recursive: true, force: true });
         }
       } catch {
@@ -404,6 +408,9 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       }
     } else if (lease.state === "starting" || lease.state === "stopping") {
       const deadWorker = !lease.workerPid || !livenessCheck(lease.workerPid);
+      if (lease.state === "stopping" && lease.awaitOfflineReconcile && deadWorker) {
+        continue;
+      }
       const hasDeadline = typeof lease.deadlineMs === "number" && Number.isFinite(lease.deadlineMs);
       const pastDeadline =
         (hasDeadline && now >= lease.deadlineMs) ||
@@ -456,12 +463,47 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
   return pruned;
 }
 
+export function avdHasRuntimeLockFiles(avdId, avdHome) {
+  if (!avdId || !avdHome) return false;
+  try {
+    let avdDir = path.join(avdHome, `${avdId}.avd`);
+    const iniPath = path.join(avdHome, `${avdId}.ini`);
+    if (fs.existsSync(iniPath)) {
+      const content = fs.readFileSync(iniPath, "utf8");
+      for (const rawLine of String(content).split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+        const eqIdx = line.indexOf("=");
+        if (eqIdx === -1) continue;
+        const key = line.slice(0, eqIdx).trim();
+        const val = line.slice(eqIdx + 1).trim();
+        if (key === "path" && val && fs.existsSync(val)) {
+          avdDir = val;
+          break;
+        }
+      }
+    }
+    if (!fs.existsSync(avdDir)) return false;
+    return fs
+      .readdirSync(avdDir)
+      .some(
+        (entry) =>
+          entry === "hardware-qemu.ini.lock" ||
+          entry === "snapshot.lock" ||
+          entry === "modem-nv-ram-5554.lock",
+      );
+  } catch {
+    return true;
+  }
+}
+
 export function reconcileOfflineLeases(
   state,
   inventory,
   callerSessionId,
   now = Date.now(),
   livenessCheck = isPidAlive,
+  avdHome = inventory?.avdHome || null,
 ) {
   if (!inventory) return false;
   let mutated = false;
@@ -530,6 +572,34 @@ export function reconcileOfflineLeases(
           if (destWins) continue;
         }
       }
+    }
+    if (lease.state === "stopping") {
+      if (!lease.awaitOfflineReconcile) continue;
+      if (lease.workerPid && livenessCheck(lease.workerPid)) continue;
+      if (
+        typeof lease.reconcileAfterMs === "number" &&
+        Number.isFinite(lease.reconcileAfterMs) &&
+        now < lease.reconcileAfterMs
+      ) {
+        continue;
+      }
+      if (!emulatorListOk || !adbDevicesOk) continue;
+      const avdOnline = Boolean(lease.avd && onlineAvds.has(lease.avd));
+      const serialOnline = Boolean(lease.serial && onlineSerials.has(lease.serial));
+      const hasUnmappedEmulator = Boolean(
+        lease.avd && (inventory.running || []).some((d) => d.kind === "emulator" && !d.avd),
+      );
+      if (avdOnline || serialOnline || hasUnmappedEmulator) continue;
+      const offlineEntry = lease.avd
+        ? (inventory.offline || []).find((d) => d.avd === lease.avd || d.deviceKey === deviceKey)
+        : null;
+      const hasLocks =
+        Boolean(offlineEntry?.hasLockFiles) ||
+        Boolean(lease.avd && avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome));
+      if (hasLocks) continue;
+      delete state.leases[deviceKey];
+      mutated = true;
+      continue;
     }
     if (lease.state !== "active") continue;
     if (lease.kind === "physical") {
@@ -602,6 +672,9 @@ export function withStateTransaction(stateDir, fn, options = {}) {
       return result?.value !== undefined ? result.value : result;
     },
     options.lockTimeoutMs,
+    "atc.lock",
+    undefined,
+    options,
   );
 }
 

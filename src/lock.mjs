@@ -192,6 +192,59 @@ function inspectUnownedLockDir(lockDir) {
   }
 }
 
+export function canSweepBreakClaimDir(claimDir, now = Date.now()) {
+  let entries;
+  try {
+    entries = fs.readdirSync(claimDir);
+  } catch {
+    return false;
+  }
+  for (const name of entries) {
+    const fullPath = path.join(claimDir, name);
+    if (name.startsWith("breaker.") && name.endsWith(".json")) {
+      try {
+        const raw = fs.readFileSync(fullPath, "utf8");
+        const parsed = JSON.parse(raw);
+        const validRecord =
+          parsed &&
+          typeof parsed === "object" &&
+          typeof parsed.nonce === "string" &&
+          parsed.nonce.length > 0;
+        if (validRecord && isPidAlive(parsed.pid)) {
+          return false;
+        }
+      } catch (err) {
+        if (!err || err.code !== "ENOENT") {
+          try {
+            const st = fs.lstatSync(fullPath);
+            if (now - (st.mtimeMs || st.ctimeMs || 0) < MISSING_OWNER_STALE_MS) {
+              return false;
+            }
+          } catch {
+            return false;
+          }
+        }
+      }
+    } else if (name.includes(".tmp.")) {
+      const m = name.match(/\.tmp\.(\d+)\./);
+      const tmpPid = m ? Number(m[1]) : 0;
+      try {
+        const st = fs.lstatSync(fullPath);
+        const alive =
+          tmpPid > 0
+            ? isPidAlive(tmpPid)
+            : now - (st.mtimeMs || st.ctimeMs || 0) < MISSING_OWNER_STALE_MS;
+        if (alive) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 function sweepStaleLockClaims(stateDir, lockName, now = Date.now()) {
   const prefix = `${lockName}.stale.`;
   try {
@@ -200,7 +253,10 @@ function sweepStaleLockClaims(stateDir, lockName, now = Date.now()) {
       const fullPath = path.join(stateDir, name);
       try {
         const st = fs.lstatSync(fullPath);
-        if (now - (st.mtimeMs || st.ctimeMs || 0) > 60_000) {
+        if (
+          now - (st.mtimeMs || st.ctimeMs || 0) > 60_000 &&
+          (!st.isDirectory() || canSweepBreakClaimDir(fullPath, now))
+        ) {
           fs.rmSync(fullPath, { recursive: true, force: true });
         }
       } catch {
@@ -473,6 +529,9 @@ export function acquireLock(
   const observedUnownedAtMs = new Map();
 
   while (true) {
+    if (typeof options?.shouldAbort === "function" && options.shouldAbort()) {
+      throw new Error(`Aborted waiting to acquire ${lockDir}`);
+    }
     const attemptStartMs = Date.now();
     try {
       fs.mkdirSync(lockDir, { mode: 0o700 });
@@ -554,6 +613,9 @@ export function acquireLock(
     }
 
     if (candidateStale && candidateBreakToken && Date.now() - now < 30_000) {
+      if (typeof options?.shouldAbort === "function" && options.shouldAbort()) {
+        throw new Error(`Aborted waiting to acquire ${lockDir}`);
+      }
       const brokeLock = tryWithBreakClaim(
         stateDir,
         lockName,

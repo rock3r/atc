@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { runCommandSync } from "./spawn.mjs";
-import { DEFAULT_CONFIG, normalizeApiLevel } from "./state.mjs";
+import { DEFAULT_CONFIG, avdHasRuntimeLockFiles, normalizeApiLevel } from "./state.mjs";
 
 export class ResourceError extends Error {
   constructor(exitCode, message) {
@@ -147,6 +147,7 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
     avd: avdId,
     avdPath,
     exists: fs.existsSync(avdPath) || fs.existsSync(iniPath),
+    hasLockFiles: avdHasRuntimeLockFiles(avdId, avdHome),
     profile: {
       deviceType,
       deviceName,
@@ -672,6 +673,7 @@ export function discoverFleet({
 
   return {
     host,
+    avdHome,
     running,
     offline,
     creatable,

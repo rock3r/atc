@@ -20,6 +20,7 @@ import {
   commitState,
   runGarbageCollection,
   reconcileOfflineLeases,
+  sweepOrphanFiles,
   matchesProfile,
   matchesApiSpec,
   computeEffectiveMaxEmulators,
@@ -5260,6 +5261,119 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         } finally {
           fs.rmSync(fakeHome, { recursive: true, force: true });
         }
+      }
+
+      // 19. Stale-claim sweepers retain claim directories with a live breaker even past 60s
+      const sweepClaimDir = makeTempStateDir();
+      try {
+        const liveClaimPath = path.join(sweepClaimDir, "atc.lock.stale.owner.live");
+        const doneClaimPath = path.join(sweepClaimDir, "atc.lock.stale.owner.done");
+        fs.mkdirSync(liveClaimPath, { recursive: true });
+        fs.mkdirSync(doneClaimPath, { recursive: true });
+        fs.writeFileSync(
+          path.join(liveClaimPath, "breaker.live-nonce.json"),
+          JSON.stringify({
+            pid: process.pid,
+            createdAtMs: Date.now() - 120_000,
+            nonce: "live-nonce",
+          }),
+          "utf8",
+        );
+        fs.writeFileSync(path.join(doneClaimPath, "done"), "1", "utf8");
+        const oldSec = Math.floor((Date.now() - 120_000) / 1000);
+        fs.utimesSync(liveClaimPath, oldSec, oldSec);
+        fs.utimesSync(doneClaimPath, oldSec, oldSec);
+
+        sweepOrphanFiles(sweepClaimDir, Date.now());
+        assert.equal(fs.existsSync(liveClaimPath), true);
+        assert.equal(fs.existsSync(doneClaimPath), false);
+      } finally {
+        fs.rmSync(sweepClaimDir, { recursive: true, force: true });
+      }
+
+      // 20. Windows stopping reservation with awaitOfflineReconcile is retained past deadlineMs until reconcileOfflineLeases confirms offline + no lock files
+      const winReconcileDir = makeTempStateDir();
+      try {
+        const winAvdDir = path.join(avdHome, "Pixel_Win_Reconcile.avd");
+        fs.mkdirSync(winAvdDir, { recursive: true });
+        const qemuLockPath = path.join(winAvdDir, "hardware-qemu.ini.lock");
+        fs.writeFileSync(qemuLockPath, "locked", "utf8");
+
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          s.leases["avd:Pixel_Win_Reconcile"] = {
+            leaseId: "lease_win_reconcile",
+            deviceKey: "avd:Pixel_Win_Reconcile",
+            kind: "emulator",
+            avd: "Pixel_Win_Reconcile",
+            serial: "emulator-5582",
+            state: "stopping",
+            awaitOfflineReconcile: true,
+            workerPid: null,
+            workerPids: [],
+            sessionId: "win-reconcile-sess",
+            claimedAtMs: now - 120_000,
+            deadlineMs: now - 60_000,
+          };
+          return { mutated: true };
+        });
+
+        // GC must NOT expire an awaitOfflineReconcile stopping reservation even past deadlineMs
+        withStateTransaction(winReconcileDir, () => ({ mutated: false }));
+        assert.ok(readState(winReconcileDir).leases["avd:Pixel_Win_Reconcile"]);
+
+        // Reconcile while hardware-qemu.ini.lock still exists must retain the stopping reservation
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          reconcileOfflineLeases(
+            s,
+            {
+              avdHome,
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Win_Reconcile",
+                  kind: "emulator",
+                  avd: "Pixel_Win_Reconcile",
+                  online: false,
+                },
+              ],
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            "other-sess",
+            now,
+          );
+          return { mutated: true };
+        });
+        assert.ok(
+          readState(winReconcileDir).leases["avd:Pixel_Win_Reconcile"],
+          "Stopping reservation must remain held while hardware-qemu.ini.lock is present",
+        );
+
+        // Once hardware-qemu.ini.lock is removed and emulator is offline, reconcileOfflineLeases clears it
+        fs.rmSync(qemuLockPath, { force: true });
+        withStateTransaction(winReconcileDir, (s, { now }) => {
+          reconcileOfflineLeases(
+            s,
+            {
+              avdHome,
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Win_Reconcile",
+                  kind: "emulator",
+                  avd: "Pixel_Win_Reconcile",
+                  online: false,
+                },
+              ],
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            "other-sess",
+            now,
+          );
+          return { mutated: true };
+        });
+        assert.equal(readState(winReconcileDir).leases["avd:Pixel_Win_Reconcile"], undefined);
+      } finally {
+        fs.rmSync(winReconcileDir, { recursive: true, force: true });
       }
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });

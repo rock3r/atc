@@ -383,7 +383,7 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
 }
 
 function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
-  const stopFlag = new Int32Array(new SharedArrayBuffer(8));
+  const stopFlag = new Int32Array(new SharedArrayBuffer(12));
   const workerUrl = new URL("./heartbeat.mjs", import.meta.url);
   const worker = new Worker(workerUrl, {
     workerData: {
@@ -395,22 +395,28 @@ function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
       stopFlag,
     },
   });
-  worker.on("error", () => {});
+  worker.on("error", () => {
+    Atomics.store(stopFlag, 1, 0);
+    Atomics.notify(stopFlag, 1);
+    Atomics.store(stopFlag, 2, 1);
+    Atomics.notify(stopFlag, 2);
+  });
+  worker.on("exit", () => {
+    Atomics.store(stopFlag, 1, 0);
+    Atomics.notify(stopFlag, 1);
+    Atomics.store(stopFlag, 2, 1);
+    Atomics.notify(stopFlag, 2);
+  });
   if (typeof worker.unref === "function") {
     worker.unref();
   }
+  Atomics.wait(stopFlag, 2, 0, 2000);
   return {
     stop() {
       Atomics.store(stopFlag, 0, 1);
       Atomics.notify(stopFlag, 0);
-      const waitStart = Date.now();
-      while (Atomics.load(stopFlag, 1) !== 0 && Date.now() - waitStart < 1500) {
-        Atomics.wait(stopFlag, 1, 1, 20);
-      }
-      try {
-        worker.terminate();
-      } catch {
-        // Ignore termination error
+      while (Atomics.load(stopFlag, 1) !== 0) {
+        Atomics.wait(stopFlag, 1, 1, 25);
       }
     },
   };
@@ -1009,6 +1015,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           identity.sessionId,
           now,
           options.livenessCheck || isPidAlive,
+          avdHome,
         );
 
         // Step 3: Idempotent Re-Claim (Same Session)
@@ -2072,6 +2079,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         if (owned) {
           if (rebootStopWaitTimedOut) {
             current.state = "stopping";
+            current.awaitOfflineReconcile = true;
             removeLeaseWorker(current, process.pid, livenessCheck);
             current.replacingAvd = null;
             current.serial = candidate.serial || current.serial || null;
@@ -2115,6 +2123,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           state.leases[lease.deviceKey] = {
             ...lease,
             state: "stopping",
+            awaitOfflineReconcile: true,
             workerPid: null,
             workerPids: [],
             replacingAvd: null,
@@ -2127,6 +2136,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           if (vCurrent && vCurrent.leaseId === victimLeaseId) {
             if (victimStopWaitTimedOut) {
               vCurrent.state = "stopping";
+              vCurrent.awaitOfflineReconcile = true;
               removeLeaseWorker(vCurrent, process.pid, livenessCheck);
               vCurrent.deadlineMs = now + effectiveStopTimeoutMs;
             } else {
@@ -2143,6 +2153,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               sessionId: lease.sessionId,
               anchorPid: lease.anchorPid ?? null,
               state: "stopping",
+              awaitOfflineReconcile: true,
               workerPid: null,
               workerPids: [],
               replacingAvd: null,
@@ -2266,6 +2277,9 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               }
             } else if (cur && cur.leaseId === lease.leaseId) {
               cur.state = "stopping";
+              if (isWin) {
+                cur.awaitOfflineReconcile = true;
+              }
               removeLeaseWorker(cur, process.pid, livenessCheck);
               cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
               cur.deadlineMs = now + effectiveStopTimeoutMs;
@@ -2273,6 +2287,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               state.leases[lease.deviceKey] = {
                 ...lease,
                 state: "stopping",
+                ...(isWin ? { awaitOfflineReconcile: true } : {}),
                 workerPid: null,
                 workerPids: [],
                 replacingAvd: null,
@@ -2657,6 +2672,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               removeLeaseWorker(cur, process.pid, livenessCheck);
               if (windowsStopWaitTimedOut) {
                 cur.state = "stopping";
+                cur.awaitOfflineReconcile = true;
                 cur.deadlineMs = now + stopTimeoutMs;
               } else {
                 cur.state = "active";
@@ -2685,6 +2701,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             state.leases[lease.deviceKey] = {
               ...lease,
               state: "stopping",
+              awaitOfflineReconcile: true,
               workerPid: null,
               workerPids: [],
               deadlineMs: now + stopTimeoutMs,
@@ -3237,7 +3254,7 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   };
 
   return withStateTransaction(stateDir, (state, { now }) => {
-    reconcileOfflineLeases(state, inventory, null, now, options.livenessCheck || isPidAlive);
+    reconcileOfflineLeases(state, inventory, null, now, options.livenessCheck || isPidAlive, avdHome);
     const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
     const usedSlots = computeUsedEmulatorSlots(state, inventory);
     const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
