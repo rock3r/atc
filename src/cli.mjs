@@ -34,7 +34,9 @@ import {
   canJumpAhead,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
+  hasAliveProcessInGroup,
   isTicketStarvationProtected,
+  killProcessGroupTree,
   matchesProfile,
   offlineAvdHasRuntimeLockFiles,
   readState,
@@ -44,6 +46,7 @@ import {
   removeLeaseWorker,
   resolveSessionIdentity,
   resolveStableParentPid,
+  snapshotProcessGroupsOutsideLock,
   syncLeaseWorkers,
   withStateTransaction,
 } from "./state.mjs";
@@ -2761,14 +2764,79 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const freeDiskMb =
     options.host?.freeDiskMb ?? (!flags.force ? readFreeDiskMb(avdHome) : 16384);
 
-  let outcome;
-  try {
-    outcome = withStateTransaction(stateDir, (state, { now }) => {
-      const identity = resolveSessionIdentity({
+  const terminatedPgids = [];
+  if (!options.deferOnBusyWorker) {
+    try {
+      const preLiveness = options.livenessCheck || isPidAlive;
+      const preState = readState(stateDir);
+      const preIdentity = resolveSessionIdentity({
         flags,
         env: options.env || process.env,
-        state,
+        state: preState,
         cwd: options.cwd || process.cwd(),
+        ppid: options.ppid ?? process.ppid,
+        ancestorPids: options.ancestorPids,
+        processChain: options.processChain,
+      });
+      const preLeases = Object.values(preState.leases || {});
+      const preMatches = [];
+      if (effectiveTarget) {
+        const found =
+          preLeases.find((l) => l.leaseId === effectiveTarget) ||
+          preLeases.find((l) => l.serial === effectiveTarget) ||
+          preLeases.find((l) => l.avd === effectiveTarget);
+        if (
+          found &&
+          (found.sessionId === preIdentity.sessionId ||
+            found.leaseId === effectiveTarget ||
+            parseBoolFlag(flags.force))
+        ) {
+          preMatches.push(found);
+        }
+      } else {
+        for (const l of preLeases) {
+          if (
+            l.sessionId === preIdentity.sessionId &&
+            (l.state === "active" || l.state === "starting")
+          ) {
+            preMatches.push(l);
+          }
+        }
+      }
+      for (const l of preMatches) {
+        if (!Array.isArray(l.workerPgids) || l.workerPgids.length === 0) continue;
+        const pgidSet = new Set(l.workerPgids.map(Number));
+        const hasLiveWrapperPid = (l.workerPids || []).some((p) => {
+          const num = Number(p);
+          return num !== options.callerWorkerPid && !pgidSet.has(num) && preLiveness(num);
+        });
+        const hasLiveLeaderPid = l.workerPgids.some((p) => {
+          const num = Number(p);
+          return num !== options.callerWorkerPid && preLiveness(num);
+        });
+        if (parseBoolFlag(flags.force) || (!hasLiveWrapperPid && !hasLiveLeaderPid)) {
+          killProcessGroupTree(l, "SIGKILL", {
+            spawnSyncFn: options.spawnSyncFn || options.runner,
+            platform: options.platform,
+          });
+          terminatedPgids.push(...l.workerPgids.map(Number));
+        }
+      }
+    } catch {
+      // Best-effort pre-lock orphan tree termination
+    }
+  }
+
+  let outcome;
+  try {
+    outcome = withStateTransaction(
+      stateDir,
+      (state, { now }) => {
+        const identity = resolveSessionIdentity({
+          flags,
+          env: options.env || process.env,
+          state,
+          cwd: options.cwd || process.cwd(),
         ppid: options.ppid ?? process.ppid,
         ancestorPids: options.ancestorPids,
         processChain: options.processChain,
@@ -2951,7 +3019,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           busyErrors: options.deferOnBusyWorker ? [] : busyErrors,
         },
       };
-    }, options);
+    }, terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options);
   } catch (err) {
     if (err instanceof ResourceError) {
       return { exitCode: err.exitCode, error: err.message };
@@ -3744,6 +3812,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         check.lease.leaseId,
       );
       if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+        syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
         cur.renewedAtMs = now;
         cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
         return { mutated: true };
@@ -3756,6 +3825,16 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const onChildSpawn = (childPid, { isProcessGroup } = {}) => {
     spawnedChildPid = childPid;
     try {
+      if (
+        isProcessGroup &&
+        !options.livenessCheck &&
+        (options.platform || process.platform) === "win32"
+      ) {
+        snapshotProcessGroupsOutsideLock([childPid], {
+          spawnSyncFn: options.spawnSyncFn,
+          platform: options.platform,
+        });
+      }
       withStateTransaction(
         stateDir,
         (state) => {
@@ -3795,6 +3874,18 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     return { exitCode };
   } finally {
     try {
+      let keepSpawnedChildGroup = false;
+      if (spawnedChildPid && !options.livenessCheck) {
+        try {
+          keepSpawnedChildGroup = hasAliveProcessInGroup(spawnedChildPid, {
+            allowSubprocess: true,
+            spawnSyncFn: options.spawnSyncFn,
+            platform: options.platform,
+          });
+        } catch {
+          keepSpawnedChildGroup = false;
+        }
+      }
       finishLeaseWorker(
         stateDir,
         check.lease.deviceKey,
@@ -3803,7 +3894,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         options,
         (cur) => {
           if (spawnedChildPid) {
-            removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+            if (keepSpawnedChildGroup) {
+              syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+            } else {
+              removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+            }
           }
         },
       );
@@ -3826,7 +3921,13 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   const discoveryStartedAtMs = Date.now();
   const rawInventory =
     options.inventory ||
-    discoverFleet({ runner, avdHome, cfg, platform: options.platform });
+    discoverFleet({
+      runner,
+      avdHome,
+      cfg,
+      platform: options.platform,
+      livenessCheck: options.livenessCheck,
+    });
   const inventory = options.inventory
     ? rawInventory
     : {
@@ -3843,38 +3944,49 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
     abi: flags.abi || null,
   };
 
-  return withStateTransaction(stateDir, (state, { now }) => {
-    reconcileOfflineLeases(state, inventory, null, now, options.livenessCheck || isPidAlive, avdHome);
-    const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
-    const usedSlots = computeUsedEmulatorSlots(state, inventory);
-    const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
-    const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
-    const creatable = (inventory.creatable || []).filter((d) =>
-      matchesProfile({ ...d, kind: d.kind || "emulator" }, req),
-    );
+  return withStateTransaction(
+    stateDir,
+    (state, { now }) => {
+      reconcileOfflineLeases(
+        state,
+        inventory,
+        null,
+        now,
+        options.livenessCheck || isPidAlive,
+        avdHome,
+      );
+      const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
+      const usedSlots = computeUsedEmulatorSlots(state, inventory);
+      const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
+      const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
+      const creatable = (inventory.creatable || []).filter((d) =>
+        matchesProfile({ ...d, kind: d.kind || "emulator" }, req),
+      );
 
-    return {
-      mutated: true,
-      value: {
-        exitCode: 0,
-        hostCapacity: {
-          ...inventory.host,
-          usedSlots,
-          effectiveMaxEmulators,
-          minFreeRamMb: state.config.minFreeRamMb,
-          minFreeDiskMb: state.config.minFreeDiskMb,
+      return {
+        mutated: true,
+        value: {
+          exitCode: 0,
+          hostCapacity: {
+            ...inventory.host,
+            usedSlots,
+            effectiveMaxEmulators,
+            minFreeRamMb: state.config.minFreeRamMb,
+            minFreeDiskMb: state.config.minFreeDiskMb,
+          },
+          fleet: {
+            running,
+            offline,
+            creatable,
+          },
+          leases: state.leases,
+          queue: state.queue,
+          config: state.config,
         },
-        fleet: {
-          running,
-          offline,
-          creatable,
-        },
-        leases: state.leases,
-        queue: state.queue,
-        config: state.config,
-      },
-    };
-  });
+      };
+    },
+    options,
+  );
 }
 
 export function cmdConfig(stateDir, action, key = null, val = null) {
@@ -3990,10 +4102,51 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
   });
 }
 
-export function cmdGc(stateDir) {
-  return withStateTransaction(stateDir, (_state, { pruned }) => {
-    return { mutated: true, value: { exitCode: 0, pruned } };
-  });
+export function cmdGc(stateDir, options = {}) {
+  const terminatedPgids = [];
+  try {
+    const preLiveness = options.livenessCheck || isPidAlive;
+    const preState = readState(stateDir);
+    const now = options.now ?? Date.now();
+    const cfg = preState.config || DEFAULT_CONFIG;
+    const maxTtlMs = (cfg.maxTtlSec || 3600) * 1000;
+    for (const lease of Object.values(preState.leases || {})) {
+      if (!lease || typeof lease !== "object") continue;
+      if (!Array.isArray(lease.workerPgids) || lease.workerPgids.length === 0) continue;
+      const pgidSet = new Set(lease.workerPgids.map(Number));
+      const hasLiveWrapperPid = (lease.workerPids || []).some((p) => {
+        const num = Number(p);
+        return !pgidSet.has(num) && preLiveness(num);
+      });
+      if (hasLiveWrapperPid) continue;
+      const lastRenewedMs =
+        typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;
+      const isExpired =
+        now >= lease.expiresAtMs ||
+        now < lease.claimedAtMs ||
+        (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
+      const isDeadAnchor =
+        lease.anchorPid !== null &&
+        lease.anchorPid !== undefined &&
+        !preLiveness(lease.anchorPid);
+      if (isExpired || isDeadAnchor || Boolean(lease.releaseOnWorkerExit)) {
+        killProcessGroupTree(lease, "SIGKILL", {
+          spawnSyncFn: options.spawnSyncFn || options.runner,
+          platform: options.platform,
+        });
+        terminatedPgids.push(...lease.workerPgids.map(Number));
+      }
+    }
+  } catch {
+    // Best-effort pre-lock orphan tree termination
+  }
+  return withStateTransaction(
+    stateDir,
+    (_state, { pruned }) => {
+      return { mutated: true, value: { exitCode: 0, pruned } };
+    },
+    terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options,
+  );
 }
 
 export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {

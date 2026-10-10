@@ -85,7 +85,12 @@ export function resolveAvdHome(env = process.env) {
   return path.join(os.homedir(), ".android", "avd");
 }
 
-export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DEFAULT_CONFIG) {
+export function readLocalAvdMetadata(
+  avdId,
+  avdHome = resolveAvdHome(),
+  cfg = DEFAULT_CONFIG,
+  livenessCheck = undefined,
+) {
   const iniPath = path.join(avdHome, `${avdId}.ini`);
   let avdPath = path.join(avdHome, `${avdId}.avd`);
   let targetApi = null;
@@ -150,7 +155,7 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
     avd: avdId,
     avdPath,
     exists: fs.existsSync(avdPath) || fs.existsSync(iniPath),
-    hasLockFiles: avdHasRuntimeLockFiles(avdId, avdHome),
+    hasLockFiles: avdHasRuntimeLockFiles(avdId, avdHome, livenessCheck),
     profile: {
       deviceType,
       deviceName,
@@ -169,13 +174,18 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   };
 }
 
-export function wipeAvdUserData(avdId, avdHome = resolveAvdHome(), cfg = DEFAULT_CONFIG) {
-  const meta = readLocalAvdMetadata(avdId, avdHome, cfg);
+export function wipeAvdUserData(
+  avdId,
+  avdHome = resolveAvdHome(),
+  cfg = DEFAULT_CONFIG,
+  livenessCheck = undefined,
+) {
+  const meta = readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck);
   const avdPath = meta.avdPath;
   if (!avdPath || !fs.existsSync(avdPath)) {
     return;
   }
-  if (avdHasRuntimeLockFiles(avdId, avdHome)) {
+  if (avdHasRuntimeLockFiles(avdId, avdHome, livenessCheck)) {
     throw new Error(
       `Cannot wipe AVD ${avdId}: emulator runtime lock files are still present in ${avdPath}`,
     );
@@ -585,6 +595,7 @@ export function discoverFleet({
   runner = runCommandSync,
   platform = process.platform,
   onProgress = null,
+  livenessCheck = undefined,
 } = {}) {
   const notifyProgress = () => {
     if (typeof onProgress === "function") {
@@ -606,7 +617,7 @@ export function discoverFleet({
         if (entry.endsWith(".ini")) {
           const avdId = entry.slice(0, -4);
           knownAvds.set(avdId, {
-            ...readLocalAvdMetadata(avdId, avdHome, cfg),
+            ...readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck),
             deviceKey: `avd:${avdId}`,
             kind: "emulator",
             online: false,
@@ -628,7 +639,7 @@ export function discoverFleet({
   if (emulatorListOk && emuListRes.stdout) {
     for (const item of parseAndroidEmulatorListOutput(emuListRes.stdout)) {
       const existing = knownAvds.get(item.avd) || {
-        ...readLocalAvdMetadata(item.avd, avdHome, cfg),
+        ...readLocalAvdMetadata(item.avd, avdHome, cfg, livenessCheck),
         deviceKey: `avd:${item.avd}`,
         kind: "emulator",
       };
@@ -652,7 +663,7 @@ export function discoverFleet({
         if (!avdId || !/^[A-Za-z0-9._-]+$/.test(avdId)) continue;
         if (!knownAvds.has(avdId)) {
           knownAvds.set(avdId, {
-            ...readLocalAvdMetadata(avdId, avdHome, cfg),
+            ...readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck),
             deviceKey: `avd:${avdId}`,
             kind: "emulator",
             online: false,
@@ -686,7 +697,7 @@ export function discoverFleet({
             : "";
         if (avdId && avdId !== "OK") {
           const existing = knownAvds.get(avdId) || {
-            ...readLocalAvdMetadata(avdId, avdHome, cfg),
+            ...readLocalAvdMetadata(avdId, avdHome, cfg, livenessCheck),
             deviceKey: `avd:${avdId}`,
             kind: "emulator",
           };

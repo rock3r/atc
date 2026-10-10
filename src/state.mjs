@@ -4,9 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import {
   canSweepBreakClaimDir,
+  clearKnownWindowsTreeDescendants,
+  getKnownWindowsTreeDescendants,
+  getKnownWindowsTreePids,
+  hasAliveProcessInGroup,
   isPidAlive,
   isProcessGroupAlive,
+  killProcessGroupTree,
+  queryWindowsProcessGroups,
   randomNonce,
+  seedWindowsKnownDescendants,
   sleepSync,
   snapshotProcessGroupsOutsideLock,
   trySweepBreakClaimDir,
@@ -15,6 +22,19 @@ import {
   withProcessGroupSnapshot,
   writeFileAtomic,
 } from "./lock.mjs";
+
+export {
+  clearKnownWindowsTreeDescendants,
+  getKnownWindowsTreeDescendants,
+  getKnownWindowsTreePids,
+  hasAliveProcessInGroup,
+  isProcessGroupAlive,
+  killProcessGroupTree,
+  queryWindowsProcessGroups,
+  seedWindowsKnownDescendants,
+  snapshotProcessGroupsOutsideLock,
+  withProcessGroupSnapshot,
+};
 
 const ancestorPidCache = new Map();
 const ancestorProcessCache = new Map();
@@ -373,6 +393,9 @@ export function sweepOrphanFiles(stateDir, now = Date.now()) {
 
 export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
   if (!lease || typeof lease !== "object") return [];
+  if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
+    seedWindowsKnownDescendants(lease.workerDescendants);
+  }
   const raw = [];
   if (Array.isArray(lease.workerPids)) {
     raw.push(...lease.workerPids);
@@ -391,15 +414,52 @@ export function getLiveLeaseWorkerPids(lease, livenessCheck = isPidAlive) {
     const pid = Number(val);
     if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) continue;
     seen.add(pid);
-    const isAlive =
-      livenessCheck === isPidAlive && pgidSet.has(pid)
-        ? isProcessGroupAlive(pid, { allowSubprocess: false })
-        : livenessCheck(pid);
+    const isAlive = pgidSet.has(pid)
+      ? livenessCheck === isPidAlive
+        ? hasAliveProcessInGroup(pid, {
+            allowSubprocess: false,
+            knownDescendants: lease.workerDescendants,
+          })
+        : livenessCheck(pid) ||
+          hasAliveProcessInGroup(pid, {
+            allowSubprocess: false,
+            knownDescendants: lease.workerDescendants,
+            livenessCheck,
+          })
+      : livenessCheck(pid);
     if (isAlive) {
       alive.push(pid);
     }
   }
   return alive;
+}
+
+function syncLeaseWindowsDescendants(lease) {
+  if (!lease || typeof lease !== "object") return;
+  if (!Array.isArray(lease.workerPgids) || lease.workerPgids.length === 0) {
+    delete lease.workerDescendants;
+    return;
+  }
+  const nextDesc = {};
+  const prevDesc =
+    lease.workerDescendants && typeof lease.workerDescendants === "object"
+      ? lease.workerDescendants
+      : {};
+  for (const rawPgid of lease.workerPgids) {
+    const pgid = Number(rawPgid);
+    if (!Number.isInteger(pgid) || pgid <= 1) continue;
+    const known = getKnownWindowsTreeDescendants(pgid);
+    if (known.length > 0) {
+      nextDesc[String(pgid)] = known;
+    } else if (Array.isArray(prevDesc[String(pgid)]) && prevDesc[String(pgid)].length > 0) {
+      nextDesc[String(pgid)] = prevDesc[String(pgid)];
+    }
+  }
+  if (Object.keys(nextDesc).length > 0) {
+    lease.workerDescendants = nextDesc;
+  } else {
+    delete lease.workerDescendants;
+  }
 }
 
 export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
@@ -414,6 +474,7 @@ export function syncLeaseWorkers(lease, livenessCheck = isPidAlive) {
       delete lease.workerPgids;
     }
   }
+  syncLeaseWindowsDescendants(lease);
   lease.workerPid = alive[0] ?? null;
   return alive;
 }
@@ -430,8 +491,12 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
       pgids.push(numericPid);
     }
     lease.workerPgids = pgids;
+    if (options.descendants) {
+      seedWindowsKnownDescendants(numericPid, options.descendants);
+    }
   }
   lease.workerPids = alive;
+  syncLeaseWindowsDescendants(lease);
   lease.workerPid = alive[0] ?? null;
   return alive;
 }
@@ -444,8 +509,16 @@ export function removeLeaseWorker(lease, pid, livenessCheck = isPidAlive) {
       delete lease.workerPgids;
     }
   }
+  clearKnownWindowsTreeDescendants(numericPid);
+  if (lease?.workerDescendants && typeof lease.workerDescendants === "object") {
+    delete lease.workerDescendants[String(numericPid)];
+    if (Object.keys(lease.workerDescendants).length === 0) {
+      delete lease.workerDescendants;
+    }
+  }
   const alive = getLiveLeaseWorkerPids(lease, livenessCheck).filter((p) => p !== numericPid);
   lease.workerPids = alive;
+  syncLeaseWindowsDescendants(lease);
   lease.workerPid = alive[0] ?? null;
   return alive;
 }
@@ -455,6 +528,7 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
     leases: [],
     queue: [],
     hookSessions: [],
+    workersMutated: false,
   };
   const cfg = state.config || DEFAULT_CONFIG;
   const maxTtlMs = (cfg.maxTtlSec || 3600) * 1000;
@@ -466,7 +540,17 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
       continue;
     }
     if (lease.state === "active") {
+      const beforeWorkerPids = JSON.stringify(lease.workerPids || null);
+      const beforeWorkerPgids = JSON.stringify(lease.workerPgids || null);
+      const beforeDescendants = JSON.stringify(lease.workerDescendants || null);
       const aliveWorkers = syncLeaseWorkers(lease, livenessCheck);
+      if (
+        beforeWorkerPids !== JSON.stringify(lease.workerPids || null) ||
+        beforeWorkerPgids !== JSON.stringify(lease.workerPgids || null) ||
+        beforeDescendants !== JSON.stringify(lease.workerDescendants || null)
+      ) {
+        pruned.workersMutated = true;
+      }
       const workerAlive = aliveWorkers.length > 0;
       if (workerAlive) {
         const defaultTtlMs = (cfg.defaultTtlSec || 600) * 1000;
@@ -578,7 +662,51 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
   return pruned;
 }
 
-export function avdHasRuntimeLockFiles(avdId, avdHome) {
+const AVD_RUNTIME_LOCK_NAMES = new Set([
+  "hardware-qemu.ini.lock",
+  "snapshot.lock",
+  "modem-nv-ram-5554.lock",
+]);
+
+function isAvdLockEntryLive(lockPath, livenessCheck = isPidAlive) {
+  try {
+    const stat = fs.statSync(lockPath);
+    let rawContent = null;
+    if (stat.isDirectory()) {
+      const pidFile = path.join(lockPath, "pid");
+      if (!fs.existsSync(pidFile)) {
+        return true;
+      }
+      rawContent = fs.readFileSync(pidFile, "utf8");
+    } else if (stat.isFile()) {
+      rawContent = fs.readFileSync(lockPath, "utf8");
+    } else {
+      return true;
+    }
+    const cleaned = String(rawContent).replace(/\0/g, "");
+    const barePidMatch = cleaned.match(/^\s*(\d+)\s*$/);
+    if (!barePidMatch) {
+      return true;
+    }
+    const pid = Number(barePidMatch[1]);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return true;
+    }
+    if (livenessCheck(pid)) {
+      return true;
+    }
+    try {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors on read-only or race-removed lock paths
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export function avdHasRuntimeLockFiles(avdId, avdHome, livenessCheck = isPidAlive) {
   if (!avdId || !avdHome) return false;
   try {
     let avdDir = path.join(avdHome, `${avdId}.avd`);
@@ -599,27 +727,40 @@ export function avdHasRuntimeLockFiles(avdId, avdHome) {
       }
     }
     if (!fs.existsSync(avdDir)) return false;
-    return fs
-      .readdirSync(avdDir)
-      .some(
-        (entry) =>
-          entry === "hardware-qemu.ini.lock" ||
-          entry === "snapshot.lock" ||
-          entry === "modem-nv-ram-5554.lock",
-      );
+    let hasLiveLock = false;
+    for (const entry of fs.readdirSync(avdDir)) {
+      if (!AVD_RUNTIME_LOCK_NAMES.has(entry)) continue;
+      if (isAvdLockEntryLive(path.join(avdDir, entry), livenessCheck)) {
+        hasLiveLock = true;
+      }
+    }
+    return hasLiveLock;
   } catch {
     return true;
   }
 }
 
-export function offlineAvdHasRuntimeLockFiles(avdHome, excludedAvds = new Set()) {
+export function offlineAvdHasRuntimeLockFiles(
+  avdHomeOrDevice,
+  excludedAvdsOrAvdHome = new Set(),
+  livenessCheck = isPidAlive,
+) {
+  if (avdHomeOrDevice && typeof avdHomeOrDevice === "object") {
+    const dev = avdHomeOrDevice;
+    if (typeof excludedAvdsOrAvdHome === "string" && excludedAvdsOrAvdHome && dev.avd) {
+      return avdHasRuntimeLockFiles(dev.avd, excludedAvdsOrAvdHome, livenessCheck);
+    }
+    return Boolean(dev.hasLockFiles);
+  }
+  const avdHome = avdHomeOrDevice;
+  const excludedAvds = excludedAvdsOrAvdHome;
   if (!avdHome || !fs.existsSync(avdHome)) return false;
   try {
     for (const entry of fs.readdirSync(avdHome)) {
       if (entry.endsWith(".ini") || entry.endsWith(".avd")) {
         const avdId = entry.slice(0, -4);
         if (excludedAvds && excludedAvds.has(avdId)) continue;
-        if (avdHasRuntimeLockFiles(avdId, avdHome)) {
+        if (avdHasRuntimeLockFiles(avdId, avdHome, livenessCheck)) {
           return true;
         }
       }
@@ -820,12 +961,15 @@ export function reconcileOfflineLeases(
         : null;
       const hasLocks = lease.avd
         ? Boolean(offlineEntry?.hasLockFiles) ||
-          Boolean(avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome))
+          Boolean(avdHome && avdHasRuntimeLockFiles(lease.avd, avdHome, livenessCheck))
         : Boolean(
             (inventory.offline || []).some(
               (d) => d?.hasLockFiles && (!d.avd || !otherActiveAvds.has(d.avd)),
             ),
-          ) || Boolean(avdHome && offlineAvdHasRuntimeLockFiles(avdHome, otherActiveAvds));
+          ) ||
+          Boolean(
+            avdHome && offlineAvdHasRuntimeLockFiles(avdHome, otherActiveAvds, livenessCheck),
+          );
       if (hasLocks) continue;
       recordDeviceStoppedInState(state, lease, now);
       delete state.leases[deviceKey];
@@ -943,23 +1087,53 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     getAncestorPids(options.ppid ?? process.ppid);
   }
   let pgidSnapshot = null;
-  if (!options.livenessCheck) {
-    try {
-      const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
-      if (preRaw) {
-        const preParsed = JSON.parse(preRaw);
-        const pgids = [];
-        for (const lease of Object.values(preParsed?.leases || {})) {
-          if (lease && Array.isArray(lease.workerPgids)) {
-            pgids.push(...lease.workerPgids);
+  const terminatedSet = new Set(
+    Array.isArray(options.terminatedPgids)
+      ? options.terminatedPgids.map(Number).filter((p) => Number.isInteger(p) && p > 1)
+      : [],
+  );
+  try {
+    const preRaw = readStateFileRaw(path.join(stateDir, "state.json"), false);
+    if (preRaw) {
+      const preParsed = JSON.parse(preRaw);
+      const pgids = [];
+      const knownDescendants = {};
+      for (const lease of Object.values(preParsed?.leases || {})) {
+        if (!lease || typeof lease !== "object") continue;
+        if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
+          for (const [k, v] of Object.entries(lease.workerDescendants)) {
+            if (!terminatedSet.has(Number(k))) {
+              knownDescendants[k] = v;
+            }
           }
         }
-        if (pgids.length > 0) {
-          pgidSnapshot = snapshotProcessGroupsOutsideLock(pgids);
+        if (Array.isArray(lease.workerPgids)) {
+          for (const p of lease.workerPgids) {
+            if (!terminatedSet.has(Number(p))) {
+              pgids.push(p);
+            }
+          }
         }
       }
-    } catch {
-      // Ignore pre-lock snapshot parse errors
+      if (Object.keys(knownDescendants).length > 0) {
+        seedWindowsKnownDescendants(knownDescendants);
+      }
+      if (pgids.length > 0) {
+        pgidSnapshot = snapshotProcessGroupsOutsideLock(pgids, {
+          knownDescendants,
+          spawnSyncFn: options.spawnSyncFn || options.runner,
+          platform: options.platform,
+        });
+      }
+    }
+  } catch {
+    // Ignore pre-lock snapshot parse errors
+  }
+  if (terminatedSet.size > 0) {
+    if (!pgidSnapshot) pgidSnapshot = new Map();
+    for (const p of terminatedSet) {
+      pgidSnapshot.set(p, false);
+      clearKnownWindowsTreeDescendants(p);
     }
   }
   return withLock(
@@ -971,7 +1145,10 @@ export function withStateTransaction(stateDir, fn, options = {}) {
         const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
         const result = fn(state, { now, pruned, lockHandle });
         const gcMutated =
-          pruned.leases.length > 0 || pruned.queue.length > 0 || pruned.hookSessions.length > 0;
+          pruned.leases.length > 0 ||
+          pruned.queue.length > 0 ||
+          pruned.hookSessions.length > 0 ||
+          Boolean(pruned.workersMutated);
         if ((result && result.mutated !== false) || gcMutated) {
           commitState(stateDir, state, lockHandle);
         }

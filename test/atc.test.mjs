@@ -8,15 +8,23 @@ import { Worker } from "node:worker_threads";
 
 import {
   acquireLock,
+  clearKnownWindowsTreeDescendants,
+  getKnownWindowsTreeDescendants,
+  hasAliveProcessInGroup,
   isProcessGroupAlive,
+  killProcessGroupTree,
   queryWindowsProcessGroups,
   releaseLock,
+  seedWindowsKnownDescendants,
   sleepSync,
+  snapshotProcessGroupsOutsideLock,
   verifyLockOwnership,
   withLock,
   writeFileAtomic,
 } from "../src/lock.mjs";
 import {
+  avdHasRuntimeLockFiles,
+  offlineAvdHasRuntimeLockFiles,
   createDefaultState,
   readState,
   commitState,
@@ -66,6 +74,7 @@ import {
   cmdExec,
   cmdStatus,
   cmdConfig,
+  cmdGc,
   cmdGuard,
   cmdGuide,
   parseCliArgs,
@@ -7079,6 +7088,462 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     assert.equal(versionExit, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-MVP hardening: Windows multi-hop detached grandchild tracking, CreationDate PID-reuse guard, stale AVD dead-PID lock cleanup, and compound loop rewriting", async () => {
+  const dir = makeTempStateDir();
+  const avdHome = makeTempStateDir();
+  const rootPgid = 710001;
+  try {
+    // 1. Windows Multi-Hop Detached Grandchild Tracking & Cross-Invocation Persistence (Issue #3)
+    clearKnownWindowsTreeDescendants(rootPgid);
+
+    // Phase A: Root process (710001) spawns intermediate shell (710002), which spawns grandchild (710003)
+    const phaseAProcesses = [
+      { ProcessId: 710001, ParentProcessId: 4000, CreationDate: "20261010150000.000000+000" },
+      { ProcessId: 710002, ParentProcessId: 710001, CreationDate: "20261010150001.000000+000" },
+      { ProcessId: 710003, ParentProcessId: 710002, CreationDate: "20261010150002.000000+000" },
+    ];
+    const mapA = queryWindowsProcessGroups([rootPgid], () => ({
+      status: 0,
+      stdout: JSON.stringify(phaseAProcesses),
+      stderr: "",
+    }));
+    assert.equal(mapA.get(rootPgid), true);
+    const knownAfterA = getKnownWindowsTreeDescendants(rootPgid);
+    assert.deepEqual(knownAfterA, [
+      { pid: 710001, creationDate: "20261010150000.000000+000" },
+      { pid: 710002, creationDate: "20261010150001.000000+000" },
+      { pid: 710003, creationDate: "20261010150002.000000+000" },
+    ]);
+
+    // Phase B: Both root (710001) and intermediate shell (710002) exit; grandchild (710003) survives and spawns great-grandchild (710004)
+    const phaseBProcesses = [
+      { ProcessId: 710003, ParentProcessId: 710002, CreationDate: "20261010150002.000000+000" },
+      { ProcessId: 710004, ParentProcessId: 710003, CreationDate: "20261010150003.000000+000" },
+    ];
+    // Simulate a separate CLI invocation by clearing in-memory cache and seeding from persisted state.json metadata
+    clearKnownWindowsTreeDescendants(rootPgid);
+    assert.deepEqual(getKnownWindowsTreeDescendants(rootPgid), []);
+    seedWindowsKnownDescendants({ [String(rootPgid)]: knownAfterA });
+
+    const aliveInB = hasAliveProcessInGroup(rootPgid, null, {
+      platform: "win32",
+      runner: () => ({
+        status: 0,
+        stdout: JSON.stringify(phaseBProcesses),
+        stderr: "",
+      }),
+    });
+    assert.equal(
+      aliveInB,
+      true,
+      "Cross-invocation seeded descendants must detect surviving grandchild/great-grandchild after root & intermediate shell exit",
+    );
+    const knownAfterB = getKnownWindowsTreeDescendants(rootPgid);
+    assert.deepEqual(
+      knownAfterB.find((entry) => entry.pid === 710004),
+      { pid: 710004, creationDate: "20261010150003.000000+000" },
+    );
+
+    // Phase C: PID reuse guard — 710003 and 710004 exit, and OS reuses PID 710003 for an unrelated process with a different CreationDate
+    const phaseCReusedProcesses = [
+      { ProcessId: 710003, ParentProcessId: 8888, CreationDate: "20261010150999.000000+000" },
+      { ProcessId: 710099, ParentProcessId: 710003, CreationDate: "20261010151000.000000+000" },
+    ];
+    const aliveInC = hasAliveProcessInGroup(rootPgid, null, {
+      platform: "win32",
+      runner: () => ({
+        status: 0,
+        stdout: JSON.stringify(phaseCReusedProcesses),
+        stderr: "",
+      }),
+    });
+    assert.equal(
+      aliveInC,
+      false,
+      "Reused PID with mismatched CreationDate must not be treated as a live lease worker descendant",
+    );
+
+    // Phase D: killProcessGroupTree on Windows kills surviving verified descendants (710004) but skips reused PIDs (710003) and clears tracking
+    seedWindowsKnownDescendants({ [String(rootPgid)]: knownAfterB });
+    const killedWinPids = [];
+    killProcessGroupTree(rootPgid, "SIGTERM", {
+      platform: "win32",
+      runner: (cmd, args) => {
+        if (cmd === "powershell.exe") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              // 710003 was reused by an unrelated process -> must NOT be killed
+              { ProcessId: 710003, ParentProcessId: 8888, CreationDate: "20261010150999.000000+000" },
+              // 710004 is still the genuine great-grandchild -> MUST be killed
+              { ProcessId: 710004, ParentProcessId: 710003, CreationDate: "20261010150003.000000+000" },
+            ]),
+            stderr: "",
+          };
+        }
+        if (cmd === "taskkill") {
+          killedWinPids.push(Number(args[args.indexOf("/PID") + 1]));
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.deepEqual(killedWinPids, [710004]);
+    assert.deepEqual(getKnownWindowsTreeDescendants(rootPgid), []);
+
+    // Phase E: Cross-invocation state.json persistence across withStateTransaction, cmdStatus, cmdFree, and cmdGc
+    const now = Date.now();
+    seedWindowsKnownDescendants({ [String(rootPgid)]: knownAfterA });
+    const winState = createDefaultState();
+    winState.leases["serial:emulator-5554"] = {
+      leaseId: "lease_win_desc",
+      deviceKey: "serial:emulator-5554",
+      kind: "emulator",
+      avd: "Pixel_8_API_35",
+      serial: "emulator-5554",
+      profile: { apiLevel: "android-35", deviceType: "phone" },
+      sessionId: "win-desc-sess",
+      anchorPid: process.pid,
+      workerPid: rootPgid,
+      workerPids: [rootPgid],
+      workerPgids: [rootPgid],
+      workerDescendants: { [String(rootPgid)]: knownAfterA },
+      state: "active",
+      claimedAtMs: now - 10_000,
+      activatedAtMs: now - 9_000,
+      renewedAtMs: now - 1_000,
+      expiresAtMs: now + 300_000,
+    };
+    withLock(dir, (h) => commitState(dir, winState, h));
+
+    // Clear in-memory map to simulate a fresh CLI process (`atc status`)
+    clearKnownWindowsTreeDescendants(rootPgid);
+    const statusRes = cmdStatus(
+      dir,
+      { json: true },
+      {
+        platform: "win32",
+        livenessCheck: (pid) => pid === process.pid, // rootPgid (710001) itself is dead!
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify(phaseBProcesses),
+              stderr: "",
+            };
+          }
+          if (cmd === "adb" && args[0] === "devices") {
+            return {
+              status: 0,
+              stdout: "List of devices attached\nemulator-5554\tdevice\n",
+              stderr: "",
+            };
+          }
+          if (cmd === "android") {
+            return {
+              status: 0,
+              stdout: JSON.stringify({
+                avds: [
+                  {
+                    name: "Pixel_8_API_35",
+                    serial: "emulator-5554",
+                    online: true,
+                    api_level: "android-35",
+                    device_type: "phone",
+                  },
+                ],
+              }),
+              stderr: "",
+            };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(statusRes.exitCode, 0);
+    const persistedAfterStatus = readState(dir).leases["serial:emulator-5554"];
+    assert.ok(persistedAfterStatus, "Lease must remain active while detached grandchild 710003/710004 is alive");
+    assert.deepEqual(persistedAfterStatus.workerPids, [rootPgid]);
+    assert.deepEqual(
+      persistedAfterStatus.workerDescendants?.[String(rootPgid)]?.find((e) => e.pid === 710004),
+      { pid: 710004, creationDate: "20261010150003.000000+000" },
+      "Discovered multi-hop descendant 710004 must be persisted to state.json across CLI invocations",
+    );
+
+    // Simulate `atc free` in a separate CLI process: when leader PID (710001) is dead and detached grandchild (710004) is orphaned,
+    // `atc free` terminates the surviving detached grandchild tree outside atc.lock and frees the lease
+    clearKnownWindowsTreeDescendants(rootPgid);
+    const freeKilledPids = [];
+    const freeRes = cmdFree(
+      dir,
+      "lease_win_desc",
+      {},
+      {
+        platform: "win32",
+        env: { ATC_SESSION_ID: "win-desc-sess" },
+        livenessCheck: (pid) => pid === process.pid,
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                { ProcessId: 710004, ParentProcessId: 710003, CreationDate: "20261010150003.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            freeKilledPids.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(freeRes.exitCode, 0);
+    assert.deepEqual(freeRes.freed, ["lease_win_desc"]);
+    assert.deepEqual(
+      freeKilledPids,
+      [710004],
+      "atc free must terminate surviving detached grandchild discovered via persisted workerDescendants",
+    );
+    assert.equal(readState(dir).leases["serial:emulator-5554"], undefined);
+
+    // Simulate `atc gc` in a separate CLI process cleaning up an expired lease's detached Windows grandchild
+    const gcPgid = 720001;
+    const gcDescMap = [
+      { pid: 720001, creationDate: "20261010160000.000000+000" },
+      { pid: 720003, creationDate: "20261010160002.000000+000" },
+    ];
+    const gcState = createDefaultState();
+    gcState.leases["serial:emulator-5556"] = {
+      leaseId: "lease_win_gc",
+      deviceKey: "serial:emulator-5556",
+      kind: "emulator",
+      avd: "Pixel_GC",
+      serial: "emulator-5556",
+      profile: { apiLevel: "android-35", deviceType: "phone" },
+      sessionId: "win-gc-sess",
+      anchorPid: 99999991, // dead anchor
+      workerPid: gcPgid,
+      workerPids: [gcPgid],
+      workerPgids: [gcPgid],
+      workerDescendants: { [String(gcPgid)]: gcDescMap },
+      state: "active",
+      claimedAtMs: now - 700_000,
+      activatedAtMs: now - 699_000,
+      renewedAtMs: now - 650_000,
+      expiresAtMs: now - 10_000, // expired
+    };
+    withLock(dir, (h) => commitState(dir, gcState, h));
+    clearKnownWindowsTreeDescendants(gcPgid);
+    const gcKilledPids = [];
+    const gcRes = cmdGc(dir, {
+      platform: "win32",
+      livenessCheck: () => false,
+      runner: (cmd, args) => {
+        if (cmd === "powershell.exe") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: 720003, ParentProcessId: 720002, CreationDate: "20261010160002.000000+000" },
+            ]),
+            stderr: "",
+          };
+        }
+        if (cmd === "taskkill") {
+          gcKilledPids.push(Number(args[args.indexOf("/PID") + 1]));
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(gcRes.exitCode, 0);
+    assert.deepEqual(gcKilledPids, [720003], "atc gc must kill surviving detached grandchild of expired lease");
+    assert.equal(readState(dir).leases["serial:emulator-5556"], undefined);
+
+    // 2. Stale `.avd/*.lock` Dead-PID Detection in `avdHasRuntimeLockFiles`
+    const crashedAvdDir = path.join(avdHome, "Crashed_Pixel.avd");
+    fs.mkdirSync(crashedAvdDir, { recursive: true });
+    fs.writeFileSync(path.join(crashedAvdDir, "config.ini"), "hw.ramSize=2048\n");
+    const hwLockFile = path.join(crashedAvdDir, "hardware-qemu.ini.lock");
+    const modemLockFile = path.join(crashedAvdDir, "modem-nv-ram-5554.lock");
+    const snapshotLockDir = path.join(crashedAvdDir, "snapshot.lock");
+    fs.writeFileSync(hwLockFile, "59872 \n");
+    fs.writeFileSync(modemLockFile, " 59872\n");
+    fs.mkdirSync(snapshotLockDir, { recursive: true });
+    fs.writeFileSync(path.join(snapshotLockDir, "pid"), "59872");
+
+    // Dead PID (59872) -> avdHasRuntimeLockFiles returns false and removes stale lock files/dirs
+    const deadLockCheck = avdHasRuntimeLockFiles("Crashed_Pixel", avdHome, (pid) => pid !== 59872);
+    assert.equal(deadLockCheck, false, "Stale lock files with dead bare numeric PID must be ignored");
+    assert.equal(fs.existsSync(hwLockFile), false, "Dead-PID hardware-qemu.ini.lock must be cleaned up");
+    assert.equal(fs.existsSync(modemLockFile), false, "Dead-PID modem-nv-ram-5554.lock must be cleaned up");
+    assert.equal(fs.existsSync(snapshotLockDir), false, "Dead-PID snapshot.lock/pid directory must be cleaned up");
+
+    // Live numeric PID -> avdHasRuntimeLockFiles returns true and preserves the lock file
+    fs.writeFileSync(hwLockFile, `${process.pid}\n`);
+    assert.equal(avdHasRuntimeLockFiles("Crashed_Pixel", avdHome), true);
+    assert.equal(fs.existsSync(hwLockFile), true);
+
+    // Non-numeric / synthetic lock contents ("locked", "pid=123") -> preserved as active lock
+    fs.writeFileSync(hwLockFile, "locked");
+    assert.equal(avdHasRuntimeLockFiles("Crashed_Pixel", avdHome, () => false), true);
+    fs.writeFileSync(hwLockFile, "pid=123");
+    assert.equal(avdHasRuntimeLockFiles("Crashed_Pixel", avdHome, () => false), true);
+
+    // Verify discoverFleet + computeUsedEmulatorSlots do not count an offline AVD with a dead-PID lock as occupying a slot
+    fs.writeFileSync(hwLockFile, "59872\n");
+    const fleetWithCrashedLock = discoverFleet({
+      avdHome,
+      livenessCheck: (pid) => pid !== 59872,
+      runner: (cmd, args) => {
+        if (cmd === "adb" && args[0] === "devices") {
+          return { status: 0, stdout: "List of devices attached\n", stderr: "" };
+        }
+        if (cmd === "android") {
+          return {
+            status: 0,
+            stdout: "Crashed_Pixel offline android-35\n",
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(fleetWithCrashedLock.offline.length, 1);
+    assert.equal(fleetWithCrashedLock.offline[0].hasLockFiles, false);
+    assert.equal(computeUsedEmulatorSlots(createDefaultState(), fleetWithCrashedLock), 0);
+    assert.equal(
+      offlineAvdHasRuntimeLockFiles({ avd: "Crashed_Pixel" }, avdHome, (pid) => pid !== 59872),
+      false,
+    );
+
+    // 3. Generalized Compound Shell Loop Rewriting in `src/guard.mjs`
+    const activeLeases = [{ leaseId: "lease_loop", serial: "emulator-5554" }];
+
+    // 3a. Multi-variable `while read -r a b; do ...; done` pipeline (both simple and sh -c wrapped stages)
+    const multiReadSimple = evaluateCommandGuard(
+      'printf "com.example.one .MainActivity\\ncom.example.two .HomeActivity\\n" | while read -r pkg act; do adb shell am start -n "$pkg/$act"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(multiReadSimple.allowed, true);
+    assert.doesNotMatch(multiReadSimple.rewrittenCommand, /__atc_cmd_sub__/);
+    assert.equal(
+      multiReadSimple.rewrittenCommand,
+      'printf "com.example.one .MainActivity\\ncom.example.two .HomeActivity\\n" | while read -r pkg act ; do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- adb shell am start -n "$pkg/$act" ; done',
+    );
+
+    // Multi-variable `while IFS=, read -r -u 3 pkg out; do ... > "$out"; done` where `pkg` and `out` had prior static assignments
+    const multiReadRedir = evaluateCommandGuard(
+      'pkg=static_pkg; out=/tmp/static.txt; while IFS=, read -r -u 3 pkg out; do adb shell pm path "$pkg" > "$out"; done 3< pairs.csv',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(multiReadRedir.allowed, true);
+    assert.doesNotMatch(multiReadRedir.rewrittenCommand, /__atc_cmd_sub__/);
+    assert.doesNotMatch(
+      multiReadRedir.rewrittenCommand,
+      /pm path "static_pkg"/,
+      "Loop read variable pkg must override prior static shell variable inside loop body",
+    );
+    assert.match(
+      multiReadRedir.rewrittenCommand,
+      /do pkg="\$pkg" out="\$out" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell pm path "\$pkg" > "\$out"'/,
+    );
+
+    // Bare `while read -r; do ... "$REPLY" ...; done` preserves implicit REPLY variable
+    const bareReadReply = evaluateCommandGuard(
+      'adb shell pm list packages | while read -r; do adb shell pm path "$REPLY" > /tmp/paths.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bareReadReply.allowed, true);
+    assert.match(
+      bareReadReply.rewrittenCommand,
+      /do REPLY="\$REPLY" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell pm path "\$REPLY" > \/tmp\/paths\.txt'/,
+    );
+
+    // 3b. Nested `for` / `while` / `until` compound blocks
+    const nestedForFor = evaluateCommandGuard(
+      'a=outer_init; b=inner_init; for a in 1 2; do for b in x y; do adb shell "echo $a $b" > "/tmp/${a}_${b}.txt"; done; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(nestedForFor.allowed, true);
+    assert.doesNotMatch(nestedForFor.rewrittenCommand, /outer_init.*inner_init.*\/tmp\/outer_init/);
+    assert.match(
+      nestedForFor.rewrittenCommand,
+      /do a="\$a" b="\$b" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell "echo \$a \$b" > "\/tmp\/\$\{a\}_\$\{b\}\.txt"'/,
+    );
+
+    const nestedForWhileRead = evaluateCommandGuard(
+      'for suite in smoke full; do while read -r pkg runner; do adb shell am instrument -w "$pkg/$runner" > "/tmp/${suite}_${pkg}.log"; done < suites.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(nestedForWhileRead.allowed, true);
+    assert.match(
+      nestedForWhileRead.rewrittenCommand,
+      /do suite="\$suite" pkg="\$pkg" runner="\$runner" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell am instrument -w "\$pkg\/\$runner" > "\/tmp\/\$\{suite\}_\$\{pkg\}\.log"'/,
+    );
+
+    // 3c. C-style arithmetic `for (( i = 0; i < 3; i++ ))` and loop-mutated counter `i=0; while ...; do ...; i=$((i+1)); done`
+    const arithForLoop = evaluateCommandGuard(
+      'for (( i = 0; i < 3; i++ )); do adb shell input keyevent 24 > "/tmp/vol_$i.log"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(arithForLoop.allowed, true);
+    assert.match(
+      arithForLoop.rewrittenCommand,
+      /^for \(\( i = 0; i < 3; i\+\+ \)\) ; do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell input keyevent 24 > "\/tmp\/vol_\$i\.log"' ; done$/,
+    );
+
+    const mutatedWhileLoop = evaluateCommandGuard(
+      'i=0; until [ "$i" -ge 3 ]; do adb shell echo "$i" > "/tmp/iter_$i.txt"; i=$((i + 1)); done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(mutatedWhileLoop.allowed, true);
+    assert.doesNotMatch(
+      mutatedWhileLoop.rewrittenCommand,
+      /iter_0\.txt/,
+      "Loop-mutated counter i must not be statically inlined to initial value 0 inside loop body",
+    );
+    assert.match(
+      mutatedWhileLoop.rewrittenCommand,
+      /do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$i" > "\/tmp\/iter_\$i\.txt"' ; i=\$\(\(i \+ 1\)\) ; done$/,
+    );
+  } finally {
+    clearKnownWindowsTreeDescendants(rootPgid);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(avdHome, { recursive: true, force: true });
   }
 });
 

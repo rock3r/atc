@@ -87,6 +87,26 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "false",
   "which",
   "type",
+  "for",
+  "select",
+  "read",
+  "case",
+  "[",
+  "[[",
+  "test",
+  "sleep",
+  "shift",
+  "break",
+  "continue",
+  "return",
+  "exit",
+  ":",
+  "export",
+  "unset",
+  "local",
+  "declare",
+  "typeset",
+  "readonly",
   "esac",
   "fi",
   "done",
@@ -326,6 +346,8 @@ function splitOutsideQuotes(str, sepType) {
   let cur = "";
   let inSingle = false;
   let inDouble = false;
+  let arithDepth = 0;
+  let subParenDepth = 0;
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
     if (ch === "\\" && !inSingle && i + 1 < str.length) {
@@ -344,6 +366,40 @@ function splitOutsideQuotes(str, sepType) {
       continue;
     }
     if (!inSingle && !inDouble) {
+      if (ch === "(" && str[i + 1] === "(") {
+        arithDepth++;
+        cur += "((";
+        i++;
+        continue;
+      }
+      if (arithDepth > 0 && ch === ")" && str[i + 1] === ")") {
+        arithDepth--;
+        cur += "))";
+        i++;
+        continue;
+      }
+      if (arithDepth > 0) {
+        cur += ch;
+        continue;
+      }
+      if ((ch === "$" || ch === "<" || ch === ">") && str[i + 1] === "(") {
+        subParenDepth++;
+        cur += ch + "(";
+        i++;
+        continue;
+      }
+      if (subParenDepth > 0 && ch === "(") {
+        subParenDepth++;
+        cur += ch;
+        continue;
+      }
+      if (subParenDepth > 0 && ch === ")") {
+        subParenDepth--;
+        cur += ch;
+        continue;
+      }
+    }
+    if (!inSingle && !inDouble && arithDepth === 0 && subParenDepth === 0) {
       if (sepType === "clause") {
         if ((ch === "&" && str[i + 1] === "&") || (ch === "|" && str[i + 1] === "|")) {
           if (cur.trim()) parts.push(cur.trim());
@@ -546,6 +602,20 @@ export function tokenizeSegment(segment, { preserveLiteralDollar = false } = {})
         end++;
         while (end < str.length && str[end] !== "'") end++;
         if (end < str.length) end++;
+      } else if (str[end] === "(" && str[end + 1] === "(") {
+        let aDepth = 1;
+        end += 2;
+        while (end < str.length && aDepth > 0) {
+          if (str[end] === "(" && str[end + 1] === "(") {
+            aDepth++;
+            end += 2;
+          } else if (str[end] === ")" && str[end + 1] === ")") {
+            aDepth--;
+            end += 2;
+          } else {
+            end++;
+          }
+        }
       } else if (str[end] === "\\" && end + 1 < str.length) {
         end += 2;
       } else {
@@ -916,6 +986,21 @@ export function parseSegment(segment, inheritedVars = {}) {
       }
       continue;
     }
+    if (tok === "local" || tok === "declare" || tok === "typeset" || tok === "readonly") {
+      idx++;
+      while (idx < tokens.length && tokens[idx].startsWith("-")) {
+        const flag = tokens[idx++];
+        if (flag === "--") break;
+      }
+      while (
+        idx < tokens.length &&
+        /^[A-Za-z_][A-Za-z0-9_]*$/.test(tokens[idx]) &&
+        !tokens[idx].includes("=")
+      ) {
+        idx++;
+      }
+      continue;
+    }
     if (tok === "unset") {
       idx++;
       while (idx < tokens.length && tokens[idx].startsWith("-")) {
@@ -937,7 +1022,9 @@ export function parseSegment(segment, inheritedVars = {}) {
     if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok.slice(0, eq))) {
       const k = tok.slice(0, eq);
       const rawVal = tok.slice(eq + 1);
-      const expandedVal = expandVariables(rawVal, { ...baseVars, ...envVars });
+      const expandedVal = rawVal.includes("$((")
+        ? "__atc_cmd_sub__"
+        : expandVariables(rawVal, { ...baseVars, ...envVars });
       envVars[k] = expandedVal;
       if (k === "ANDROID_SERIAL") {
         if (expandedVal) {
@@ -1184,7 +1271,11 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   const { baseCmd, args } = parsed;
   const effectiveSegment = parsed.raw || segment;
 
-  if (!baseCmd || (baseCmd === "command" && (args[0] === "-v" || args[0] === "-V"))) {
+  if (
+    !baseCmd ||
+    baseCmd.startsWith("((") ||
+    (baseCmd === "command" && (args[0] === "-v" || args[0] === "-V"))
+  ) {
     return { kind: "ignore", parsed };
   }
 
@@ -1950,6 +2041,116 @@ function rewriteStageCommandSubstitutions(stageText, rewriteOpts) {
   return { changed, rewrittenStage, maskedStage };
 }
 
+function extractStageLoopVariables(stageText) {
+  let s = String(stageText || "").trim();
+  if (!s) return [];
+  while (true) {
+    const m = s.match(LEADING_CONTROL_PREFIX_RE);
+    if (!m) break;
+    s = s.slice(m[0].length).trimStart();
+  }
+  s = splitTrailingControlClosers(s).body;
+  if (!s) return [];
+
+  const vars = new Set();
+  const forVarMatch = s.match(/^(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
+  if (forVarMatch) {
+    vars.add(forVarMatch[1]);
+  }
+
+  const arithRe = /\(\(([\s\S]*?)\)\)/g;
+  let am;
+  while ((am = arithRe.exec(s)) !== null) {
+    const expr = am[1];
+    const postRe = /\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\+\+|--|(?:<<|>>|[+\-*/%&|^])?=(?!=))/g;
+    let pm;
+    while ((pm = postRe.exec(expr)) !== null) {
+      vars.add(pm[1]);
+    }
+    const preRe = /(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)\b/g;
+    while ((pm = preRe.exec(expr)) !== null) {
+      vars.add(pm[1]);
+    }
+  }
+
+  const tokens = tokenizeSegment(s, { preserveLiteralDollar: true });
+  let idx = 0;
+  while (idx < tokens.length) {
+    const tok = tokens[idx];
+    const eq = tok.indexOf("=");
+    if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok.slice(0, eq))) {
+      idx++;
+      continue;
+    }
+    if (tok === "builtin" || tok === "command") {
+      idx++;
+      while (idx < tokens.length && (tokens[idx] === "-p" || tokens[idx] === "--")) {
+        idx++;
+      }
+      continue;
+    }
+    break;
+  }
+
+  if (idx < tokens.length && tokens[idx] === "read") {
+    idx++;
+    let optionsEnded = false;
+    const readVars = [];
+    while (idx < tokens.length) {
+      const tok = tokens[idx++];
+      if (
+        tok === "<" ||
+        tok === "<<" ||
+        tok === "<<<" ||
+        tok === ">" ||
+        tok === ">>" ||
+        tok === "<&" ||
+        tok === ">&" ||
+        tok === "<>" ||
+        tok === "&>" ||
+        tok === "&>>"
+      ) {
+        if (idx < tokens.length) idx++;
+        continue;
+      }
+      if (/^[0-9]*[<>]/.test(tok) || tok.startsWith("&>") || tok.startsWith("&>>")) {
+        continue;
+      }
+      if (!optionsEnded && tok === "--") {
+        optionsEnded = true;
+        continue;
+      }
+      if (!optionsEnded && tok.startsWith("-") && tok.length > 1) {
+        if (/^-[rsuAeE]*[aA]$/.test(tok)) {
+          if (idx < tokens.length) {
+            const arrVar = tokens[idx++].replace(/^['"]|['"]$/g, "").replace(/\[.*$/, "");
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(arrVar)) {
+              readVars.push(arrVar);
+            }
+          }
+        } else if (/^-[rsuAeE]*[udnNpti]$/.test(tok)) {
+          if (idx < tokens.length) idx++;
+        }
+        continue;
+      }
+      optionsEnded = true;
+      const cleaned = tok.replace(/^['"]|['"]$/g, "").replace(/\[.*$/, "");
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleaned)) {
+        readVars.push(cleaned);
+      }
+    }
+    if (readVars.length === 0) {
+      vars.add("REPLY");
+    } else {
+      for (const rv of readVars) {
+        vars.add(rv);
+      }
+    }
+  }
+
+  return Array.from(vars);
+}
+
 function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, platform = "win32" }) {
   const rewriteOpts = { sessionId, anchorPid, execSerial, platform };
   const isWin = platform === "win32";
@@ -1971,6 +2172,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
   let inDouble = false;
   let inBacktick = false;
   let subParenDepth = 0;
+  let arithDepth = 0;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (ch === "\\" && !inSingle && i + 1 < command.length) {
@@ -1995,6 +2197,18 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         continue;
       }
       if (!inBacktick) {
+        if (!inDouble && ch === "(" && command[i + 1] === "(") {
+          arithDepth++;
+          cur += "((";
+          i++;
+          continue;
+        }
+        if (!inDouble && arithDepth > 0 && ch === ")" && command[i + 1] === ")") {
+          arithDepth--;
+          cur += "))";
+          i++;
+          continue;
+        }
         if ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(") {
           subParenDepth++;
           cur += ch + "(";
@@ -2013,7 +2227,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         }
       }
     }
-    if (!inSingle && !inDouble && !inBacktick && subParenDepth === 0) {
+    if (!inSingle && !inDouble && !inBacktick && subParenDepth === 0 && arithDepth === 0) {
       if ((ch === "&" && command[i + 1] === "&") || (ch === "|" && command[i + 1] === "|")) {
         tokens.push({ type: "stage", text: cur });
         tokens.push({ type: "sep", text: ` ${ch}${command[i + 1]} ` });
@@ -2073,9 +2287,34 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
     tokens.push({ type: "stage", text: cur });
   }
 
+  const loopDynamicVars = new Set();
+  const stageAssignedCounts = new Map();
+  for (const tok of tokens) {
+    if (tok.type !== "stage") continue;
+    const t = tok.text.trim();
+    if (!t) continue;
+    for (const v of extractStageLoopVariables(t)) {
+      loopDynamicVars.add(v);
+    }
+    const p = parseSegment(t);
+    for (const [k, v] of Object.entries(p.envVars)) {
+      if (k.startsWith("__atc_")) continue;
+      stageAssignedCounts.set(k, (stageAssignedCounts.get(k) || 0) + 1);
+      if (typeof v === "string" && v.includes("__atc_cmd_sub__")) {
+        loopDynamicVars.add(k);
+      }
+    }
+  }
+  for (const [k, count] of stageAssignedCounts.entries()) {
+    if (count > 1) {
+      loopDynamicVars.add(k);
+    }
+  }
+
   const shellVars = {};
   let pipeUpstreamArgs = [];
   let inPipeline = false;
+  let loopDepth = 0;
   return tokens
     .map((tok) => {
       if (tok.type !== "stage") {
@@ -2090,6 +2329,19 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       }
       let trimmed = tok.text.trim();
       if (!trimmed) return tok.text;
+      if (/(?:^|\s)(?:for|select|while|until)\b/.test(trimmed)) {
+        loopDepth++;
+      }
+      if (loopDepth > 0) {
+        for (const dv of loopDynamicVars) {
+          if (Object.prototype.hasOwnProperty.call(shellVars, dv)) {
+            shellVars[dv] = "__atc_cmd_sub__";
+          }
+        }
+      }
+      for (const lv of extractStageLoopVariables(trimmed)) {
+        shellVars[lv] = "__atc_cmd_sub__";
+      }
       const subRewrite = rewriteStageCommandSubstitutions(trimmed, rewriteOpts);
       const stageForClassify = subRewrite.changed ? subRewrite.maskedStage : trimmed;
       const parsedStage = parseSegment(stageForClassify, shellVars);
@@ -2103,22 +2355,31 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
       }
       const c = classifySegment(classifyInput, shellVars);
       Object.assign(shellVars, c.parsed?.envVars || {});
-      const forVarMatch = trimmed.match(/^(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\b/);
-      if (forVarMatch) {
-        shellVars[forVarMatch[1]] = "__atc_cmd_sub__";
+      for (const lv of extractStageLoopVariables(trimmed)) {
+        shellVars[lv] = "__atc_cmd_sub__";
       }
-      const readVarMatch = trimmed.match(/(?:^|\b)read\s+(?:-[A-Za-z0-9]+\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*$/);
-      if (readVarMatch) {
-        shellVars[readVarMatch[1]] = "__atc_cmd_sub__";
+      if (loopDepth > 0) {
+        for (const dv of loopDynamicVars) {
+          if (Object.prototype.hasOwnProperty.call(shellVars, dv)) {
+            shellVars[dv] = "__atc_cmd_sub__";
+          }
+        }
       }
       for (const arg of parsedStage.args) {
         if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
           pipeUpstreamArgs.push(arg);
         }
       }
+      const doneMatches = trimmed.match(/(?:^|\s)done(?=\s|$)/g);
+      const finishLoopDepth = () => {
+        if (doneMatches) {
+          loopDepth = Math.max(0, loopDepth - doneMatches.length);
+        }
+      };
       if (subRewrite.changed) {
         trimmed = subRewrite.rewrittenStage;
         if (c.kind !== "device_action" && c.kind !== "atc") {
+          finishLoopDepth();
           return trimmed;
         }
       }
@@ -2144,6 +2405,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         if (Object.keys(staticShellVars).length > 0 && cmdBody.includes("$")) {
           cmdBody = expandVariables(cmdBody, staticShellVars, { opaqueFallback: null });
         }
+        finishLoopDepth();
         if (isWin) {
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
@@ -2158,7 +2420,7 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
               !k.startsWith("__atc_") &&
               /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) &&
               !Object.prototype.hasOwnProperty.call(staticShellVars, k) &&
-              new RegExp(`\\$(?:\\{${k}[^}]*\\}|${k}\\b)`).test(cmdBody),
+              new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}][^}]*\\})|${k}\\b)`).test(cmdBody),
           )
           .map(([k]) => `${k}="$${k}" `)
           .join("");
@@ -2176,9 +2438,11 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
               a.startsWith("--role="),
           );
         if (!hasSession) {
+          finishLoopDepth();
           return trimmed.replace(/\batc(\s+[A-Za-z0-9_-]+)/i, `atc$1 ${sessionFlags}`);
         }
       }
+      finishLoopDepth();
       return trimmed;
     })
     .join("");
@@ -2200,8 +2464,14 @@ export function evaluateCommandGuard(
   const shellVars = {};
 
   for (const seg of segments) {
+    for (const lv of extractStageLoopVariables(seg)) {
+      shellVars[lv] = "__atc_cmd_sub__";
+    }
     const c = classifySegment(seg, shellVars);
     Object.assign(shellVars, c.parsed?.envVars || {});
+    for (const lv of extractStageLoopVariables(seg)) {
+      shellVars[lv] = "__atc_cmd_sub__";
+    }
     if (c.parsed?.stripsAndroidSerial) {
       delete shellVars.ANDROID_SERIAL;
       shellVars.__atc_stripped_android_serial = "1";

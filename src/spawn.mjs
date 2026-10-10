@@ -2,7 +2,12 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getKnownWindowsTreePids, isProcessGroupAlive, sleepSync } from "./lock.mjs";
+import {
+  hasAliveProcessInGroup,
+  isProcessGroupAlive,
+  killProcessGroupTree,
+  sleepSync,
+} from "./lock.mjs";
 
 const SAFE_TOKEN_REGEX = /^[A-Za-z0-9._:/@=-]+$/;
 
@@ -646,40 +651,8 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   return { cmd, args: nextArgs, env };
 }
 
-function terminateChildTree(childPid, signal = "SIGTERM") {
-  if (!Number.isInteger(childPid) || childPid <= 0) return;
-  if (process.platform === "win32") {
-    const pids = Array.from(new Set([childPid, ...getKnownWindowsTreePids(childPid)]));
-    const pidArgs = [];
-    for (const p of pids) {
-      if (Number.isInteger(p) && p > 0) {
-        pidArgs.push("/PID", String(p));
-      }
-    }
-    try {
-      spawnSync("taskkill", ["/T", "/F", ...pidArgs], {
-        stdio: "ignore",
-        timeout: 3000,
-        windowsHide: true,
-      });
-    } catch {
-      try {
-        process.kill(childPid, signal);
-      } catch {
-        // Ignore
-      }
-    }
-    return;
-  }
-  try {
-    process.kill(-childPid, signal);
-  } catch {
-    try {
-      process.kill(childPid, signal);
-    } catch {
-      // Ignore
-    }
-  }
+function terminateChildTree(childPid, signal = "SIGTERM", options = {}) {
+  killProcessGroupTree(childPid, signal, options);
 }
 
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
@@ -705,11 +678,32 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
 
     let wrapperSignal = null;
     let killEscalationTimer = null;
+    let earlyWinDiscoveryTimer = null;
     const forwardedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
     const signalHandlers = new Map();
 
+    if (childPid && (options.platform || process.platform) === "win32") {
+      earlyWinDiscoveryTimer = setTimeout(() => {
+        earlyWinDiscoveryTimer = null;
+        try {
+          if (hasAliveProcessInGroup(childPid)) {
+            onHeartbeat();
+          }
+        } catch {
+          // Best-effort early descendant discovery
+        }
+      }, 80);
+      if (typeof earlyWinDiscoveryTimer.unref === "function") {
+        earlyWinDiscoveryTimer.unref();
+      }
+    }
+
     const cleanupListenersAndTimers = () => {
       clearInterval(timer);
+      if (earlyWinDiscoveryTimer) {
+        clearTimeout(earlyWinDiscoveryTimer);
+        earlyWinDiscoveryTimer = null;
+      }
       if (killEscalationTimer) {
         clearTimeout(killEscalationTimer);
         killEscalationTimer = null;
@@ -802,6 +796,11 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
           finishClose();
           return;
         }
+        try {
+          onHeartbeat();
+        } catch {
+          // Best-effort descendant persistence when child shell exits early
+        }
         let pollDelayMs = process.platform === "win32" ? 200 : 50;
         const maxPollDelayMs = process.platform === "win32" ? 1500 : 1000;
         const scheduleNextGroupPoll = () => {
@@ -812,6 +811,11 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
             if (!isProcessGroupAlive(childPid)) {
               finishClose();
               return;
+            }
+            try {
+              onHeartbeat();
+            } catch {
+              // Best-effort descendant sync during group polling
             }
             pollDelayMs = Math.min(maxPollDelayMs, pollDelayMs * 2);
             scheduleNextGroupPoll();
