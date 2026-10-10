@@ -26,15 +26,442 @@ export function isPidAlive(pid) {
 
 let activePgidLivenessSnapshot = null;
 const winKnownTreeDescendants = new Map();
+const posixKnownPgidStartTokens = new Map();
 
-export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync) {
+function normalizeCreationToken(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return String(raw);
+  }
+  if (typeof raw === "object") {
+    if (typeof raw.value === "string" && raw.value.trim()) return raw.value.trim();
+    if (typeof raw.DateTime === "string" && raw.DateTime.trim()) return raw.DateTime.trim();
+    if (typeof raw.Ticks === "number") return String(raw.Ticks);
+  }
+  return null;
+}
+
+function parseWindowsPgidKey(rawPgid) {
+  if (typeof rawPgid === "number" && Number.isInteger(rawPgid) && rawPgid > 1) {
+    return { key: rawPgid, pid: rawPgid, rootCreation: null };
+  }
+  const str = String(rawPgid ?? "").trim();
+  const atIdx = str.indexOf("@");
+  if (atIdx > 0) {
+    const pid = Number(str.slice(0, atIdx));
+    const rootCreation = str.slice(atIdx + 1).trim() || null;
+    if (Number.isInteger(pid) && pid > 1 && rootCreation) {
+      return { key: `${pid}@${rootCreation}`, pid, rootCreation };
+    }
+  }
+  const pid = Number(str);
+  if (Number.isInteger(pid) && pid > 1) {
+    return { key: pid, pid, rootCreation: null };
+  }
+  return null;
+}
+
+function parseWindowsCreationTokenMicros(rawToken) {
+  const token = normalizeCreationToken(rawToken);
+  if (!token || token === "__exited__") return null;
+  const dmtf = token.match(
+    /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-]\d{3})$/,
+  );
+  if (dmtf) {
+    const [, y, mo, d, h, mi, s, us, tz] = dmtf;
+    const utcMs =
+      Date.UTC(
+        Number(y),
+        Number(mo) - 1,
+        Number(d),
+        Number(h),
+        Number(mi),
+        Number(s),
+      ) -
+      Number(tz) * 60_000;
+    return BigInt(utcMs) * 1000n + BigInt(Number(us));
+  }
+  const msDate = token.match(/^\/Date\((-?\d+)(?:[+-]\d+)?\)\/$/);
+  if (msDate) {
+    return BigInt(msDate[1]) * 1000n;
+  }
+  const parsedMs = Date.parse(token);
+  if (Number.isFinite(parsedMs)) {
+    return BigInt(parsedMs) * 1000n;
+  }
+  return null;
+}
+
+function compareWindowsCreationTokens(a, b) {
+  const usA = parseWindowsCreationTokenMicros(a);
+  const usB = parseWindowsCreationTokenMicros(b);
+  if (usA !== null && usB !== null) {
+    return usA < usB ? -1 : usA > usB ? 1 : 0;
+  }
+  return null;
+}
+
+export function getPosixProcessStartToken(pid, options = {}) {
+  const numPid = Number(pid);
+  if (!Number.isInteger(numPid) || numPid <= 1) return null;
+  const platform = options.platform || process.platform;
+  if (platform === "win32") {
+    if (options.allowSubprocess === false) {
+      return null;
+    }
+    const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+    try {
+      const psCmd =
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress";
+      const res = spawnSyncFn(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", psCmd],
+        { encoding: "utf8", timeout: 2500, windowsHide: true },
+      );
+      if (res && res.status === 0 && typeof res.stdout === "string" && res.stdout.trim()) {
+        const parsed = JSON.parse(res.stdout.trim());
+        const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+        const match = rows.find((r) => Number(r?.ProcessId) === numPid);
+        const token = normalizeCreationToken(match?.CreationDate);
+        if (token && token !== "__exited__") {
+          if (options.isSpawnCapture) {
+            seedPosixPgidStartTokens(numPid, token);
+            queryWindowsProcessGroups([numPid], () => res, {
+              expectedStartToken: token,
+            });
+          }
+          return token;
+        }
+        if (!match && options.isSpawnCapture) {
+          seedPosixPgidStartTokens(numPid, "__exited__");
+          queryWindowsProcessGroups([numPid], () => res, {
+            expectedStartToken: "__exited__",
+            allowInitialExitedRootChildren: true,
+          });
+          return "__exited__";
+        }
+      }
+    } catch {
+      // Ignore PowerShell failures
+    }
+    return null;
+  }
+  const expectedToken = normalizeCreationToken(options.expectedToken);
+  const preferPs = Boolean(expectedToken && !expectedToken.startsWith("proc:"));
+  if (platform === "linux" && !preferPs) {
+    try {
+      const stat = fs.readFileSync(`/proc/${numPid}/stat`, "utf8");
+      const closeParen = stat.lastIndexOf(")");
+      if (closeParen !== -1) {
+        const fields = stat.slice(closeParen + 1).trim().split(/\s+/);
+        if (fields.length > 19 && fields[19]) {
+          return `proc:${fields[19].trim()}`;
+        }
+      }
+    } catch {
+      // Fall back to ps below if /proc is unavailable or unreadable
+    }
+  }
+  if (options.allowSubprocess === false) {
+    return null;
+  }
+  const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+  try {
+    const res = spawnSyncFn("ps", ["-o", "lstart=", "-p", String(numPid)], {
+      encoding: "utf8",
+      timeout: 1500,
+    });
+    if (res && res.status === 0 && typeof res.stdout === "string") {
+      const token = res.stdout.trim().replace(/\s+/g, " ");
+      if (token.length > 0) {
+        return token;
+      }
+    }
+  } catch {
+    // Ignore ps failures
+  }
+  return null;
+}
+
+export function seedPosixPgidStartTokens(pgidOrMap, token = undefined) {
+  if (pgidOrMap && typeof pgidOrMap === "object" && !(pgidOrMap instanceof Set)) {
+    const iterable =
+      pgidOrMap instanceof Map ? pgidOrMap.entries() : Object.entries(pgidOrMap);
+    for (const [k, v] of iterable) {
+      seedPosixPgidStartTokens(k, v);
+    }
+    return;
+  }
+  const parsed = parseWindowsPgidKey(pgidOrMap);
+  if (!parsed) return;
+  const norm = normalizeCreationToken(token ?? parsed.rootCreation);
+  if (norm && norm !== "__exited__") {
+    posixKnownPgidStartTokens.set(parsed.pid, norm);
+  }
+}
+
+export function getKnownPosixPgidStartToken(pgid) {
+  const parsed = parseWindowsPgidKey(pgid);
+  if (!parsed) return null;
+  return posixKnownPgidStartTokens.get(parsed.pid) ?? parsed.rootCreation ?? null;
+}
+
+export function clearKnownPosixPgidStartTokens(pgid = null) {
+  if (pgid === null || pgid === undefined) {
+    posixKnownPgidStartTokens.clear();
+  } else {
+    const parsed = parseWindowsPgidKey(pgid);
+    if (parsed) {
+      posixKnownPgidStartTokens.delete(parsed.pid);
+    }
+  }
+}
+
+export function resolveExpectedPosixPgidStartToken(rawPgid, options = {}) {
+  const parsed = parseWindowsPgidKey(rawPgid);
+  if (!parsed) return null;
+  const pidStr = String(parsed.pid);
+  const direct =
+    normalizeCreationToken(options.startToken) ??
+    parsed.rootCreation ??
+    normalizeCreationToken(
+      options.pgidStartTokens?.[pidStr] ??
+        options.lease?.workerPgidStartTokens?.[pidStr] ??
+        null,
+    );
+  if (direct && direct !== "__exited__") {
+    return direct;
+  }
+  const descMap = options.knownDescendants ?? options.lease?.workerDescendants ?? null;
+  const descEntries = Array.isArray(descMap) ? descMap : descMap?.[pidStr];
+  if (Array.isArray(descEntries)) {
+    const rootEntry = descEntries.find(
+      (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === parsed.pid,
+    );
+    const rootToken = rootEntry
+      ? normalizeCreationToken(
+          rootEntry.startToken ?? rootEntry.creationDate ?? rootEntry.CreationDate ?? null,
+        )
+      : null;
+    if (rootToken && rootToken !== "__exited__") {
+      return rootToken;
+    }
+  }
+  return posixKnownPgidStartTokens.get(parsed.pid) ?? null;
+}
+
+export function deriveWindowsTreeGenerationToken(pgid, entriesOrMap) {
+  const numPgid = Number(pgid);
+  if (!Number.isInteger(numPgid) || numPgid <= 1 || !entriesOrMap) {
+    return null;
+  }
+  const list =
+    entriesOrMap instanceof Map
+      ? Array.from(entriesOrMap.values())
+      : entriesOrMap instanceof Set || Array.isArray(entriesOrMap)
+        ? Array.from(entriesOrMap)
+        : typeof entriesOrMap === "object"
+          ? Object.entries(entriesOrMap).map(([k, v]) =>
+              v && typeof v === "object"
+                ? { pid: Number(k), ...v }
+                : { pid: Number(k), creationDate: v },
+            )
+          : [];
+  if (list.length === 0) return null;
+  const rootItem = list.find(
+    (item) =>
+      item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === numPgid,
+  );
+  const rootCreation = rootItem
+    ? normalizeCreationToken(
+        rootItem.creationDate ?? rootItem.CreationDate ?? rootItem.startToken ?? null,
+      )
+    : null;
+  if (rootCreation && rootCreation !== "__exited__") {
+    return rootCreation;
+  }
+  const descParts = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const pid = Number(item.pid ?? item.ProcessId);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === numPgid) continue;
+    const c = normalizeCreationToken(
+      item.creationDate ?? item.CreationDate ?? item.startToken ?? null,
+    );
+    if (c && c !== "__exited__") {
+      descParts.push({ pid, creationDate: c, token: `${pid}:${c}` });
+    }
+  }
+  descParts.sort((a, b) => {
+    const cmp = compareWindowsCreationTokens(a.creationDate, b.creationDate);
+    if (cmp !== null && cmp !== 0) return cmp;
+    if (a.creationDate !== b.creationDate) {
+      return a.creationDate < b.creationDate ? -1 : 1;
+    }
+    return a.pid - b.pid;
+  });
+  if (descParts.length > 0) {
+    return `__exited__:${descParts[0].token}`;
+  }
+  return rootCreation === "__exited__" ? "__exited__" : null;
+}
+
+export function archiveWindowsProcessGroupGeneration(rawPgid) {
+  const parsed = parseWindowsPgidKey(rawPgid);
+  if (!parsed) return null;
+  posixKnownPgidStartTokens.delete(parsed.pid);
+  const existing = winKnownTreeDescendants.get(parsed.pid);
+  if (!existing) return null;
+  const genToken = deriveWindowsTreeGenerationToken(parsed.pid, existing);
+  if (genToken) {
+    const archiveKey = `${parsed.pid}@${genToken}`;
+    winKnownTreeDescendants.set(archiveKey, existing);
+    winKnownTreeDescendants.delete(parsed.pid);
+    return archiveKey;
+  }
+  winKnownTreeDescendants.delete(parsed.pid);
+  return null;
+}
+
+function collectArchivedWindowsMemberTokens(pgid, currentKey) {
+  const archived = new Map();
+  const prefix = `${pgid}@`;
+  for (const [k, map] of winKnownTreeDescendants.entries()) {
+    if (typeof k !== "string" || !k.startsWith(prefix) || k === currentKey) continue;
+    if (!(map instanceof Map)) continue;
+    for (const [mPid, meta] of map.entries()) {
+      if (meta?.creationDate && meta.creationDate !== "__exited__") {
+        archived.set(mPid, meta.creationDate);
+      }
+    }
+  }
+  return archived;
+}
+
+export function seedWindowsKnownDescendants(pgidOrMap, entries) {
+  if (pgidOrMap && typeof pgidOrMap === "object" && !(pgidOrMap instanceof Set)) {
+    const iterable =
+      pgidOrMap instanceof Map ? pgidOrMap.entries() : Object.entries(pgidOrMap);
+    for (const [k, v] of iterable) {
+      seedWindowsKnownDescendants(k, v);
+    }
+    return;
+  }
+  const parsedPgid = parseWindowsPgidKey(pgidOrMap);
+  if (!parsedPgid) return;
+  const { pid: pgid } = parsedPgid;
+  let targetKey = parsedPgid.key;
+  if (!entries) return;
+  if (
+    activePgidLivenessSnapshot &&
+    (activePgidLivenessSnapshot.get(targetKey) === false ||
+      (targetKey === pgid && activePgidLivenessSnapshot.get(String(pgid)) === false))
+  ) {
+    return;
+  }
+  const list =
+    entries instanceof Map
+      ? Array.from(entries.values())
+      : entries instanceof Set || Array.isArray(entries)
+        ? Array.from(entries)
+        : entries && typeof entries === "object"
+          ? Object.entries(entries).map(([k, v]) =>
+              v && typeof v === "object" ? { pid: Number(k), ...v } : { pid: Number(k), creationDate: v },
+            )
+          : [];
+  if (targetKey === pgid) {
+    const incomingGenToken = deriveWindowsTreeGenerationToken(pgid, list);
+    if (incomingGenToken) {
+      const incomingArchiveKey = `${pgid}@${incomingGenToken}`;
+      if (winKnownTreeDescendants.has(incomingArchiveKey)) {
+        targetKey = incomingArchiveKey;
+      } else {
+        const existingBare = winKnownTreeDescendants.get(pgid);
+        const existingGenToken = deriveWindowsTreeGenerationToken(pgid, existingBare);
+        if (existingGenToken && incomingGenToken !== existingGenToken) {
+          winKnownTreeDescendants.set(`${pgid}@${existingGenToken}`, existingBare);
+          winKnownTreeDescendants.delete(pgid);
+        }
+      }
+    }
+  }
+  let known = winKnownTreeDescendants.get(targetKey);
+  if (!known) {
+    known = new Map();
+    winKnownTreeDescendants.set(targetKey, known);
+  }
+  for (const item of list) {
+    if (typeof item === "number" && Number.isInteger(item) && item > 0) {
+      if (!known.has(item)) {
+        known.set(item, { pid: item, creationDate: null, alive: true });
+      }
+    } else if (item && typeof item === "object") {
+      const pid = Number(item.pid ?? item.ProcessId);
+      if (Number.isInteger(pid) && pid > 0) {
+        const creationDate = normalizeCreationToken(
+          item.creationDate ?? item.CreationDate ?? item.startToken ?? null,
+        );
+        const prev = known.get(pid);
+        const effectiveCreation = creationDate ?? prev?.creationDate ?? null;
+        known.set(pid, {
+          pid,
+          creationDate: effectiveCreation,
+          alive:
+            item.alive !== undefined
+              ? Boolean(item.alive)
+              : effectiveCreation === "__exited__"
+                ? false
+                : (prev?.alive ?? true),
+        });
+      }
+    }
+  }
+}
+
+export function clearKnownWindowsTreeDescendants(pgid = null) {
+  if (pgid === null || pgid === undefined) {
+    winKnownTreeDescendants.clear();
+  } else {
+    const parsed = parseWindowsPgidKey(pgid);
+    if (parsed) {
+      winKnownTreeDescendants.delete(parsed.key);
+    }
+  }
+}
+
+export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, options = {}) {
   const result = new Map();
-  for (const pgid of pgids) {
-    result.set(pgid, true);
+  result.refreshed = false;
+  const triState = Boolean(options && options.triState);
+  if (options && options.freshGeneration) {
+    for (const rawPgid of pgids || []) {
+      archiveWindowsProcessGroupGeneration(rawPgid);
+    }
+  }
+  if (options && options.knownDescendants) {
+    if (
+      Array.isArray(options.knownDescendants) &&
+      Array.isArray(pgids) &&
+      pgids.length === 1
+    ) {
+      seedWindowsKnownDescendants(pgids[0], options.knownDescendants);
+    } else {
+      seedWindowsKnownDescendants(options.knownDescendants);
+    }
+  }
+  for (const rawPgid of pgids || []) {
+    const parsedPgid = parseWindowsPgidKey(rawPgid);
+    if (parsedPgid) {
+      result.set(parsedPgid.key, triState ? null : true);
+    }
   }
   try {
     const psCmd =
-      "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress";
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate | ConvertTo-Json -Compress";
     const res = spawnSyncFn(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", psCmd],
@@ -44,12 +471,17 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync) {
       const parsed = JSON.parse(res.stdout.trim());
       const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
       const alivePids = new Set();
+      const creationByPid = new Map();
       const childrenByParent = new Map();
       for (const r of rows) {
         const pid = Number(r?.ProcessId);
         const ppid = Number(r?.ParentProcessId);
+        const cdate = normalizeCreationToken(r?.CreationDate);
         if (Number.isInteger(pid) && pid > 0) {
           alivePids.add(pid);
+          if (cdate) {
+            creationByPid.set(pid, cdate);
+          }
           if (Number.isInteger(ppid) && ppid > 0) {
             let list = childrenByParent.get(ppid);
             if (!list) {
@@ -60,85 +492,407 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync) {
           }
         }
       }
-      for (const pgid of pgids) {
-        const prevKnown = winKnownTreeDescendants.get(pgid) || new Set();
-        const queue = [pgid, ...prevKnown];
-        const visited = new Set(queue);
-        const liveMembers = new Set();
-        if (alivePids.has(pgid)) {
-          liveMembers.add(pgid);
-        }
-        for (const k of prevKnown) {
-          if (alivePids.has(k)) {
-            liveMembers.add(k);
+      if (options && options.pgidStartTokens && typeof options.pgidStartTokens === "object") {
+        seedPosixPgidStartTokens(options.pgidStartTokens);
+      }
+      if (
+        options &&
+        options.lease?.workerPgidStartTokens &&
+        typeof options.lease.workerPgidStartTokens === "object"
+      ) {
+        seedPosixPgidStartTokens(options.lease.workerPgidStartTokens);
+      }
+      const isSameProcessInstance = (pid, expectedCreation, prevAlive = true) => {
+        if (!alivePids.has(pid)) return false;
+        if (prevAlive === false || expectedCreation === "__exited__") return false;
+        const actualCreation = creationByPid.get(pid) ?? null;
+        if (!actualCreation || !expectedCreation) return false;
+        return actualCreation === expectedCreation;
+      };
+      const isIdentityUnverifiable = (pid, expectedCreation, prevAlive = true) =>
+        alivePids.has(pid) &&
+        prevAlive !== false &&
+        expectedCreation !== "__exited__" &&
+        (!expectedCreation || !creationByPid.get(pid));
+      const singleTargetExplicitToken =
+        Array.isArray(pgids) && pgids.length === 1
+          ? (options?.expectedStartToken ?? options?.startToken ?? null)
+          : null;
+      for (const rawPgid of pgids || []) {
+        const parsedPgid = parseWindowsPgidKey(rawPgid);
+        if (!parsedPgid) continue;
+        const { key: pgidKey, pid: pgid, rootCreation: explicitRootCreation } = parsedPgid;
+        let prevKnown = winKnownTreeDescendants.get(pgidKey);
+        if (!prevKnown && explicitRootCreation) {
+          const byBare = winKnownTreeDescendants.get(pgid);
+          if (byBare && deriveWindowsTreeGenerationToken(pgid, byBare) === explicitRootCreation) {
+            prevKnown = byBare;
           }
         }
+        prevKnown = prevKnown || new Map();
+        const prevRootEntry = prevKnown.get(pgid);
+        const normalizedExplicitRoot =
+          explicitRootCreation && explicitRootCreation.startsWith("__exited__")
+            ? "__exited__"
+            : explicitRootCreation;
+        const startTokenFromMap = normalizeCreationToken(
+          singleTargetExplicitToken ??
+            options?.pgidStartTokens?.[String(pgid)] ??
+            options?.lease?.workerPgidStartTokens?.[String(pgid)] ??
+            posixKnownPgidStartTokens.get(pgid) ??
+            null,
+        );
+        const expectedRootCreation =
+          prevRootEntry?.creationDate ??
+          normalizedExplicitRoot ??
+          startTokenFromMap ??
+          null;
+        let hasUnverifiableIdentity = isIdentityUnverifiable(
+          pgid,
+          expectedRootCreation,
+          prevRootEntry?.alive,
+        );
+        if (!hasUnverifiableIdentity) {
+          for (const [kPid, prevMeta] of prevKnown.entries()) {
+            if (isIdentityUnverifiable(kPid, prevMeta?.creationDate, prevMeta?.alive)) {
+              hasUnverifiableIdentity = true;
+              break;
+            }
+          }
+        }
+        if (hasUnverifiableIdentity) {
+          result.set(pgidKey, triState ? null : true);
+          continue;
+        }
+        const archivedMemberTokens = collectArchivedWindowsMemberTokens(pgid, pgidKey);
+        const nextKnown = new Map();
+        const queue = [];
+        const visited = new Set();
+        const liveMembers = new Set();
+
+        const rootCreation = expectedRootCreation;
+        let reusedRootCreation = null;
+        if (isSameProcessInstance(pgid, expectedRootCreation, prevRootEntry?.alive)) {
+          queue.push(pgid);
+          visited.add(pgid);
+          liveMembers.add(pgid);
+          nextKnown.set(pgid, {
+            pid: pgid,
+            creationDate: creationByPid.get(pgid) ?? rootCreation,
+            alive: true,
+          });
+        } else if (
+          !prevRootEntry &&
+          ((expectedRootCreation && expectedRootCreation !== "__exited__") ||
+            (expectedRootCreation === "__exited__" &&
+              options?.allowInitialExitedRootChildren &&
+              !alivePids.has(pgid)))
+        ) {
+          if (alivePids.has(pgid)) {
+            reusedRootCreation = creationByPid.get(pgid) ?? null;
+          }
+          queue.push(pgid);
+          visited.add(pgid);
+          nextKnown.set(pgid, {
+            pid: pgid,
+            creationDate: "__exited__",
+            alive: false,
+          });
+        } else if (!expectedRootCreation && (childrenByParent.get(pgid) || []).length > 0) {
+          result.set(pgidKey, triState ? null : true);
+          continue;
+        } else {
+          nextKnown.set(pgid, {
+            pid: pgid,
+            creationDate: expectedRootCreation ?? "__exited__",
+            alive: false,
+          });
+        }
+
+        for (const [kPid, prevMeta] of prevKnown.entries()) {
+          if (kPid === pgid) continue;
+          const expectedCreation = prevMeta?.creationDate ?? null;
+          if (isSameProcessInstance(kPid, expectedCreation, prevMeta?.alive)) {
+            liveMembers.add(kPid);
+            nextKnown.set(kPid, {
+              pid: kPid,
+              creationDate: creationByPid.get(kPid) ?? expectedCreation,
+              alive: true,
+            });
+            if (!visited.has(kPid)) {
+              visited.add(kPid);
+              queue.push(kPid);
+            }
+          } else {
+            // Exited or reused intermediate PID: keep tombstone without traversing children,
+            // since any legitimate descendant observed while kPid was alive is already in prevKnown.
+            nextKnown.set(kPid, {
+              pid: kPid,
+              creationDate: expectedCreation ?? "__exited__",
+              alive: false,
+            });
+          }
+        }
+
         while (queue.length > 0) {
           const cur = queue.shift();
           const kids = childrenByParent.get(cur) || [];
+          const parentCreation =
+            cur === pgid
+              ? expectedRootCreation
+              : (nextKnown.get(cur)?.creationDate ?? null);
           for (const kid of kids) {
-            if (alivePids.has(kid)) {
-              liveMembers.add(kid);
+            const prevKidMeta = prevKnown.get(kid);
+            const actualKidCreation = creationByPid.get(kid) ?? null;
+            if (!prevKidMeta) {
+              const archivedTok = archivedMemberTokens.get(kid);
+              if (archivedTok && (!actualKidCreation || archivedTok === actualKidCreation)) {
+                continue;
+              }
+              if (parentCreation && parentCreation !== "__exited__" && actualKidCreation) {
+                const cmpParent = compareWindowsCreationTokens(
+                  actualKidCreation,
+                  parentCreation,
+                );
+                if (cmpParent !== null && cmpParent < 0) {
+                  continue;
+                }
+              }
+              if (cur === pgid && reusedRootCreation) {
+                const cmpReused = actualKidCreation
+                  ? compareWindowsCreationTokens(actualKidCreation, reusedRootCreation)
+                  : null;
+                if (cmpReused === null || cmpReused >= 0) {
+                  continue;
+                }
+              }
             }
-            if (!visited.has(kid)) {
-              visited.add(kid);
-              queue.push(kid);
+            const expectedKidCreation = prevKidMeta
+              ? (prevKidMeta.creationDate ?? null)
+              : actualKidCreation;
+            if (isIdentityUnverifiable(kid, expectedKidCreation, prevKidMeta?.alive)) {
+              hasUnverifiableIdentity = true;
+              break;
+            }
+            if (isSameProcessInstance(kid, expectedKidCreation, prevKidMeta?.alive)) {
+              liveMembers.add(kid);
+              nextKnown.set(kid, {
+                pid: kid,
+                creationDate: actualKidCreation ?? expectedKidCreation,
+                alive: true,
+              });
+              if (!visited.has(kid)) {
+                visited.add(kid);
+                queue.push(kid);
+              }
             }
           }
+          if (hasUnverifiableIdentity) break;
         }
+        if (hasUnverifiableIdentity) {
+          result.set(pgidKey, triState ? null : true);
+          continue;
+        }
+
         if (liveMembers.size > 0) {
-          winKnownTreeDescendants.set(pgid, liveMembers);
-          result.set(pgid, true);
+          winKnownTreeDescendants.set(pgidKey, nextKnown);
+          result.set(pgidKey, true);
         } else {
-          winKnownTreeDescendants.delete(pgid);
-          result.set(pgid, false);
+          winKnownTreeDescendants.delete(pgidKey);
+          result.set(pgidKey, false);
         }
       }
+      result.refreshed = true;
     }
   } catch {
-    // Preserve conservative alive (true) default when PowerShell fails or times out
+    // Preserve conservative alive (true) default (or null in triState mode) when PowerShell fails or times out
   }
   return result;
 }
 
-export function getKnownWindowsTreePids(pgid) {
-  const known = winKnownTreeDescendants.get(Number(pgid));
-  return known ? Array.from(known) : [];
+export function getKnownWindowsTreePids(pgid, { liveOnly = false } = {}) {
+  const parsed = parseWindowsPgidKey(pgid);
+  if (!parsed) return [];
+  const known = winKnownTreeDescendants.get(parsed.key);
+  if (!known) return [];
+  const out = [];
+  for (const [pid, meta] of known.entries()) {
+    if (liveOnly && meta && meta.alive === false) continue;
+    out.push(pid);
+  }
+  return out;
 }
 
-export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
-  if (!Number.isInteger(pgid) || pgid <= 1) {
+export function getKnownWindowsTreeDescendants(pgid) {
+  const parsed = parseWindowsPgidKey(pgid);
+  if (!parsed) return [];
+  const known = winKnownTreeDescendants.get(parsed.key);
+  if (!known) return [];
+  const out = [];
+  for (const [pid, meta] of known.entries()) {
+    out.push({
+      pid,
+      creationDate: meta?.creationDate ?? null,
+    });
+  }
+  return out;
+}
+
+function resolveWindowsPgidKey(parsedPgid, knownDescendants) {
+  if (!parsedPgid) return null;
+  if (parsedPgid.rootCreation || !knownDescendants || typeof knownDescendants !== "object") {
+    return parsedPgid.key;
+  }
+  const pgid = parsedPgid.pid;
+  const entries = Array.isArray(knownDescendants)
+    ? knownDescendants
+    : knownDescendants[String(pgid)];
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return parsedPgid.key;
+  }
+  const expectedGenToken = deriveWindowsTreeGenerationToken(pgid, entries);
+  if (!expectedGenToken) {
+    return parsedPgid.key;
+  }
+  const archiveKey = `${pgid}@${expectedGenToken}`;
+  if (winKnownTreeDescendants.has(archiveKey)) {
+    return archiveKey;
+  }
+  const existingBare = winKnownTreeDescendants.get(pgid);
+  const existingGenToken = deriveWindowsTreeGenerationToken(pgid, existingBare);
+  if (existingGenToken && existingGenToken !== expectedGenToken) {
+    return archiveKey;
+  }
+  return parsedPgid.key;
+}
+
+export function isProcessGroupAlive(
+  pgidOrLease,
+  secondArg = {},
+  thirdArg = undefined,
+) {
+  const options =
+    thirdArg !== undefined
+      ? { ...(thirdArg || {}), knownDescendants: secondArg ?? thirdArg?.knownDescendants ?? null }
+      : secondArg || {};
+  const {
+    allowSubprocess = true,
+    knownDescendants = null,
+    lease = null,
+    platform = process.platform,
+    livenessCheck = isPidAlive,
+  } = options;
+  const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+  const killFn = options.killFn || process.kill.bind(process);
+
+  if (pgidOrLease && typeof pgidOrLease === "object") {
+    const targetLease = pgidOrLease;
+    const leasePgids = Array.isArray(targetLease.workerPgids)
+      ? targetLease.workerPgids
+      : Array.isArray(targetLease.workerPids)
+        ? targetLease.workerPids
+        : targetLease.workerPid
+          ? [targetLease.workerPid]
+          : [];
+    return leasePgids.some((p) =>
+      isProcessGroupAlive(p, {
+        allowSubprocess,
+        knownDescendants: knownDescendants || targetLease.workerDescendants || null,
+        pgidStartTokens:
+          options.pgidStartTokens || targetLease.workerPgidStartTokens || null,
+        lease: targetLease,
+        spawnSyncFn,
+        platform,
+        livenessCheck,
+        killFn,
+      }),
+    );
+  }
+  const parsedPgid = parseWindowsPgidKey(pgidOrLease);
+  if (!parsedPgid) {
     return false;
   }
-  if (process.platform === "win32") {
-    if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgid)) {
-      return activePgidLivenessSnapshot.get(pgid);
+  const { pid: pgid } = parsedPgid;
+  const effectiveKnown = knownDescendants || lease?.workerDescendants || null;
+  if (effectiveKnown) {
+    if (Array.isArray(effectiveKnown)) {
+      seedWindowsKnownDescendants(parsedPgid.key, effectiveKnown);
+    } else {
+      seedWindowsKnownDescendants(effectiveKnown);
     }
-    if (isPidAlive(pgid)) {
+  }
+  const pgidKey = resolveWindowsPgidKey(parsedPgid, effectiveKnown);
+  if (platform === "win32" || winKnownTreeDescendants.has(pgidKey)) {
+    if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgidKey)) {
+      return activePgidLivenessSnapshot.get(pgidKey);
+    }
+    if (allowSubprocess) {
+      return Boolean(
+        queryWindowsProcessGroups([pgidKey], spawnSyncFn, {
+          knownDescendants: effectiveKnown,
+          pgidStartTokens:
+            options.pgidStartTokens || lease?.workerPgidStartTokens || null,
+          expectedStartToken: options.expectedStartToken || null,
+          lease,
+        }).get(pgidKey),
+      );
+    }
+    const knownMap = winKnownTreeDescendants.get(pgidKey);
+    const rootMeta = knownMap?.get(pgid);
+    if ((!rootMeta || rootMeta.alive !== false) && livenessCheck(pgid)) {
       return true;
     }
-    const knownDescendants = winKnownTreeDescendants.get(pgid);
-    if (knownDescendants) {
-      for (const descPid of knownDescendants) {
-        if (isPidAlive(descPid)) {
+    if (knownMap) {
+      for (const [descPid, meta] of knownMap.entries()) {
+        if (meta && meta.alive === false) continue;
+        if (livenessCheck(descPid)) {
           return true;
         }
       }
     }
-    if (!allowSubprocess) {
-      return false;
-    }
-    return Boolean(queryWindowsProcessGroups([pgid]).get(pgid));
+    return false;
   }
-  try {
-    process.kill(-pgid, 0);
-  } catch (err) {
-    if (!err || err.code !== "EPERM") return false;
+  if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgidKey)) {
+    return activePgidLivenessSnapshot.get(pgidKey);
   }
   if (activePgidLivenessSnapshot && activePgidLivenessSnapshot.has(pgid)) {
     return activePgidLivenessSnapshot.get(pgid);
   }
-  if (process.platform === "linux") {
+  const hasCustomLiveness =
+    typeof livenessCheck === "function" && livenessCheck !== isPidAlive;
+  let groupExists = false;
+  try {
+    killFn(-pgid, 0);
+    groupExists = true;
+  } catch (err) {
+    if (err && err.code === "EPERM") {
+      groupExists = true;
+    }
+  }
+  if (!groupExists && !(hasCustomLiveness && livenessCheck(pgid))) {
+    return false;
+  }
+  const expectedStartToken = resolveExpectedPosixPgidStartToken(
+    pgidOrLease,
+    options,
+  );
+  if (expectedStartToken) {
+    const actualStartToken = getPosixProcessStartToken(pgid, {
+      spawnSyncFn,
+      platform,
+      expectedToken: expectedStartToken,
+      allowSubprocess,
+    });
+    if (actualStartToken !== null && actualStartToken !== expectedStartToken) {
+      return false;
+    }
+    if (!groupExists && hasCustomLiveness && livenessCheck(pgid)) {
+      return true;
+    }
+  } else if (!groupExists && hasCustomLiveness && livenessCheck(pgid)) {
+    return true;
+  }
+  if (platform === "linux") {
     try {
       const entries = fs.readdirSync("/proc");
       let inspectedAny = false;
@@ -171,7 +925,7 @@ export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
     return true;
   }
   try {
-    const res = spawnSync("ps", ["-axo", "pgid=,stat="], {
+    const res = spawnSyncFn("ps", ["-axo", "pgid=,stat="], {
       encoding: "utf8",
       timeout: 1500,
     });
@@ -196,49 +950,389 @@ export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
   return true;
 }
 
-export function snapshotProcessGroupsOutsideLock(pgids) {
+export const hasAliveProcessInGroup = isProcessGroupAlive;
+
+function withTerminatedPgids(arr, terminatedPgids) {
+  Object.defineProperty(arr, "terminatedPgids", {
+    value: terminatedPgids,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  return arr;
+}
+
+export function killProcessGroupTree(
+  pgidOrLease,
+  signalOrOptions = "SIGTERM",
+  maybeOptions = {},
+) {
+  const options =
+    signalOrOptions && typeof signalOrOptions === "object"
+      ? signalOrOptions
+      : maybeOptions || {};
+  const signal =
+    typeof signalOrOptions === "string"
+      ? signalOrOptions
+      : options.signal || "SIGTERM";
+  const platform = options.platform || process.platform;
+  const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+  const knownDescendants =
+    options.knownDescendants || options.lease?.workerDescendants || null;
+
+  if (pgidOrLease && typeof pgidOrLease === "object") {
+    const lease = pgidOrLease;
+    const pgids = Array.isArray(lease.workerPgids)
+      ? lease.workerPgids
+      : Array.isArray(lease.workerPids)
+        ? lease.workerPids
+        : lease.workerPid
+          ? [lease.workerPid]
+          : [];
+    const killed = [];
+    const confirmedPgids = [];
+    for (const p of pgids) {
+      const sub = killProcessGroupTree(p, signal, {
+        ...options,
+        lease,
+        knownDescendants: knownDescendants || lease.workerDescendants || null,
+        pgidStartTokens:
+          options.pgidStartTokens || lease.workerPgidStartTokens || null,
+      });
+      killed.push(...sub);
+      if (Array.isArray(sub.terminatedPgids)) {
+        confirmedPgids.push(...sub.terminatedPgids);
+      } else if (sub.length > 0) {
+        const parsedP = parseWindowsPgidKey(p);
+        confirmedPgids.push(parsedP ? parsedP.key : Number(p));
+      }
+    }
+    return withTerminatedPgids(killed, confirmedPgids);
+  }
+
+  const parsedPgid = parseWindowsPgidKey(pgidOrLease);
+  const childPid = parsedPgid ? parsedPgid.pid : Number(pgidOrLease);
+  if (!Number.isInteger(childPid) || childPid <= 0) {
+    return withTerminatedPgids([], []);
+  }
+
+  if (platform === "win32") {
+    if (knownDescendants) {
+      if (Array.isArray(knownDescendants)) {
+        seedWindowsKnownDescendants(parsedPgid ? parsedPgid.key : childPid, knownDescendants);
+      } else {
+        seedWindowsKnownDescendants(knownDescendants);
+      }
+    }
+    const childKey = parsedPgid
+      ? resolveWindowsPgidKey(parsedPgid, knownDescendants)
+      : childPid;
+    let refreshedAlive = null;
+    if (options.refresh !== false) {
+      refreshedAlive = queryWindowsProcessGroups([childKey], spawnSyncFn, {
+        triState: true,
+        knownDescendants,
+        pgidStartTokens:
+          options.pgidStartTokens || options.lease?.workerPgidStartTokens || null,
+        expectedStartToken: options.expectedStartToken || null,
+        lease: options.lease || null,
+      }).get(childKey);
+    }
+    if (refreshedAlive === false) {
+      winKnownTreeDescendants.delete(childKey);
+      return withTerminatedPgids([], [childKey]);
+    }
+    if (refreshedAlive !== true) {
+      return withTerminatedPgids([], []);
+    }
+    const liveKnownPids = getKnownWindowsTreePids(childKey, { liveOnly: true });
+    const pidsToKill = [];
+    const seen = new Set();
+    for (const p of liveKnownPids) {
+      if (Number.isInteger(p) && p > 0 && !seen.has(p)) {
+        seen.add(p);
+        pidsToKill.push(p);
+      }
+    }
+    if (pidsToKill.length === 0) {
+      winKnownTreeDescendants.delete(childKey);
+      return withTerminatedPgids([], [childKey]);
+    }
+    if (
+      typeof options.beforeKill === "function" &&
+      !options.beforeKill(options.lease || pgidOrLease)
+    ) {
+      return withTerminatedPgids([], []);
+    }
+    const pidArgs = [];
+    for (const p of pidsToKill) {
+      pidArgs.push("/PID", String(p));
+    }
+    let taskkillConfirmed = false;
+    try {
+      const tkRes = spawnSyncFn("taskkill", ["/T", "/F", ...pidArgs], {
+        stdio: "ignore",
+        timeout: 3000,
+        windowsHide: true,
+      });
+      taskkillConfirmed =
+        Boolean(tkRes) &&
+        !tkRes.error &&
+        (tkRes.status === 0 || tkRes.status === 128);
+    } catch {
+      let allSignaled = true;
+      for (const p of pidsToKill) {
+        try {
+          process.kill(p, signal);
+        } catch (err) {
+          if (err && err.code !== "ESRCH") {
+            allSignaled = false;
+          }
+        }
+      }
+      taskkillConfirmed = allSignaled;
+    }
+    if (!taskkillConfirmed) {
+      return withTerminatedPgids([], []);
+    }
+    winKnownTreeDescendants.delete(childKey);
+    return withTerminatedPgids(pidsToKill, [childKey]);
+  }
+
+  const killFn = options.killFn || process.kill.bind(process);
+  const livenessCheck = options.livenessCheck || isPidAlive;
+  if (options.pgidStartTokens && typeof options.pgidStartTokens === "object") {
+    seedPosixPgidStartTokens(options.pgidStartTokens);
+  }
+  if (
+    options.lease?.workerPgidStartTokens &&
+    typeof options.lease.workerPgidStartTokens === "object"
+  ) {
+    seedPosixPgidStartTokens(options.lease.workerPgidStartTokens);
+  }
+  const expectedStartToken = resolveExpectedPosixPgidStartToken(
+    pgidOrLease,
+    options,
+  );
+  const hasLeaseContext = Boolean(options.lease || options.requireLeaderToken);
+  if (expectedStartToken) {
+    const actualStartToken = getPosixProcessStartToken(childPid, {
+      spawnSyncFn,
+      platform,
+      expectedToken: expectedStartToken,
+    });
+    if (actualStartToken !== null && actualStartToken !== expectedStartToken) {
+      posixKnownPgidStartTokens.delete(childPid);
+      return withTerminatedPgids([], [parsedPgid ? parsedPgid.key : childPid]);
+    }
+    if (actualStartToken === null && livenessCheck(childPid)) {
+      return withTerminatedPgids([], []);
+    }
+  } else if (hasLeaseContext && livenessCheck(childPid)) {
+    return withTerminatedPgids([], []);
+  }
+  if (
+    typeof options.beforeKill === "function" &&
+    !options.beforeKill(options.lease || pgidOrLease)
+  ) {
+    return withTerminatedPgids([], []);
+  }
+  let groupSignaled = false;
+  let groupMissing = false;
+  try {
+    killFn(-childPid, signal);
+    groupSignaled = true;
+  } catch (groupErr) {
+    groupMissing = Boolean(groupErr && groupErr.code === "ESRCH");
+  }
+  if (groupMissing) {
+    return withTerminatedPgids([], [parsedPgid ? parsedPgid.key : childPid]);
+  }
+  if (
+    !groupSignaled &&
+    isProcessGroupAlive(childPid, {
+      allowSubprocess: true,
+      spawnSyncFn,
+      platform,
+      killFn,
+      expectedStartToken,
+    })
+  ) {
+    return withTerminatedPgids([], []);
+  }
+  return withTerminatedPgids(
+    groupSignaled ? [childPid] : [],
+    [parsedPgid ? parsedPgid.key : childPid],
+  );
+}
+
+export function snapshotProcessGroupsOutsideLock(pgidsOrState, options = {}) {
   const snapshot = new Map();
-  if (!Array.isArray(pgids) || pgids.length === 0) {
+  const platform = options.platform || process.platform;
+  const spawnSyncFn = options.spawnSyncFn || options.runner || spawnSync;
+  const rawList = [];
+  const mergedKnown = {};
+  const mergedTokens = {};
+  if (options.knownDescendants && typeof options.knownDescendants === "object") {
+    if (Array.isArray(options.knownDescendants)) {
+      // Handled per-pgid below if single pgid
+    } else {
+      Object.assign(mergedKnown, options.knownDescendants);
+    }
+  }
+  if (options.pgidStartTokens && typeof options.pgidStartTokens === "object") {
+    Object.assign(mergedTokens, options.pgidStartTokens);
+  }
+  if (Array.isArray(pgidsOrState)) {
+    for (const item of pgidsOrState) {
+      if (item && typeof item === "object") {
+        if (Array.isArray(item.workerPgids)) {
+          rawList.push(...item.workerPgids);
+        }
+        if (item.workerDescendants && typeof item.workerDescendants === "object") {
+          Object.assign(mergedKnown, item.workerDescendants);
+        }
+        if (
+          item.workerPgidStartTokens &&
+          typeof item.workerPgidStartTokens === "object"
+        ) {
+          Object.assign(mergedTokens, item.workerPgidStartTokens);
+        }
+      } else {
+        rawList.push(item);
+      }
+    }
+  } else if (pgidsOrState && typeof pgidsOrState === "object") {
+    const leases = pgidsOrState.leases
+      ? Object.values(pgidsOrState.leases)
+      : [pgidsOrState];
+    for (const lease of leases) {
+      if (!lease || typeof lease !== "object") continue;
+      if (Array.isArray(lease.workerPgids)) {
+        rawList.push(...lease.workerPgids);
+      }
+      if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
+        Object.assign(mergedKnown, lease.workerDescendants);
+      }
+      if (
+        lease.workerPgidStartTokens &&
+        typeof lease.workerPgidStartTokens === "object"
+      ) {
+        Object.assign(mergedTokens, lease.workerPgidStartTokens);
+      }
+    }
+  }
+  if (rawList.length === 0) {
     return snapshot;
   }
-  if (process.platform === "win32") {
+  if (Object.keys(mergedTokens).length > 0) {
+    seedPosixPgidStartTokens(mergedTokens);
+  }
+  if (platform === "win32") {
     const validCandidates = [];
-    for (const raw of pgids) {
-      const pgid = Number(raw);
-      if (!Number.isInteger(pgid) || pgid <= 1 || snapshot.has(pgid)) continue;
-      validCandidates.push(pgid);
-      snapshot.set(pgid, isPidAlive(pgid));
+    if (Object.keys(mergedKnown).length > 0) {
+      seedWindowsKnownDescendants(mergedKnown);
+    }
+    for (const raw of rawList) {
+      const parsed = parseWindowsPgidKey(raw);
+      if (!parsed || snapshot.has(parsed.key)) continue;
+      validCandidates.push(parsed.key);
+      snapshot.set(parsed.key, isPidAlive(parsed.pid));
+      if (Array.isArray(options.knownDescendants)) {
+        seedWindowsKnownDescendants(parsed.key, options.knownDescendants);
+      }
+      if (parsed.key === parsed.pid) {
+        const bareEntries = mergedKnown[String(parsed.pid)];
+        const bareRoot = Array.isArray(bareEntries)
+          ? bareEntries.find((e) => Number(e?.pid ?? e?.ProcessId) === parsed.pid)
+          : null;
+        const bareCreation = bareRoot
+          ? normalizeCreationToken(bareRoot.creationDate ?? bareRoot.CreationDate)
+          : null;
+        const archivedKey = bareCreation ? `${parsed.pid}@${bareCreation}` : null;
+        if (archivedKey && winKnownTreeDescendants.has(archivedKey) && !snapshot.has(archivedKey)) {
+          validCandidates.push(archivedKey);
+          snapshot.set(archivedKey, true);
+        }
+      }
     }
     if (validCandidates.length > 0) {
-      const winRes = queryWindowsProcessGroups(validCandidates);
-      for (const [pgid, alive] of winRes.entries()) {
-        snapshot.set(pgid, Boolean(snapshot.get(pgid)) || alive);
+      const winRes = queryWindowsProcessGroups(validCandidates, spawnSyncFn, {
+        pgidStartTokens: mergedTokens,
+      });
+      for (const [pgidKey, alive] of winRes.entries()) {
+        snapshot.set(pgidKey, Boolean(alive));
       }
     }
     return snapshot;
   }
+  const killFn = options.killFn || process.kill.bind(process);
+  const hasCustomLiveness =
+    typeof options.livenessCheck === "function" &&
+    options.livenessCheck !== isPidAlive;
   const candidates = [];
-  for (const raw of pgids) {
-    const pgid = Number(raw);
+  for (const raw of rawList) {
+    const parsed = parseWindowsPgidKey(raw);
+    if (!parsed) continue;
+    const pgid = parsed.pid;
     if (!Number.isInteger(pgid) || pgid <= 1 || snapshot.has(pgid)) continue;
+    let groupExists = false;
     try {
-      process.kill(-pgid, 0);
-      candidates.push(pgid);
-      snapshot.set(pgid, false);
+      killFn(-pgid, 0);
+      groupExists = true;
     } catch (err) {
       if (err && err.code === "EPERM") {
-        candidates.push(pgid);
-        snapshot.set(pgid, false);
-      } else {
-        snapshot.set(pgid, false);
+        groupExists = true;
       }
     }
+    const customAlive = !groupExists && hasCustomLiveness && options.livenessCheck(pgid);
+    if (!groupExists && !customAlive) {
+      snapshot.set(pgid, false);
+      if (parsed.key !== pgid) {
+        snapshot.set(parsed.key, false);
+      }
+      continue;
+    }
+    const expectedToken =
+      parsed.rootCreation ||
+      mergedTokens[String(pgid)] ||
+      posixKnownPgidStartTokens.get(pgid) ||
+      null;
+    if (expectedToken) {
+      const actualToken = getPosixProcessStartToken(pgid, {
+        spawnSyncFn,
+        platform,
+        expectedToken,
+      });
+      if (actualToken !== null && actualToken !== expectedToken) {
+        snapshot.set(pgid, false);
+        if (parsed.key !== pgid) {
+          snapshot.set(parsed.key, false);
+        }
+        continue;
+      }
+      if (customAlive) {
+        snapshot.set(pgid, true);
+        if (parsed.key !== pgid) {
+          snapshot.set(parsed.key, true);
+        }
+        continue;
+      }
+    } else if (customAlive) {
+      snapshot.set(pgid, true);
+      if (parsed.key !== pgid) {
+        snapshot.set(parsed.key, true);
+      }
+      continue;
+    }
+    candidates.push(pgid);
+    snapshot.set(pgid, false);
   }
   if (candidates.length === 0) {
     return snapshot;
   }
   const candidateSet = new Set(candidates);
-  if (process.platform === "linux") {
+  if (platform === "linux") {
     try {
       const entries = fs.readdirSync("/proc");
       let inspectedAny = false;
@@ -268,7 +1362,7 @@ export function snapshotProcessGroupsOutsideLock(pgids) {
     }
   }
   try {
-    const res = spawnSync("ps", ["-axo", "pgid=,stat="], {
+    const res = spawnSyncFn("ps", ["-axo", "pgid=,stat="], {
       encoding: "utf8",
       timeout: 1500,
     });

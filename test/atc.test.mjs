@@ -8,15 +8,28 @@ import { Worker } from "node:worker_threads";
 
 import {
   acquireLock,
+  clearKnownPosixPgidStartTokens,
+  clearKnownWindowsTreeDescendants,
+  getKnownWindowsTreeDescendants,
+  getKnownWindowsTreePids,
+  getPosixProcessStartToken,
+  hasAliveProcessInGroup,
   isProcessGroupAlive,
+  killProcessGroupTree,
   queryWindowsProcessGroups,
   releaseLock,
+  seedWindowsKnownDescendants,
   sleepSync,
+  snapshotProcessGroupsOutsideLock,
   verifyLockOwnership,
   withLock,
   writeFileAtomic,
 } from "../src/lock.mjs";
 import {
+  addLeaseWorker,
+  archiveWindowsProcessGroupGeneration,
+  avdHasRuntimeLockFiles,
+  offlineAvdHasRuntimeLockFiles,
   createDefaultState,
   readState,
   commitState,
@@ -30,6 +43,7 @@ import {
   canJumpAhead,
   isTicketStarvationProtected,
   resolveSessionIdentity,
+  syncLeaseWorkers,
   withStateTransaction,
 } from "../src/state.mjs";
 import {
@@ -66,6 +80,7 @@ import {
   cmdExec,
   cmdStatus,
   cmdConfig,
+  cmdGc,
   cmdGuard,
   cmdGuide,
   parseCliArgs,
@@ -4049,7 +4064,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(subPrintfDeviceRewrite.fastPath, false);
             assert.equal(
               subPrintfDeviceRewrite.rewrittenCommand,
-              "ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c '$(printf ad)b shell getprop'",
+              '__atc_flags="$-" ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c \'case $__atc_flags in *f*) set -f;; esac; $(printf ad)b shell getprop\'',
             );
 
             const subPrintfHexKill = evaluateCommandGuard(
@@ -6778,8 +6793,21 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
             const fs = require("node:fs");
             const path = require("node:path");
             const statePath = path.join(process.argv[1], "state.json");
-            const st = JSON.parse(fs.readFileSync(statePath, "utf8"));
-            const old = st.leases["serial:emulator-5576"];
+            const lockPath = path.join(process.argv[1], "atc.lock");
+            const deadline = Date.now() + 3000;
+            let st;
+            while (Date.now() < deadline) {
+              try {
+                if (!fs.existsSync(lockPath)) {
+                  st = JSON.parse(fs.readFileSync(statePath, "utf8"));
+                  if (st.leases["serial:emulator-5576"]?.workerPids?.includes(process.pid)) {
+                    break;
+                  }
+                }
+              } catch {}
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            }
+            const old = st?.leases?.["serial:emulator-5576"];
             if (old) {
               delete st.leases["serial:emulator-5576"];
               old.avd = "Pixel_Rekeyed";
@@ -7092,6 +7120,2461 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     assert.equal(versionExit, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-MVP hardening: Windows multi-hop detached grandchild tracking, CreationDate PID-reuse guard, stale AVD dead-PID lock cleanup, and compound loop rewriting", async () => {
+  const dir = makeTempStateDir();
+  const avdHome = makeTempStateDir();
+  const rootPgid = 710001;
+  try {
+    // 1. Windows Multi-Hop Detached Grandchild Tracking & Cross-Invocation Persistence (Issue #3)
+    clearKnownWindowsTreeDescendants(rootPgid);
+
+    // Phase A: Root process (710001) spawns intermediate shell (710002), which spawns grandchild (710003)
+    const phaseAProcesses = [
+      { ProcessId: 710001, ParentProcessId: 4000, CreationDate: "20261010150000.000000+000" },
+      { ProcessId: 710002, ParentProcessId: 710001, CreationDate: "20261010150001.000000+000" },
+      { ProcessId: 710003, ParentProcessId: 710002, CreationDate: "20261010150002.000000+000" },
+    ];
+    const mapA = queryWindowsProcessGroups(
+      [rootPgid],
+      () => ({
+        status: 0,
+        stdout: JSON.stringify(phaseAProcesses),
+        stderr: "",
+      }),
+      { pgidStartTokens: { [String(rootPgid)]: "20261010150000.000000+000" } },
+    );
+    assert.equal(mapA.get(rootPgid), true);
+    const knownAfterA = getKnownWindowsTreeDescendants(rootPgid);
+    assert.deepEqual(knownAfterA, [
+      { pid: 710001, creationDate: "20261010150000.000000+000" },
+      { pid: 710002, creationDate: "20261010150001.000000+000" },
+      { pid: 710003, creationDate: "20261010150002.000000+000" },
+    ]);
+
+    // Phase B: Both root (710001) and intermediate shell (710002) exit; grandchild (710003) survives and spawns great-grandchild (710004)
+    const phaseBProcesses = [
+      { ProcessId: 710003, ParentProcessId: 710002, CreationDate: "20261010150002.000000+000" },
+      { ProcessId: 710004, ParentProcessId: 710003, CreationDate: "20261010150003.000000+000" },
+    ];
+    // Simulate a separate CLI invocation by clearing in-memory cache and seeding from persisted state.json metadata
+    clearKnownWindowsTreeDescendants(rootPgid);
+    assert.deepEqual(getKnownWindowsTreeDescendants(rootPgid), []);
+    seedWindowsKnownDescendants({ [String(rootPgid)]: knownAfterA });
+
+    const aliveInB = hasAliveProcessInGroup(rootPgid, null, {
+      platform: "win32",
+      runner: () => ({
+        status: 0,
+        stdout: JSON.stringify(phaseBProcesses),
+        stderr: "",
+      }),
+    });
+    assert.equal(
+      aliveInB,
+      true,
+      "Cross-invocation seeded descendants must detect surviving grandchild/great-grandchild after root & intermediate shell exit",
+    );
+    const knownAfterB = getKnownWindowsTreeDescendants(rootPgid);
+    assert.deepEqual(
+      knownAfterB.find((entry) => entry.pid === 710004),
+      { pid: 710004, creationDate: "20261010150003.000000+000" },
+    );
+
+    // Phase C: PID reuse guard — 710003 and 710004 exit, and OS reuses PID 710003 for an unrelated process with a different CreationDate
+    const phaseCReusedProcesses = [
+      { ProcessId: 710003, ParentProcessId: 8888, CreationDate: "20261010150999.000000+000" },
+      { ProcessId: 710099, ParentProcessId: 710003, CreationDate: "20261010151000.000000+000" },
+    ];
+    const aliveInC = hasAliveProcessInGroup(rootPgid, null, {
+      platform: "win32",
+      runner: () => ({
+        status: 0,
+        stdout: JSON.stringify(phaseCReusedProcesses),
+        stderr: "",
+      }),
+    });
+    assert.equal(
+      aliveInC,
+      false,
+      "Reused PID with mismatched CreationDate must not be treated as a live lease worker descendant",
+    );
+
+    // Phase D: killProcessGroupTree on Windows kills surviving verified descendants (710004) but skips reused PIDs (710003) and clears tracking
+    seedWindowsKnownDescendants({ [String(rootPgid)]: knownAfterB });
+    const killedWinPids = [];
+    killProcessGroupTree(rootPgid, "SIGTERM", {
+      platform: "win32",
+      runner: (cmd, args) => {
+        if (cmd === "powershell.exe") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              // 710003 was reused by an unrelated process -> must NOT be killed
+              { ProcessId: 710003, ParentProcessId: 8888, CreationDate: "20261010150999.000000+000" },
+              // 710004 is still the genuine great-grandchild -> MUST be killed
+              { ProcessId: 710004, ParentProcessId: 710003, CreationDate: "20261010150003.000000+000" },
+            ]),
+            stderr: "",
+          };
+        }
+        if (cmd === "taskkill") {
+          killedWinPids.push(Number(args[args.indexOf("/PID") + 1]));
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.deepEqual(killedWinPids, [710004]);
+    assert.deepEqual(getKnownWindowsTreeDescendants(rootPgid), []);
+
+    // Phase E: Cross-invocation state.json persistence across withStateTransaction, cmdStatus, cmdFree, and cmdGc
+    const now = Date.now();
+    seedWindowsKnownDescendants({ [String(rootPgid)]: knownAfterA });
+    const winState = createDefaultState();
+    winState.leases["serial:emulator-5554"] = {
+      leaseId: "lease_win_desc",
+      deviceKey: "serial:emulator-5554",
+      kind: "emulator",
+      avd: "Pixel_8_API_35",
+      serial: "emulator-5554",
+      profile: { apiLevel: "android-35", deviceType: "phone" },
+      sessionId: "win-desc-sess",
+      anchorPid: process.pid,
+      workerPid: rootPgid,
+      workerPids: [rootPgid],
+      workerPgids: [rootPgid],
+      workerDescendants: { [String(rootPgid)]: knownAfterA },
+      state: "active",
+      claimedAtMs: now - 10_000,
+      activatedAtMs: now - 9_000,
+      renewedAtMs: now - 1_000,
+      expiresAtMs: now + 300_000,
+    };
+    withLock(dir, (h) => commitState(dir, winState, h));
+
+    // Clear in-memory map to simulate a fresh CLI process (`atc status`)
+    clearKnownWindowsTreeDescendants(rootPgid);
+    const statusRes = cmdStatus(
+      dir,
+      { json: true },
+      {
+        platform: "win32",
+        livenessCheck: (pid) => pid === process.pid, // rootPgid (710001) itself is dead!
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify(phaseBProcesses),
+              stderr: "",
+            };
+          }
+          if (cmd === "adb" && args[0] === "devices") {
+            return {
+              status: 0,
+              stdout: "List of devices attached\nemulator-5554\tdevice\n",
+              stderr: "",
+            };
+          }
+          if (cmd === "android") {
+            return {
+              status: 0,
+              stdout: JSON.stringify({
+                avds: [
+                  {
+                    name: "Pixel_8_API_35",
+                    serial: "emulator-5554",
+                    online: true,
+                    api_level: "android-35",
+                    device_type: "phone",
+                  },
+                ],
+              }),
+              stderr: "",
+            };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(statusRes.exitCode, 0);
+    const persistedAfterStatus = readState(dir).leases["serial:emulator-5554"];
+    assert.ok(persistedAfterStatus, "Lease must remain active while detached grandchild 710003/710004 is alive");
+    assert.deepEqual(persistedAfterStatus.workerPids, [rootPgid]);
+    assert.deepEqual(
+      persistedAfterStatus.workerDescendants?.[String(rootPgid)]?.find((e) => e.pid === 710004),
+      { pid: 710004, creationDate: "20261010150003.000000+000" },
+      "Discovered multi-hop descendant 710004 must be persisted to state.json across CLI invocations",
+    );
+
+    // Simulate `atc free` in a separate CLI process: when leader PID (710001) is dead and detached grandchild (710004) is orphaned,
+    // `atc free` terminates the surviving detached grandchild tree outside atc.lock and frees the lease
+    clearKnownWindowsTreeDescendants(rootPgid);
+    const freeKilledPids = [];
+    const freeRes = cmdFree(
+      dir,
+      "lease_win_desc",
+      {},
+      {
+        platform: "win32",
+        env: { ATC_SESSION_ID: "win-desc-sess" },
+        livenessCheck: (pid) => pid === process.pid,
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                { ProcessId: 710004, ParentProcessId: 710003, CreationDate: "20261010150003.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            freeKilledPids.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(freeRes.exitCode, 0);
+    assert.deepEqual(freeRes.freed, ["lease_win_desc"]);
+    assert.deepEqual(
+      freeKilledPids,
+      [710004],
+      "atc free must terminate surviving detached grandchild discovered via persisted workerDescendants",
+    );
+    assert.equal(readState(dir).leases["serial:emulator-5554"], undefined);
+
+    // Simulate `atc gc` in a separate CLI process cleaning up an expired lease's detached Windows grandchild
+    const gcPgid = 720001;
+    const gcDescMap = [
+      { pid: 720001, creationDate: "20261010160000.000000+000" },
+      { pid: 720003, creationDate: "20261010160002.000000+000" },
+    ];
+    const gcState = createDefaultState();
+    gcState.leases["serial:emulator-5556"] = {
+      leaseId: "lease_win_gc",
+      deviceKey: "serial:emulator-5556",
+      kind: "emulator",
+      avd: "Pixel_GC",
+      serial: "emulator-5556",
+      profile: { apiLevel: "android-35", deviceType: "phone" },
+      sessionId: "win-gc-sess",
+      anchorPid: 99999991, // dead anchor
+      workerPid: gcPgid,
+      workerPids: [gcPgid],
+      workerPgids: [gcPgid],
+      workerDescendants: { [String(gcPgid)]: gcDescMap },
+      state: "active",
+      claimedAtMs: now - 700_000,
+      activatedAtMs: now - 699_000,
+      renewedAtMs: now - 650_000,
+      expiresAtMs: now - 10_000, // expired
+    };
+    withLock(dir, (h) => commitState(dir, gcState, h));
+    clearKnownWindowsTreeDescendants(gcPgid);
+    const gcKilledPids = [];
+    const gcRes = cmdGc(dir, {
+      platform: "win32",
+      livenessCheck: () => false,
+      runner: (cmd, args) => {
+        if (cmd === "powershell.exe") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: 720003, ParentProcessId: 720002, CreationDate: "20261010160002.000000+000" },
+            ]),
+            stderr: "",
+          };
+        }
+        if (cmd === "taskkill") {
+          gcKilledPids.push(Number(args[args.indexOf("/PID") + 1]));
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(gcRes.exitCode, 0);
+    assert.deepEqual(gcKilledPids, [720003], "atc gc must kill surviving detached grandchild of expired lease");
+    assert.equal(readState(dir).leases["serial:emulator-5556"], undefined);
+
+    // 2. Stale `.avd/*.lock` Dead-PID Detection in `avdHasRuntimeLockFiles`
+    const crashedAvdDir = path.join(avdHome, "Crashed_Pixel.avd");
+    fs.mkdirSync(crashedAvdDir, { recursive: true });
+    fs.writeFileSync(path.join(crashedAvdDir, "config.ini"), "hw.ramSize=2048\n");
+    const hwLockFile = path.join(crashedAvdDir, "hardware-qemu.ini.lock");
+    const modemLockFile = path.join(crashedAvdDir, "modem-nv-ram-5554.lock");
+    const snapshotLockDir = path.join(crashedAvdDir, "snapshot.lock");
+    fs.writeFileSync(hwLockFile, "59872 \n");
+    fs.writeFileSync(modemLockFile, " 59872\n");
+    fs.mkdirSync(snapshotLockDir, { recursive: true });
+    fs.writeFileSync(path.join(snapshotLockDir, "pid"), "59872");
+
+    // Dead PID (59872) -> avdHasRuntimeLockFiles returns false and removes stale lock files/dirs
+    const deadLockCheck = avdHasRuntimeLockFiles("Crashed_Pixel", avdHome, (pid) => pid !== 59872);
+    assert.equal(deadLockCheck, false, "Stale lock files with dead bare numeric PID must be ignored");
+    assert.equal(fs.existsSync(hwLockFile), false, "Dead-PID hardware-qemu.ini.lock must be cleaned up");
+    assert.equal(fs.existsSync(modemLockFile), false, "Dead-PID modem-nv-ram-5554.lock must be cleaned up");
+    assert.equal(fs.existsSync(snapshotLockDir), false, "Dead-PID snapshot.lock/pid directory must be cleaned up");
+
+    // Live numeric PID -> avdHasRuntimeLockFiles returns true and preserves the lock file
+    fs.writeFileSync(hwLockFile, `${process.pid}\n`);
+    assert.equal(avdHasRuntimeLockFiles("Crashed_Pixel", avdHome), true);
+    assert.equal(fs.existsSync(hwLockFile), true);
+
+    // Non-numeric / synthetic lock contents ("locked", "pid=123") -> preserved as active lock
+    fs.writeFileSync(hwLockFile, "locked");
+    assert.equal(avdHasRuntimeLockFiles("Crashed_Pixel", avdHome, () => false), true);
+    fs.writeFileSync(hwLockFile, "pid=123");
+    assert.equal(avdHasRuntimeLockFiles("Crashed_Pixel", avdHome, () => false), true);
+
+    // Verify discoverFleet + computeUsedEmulatorSlots do not count an offline AVD with a dead-PID lock as occupying a slot
+    fs.writeFileSync(hwLockFile, "59872\n");
+    const fleetWithCrashedLock = discoverFleet({
+      avdHome,
+      livenessCheck: (pid) => pid !== 59872,
+      runner: (cmd, args) => {
+        if (cmd === "adb" && args[0] === "devices") {
+          return { status: 0, stdout: "List of devices attached\n", stderr: "" };
+        }
+        if (cmd === "android") {
+          return {
+            status: 0,
+            stdout: "Crashed_Pixel offline android-35\n",
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(fleetWithCrashedLock.offline.length, 1);
+    assert.equal(fleetWithCrashedLock.offline[0].hasLockFiles, false);
+    assert.equal(computeUsedEmulatorSlots(createDefaultState(), fleetWithCrashedLock), 0);
+    assert.equal(
+      offlineAvdHasRuntimeLockFiles({ avd: "Crashed_Pixel" }, avdHome, (pid) => pid !== 59872),
+      false,
+    );
+
+    // 3. Generalized Compound Shell Loop Rewriting in `src/guard.mjs`
+    const activeLeases = [{ leaseId: "lease_loop", serial: "emulator-5554" }];
+
+    // 3a. Multi-variable `while read -r a b; do ...; done` pipeline (both simple and sh -c wrapped stages)
+    const multiReadSimple = evaluateCommandGuard(
+      'printf "com.example.one .MainActivity\\ncom.example.two .HomeActivity\\n" | while read -r pkg act; do adb shell am start -n "$pkg/$act"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(multiReadSimple.allowed, true);
+    assert.doesNotMatch(multiReadSimple.rewrittenCommand, /__atc_cmd_sub__/);
+    assert.equal(
+      multiReadSimple.rewrittenCommand,
+      'printf "com.example.one .MainActivity\\ncom.example.two .HomeActivity\\n" | while read -r pkg act ; do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- adb shell am start -n "$pkg/$act" ; done',
+    );
+
+    // Multi-variable `while IFS=, read -r -u 3 pkg out; do ... > "$out"; done` where `pkg` and `out` had prior static assignments
+    const multiReadRedir = evaluateCommandGuard(
+      'pkg=static_pkg; out=/tmp/static.txt; while IFS=, read -r -u 3 pkg out; do adb shell pm path "$pkg" > "$out"; done 3< pairs.csv',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(multiReadRedir.allowed, true);
+    assert.doesNotMatch(multiReadRedir.rewrittenCommand, /__atc_cmd_sub__/);
+    assert.doesNotMatch(
+      multiReadRedir.rewrittenCommand,
+      /pm path "static_pkg"/,
+      "Loop read variable pkg must override prior static shell variable inside loop body",
+    );
+    assert.match(
+      multiReadRedir.rewrittenCommand,
+      /do pkg="\$pkg" out="\$out" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell pm path "\$pkg" > "\$out"'/,
+    );
+
+    // Bare `while read -r; do ... "$REPLY" ...; done` preserves implicit REPLY variable
+    const bareReadReply = evaluateCommandGuard(
+      'adb shell pm list packages | while read -r; do adb shell pm path "$REPLY" > /tmp/paths.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bareReadReply.allowed, true);
+    assert.match(
+      bareReadReply.rewrittenCommand,
+      /do REPLY="\$REPLY" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell pm path "\$REPLY" > \/tmp\/paths\.txt'/,
+    );
+
+    // 3b. Nested `for` / `while` / `until` compound blocks
+    const nestedForFor = evaluateCommandGuard(
+      'a=outer_init; b=inner_init; for a in 1 2; do for b in x y; do adb shell "echo $a $b" > "/tmp/${a}_${b}.txt"; done; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(nestedForFor.allowed, true);
+    assert.doesNotMatch(nestedForFor.rewrittenCommand, /outer_init.*inner_init.*\/tmp\/outer_init/);
+    assert.match(
+      nestedForFor.rewrittenCommand,
+      /do a="\$a" b="\$b" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell "echo \$a \$b" > "\/tmp\/\$\{a\}_\$\{b\}\.txt"'/,
+    );
+
+    const nestedForWhileRead = evaluateCommandGuard(
+      'for suite in smoke full; do while read -r pkg runner; do adb shell am instrument -w "$pkg/$runner" > "/tmp/${suite}_${pkg}.log"; done < suites.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(nestedForWhileRead.allowed, true);
+    assert.match(
+      nestedForWhileRead.rewrittenCommand,
+      /do suite="\$suite" pkg="\$pkg" runner="\$runner" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell am instrument -w "\$pkg\/\$runner" > "\/tmp\/\$\{suite\}_\$\{pkg\}\.log"'/,
+    );
+
+    // 3c. C-style arithmetic `for (( i = 0; i < 3; i++ ))` and loop-mutated counter `i=0; while ...; do ...; i=$((i+1)); done`
+    const arithForLoop = evaluateCommandGuard(
+      'for (( i = 0; i < 3; i++ )); do adb shell input keyevent 24 > "/tmp/vol_$i.log"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(arithForLoop.allowed, true);
+    assert.match(
+      arithForLoop.rewrittenCommand,
+      /^for \(\( i = 0; i < 3; i\+\+ \)\) ; do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell input keyevent 24 > "\/tmp\/vol_\$i\.log"' ; done$/,
+    );
+
+    const mutatedWhileLoop = evaluateCommandGuard(
+      'i=0; until [ "$i" -ge 3 ]; do adb shell echo "$i" > "/tmp/iter_$i.txt"; i=$((i + 1)); done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(mutatedWhileLoop.allowed, true);
+    assert.doesNotMatch(
+      mutatedWhileLoop.rewrittenCommand,
+      /iter_0\.txt/,
+      "Loop-mutated counter i must not be statically inlined to initial value 0 inside loop body",
+    );
+    assert.match(
+      mutatedWhileLoop.rewrittenCommand,
+      /do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$i" > "\/tmp\/iter_\$i\.txt"' ; i=\$\(\(i \+ 1\)\) ; done$/,
+    );
+
+    // 3d. `read -ra parts` array subscript preservation across `sh -c` rewrites
+    const readArrayRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb shell echo "${parts[1]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readArrayRedir.allowed, true);
+    assert.doesNotMatch(
+      readArrayRedir.rewrittenCommand,
+      /\bparts="\$parts"/,
+      "Array variable from read -ra must not be flattened into scalar parts=\"$parts\"",
+    );
+    assert.match(
+      readArrayRedir.rewrittenCommand,
+      /do __atc_arr_parts_1="\$\{parts\[1\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_1\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
+    const readWholeArrayRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb install-multiple "${parts[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readWholeArrayRedir.allowed, true);
+    assert.match(
+      readWholeArrayRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    const readArrayKeysAtRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb shell echo "${!parts[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readArrayKeysAtRedir.allowed, true);
+    assert.match(
+      readArrayKeysAtRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    const readArrayKeysStarRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb shell echo "${!parts[*]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readArrayKeysStarRedir.allowed, true);
+    assert.match(
+      readArrayKeysStarRedir.rewrittenCommand,
+      /do __atc_arr_parts_keys="\$\{!parts\[\*\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_keys\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
+    // 1f. Tombstoned root identity when initial Windows snapshot misses already-exited root PID
+    const missedRootPgid = 730001;
+    clearKnownWindowsTreeDescendants(missedRootPgid);
+    try {
+      // Snapshot 1: root (730001) already exited, but child (730002) is alive and spawn-time root token was captured
+      const mapMissed1 = queryWindowsProcessGroups(
+        [missedRootPgid],
+        () => ({
+          status: 0,
+          stdout: JSON.stringify([
+            { ProcessId: 730002, ParentProcessId: 730001, CreationDate: "20261010170001.000000+000" },
+          ]),
+          stderr: "",
+        }),
+        { pgidStartTokens: { [String(missedRootPgid)]: "20261010170000.000000+000" } },
+      );
+      assert.equal(mapMissed1.get(missedRootPgid), true);
+      const knownMissed1 = getKnownWindowsTreeDescendants(missedRootPgid);
+      assert.deepEqual(
+        knownMissed1.find((e) => e.pid === missedRootPgid),
+        { pid: missedRootPgid, creationDate: "__exited__" },
+      );
+
+      // Snapshot 2: child (730002) exits, and Windows reuses root PID (730001) for an unrelated process with its own child (730099)
+      clearKnownWindowsTreeDescendants(missedRootPgid);
+      seedWindowsKnownDescendants({ [String(missedRootPgid)]: knownMissed1 });
+      const mapMissed2 = queryWindowsProcessGroups([missedRootPgid], () => ({
+        status: 0,
+        stdout: JSON.stringify([
+          { ProcessId: 730001, ParentProcessId: 9000, CreationDate: "20261010170999.000000+000" },
+          { ProcessId: 730099, ParentProcessId: 730001, CreationDate: "20261010171000.000000+000" },
+        ]),
+        stderr: "",
+      }));
+      assert.equal(
+        mapMissed2.get(missedRootPgid),
+        false,
+        "Tombstoned root PID missed on initial snapshot must not be adopted if reused later",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(missedRootPgid);
+    }
+
+    // 1g. cmdGc preserves live group leader on releaseOnWorkerExit lease
+    const liveLeaderPgid = 740001;
+    const liveGcState = createDefaultState();
+    liveGcState.leases["serial:emulator-5558"] = {
+      leaseId: "lease_live_leader_gc",
+      deviceKey: "serial:emulator-5558",
+      kind: "emulator",
+      avd: "Pixel_Live_GC",
+      serial: "emulator-5558",
+      profile: { apiLevel: "android-35", deviceType: "phone" },
+      sessionId: "live-gc-sess",
+      anchorPid: process.pid,
+      workerPid: liveLeaderPgid,
+      workerPids: [liveLeaderPgid],
+      workerPgids: [liveLeaderPgid],
+      workerPgidStartTokens: {
+        [String(liveLeaderPgid)]: "20261010180000.000000+000",
+      },
+      releaseOnWorkerExit: true,
+      state: "active",
+      claimedAtMs: now - 5_000,
+      activatedAtMs: now - 4_000,
+      renewedAtMs: now - 1_000,
+      expiresAtMs: now + 300_000,
+    };
+    withLock(dir, (h) => commitState(dir, liveGcState, h));
+    const liveGcKilled = [];
+    const liveGcRes = cmdGc(dir, {
+      platform: "win32",
+      livenessCheck: (pid) => pid === process.pid || pid === liveLeaderPgid,
+      runner: (cmd, args) => {
+        if (cmd === "powershell.exe") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: liveLeaderPgid, ParentProcessId: process.pid, CreationDate: "20261010180000.000000+000" },
+            ]),
+            stderr: "",
+          };
+        }
+        if (cmd === "taskkill") {
+          liveGcKilled.push(Number(args[args.indexOf("/PID") + 1]));
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(liveGcRes.exitCode, 0);
+    assert.deepEqual(liveGcKilled, [], "cmdGc must not kill an active worker group leader while it is still alive");
+    assert.ok(readState(dir).leases["serial:emulator-5558"], "Lease with live worker leader must remain active during GC");
+
+    // 1h. killProcessGroupTree on Windows aborts taskkill when PowerShell refresh fails/times out
+    const failedRefreshPgid = 750001;
+    seedWindowsKnownDescendants({
+      [String(failedRefreshPgid)]: [
+        { pid: failedRefreshPgid, creationDate: "20261010190000.000000+000" },
+        { pid: 750002, creationDate: "20261010190001.000000+000" },
+      ],
+    });
+    try {
+      const killedOnFailedRefresh = [];
+      const resFailedRefresh = killProcessGroupTree(failedRefreshPgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return { status: 1, stdout: "", stderr: "PowerShell timed out" };
+          }
+          if (cmd === "taskkill") {
+            killedOnFailedRefresh.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(resFailedRefresh, []);
+      assert.deepEqual(resFailedRefresh.terminatedPgids, []);
+      assert.deepEqual(
+        killedOnFailedRefresh,
+        [],
+        "killProcessGroupTree must not kill cached PIDs when PowerShell snapshot refresh fails",
+      );
+      assert.equal(
+        getKnownWindowsTreeDescendants(failedRefreshPgid).length,
+        2,
+        "Cached descendants must remain tracked when refresh fails so a subsequent retry can verify CreationDate",
+      );
+
+      const failedGcState = createDefaultState();
+      failedGcState.leases["serial:emulator-5560"] = {
+        leaseId: "lease_failed_refresh_gc",
+        deviceKey: "serial:emulator-5560",
+        kind: "emulator",
+        avd: "Pixel_Failed_Refresh_GC",
+        serial: "emulator-5560",
+        profile: { apiLevel: "android-35", deviceType: "phone" },
+        sessionId: "failed-gc-sess",
+        anchorPid: 999999,
+        workerPid: failedRefreshPgid,
+        workerPids: [failedRefreshPgid],
+        workerPgids: [failedRefreshPgid],
+        workerDescendants: {
+          [String(failedRefreshPgid)]: [
+            { pid: failedRefreshPgid, creationDate: "20261010190000.000000+000" },
+            { pid: 750002, creationDate: "20261010190001.000000+000" },
+          ],
+        },
+        releaseOnWorkerExit: true,
+        state: "active",
+        claimedAtMs: now - 600_000,
+        activatedAtMs: now - 599_000,
+        renewedAtMs: now - 500_000,
+        expiresAtMs: now - 10_000,
+      };
+      withLock(dir, (h) => commitState(dir, failedGcState, h));
+      const failedGcRes = cmdGc(dir, {
+        platform: "win32",
+        livenessCheck: () => false,
+        runner: (cmd) => {
+          if (cmd === "powershell.exe") {
+            return { status: 1, stdout: "", stderr: "PowerShell timed out" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(failedGcRes.exitCode, 0);
+      const preservedLease = readState(dir).leases["serial:emulator-5560"];
+      assert.ok(
+        preservedLease,
+        "cmdGc must not drop a lease when Windows tree termination could not be verified",
+      );
+      assert.equal(
+        preservedLease.workerDescendants?.[String(failedRefreshPgid)]?.length,
+        2,
+        "cmdGc must preserve workerDescendants when Windows tree termination could not be verified",
+      );
+
+      const resTimedOutTaskkill = killProcessGroupTree(failedRefreshPgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                { ProcessId: 750002, ParentProcessId: failedRefreshPgid, CreationDate: "20261010190001.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            return { status: null, error: new Error("spawnSync taskkill ETIMEDOUT") };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(resTimedOutTaskkill, []);
+      assert.deepEqual(
+        resTimedOutTaskkill.terminatedPgids,
+        [],
+        "killProcessGroupTree must not confirm termination when taskkill times out with status: null",
+      );
+      assert.equal(
+        getKnownWindowsTreeDescendants(failedRefreshPgid).length,
+        2,
+        "Cached descendants must remain tracked when taskkill times out",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(failedRefreshPgid);
+    }
+
+    // 2f. Concurrent replacement of stale AVD lock during liveness check preserves the new live lock
+    const raceAvdDir = path.join(avdHome, "Pixel_Race.avd");
+    fs.mkdirSync(raceAvdDir, { recursive: true });
+    const raceLockFile = path.join(raceAvdDir, "hardware-qemu.ini.lock");
+    fs.writeFileSync(raceLockFile, "99111\n", "utf8");
+    const raceLive = avdHasRuntimeLockFiles("Pixel_Race", avdHome, (pid) => {
+      if (pid === 99111) {
+        // Simulate a new emulator replacing the lock file right as the dead PID check runs
+        fs.unlinkSync(raceLockFile);
+        fs.writeFileSync(raceLockFile, "99222\n", "utf8");
+        return false;
+      }
+      return pid === 99222;
+    });
+    assert.equal(
+      raceLive,
+      true,
+      "Replacement lock file created concurrently with stale-lock cleanup must be preserved and reported as live",
+    );
+    assert.equal(fs.existsSync(raceLockFile), true);
+    assert.equal(fs.readFileSync(raceLockFile, "utf8").trim(), "99222");
+
+    // 3e. Unquoted ${parts[*]} and ${!parts[*]} forward outer IFS and array elements into bash -c without reusing $@
+    const readUnquotedStarRedir = evaluateCommandGuard(
+      "IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} > /tmp/out.txt; done < rows.txt",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readUnquotedStarRedir.allowed, true);
+    assert.match(
+      readUnquotedStarRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    const readUnquotedKeysStarRedir = evaluateCommandGuard(
+      "IFS=,; while read -ra parts; do adb shell echo ${!parts[*]} > /tmp/out.txt; done < rows.txt",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readUnquotedKeysStarRedir.allowed, true);
+    assert.match(
+      readUnquotedKeysStarRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    // 1i. cmdGc and cmdFree on Windows reap orphaned grandchildren even when exited group leader PID is reused by an unrelated process
+    const reusedLeaderPgid = 760001;
+    clearKnownWindowsTreeDescendants(reusedLeaderPgid);
+    try {
+      const reusedGcState = createDefaultState();
+      reusedGcState.leases["serial:emulator-5562"] = {
+        leaseId: "lease_reused_leader_gc",
+        deviceKey: "serial:emulator-5562",
+        kind: "emulator",
+        avd: "Pixel_Reused_Leader_GC",
+        serial: "emulator-5562",
+        profile: { apiLevel: "android-35", deviceType: "phone" },
+        sessionId: "reused-gc-sess",
+        anchorPid: process.pid,
+        workerPid: reusedLeaderPgid,
+        workerPids: [reusedLeaderPgid],
+        workerPgids: [reusedLeaderPgid],
+        workerDescendants: {
+          [String(reusedLeaderPgid)]: [
+            { pid: reusedLeaderPgid, creationDate: "20261010200000.000000+000" },
+            { pid: 760003, creationDate: "20261010200002.000000+000" },
+          ],
+        },
+        releaseOnWorkerExit: true,
+        state: "active",
+        claimedAtMs: now - 10_000,
+        activatedAtMs: now - 9_000,
+        renewedAtMs: now - 1_000,
+        expiresAtMs: now + 300_000,
+      };
+      withLock(dir, (h) => commitState(dir, reusedGcState, h));
+      const reusedGcKilled = [];
+      const reusedGcRes = cmdGc(dir, {
+        platform: "win32",
+        // Numeric PID 760001 is alive in OS because an unrelated process reused it!
+        livenessCheck: (pid) => pid === process.pid || pid === reusedLeaderPgid || pid === 760003,
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                // Unrelated process with a different CreationDate now occupies 760001
+                { ProcessId: reusedLeaderPgid, ParentProcessId: 4000, CreationDate: "20261010209999.000000+000" },
+                // Surviving detached grandchild from the original worker tree
+                { ProcessId: 760003, ParentProcessId: 760002, CreationDate: "20261010200002.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            for (let i = 0; i < args.length; i++) {
+              if (args[i] === "/PID" && args[i + 1]) {
+                reusedGcKilled.push(Number(args[i + 1]));
+              }
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(reusedGcRes.exitCode, 0);
+      assert.deepEqual(
+        reusedGcKilled,
+        [760003],
+        "cmdGc must terminate orphaned Windows grandchild without killing the unrelated process that reused the leader PID",
+      );
+      assert.equal(
+        readState(dir).leases["serial:emulator-5562"],
+        undefined,
+        "cmdGc must prune the releaseOnWorkerExit lease once orphaned grandchild is terminated despite leader PID reuse",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(reusedLeaderPgid);
+    }
+
+    // 1j. Missing/null CreationDate in CIM snapshot for a PID with an expected token is treated as unverifiable and aborts taskkill
+    const nullTokenPgid = 770001;
+    seedWindowsKnownDescendants({
+      [String(nullTokenPgid)]: [
+        { pid: nullTokenPgid, creationDate: "20261010210000.000000+000" },
+        { pid: 770002, creationDate: "20261010210001.000000+000" },
+      ],
+    });
+    try {
+      const nullTokenKilled = [];
+      const nullTokenRes = killProcessGroupTree(nullTokenPgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                // Live PID 770002 returned with null CreationDate (e.g., privileged replacement process)
+                { ProcessId: 770002, ParentProcessId: 4000, CreationDate: null },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            nullTokenKilled.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(nullTokenRes, []);
+      assert.deepEqual(
+        nullTokenRes.terminatedPgids,
+        [],
+        "killProcessGroupTree must abort destructive termination when expected CreationDate cannot be verified against a null CIM token",
+      );
+      assert.deepEqual(
+        nullTokenKilled,
+        [],
+        "killProcessGroupTree must not pass PID with missing CreationDate to taskkill /F",
+      );
+      assert.equal(
+        getKnownWindowsTreeDescendants(nullTokenPgid).length,
+        2,
+        "Cached descendants must remain intact when CreationDate is unverifiable",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(nullTokenPgid);
+    }
+
+    // 3f. Multi-array unquoted expansions use collision-free length framing (no in-band sentinel)
+    const multiUnquotedArraysRedir = evaluateCommandGuard(
+      'IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} "${!parts[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(multiUnquotedArraysRedir.allowed, true);
+    assert.doesNotMatch(
+      multiUnquotedArraysRedir.rewrittenCommand,
+      /__atc_end_arr_/,
+      "Multi-array forwarding must use length framing rather than an in-band sentinel",
+    );
+    assert.match(
+      multiUnquotedArraysRedir.rewrittenCommand,
+      /bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    // 3g. Bash scalar parameter modifiers (${x^^}, ${x:0:2}, ${#x}) are evaluated in the outer shell so /bin/sh (dash) does not fail with Bad substitution
+    const bashScalarModRedir = evaluateCommandGuard(
+      'for x in foo; do adb shell echo "${x^^}" "${x:0:2}" "${#x}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bashScalarModRedir.allowed, true);
+    assert.match(
+      bashScalarModRedir.rewrittenCommand,
+      /do __atc_var_x_0="\$\{x\^\^\}" __atc_var_x_1="\$\{x:0:2\}" __atc_var_x_len="\$\{#x\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_var_x_0\}" "\$\{__atc_var_x_1\}" "\$\{__atc_var_x_len\}" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 1k. POSIX killProcessGroupTree does not report pgid in terminatedPgids when kill(-pgid) fails with EPERM and group remains alive
+    const posixEpermPgid = 780001;
+    const posixEpermRes = killProcessGroupTree(posixEpermPgid, "SIGKILL", {
+      platform: "darwin",
+      killFn: (target) => {
+        if (target === -posixEpermPgid) {
+          const eperm = new Error("Operation not permitted");
+          eperm.code = "EPERM";
+          throw eperm;
+        }
+        const esrch = new Error("No such process");
+        esrch.code = "ESRCH";
+        throw esrch;
+      },
+      runner: (cmd) => {
+        if (cmd === "ps") {
+          return {
+            status: 0,
+            stdout: `${posixEpermPgid} S\n`,
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.deepEqual(posixEpermRes, []);
+    assert.deepEqual(
+      posixEpermRes.terminatedPgids,
+      [],
+      "POSIX killProcessGroupTree must not confirm termination when kill(-pgid) returns EPERM and group remains alive",
+    );
+
+    // 3h. Unquoted modified scalar expansion (${x^^}) preserves outer IFS inside sh -c
+    const unquotedScalarModIfs = evaluateCommandGuard(
+      "IFS=,; for x in 'a b,c'; do adb shell echo ${x^^} > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(unquotedScalarModIfs.allowed, true);
+    assert.match(
+      unquotedScalarModIfs.rewrittenCommand,
+      /do __atc_var_x_0="\$\{x\^\^\}" __atc_flags="\$-\" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$\{__atc_var_x_0\} > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 1l. Exited tracked intermediate PID is not traversed for new children after unobserved PID reuse + exit
+    const unobservedReusePgid = 790001;
+    seedWindowsKnownDescendants({
+      [String(unobservedReusePgid)]: [
+        { pid: unobservedReusePgid, creationDate: "20261010220000.000000+000" },
+        { pid: 790002, creationDate: "20261010220001.000000+000" },
+      ],
+    });
+    try {
+      const unobservedKilled = [];
+      const unobservedRes = killProcessGroupTree(unobservedReusePgid, "SIGTERM", {
+        platform: "win32",
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            return {
+              status: 0,
+              stdout: JSON.stringify([
+                // 790002 exited, was briefly reused by an unrelated parent that spawned 790099 and exited before this snapshot
+                { ProcessId: 790099, ParentProcessId: 790002, CreationDate: "20261010220500.000000+000" },
+              ]),
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            unobservedKilled.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.deepEqual(unobservedRes, []);
+      assert.deepEqual(
+        unobservedKilled,
+        [],
+        "killProcessGroupTree must not adopt or kill children of an already-exited intermediate PID after unobserved reuse",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(unobservedReusePgid);
+    }
+
+    // 1m. Newly discovered Windows root or child PID with missing/null CreationDate is rejected and not cached as creationDate: null
+    const nullInitialPgid = 800001;
+    clearKnownWindowsTreeDescendants(nullInitialPgid);
+    try {
+      const firstNullQuery = queryWindowsProcessGroups(
+        [nullInitialPgid],
+        () => ({
+          status: 0,
+          stdout: JSON.stringify([
+            { ProcessId: nullInitialPgid, ParentProcessId: 4000, CreationDate: null },
+          ]),
+          stderr: "",
+        }),
+        { triState: true, pgidStartTokens: { [String(nullInitialPgid)]: "20261010230000.000000+000" } },
+      );
+      assert.equal(
+        firstNullQuery.get(nullInitialPgid),
+        null,
+        "Initial snapshot with null CreationDate on live root PID must be treated as unverifiable (null in triState mode)",
+      );
+      assert.deepEqual(
+        getKnownWindowsTreeDescendants(nullInitialPgid),
+        [],
+        "PID with missing CreationDate must not be cached with creationDate: null",
+      );
+
+      // Child discovered via BFS with null CreationDate also marks snapshot unverifiable without caching creationDate: null
+      const bfsNullQuery = queryWindowsProcessGroups(
+        [nullInitialPgid],
+        () => ({
+          status: 0,
+          stdout: JSON.stringify([
+            { ProcessId: nullInitialPgid, ParentProcessId: 4000, CreationDate: "20261010230000.000000+000" },
+            { ProcessId: 800002, ParentProcessId: nullInitialPgid, CreationDate: null },
+          ]),
+          stderr: "",
+        }),
+        { triState: true, pgidStartTokens: { [String(nullInitialPgid)]: "20261010230000.000000+000" } },
+      );
+      assert.equal(
+        bfsNullQuery.get(nullInitialPgid),
+        null,
+        "Child discovered via BFS with null CreationDate must mark snapshot unverifiable",
+      );
+      assert.deepEqual(
+        getKnownWindowsTreeDescendants(nullInitialPgid),
+        [],
+        "Partial tree with unverifiable child CreationDate must not be cached",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(nullInitialPgid);
+    }
+
+    // 3i. Bash prefix-name expansions ("${!x@}" and unquoted ${!x*}) preserve multi-word positional arguments
+    const prefixNameAtRedir = evaluateCommandGuard(
+      'for x in ignored; do adb shell printf "%s\\n" "${!x@}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(prefixNameAtRedir.allowed, true);
+    assert.match(
+      prefixNameAtRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!x@\}" "--" ; done$/,
+    );
+
+    const prefixNameUnquotedStarRedir = evaluateCommandGuard(
+      'for x in ignored; do adb shell printf "%s\\n" ${!x*} > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(prefixNameUnquotedStarRedir.allowed, true);
+    assert.match(
+      prefixNameUnquotedStarRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{!x@\}" "--" ; done$/,
+    );
+
+    // 1n. POSIX killProcessGroupTree does not signal positive childPid when kill(-childPid) returns ESRCH
+    const posixEsrchPgid = 810001;
+    const posixSignaledTargets = [];
+    const posixEsrchRes = killProcessGroupTree(posixEsrchPgid, "SIGKILL", {
+      platform: "darwin",
+      killFn: (target) => {
+        posixSignaledTargets.push(target);
+        const esrch = new Error("No such process");
+        esrch.code = "ESRCH";
+        throw esrch;
+      },
+    });
+    assert.deepEqual(
+      posixSignaledTargets,
+      [-posixEsrchPgid],
+      "POSIX killProcessGroupTree must not fall back to signaling positive childPid when process group -childPid is gone",
+    );
+    assert.deepEqual(posixEsrchRes, []);
+    assert.deepEqual(posixEsrchRes.terminatedPgids, [posixEsrchPgid]);
+
+    // 3j. Unquoted ordinary dynamic variables ($x and ${x}) preserve outer IFS inside sh -c
+    const unquotedPlainVarIfs = evaluateCommandGuard(
+      "IFS=,; for x in 'a b,c'; do adb shell echo $x > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(unquotedPlainVarIfs.allowed, true);
+    assert.match(
+      unquotedPlainVarIfs.rewrittenCommand,
+      /do __atc_flags="\$-\" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$x > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3k. Bare arithmetic variables ($((x + 1))) and array subscripts ($((parts[1] + 1))) are forwarded into rewritten shells
+    const bareArithVarRedir = evaluateCommandGuard(
+      "for x in 1 2; do adb shell echo $((x + 1)) > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bareArithVarRedir.allowed, true);
+    assert.match(
+      bareArithVarRedir.rewrittenCommand,
+      /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x \+ 1\)\) > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3l. mapfile / readarray loop destination arrays (and default MAPFILE) are tracked and forwarded
+    const mapfileNamedRedir = evaluateCommandGuard(
+      'while mapfile -t -n 1 parts; do adb shell echo "${parts[0]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(mapfileNamedRedir.allowed, true);
+    assert.match(
+      mapfileNamedRedir.rewrittenCommand,
+      /do __atc_arr_parts_0="\$\{parts\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
+    const readarrayDefaultRedir = evaluateCommandGuard(
+      'while readarray -t -n 1; do adb shell echo "${MAPFILE[0]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readarrayDefaultRedir.allowed, true);
+    assert.match(
+      readarrayDefaultRedir.rewrittenCommand,
+      /do __atc_arr_MAPFILE_0="\$\{MAPFILE\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_MAPFILE_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
+    // 1o. Windows process-group generation archiving isolates reused leader PID across worker generations
+    {
+      const genLeaderPgid = 820001;
+      const oldGenChildPid = 820002;
+      const newGenChildPid = 820003;
+      const gen1Creation = "20261010231000.000000+000";
+      const gen1ChildCreation = "20261010231001.000000+000";
+      const gen2Creation = "20261010232000.000000+000";
+      const gen2ChildCreation = "20261010232001.000000+000";
+      const gen1ArchiveKey = `${genLeaderPgid}@${gen1Creation}`;
+      clearKnownWindowsTreeDescendants(genLeaderPgid);
+      clearKnownWindowsTreeDescendants(gen1ArchiveKey);
+      try {
+        const genLease = {
+          leaseId: "lease_win_gen",
+          deviceKey: "avd:Pixel_Gen",
+          workerPids: [genLeaderPgid],
+          workerPid: genLeaderPgid,
+          workerPgids: [genLeaderPgid],
+          workerDescendants: {
+            [String(genLeaderPgid)]: [
+              { pid: genLeaderPgid, creationDate: gen1Creation, alive: false },
+              { pid: oldGenChildPid, creationDate: gen1ChildCreation, alive: true },
+            ],
+          },
+        };
+        seedWindowsKnownDescendants(genLease.workerDescendants);
+
+        // New worker spawns reusing numeric PID 820001 with gen2Creation while oldGenChildPid (820002) is still running
+        const archivedKey = archiveWindowsProcessGroupGeneration(genLeaderPgid);
+        assert.equal(archivedKey, gen1ArchiveKey);
+
+        const gen2Snapshot = [
+          { ProcessId: genLeaderPgid, ParentProcessId: 4000, CreationDate: gen2Creation },
+          { ProcessId: newGenChildPid, ParentProcessId: genLeaderPgid, CreationDate: gen2ChildCreation },
+          { ProcessId: oldGenChildPid, ParentProcessId: 1, CreationDate: gen1ChildCreation },
+        ];
+        queryWindowsProcessGroups(
+          [gen1ArchiveKey, genLeaderPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify(gen2Snapshot),
+            stderr: "",
+          }),
+          {
+            knownDescendants: genLease.workerDescendants,
+            pgidStartTokens: { [String(genLeaderPgid)]: gen2Creation },
+          },
+        );
+
+        addLeaseWorker(
+          genLease,
+          genLeaderPgid,
+          (pid) => [genLeaderPgid, oldGenChildPid, newGenChildPid].includes(pid),
+          { isProcessGroup: true, freshGeneration: true },
+        );
+
+        assert.ok(
+          genLease.workerPgids.includes(gen1ArchiveKey) &&
+            genLease.workerPgids.includes(genLeaderPgid),
+          `Expected lease.workerPgids to track both archived ${gen1ArchiveKey} and current ${genLeaderPgid}, got ${JSON.stringify(genLease.workerPgids)}`,
+        );
+        assert.deepEqual(
+          getKnownWindowsTreeDescendants(genLeaderPgid).map((e) => e.pid).sort((a, b) => a - b),
+          [genLeaderPgid, newGenChildPid],
+          "Current generation tree must contain new root and new child, not old generation descendant",
+        );
+        assert.deepEqual(
+          getKnownWindowsTreePids(gen1ArchiveKey, { liveOnly: true }),
+          [oldGenChildPid],
+          "Archived generation tree must retain only the surviving old generation descendant",
+        );
+
+        // Signal forwarding / cleanup for the new worker (numeric genLeaderPgid) terminates only gen2 and spares oldGenChildPid
+        const killedGen2Pids = [];
+        killProcessGroupTree(genLeaderPgid, "SIGTERM", {
+          platform: "win32",
+          runner: (cmd, args) => {
+            if (cmd === "powershell.exe") {
+              return {
+                status: 0,
+                stdout: JSON.stringify(gen2Snapshot),
+                stderr: "",
+              };
+            }
+            if (cmd === "taskkill") {
+              for (let i = 0; i < args.length; i += 1) {
+                if (args[i] === "/PID") {
+                  killedGen2Pids.push(Number(args[i + 1]));
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        });
+        assert.deepEqual(
+          killedGen2Pids.sort((a, b) => a - b),
+          [genLeaderPgid, newGenChildPid],
+          "Terminating new worker generation must kill new root and new child without killing old generation descendant",
+        );
+      } finally {
+        clearKnownWindowsTreeDescendants(genLeaderPgid);
+        clearKnownWindowsTreeDescendants(gen1ArchiveKey);
+      }
+    }
+
+    // 3m. `printf -v` scalar and array-element destinations in loop bodies are tracked and forwarded
+    const printfVLoopRedir = evaluateCommandGuard(
+      'for x in a b; do printf -v y "%s" "$x"; adb shell echo "$y" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(printfVLoopRedir.allowed, true);
+    assert.match(
+      printfVLoopRedir.rewrittenCommand,
+      /y="\$y" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$y" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const printfVArrayLoopRedir = evaluateCommandGuard(
+      'for x in a b; do printf -v "arr[0]" "%s" "$x"; adb shell echo "${arr[0]}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(printfVArrayLoopRedir.allowed, true);
+    assert.match(
+      printfVArrayLoopRedir.rewrittenCommand,
+      /__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 1p. Cross-lease reused Windows leader PID disassociates bare PGID from the previous lease
+    {
+      const crossLeaderPgid = 830001;
+      const oldLeaseChildPid = 830002;
+      const newLeaseChildPid = 830003;
+      const genACreation = "20261010233000.000000+000";
+      const genAChildCreation = "20261010233001.000000+000";
+      const genBCreation = "20261010234000.000000+000";
+      const genBChildCreation = "20261010234001.000000+000";
+      const genAArchiveKey = `${crossLeaderPgid}@${genACreation}`;
+      clearKnownWindowsTreeDescendants(crossLeaderPgid);
+      clearKnownWindowsTreeDescendants(genAArchiveKey);
+      try {
+        const leaseA = {
+          leaseId: "lease_win_cross_a",
+          deviceKey: "avd:Pixel_Cross_A",
+          workerPids: [crossLeaderPgid],
+          workerPid: crossLeaderPgid,
+          workerPgids: [crossLeaderPgid],
+          workerDescendants: {
+            [String(crossLeaderPgid)]: [
+              { pid: crossLeaderPgid, creationDate: genACreation, alive: false },
+              { pid: oldLeaseChildPid, creationDate: genAChildCreation, alive: true },
+            ],
+          },
+        };
+        const leaseB = {
+          leaseId: "lease_win_cross_b",
+          deviceKey: "avd:Pixel_Cross_B",
+          workerPids: [],
+          workerPid: null,
+        };
+        seedWindowsKnownDescendants(leaseA.workerDescendants);
+        archiveWindowsProcessGroupGeneration(crossLeaderPgid);
+
+        const crossSnapshot = [
+          { ProcessId: crossLeaderPgid, ParentProcessId: 4000, CreationDate: genBCreation },
+          { ProcessId: newLeaseChildPid, ParentProcessId: crossLeaderPgid, CreationDate: genBChildCreation },
+          { ProcessId: oldLeaseChildPid, ParentProcessId: 1, CreationDate: genAChildCreation },
+        ];
+        queryWindowsProcessGroups(
+          [genAArchiveKey, crossLeaderPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify(crossSnapshot),
+            stderr: "",
+          }),
+          {
+            knownDescendants: leaseA.workerDescendants,
+            pgidStartTokens: { [String(crossLeaderPgid)]: genBCreation },
+          },
+        );
+
+        const liveCheck = (pid) =>
+          [crossLeaderPgid, oldLeaseChildPid, newLeaseChildPid].includes(pid);
+        syncLeaseWorkers(leaseA, liveCheck);
+        addLeaseWorker(leaseB, crossLeaderPgid, liveCheck, {
+          isProcessGroup: true,
+          freshGeneration: true,
+        });
+
+        assert.deepEqual(
+          leaseA.workerPgids,
+          [genAArchiveKey],
+          "Previous lease must replace bare PGID with archived generation key and not retain bare PGID owned by new lease",
+        );
+        assert.deepEqual(
+          leaseB.workerPgids,
+          [crossLeaderPgid],
+          "New lease must own the bare numeric PGID for the current generation",
+        );
+
+        const killedLeaseAPids = [];
+        killProcessGroupTree(leaseA, "SIGKILL", {
+          platform: "win32",
+          runner: (cmd, args) => {
+            if (cmd === "powershell.exe") {
+              return { status: 0, stdout: JSON.stringify(crossSnapshot), stderr: "" };
+            }
+            if (cmd === "taskkill") {
+              for (let i = 0; i < args.length; i += 1) {
+                if (args[i] === "/PID") {
+                  killedLeaseAPids.push(Number(args[i + 1]));
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        });
+        assert.deepEqual(
+          killedLeaseAPids,
+          [oldLeaseChildPid],
+          "Killing previous lease must only terminate its archived generation descendant and spare new lease worker",
+        );
+      } finally {
+        clearKnownWindowsTreeDescendants(crossLeaderPgid);
+        clearKnownWindowsTreeDescendants(genAArchiveKey);
+      }
+    }
+
+    // 3n. `getopts` loop variable and `OPTARG` are tracked and forwarded
+    const getoptsLoopRedir = evaluateCommandGuard(
+      'while getopts "s:" opt; do adb shell echo "$opt:$OPTARG" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(getoptsLoopRedir.allowed, true);
+    assert.match(
+      getoptsLoopRedir.rewrittenCommand,
+      /OPTARG="\$OPTARG" opt="\$opt" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$opt:\$OPTARG" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3o. Redirected loop stages using Bash syntax (brace expansion, process substitution) preserve `bash -c`
+    const bashBraceLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo {a,b} > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bashBraceLoopRedir.allowed, true);
+    assert.match(
+      bashBraceLoopRedir.rewrittenCommand,
+      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo \{a,b\} > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const bashProcSubLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell cat <(printf foo) > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bashProcSubLoopRedir.allowed, true);
+    assert.match(
+      bashProcSubLoopRedir.rewrittenCommand,
+      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell cat <\(printf foo\) > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 1q. Tombstoned-root generation (`creationDate: "__exited__"`) is archived under a synthetic generation key when root PID is reused
+    {
+      const tombLeaderPgid = 840001;
+      const tombOldChildPid = 840002;
+      const tombNewChildPid = 840003;
+      const tombOldChildCreation = "20261010235001.000000+000";
+      const tombNewRootCreation = "20261010235500.000000+000";
+      const tombNewChildCreation = "20261010235501.000000+000";
+      const expectedTombArchiveKey = `${tombLeaderPgid}@__exited__:${tombOldChildPid}:${tombOldChildCreation}`;
+      clearKnownWindowsTreeDescendants(tombLeaderPgid);
+      clearKnownWindowsTreeDescendants(expectedTombArchiveKey);
+      try {
+        const tombLeaseA = {
+          leaseId: "lease_win_tomb_a",
+          deviceKey: "avd:Pixel_Tomb_A",
+          workerPids: [tombLeaderPgid],
+          workerPid: tombLeaderPgid,
+          workerPgids: [tombLeaderPgid],
+          workerDescendants: {
+            [String(tombLeaderPgid)]: [
+              { pid: tombLeaderPgid, creationDate: "__exited__", alive: false },
+              { pid: tombOldChildPid, creationDate: tombOldChildCreation, alive: true },
+            ],
+          },
+        };
+        const tombLeaseB = {
+          leaseId: "lease_win_tomb_b",
+          deviceKey: "avd:Pixel_Tomb_B",
+          workerPids: [],
+          workerPid: null,
+        };
+        seedWindowsKnownDescendants(tombLeaseA.workerDescendants);
+        const archivedKey = archiveWindowsProcessGroupGeneration(tombLeaderPgid);
+        assert.equal(archivedKey, expectedTombArchiveKey);
+
+        const tombSnapshot = [
+          { ProcessId: tombLeaderPgid, ParentProcessId: 4000, CreationDate: tombNewRootCreation },
+          { ProcessId: tombNewChildPid, ParentProcessId: tombLeaderPgid, CreationDate: tombNewChildCreation },
+          { ProcessId: tombOldChildPid, ParentProcessId: 1, CreationDate: tombOldChildCreation },
+        ];
+        queryWindowsProcessGroups(
+          [expectedTombArchiveKey, tombLeaderPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify(tombSnapshot),
+            stderr: "",
+          }),
+          {
+            knownDescendants: tombLeaseA.workerDescendants,
+            pgidStartTokens: { [String(tombLeaderPgid)]: tombNewRootCreation },
+          },
+        );
+
+        const liveCheck = (pid) =>
+          [tombLeaderPgid, tombOldChildPid, tombNewChildPid].includes(pid);
+        syncLeaseWorkers(tombLeaseA, liveCheck);
+        addLeaseWorker(tombLeaseB, tombLeaderPgid, liveCheck, {
+          isProcessGroup: true,
+          freshGeneration: true,
+        });
+
+        assert.deepEqual(tombLeaseA.workerPgids, [expectedTombArchiveKey]);
+        assert.deepEqual(tombLeaseB.workerPgids, [tombLeaderPgid]);
+        assert.deepEqual(
+          getKnownWindowsTreePids(expectedTombArchiveKey, { liveOnly: true }),
+          [tombOldChildPid],
+        );
+        assert.deepEqual(
+          getKnownWindowsTreePids(tombLeaderPgid, { liveOnly: true }).sort((a, b) => a - b),
+          [tombLeaderPgid, tombNewChildPid],
+        );
+      } finally {
+        clearKnownWindowsTreeDescendants(tombLeaderPgid);
+        clearKnownWindowsTreeDescendants(expectedTombArchiveKey);
+      }
+    }
+
+    // 1r. POSIX `free --force` / `killProcessGroupTree` verifies group leader start token before signaling `-pgid`
+    {
+      const posixReusedPgid = 850001;
+      const posixUnverifiablePgid = 850002;
+      const posixVerifiedPgid = 850003;
+      const recordedToken = "Mon Oct 10 10:00:00 2026";
+      const reusedToken = "Mon Oct 10 10:05:00 2026";
+      clearKnownPosixPgidStartTokens(posixReusedPgid);
+      clearKnownPosixPgidStartTokens(posixUnverifiablePgid);
+      clearKnownPosixPgidStartTokens(posixVerifiedPgid);
+      try {
+        // Case A: Reused POSIX leader PID (mismatched start token) is NOT signaled by `free --force`, and stale PGID is pruned
+        withStateTransaction(dir, (state, { now }) => {
+          state.leases["avd:Pixel_Posix_Reused"] = {
+            leaseId: "lease_posix_reused",
+            deviceKey: "avd:Pixel_Posix_Reused",
+            avd: "Pixel_Posix_Reused",
+            serial: "emulator-5596",
+            kind: "emulator",
+            state: "active",
+            sessionId: "posix-reused-sess",
+            anchorPid: process.pid,
+            workerPid: posixReusedPgid,
+            workerPids: [posixReusedPgid],
+            workerPgids: [posixReusedPgid],
+            workerPgidStartTokens: {
+              [String(posixReusedPgid)]: recordedToken,
+            },
+            claimedAtMs: now - 5000,
+            renewedAtMs: now - 1000,
+            expiresAtMs: now + 60_000,
+          };
+          return { mutated: true };
+        });
+
+        const signaledReused = [];
+        const freeReusedRes = cmdFree(
+          dir,
+          "lease_posix_reused",
+          { session: "admin-sess", force: true },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixReusedPgid,
+            killFn: (targetPid, sig) => {
+              if (sig !== 0) {
+                signaledReused.push({ targetPid, sig });
+              }
+            },
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${reusedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixReusedPgid} S\n`, stderr: "" };
+            },
+          },
+        );
+        assert.equal(freeReusedRes.exitCode, 0);
+        assert.deepEqual(
+          signaledReused,
+          [],
+          "POSIX free --force must not signal -pgid when the leader PID start token mismatches (reused PID)",
+        );
+        assert.equal(
+          readState(dir).leases["avd:Pixel_Posix_Reused"],
+          undefined,
+          "Lease must be released after reused POSIX leader PID is pruned without signaling the unrelated process group",
+        );
+
+        // Case B: Live POSIX leader PID with missing/unverifiable start token fails closed without signaling `-pgid`
+        withStateTransaction(
+          dir,
+          (state, { now }) => {
+            state.leases["avd:Pixel_Posix_Unverifiable"] = {
+              leaseId: "lease_posix_unverifiable",
+              deviceKey: "avd:Pixel_Posix_Unverifiable",
+              avd: "Pixel_Posix_Unverifiable",
+              serial: "emulator-5597",
+              kind: "emulator",
+              state: "active",
+              sessionId: "posix-unverifiable-sess",
+              anchorPid: process.pid,
+              workerPid: posixUnverifiablePgid,
+              workerPids: [posixUnverifiablePgid],
+              workerPgids: [posixUnverifiablePgid],
+              workerPgidStartTokens: {
+                [String(posixUnverifiablePgid)]: recordedToken,
+              },
+              claimedAtMs: now - 5000,
+              renewedAtMs: now - 1000,
+              expiresAtMs: now + 60_000,
+            };
+            return { mutated: true };
+          },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixUnverifiablePgid,
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixUnverifiablePgid} S\n`, stderr: "" };
+            },
+          },
+        );
+
+        const signaledUnverifiable = [];
+        const freeUnverifiableRes = cmdFree(
+          dir,
+          "lease_posix_unverifiable",
+          { session: "admin-sess", force: true },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixUnverifiablePgid,
+            killFn: (targetPid, sig) => {
+              if (sig !== 0) {
+                signaledUnverifiable.push({ targetPid, sig });
+              }
+            },
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 1, stdout: "", stderr: "ps failed" };
+              }
+              return { status: 0, stdout: `${posixUnverifiablePgid} S\n`, stderr: "" };
+            },
+          },
+        );
+        assert.equal(
+          freeUnverifiableRes.exitCode,
+          3,
+          "POSIX free --force must retain the lease when a live leader PID's start token cannot be verified",
+        );
+        assert.deepEqual(
+          signaledUnverifiable,
+          [],
+          "POSIX free --force must not signal -pgid when start token lookup fails for a live leader PID",
+        );
+        withStateTransaction(dir, (state) => {
+          delete state.leases["avd:Pixel_Posix_Unverifiable"];
+          return { mutated: true };
+        });
+
+        // Case C: Verified POSIX leader PID (matching start token) IS signaled by `free --force` and lease is released
+        withStateTransaction(
+          dir,
+          (state, { now }) => {
+            state.leases["avd:Pixel_Posix_Verified"] = {
+              leaseId: "lease_posix_verified",
+              deviceKey: "avd:Pixel_Posix_Verified",
+              avd: "Pixel_Posix_Verified",
+              serial: "emulator-5598",
+              kind: "emulator",
+              state: "active",
+              sessionId: "posix-verified-sess",
+              anchorPid: process.pid,
+              workerPid: posixVerifiedPgid,
+              workerPids: [posixVerifiedPgid],
+              workerPgids: [posixVerifiedPgid],
+              workerPgidStartTokens: {
+                [String(posixVerifiedPgid)]: recordedToken,
+              },
+              claimedAtMs: now - 5000,
+              renewedAtMs: now - 1000,
+              expiresAtMs: now + 60_000,
+            };
+            return { mutated: true };
+          },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixVerifiedPgid,
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixVerifiedPgid} S\n`, stderr: "" };
+            },
+          },
+        );
+
+        const signaledVerified = [];
+        const freeVerifiedRes = cmdFree(
+          dir,
+          "lease_posix_verified",
+          { session: "admin-sess", force: true },
+          {
+            platform: "darwin",
+            livenessCheck: (pid) => pid === process.pid || pid === posixVerifiedPgid,
+            killFn: (targetPid, sig) => {
+              if (sig !== 0) {
+                signaledVerified.push({ targetPid, sig });
+              }
+            },
+            spawnSyncFn: (cmd, args) => {
+              if (cmd === "ps" && args[0] === "-o" && args[1] === "lstart=") {
+                return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+              }
+              return { status: 0, stdout: `${posixVerifiedPgid} S\n`, stderr: "" };
+            },
+          },
+        );
+        assert.equal(freeVerifiedRes.exitCode, 0);
+        assert.deepEqual(signaledVerified, [
+          { targetPid: -posixVerifiedPgid, sig: "SIGKILL" },
+        ]);
+        assert.equal(readState(dir).leases["avd:Pixel_Posix_Verified"], undefined);
+
+        // Case D: `addLeaseWorker` does not spawn a subprocess on macOS when `startToken` is null (default `allowSubprocess: false`)
+        let addWorkerSpawnCalled = false;
+        const noSubLease = {
+          leaseId: "lease_no_sub",
+          deviceKey: "avd:Pixel_No_Sub",
+          workerPids: [],
+          workerPid: null,
+        };
+        addLeaseWorker(noSubLease, process.pid, undefined, {
+          isProcessGroup: true,
+          platform: "darwin",
+          spawnSyncFn: () => {
+            addWorkerSpawnCalled = true;
+            return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+          },
+        });
+        assert.equal(
+          addWorkerSpawnCalled,
+          false,
+          "addLeaseWorker must not spawn a subprocess under atc.lock by default when startToken is omitted",
+        );
+      } finally {
+        clearKnownPosixPgidStartTokens(posixReusedPgid);
+        clearKnownPosixPgidStartTokens(posixUnverifiablePgid);
+        clearKnownPosixPgidStartTokens(posixVerifiedPgid);
+      }
+    }
+
+    // 3p. Loop variables (including `mapfile` arrays) are propagated into recursive `$(...)` and backtick command substitutions
+    const forCmdSubLoop = evaluateCommandGuard(
+      'while read -r x; do echo "$(adb shell echo "$x" > /tmp/out.txt)"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(forCmdSubLoop.allowed, true);
+    assert.match(
+      forCmdSubLoop.rewrittenCommand,
+      /^while read -r x ; do echo "\$\(x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'\)" ; done$/,
+    );
+
+    const mapfileCmdSubLoop = evaluateCommandGuard(
+      'while mapfile -t arr; do echo "$(adb shell echo "${arr[0]}" > /tmp/out.txt)"; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(mapfileCmdSubLoop.allowed, true);
+    assert.match(
+      mapfileCmdSubLoop.rewrittenCommand,
+      /echo "\$\(__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt'\)" ; done$/,
+    );
+
+    const backtickCmdSubLoop = evaluateCommandGuard(
+      'for x in a b; do echo `adb shell echo "$x" > /tmp/out.txt`; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(backtickCmdSubLoop.allowed, true);
+    assert.match(
+      backtickCmdSubLoop.rewrittenCommand,
+      /^for x in a b ; do echo `x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'` ; done$/,
+    );
+
+    // 3q. Extended-glob alternation (`@(foo|bar)`) is not split as a pipeline and uses `bash -O extglob -c`, whereas arithmetic `$((a*(b+1)))` stays on `sh -c`
+    const extglobLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo @(foo|bar) > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(extglobLoopRedir.allowed, true);
+    assert.match(
+      extglobLoopRedir.rewrittenCommand,
+      /__atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const arithMultLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo $((x*(x+1))) > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(arithMultLoopRedir.allowed, true);
+    assert.match(
+      arithMultLoopRedir.rewrittenCommand,
+      /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x\*\(x\+1\)\)\) > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // 3r. Positional parameters ($0, $1, $@, ${!#}) inside functions or after `set --` are forwarded into rewritten shells and not clobbered by array transport
+    const funcZeroParamLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo "$0" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(funcZeroParamLoopRedir.allowed, true);
+    assert.match(
+      funcZeroParamLoopRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$0" > \/tmp\/out\.txt' "\$0" ; done$/,
+    );
+
+    const funcPositionalLoopRedir = evaluateCommandGuard(
+      'f() { for x in 1; do adb shell echo "$1" "${!#}" > /tmp/out.txt; done; }; f expected',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(funcPositionalLoopRedir.allowed, true);
+    assert.match(
+      funcPositionalLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell echo "\$1" "\$\{!#\}" > \/tmp\/out\.txt' bash "\$@" ; done ; \} ; f expected$/,
+    );
+
+    const funcArrayAndPositionalLoopRedir = evaluateCommandGuard(
+      'f() { while read -ra parts; do adb shell echo "$0" "$1" "${X:-${parts[@]}}" > /tmp/out.txt; done < rows.txt; }; f expected',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(funcArrayAndPositionalLoopRedir.allowed, true);
+    assert.match(
+      funcArrayAndPositionalLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; case \$__atc_flags in \*u\*\) set -u;; esac; adb shell echo "\$0" "\$1" "\$\{X:-\$\{__atc_arr_at_0\[@\]\}\}" > \/tmp\/out\.txt' "\$0" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
+    );
+
+    // 3s. Array alias names do not collide when distinct array/subscript pairs flatten to the same prefix (${a_b[c]} vs ${a[b_c]}) or with reserved __atc_arr_at_<idx> (${at[0]})
+    const collidingArrayAliasesRedir = evaluateCommandGuard(
+      'while read -ra a_b && read -ra a && read -ra at; do adb shell echo "${a_b[c]}" "${a[b_c]}" "${at[0]}" "${a[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(collidingArrayAliasesRedir.allowed, true);
+    assert.match(
+      collidingArrayAliasesRedir.rewrittenCommand,
+      /do __atc_arr_a_b_c="\$\{a_b\[c\]\}" __atc_arr_a_b_c_0="\$\{a\[b_c\]\}" __atc_arr_at_0_1="\$\{at\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$\{__atc_arr_a_b_c\}" "\$\{__atc_arr_a_b_c_0\}" "\$\{__atc_arr_at_0_1\}" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#a\[@\]\}" "\$\{a\[@\]\}" ; done < rows\.txt$/,
+    );
+
+    const prefixSubstrLoopRedir = evaluateCommandGuard(
+      'for prefix_var in 1; do adb shell echo "${!pre@}" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(prefixSubstrLoopRedir.allowed, true);
+    assert.match(
+      prefixSubstrLoopRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!pre@\}" "--" ; done$/,
+    );
+
+    // 1s. Windows root identity captured at spawn protects against PID reuse before the first full tree snapshot
+    {
+      const fastExitRootPgid = 860001;
+      const reusedRootChildPid = 860099;
+      const earlierOrphanPid = 860050;
+      const legitimateSurvivingChildPid = 860055;
+      const earlierOrphanToken = "20261010235850.000000+000";
+      const genuineSpawnToken = "20261010235900.000000+000";
+      const legitimateChildToken = "20261010235902.000000+000";
+      const reusedRootToken = "20261010235905.000000+000";
+      clearKnownWindowsTreeDescendants(fastExitRootPgid);
+      clearKnownPosixPgidStartTokens(fastExitRootPgid);
+      try {
+        // Case A: Root exited and its PID was reused BEFORE the first full Windows process-table snapshot,
+        // while the spawn-time CreationDate was captured in pgidStartTokens, and an earlier-generation orphan
+        // still has ParentProcessId === fastExitRootPgid. Neither the reused root's child nor the older orphan is adopted.
+        const reusedFirstSnap = queryWindowsProcessGroups(
+          [fastExitRootPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: fastExitRootPgid, ParentProcessId: 4000, CreationDate: reusedRootToken },
+              { ProcessId: reusedRootChildPid, ParentProcessId: fastExitRootPgid, CreationDate: "20261010235906.000000+000" },
+              { ProcessId: earlierOrphanPid, ParentProcessId: fastExitRootPgid, CreationDate: earlierOrphanToken },
+            ]),
+            stderr: "",
+          }),
+          {
+            triState: true,
+            pgidStartTokens: { [String(fastExitRootPgid)]: genuineSpawnToken },
+          },
+        );
+        assert.equal(
+          reusedFirstSnap.get(fastExitRootPgid),
+          false,
+          "First Windows snapshot must reject a live root PID whose CreationDate mismatches the spawn-time token and ignore older-generation orphans",
+        );
+        assert.deepEqual(
+          getKnownWindowsTreeDescendants(fastExitRootPgid),
+          [],
+          "Unrelated process reusing the root PID or older-generation orphans must not be cached or adopted",
+        );
+
+        // Case A2: Legitimate surviving child created during [genuineSpawnToken, reusedRootToken) IS still discovered
+        // even when the root PID was reused before the first snapshot.
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+        const survivingChildSnap = queryWindowsProcessGroups(
+          [fastExitRootPgid],
+          () => ({
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: fastExitRootPgid, ParentProcessId: 4000, CreationDate: reusedRootToken },
+              { ProcessId: reusedRootChildPid, ParentProcessId: fastExitRootPgid, CreationDate: "20261010235906.000000+000" },
+              { ProcessId: legitimateSurvivingChildPid, ParentProcessId: fastExitRootPgid, CreationDate: legitimateChildToken },
+            ]),
+            stderr: "",
+          }),
+          {
+            triState: true,
+            pgidStartTokens: { [String(fastExitRootPgid)]: genuineSpawnToken },
+          },
+        );
+        assert.equal(
+          survivingChildSnap.get(fastExitRootPgid),
+          true,
+          "Surviving child created between genuineSpawnToken and reusedRootToken must keep the group alive",
+        );
+        assert.deepEqual(
+          getKnownWindowsTreeDescendants(fastExitRootPgid),
+          [
+            { pid: fastExitRootPgid, creationDate: "__exited__" },
+            { pid: legitimateSurvivingChildPid, creationDate: legitimateChildToken },
+          ],
+          "Only the __exited__ root sentinel and legitimate surviving child (not the reused root CreationDate or its new child) may be cached",
+        );
+
+        // Case A3: When the Windows wrapper exits during spawn-time capture (`getPosixProcessStartToken(..., { isSpawnCapture: true })`),
+        // subsequent `addLeaseWorker(..., { isProcessGroup: true, freshGeneration: false, archivedGeneration: true })` must NOT
+        // re-archive the freshly captured tree and must persist the detached child under `lease.workerDescendants[String(fastExitRootPgid)]`.
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+        archiveWindowsProcessGroupGeneration(fastExitRootPgid);
+        const spawnCapTok = getPosixProcessStartToken(fastExitRootPgid, {
+          platform: "win32",
+          isSpawnCapture: true,
+          spawnSyncFn: () => ({
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: legitimateSurvivingChildPid, ParentProcessId: fastExitRootPgid, CreationDate: legitimateChildToken },
+            ]),
+            stderr: "",
+          }),
+        });
+        assert.equal(spawnCapTok, "__exited__");
+        const fastExitLease = {
+          leaseId: "lease_fast_exit_win",
+          deviceKey: "avd:Pixel_Fast_Exit",
+          state: "active",
+          sessionId: "fast-exit-sess",
+          workerPids: [],
+          workerPid: null,
+        };
+        addLeaseWorker(
+          fastExitLease,
+          fastExitRootPgid,
+          (pid) => pid === legitimateSurvivingChildPid,
+          {
+            isProcessGroup: true,
+            freshGeneration: false,
+            archivedGeneration: true,
+            platform: "win32",
+            allowSubprocess: false,
+          },
+        );
+        assert.deepEqual(
+          fastExitLease.workerDescendants?.[String(fastExitRootPgid)],
+          [
+            { pid: fastExitRootPgid, creationDate: "__exited__" },
+            { pid: legitimateSurvivingChildPid, creationDate: legitimateChildToken },
+          ],
+          "Fast-exited Windows wrapper's detached child must remain registered under bare numeric PGID in lease.workerDescendants",
+        );
+
+        // Case B: If the root exited so quickly that even spawn-time CreationDate capture missed it (no expectedStartToken),
+        // and the PID is now occupied in the first snapshot, queryWindowsProcessGroups treats it as unverifiable (null) and
+        // killProcessGroupTree refuses to run taskkill /F.
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+        const uncapturedKilled = [];
+        const uncapturedKillRes = killProcessGroupTree(fastExitRootPgid, "SIGKILL", {
+          platform: "win32",
+          runner: (cmd, args) => {
+            if (cmd === "powershell.exe") {
+              return {
+                status: 0,
+                stdout: JSON.stringify([
+                  { ProcessId: fastExitRootPgid, ParentProcessId: 4000, CreationDate: reusedRootToken },
+                ]),
+                stderr: "",
+              };
+            }
+            if (cmd === "taskkill") {
+              for (let i = 0; i < args.length; i += 1) {
+                if (args[i] === "/PID") {
+                  uncapturedKilled.push(Number(args[i + 1]));
+                }
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        });
+        assert.deepEqual(
+          uncapturedKilled,
+          [],
+          "killProcessGroupTree on Windows must not taskkill a live root PID when no spawn-time CreationDate was captured",
+        );
+        assert.deepEqual(uncapturedKillRes.terminatedPgids, []);
+      } finally {
+        clearKnownWindowsTreeDescendants(fastExitRootPgid);
+        clearKnownPosixPgidStartTokens(fastExitRootPgid);
+      }
+    }
+
+    // 3t. `set -f` / `set -o noglob`, `set -u` / `set -o nounset`, `shopt` glob options, `$?`, and caller-shell `$-` state are preserved across `sh -c` / `bash -c` loop stage rewrites
+    const noglobExplicitLoopRedir = evaluateCommandGuard(
+      "set -f; for x in 1; do adb install *.apk > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(noglobExplicitLoopRedir.allowed, true);
+    assert.match(
+      noglobExplicitLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const noglobCallerGlobLoopRedir = evaluateCommandGuard(
+      "for x in 1; do adb install *.apk > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(noglobCallerGlobLoopRedir.allowed, true);
+    assert.match(
+      noglobCallerGlobLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const noglobOptionLoopRedir = evaluateCommandGuard(
+      "set -o noglob; for x in 1; do adb shell echo ok > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(noglobOptionLoopRedir.allowed, true);
+    assert.match(
+      noglobOptionLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb shell echo ok > \/tmp\/out\.txt' ; done$/,
+    );
+
+    const nounsetExplicitLoopRedir = evaluateCommandGuard(
+      'set -u; for x in 1; do adb shell rm -rf "$MISSING" > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(nounsetExplicitLoopRedir.allowed, true);
+    assert.match(
+      nounsetExplicitLoopRedir.rewrittenCommand,
+      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell rm -rf "\$MISSING" > \/tmp\/out\.txt' ; done$/,
+    );
+
+    // Concurrent lease renewal between cmdGc unlocked read (or after gcReapingAtMs marker while powershell runs) and beforeKill recheck prevents killing active detached group
+    const concurrentRenewPgid = 890001;
+    clearKnownWindowsTreeDescendants(concurrentRenewPgid);
+    try {
+      const gcRaceState = readState(dir);
+      gcRaceState.leases["serial:emulator-5578"] = {
+        leaseId: "lease_gc_race_renew",
+        deviceKey: "serial:emulator-5578",
+        kind: "emulator",
+        avd: "Pixel_GC_Race",
+        serial: "emulator-5578",
+        profile: { apiLevel: "android-35", deviceType: "phone" },
+        sessionId: "gc-race-sess",
+        anchorPid: process.pid,
+        workerPid: concurrentRenewPgid,
+        workerPids: [concurrentRenewPgid],
+        workerPgids: [concurrentRenewPgid],
+        workerDescendants: {
+          [String(concurrentRenewPgid)]: [
+            { pid: concurrentRenewPgid, creationDate: "__exited__", alive: false },
+            { pid: 890002, creationDate: "20261011000001.000000+000", alive: true },
+          ],
+        },
+        state: "active",
+        claimedAtMs: now - 600_000,
+        activatedAtMs: now - 599_000,
+        renewedAtMs: now - 500_000,
+        expiresAtMs: now - 10_000,
+      };
+      withLock(dir, (h) => commitState(dir, gcRaceState, h));
+      const raceKilledPids = [];
+      let renewDuringReap = null;
+      const winPsOutput = JSON.stringify([
+        {
+          ProcessId: 890002,
+          ParentProcessId: concurrentRenewPgid,
+          CreationDate: "20261011000001.000000+000",
+        },
+      ]);
+      const gcRaceRes = cmdGc(dir, {
+        platform: "win32",
+        now,
+        livenessCheck: (pid) => pid === process.pid || pid === 890002,
+        runner: (cmd, args) => {
+          if (cmd === "powershell.exe") {
+            // Simulate cmdRenew landing AFTER cmdGc set gcReapingAtMs under lock, while powershell.exe is running outside the lock
+            renewDuringReap = cmdRenew(
+              dir,
+              "lease_gc_race_renew",
+              { session: "gc-race-sess", ttl: 300 },
+              {
+                platform: "win32",
+                now,
+                livenessCheck: (pid) => pid === process.pid || pid === 890002,
+                runner: () => ({ status: 0, stdout: winPsOutput, stderr: "" }),
+              },
+            );
+            return {
+              status: 0,
+              stdout: winPsOutput,
+              stderr: "",
+            };
+          }
+          if (cmd === "taskkill") {
+            raceKilledPids.push(Number(args[args.indexOf("/PID") + 1]));
+            return { status: 0, stdout: "", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      assert.equal(renewDuringReap?.exitCode, 0);
+      assert.equal(gcRaceRes.exitCode, 0);
+      assert.deepEqual(
+        raceKilledPids,
+        [],
+        "cmdGc beforeKill recheck must not kill detached descendants when lease was renewed after gcReapingAtMs was set",
+      );
+      assert.ok(
+        readState(dir).leases["serial:emulator-5578"],
+        "Concurrently renewed lease must remain active after cmdGc",
+      );
+      withLock(dir, (h) => {
+        const s = readState(dir, { lockHandle: h });
+        delete s.leases["serial:emulator-5578"];
+        commitState(dir, s, h);
+      });
+    } finally {
+      clearKnownWindowsTreeDescendants(concurrentRenewPgid);
+    }
+
+    if (process.platform !== "win32") {
+      const noglobExecDir = makeTempStateDir();
+      try {
+        fs.writeFileSync(path.join(noglobExecDir, "sample.apk"), "dummy", "utf8");
+        fs.writeFileSync(path.join(noglobExecDir, "skip.apk"), "dummy", "utf8");
+        const stubBinDir = path.join(noglobExecDir, "bin");
+        fs.mkdirSync(stubBinDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(stubBinDir, "atc"),
+          '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ "$1" = "--" ] && shift\nexec "$@"\n',
+          { mode: 0o755 },
+        );
+        fs.writeFileSync(
+          path.join(stubBinDir, "adb"),
+          '#!/bin/sh\nprintf "%s\\n" "$*"\n',
+          { mode: 0o755 },
+        );
+        const outWithNoglob = path.join(noglobExecDir, "out-noglob.txt");
+        const outAfterUnsetNoglob = path.join(noglobExecDir, "out-glob.txt");
+        const rewrittenNoglobExec = evaluateCommandGuard(
+          `set -f; for x in 1; do adb install *.apk > "${outWithNoglob}"; done; set +f; for x in 1; do adb install *.apk > "${outAfterUnsetNoglob}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenNoglobExec.allowed, true);
+        const execRes = spawnSync("sh", ["-c", rewrittenNoglobExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(execRes.status, 0, execRes.stderr);
+        assert.equal(fs.readFileSync(outWithNoglob, "utf8").trim(), "install *.apk");
+        assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk skip.apk");
+
+        const outGlobignore = path.join(noglobExecDir, "out-globignore.txt");
+        const rewrittenGlobignoreExec = evaluateCommandGuard(
+          `GLOBIGNORE=skip.apk; for x in 1; do adb install *.apk > "${outGlobignore}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenGlobignoreExec.allowed, true);
+        const globignoreRes = spawnSync("bash", ["-c", rewrittenGlobignoreExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(globignoreRes.status, 0, globignoreRes.stderr);
+        assert.equal(
+          fs.readFileSync(outGlobignore, "utf8").trim(),
+          "install sample.apk",
+          "GLOBIGNORE must be forwarded into wrapped glob stage to exclude matching filenames",
+        );
+
+        const outRandom = path.join(noglobExecDir, "out-random.txt");
+        const expectedRandomRes = spawnSync("bash", ["-c", 'RANDOM=42; printf "%s" "$RANDOM"'], {
+          encoding: "utf8",
+        });
+        const rewrittenRandomExec = evaluateCommandGuard(
+          `RANDOM=42; for x in 1; do adb shell echo "$RANDOM" > "${outRandom}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenRandomExec.allowed, true);
+        const randomRes = spawnSync("bash", ["-c", rewrittenRandomExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(randomRes.status, 0, randomRes.stderr);
+        assert.equal(
+          fs.readFileSync(outRandom, "utf8").trim(),
+          `shell echo ${expectedRandomRes.stdout.trim()}`,
+          "Bash special variable $RANDOM must be preserved across wrapped stage",
+        );
+
+        const outPipestatus = path.join(noglobExecDir, "out-pipestatus.txt");
+        const rewrittenPipestatusExec = evaluateCommandGuard(
+          `false | true; for x in 1; do adb shell echo "\${PIPESTATUS[*]}" "\${PIPESTATUS[@]}" "\${PIPESTATUS[0]}" "$PIPESTATUS" > "${outPipestatus}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenPipestatusExec.allowed, true);
+        const pipestatusRes = spawnSync("bash", ["-c", rewrittenPipestatusExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(pipestatusRes.status, 0, pipestatusRes.stderr);
+        assert.equal(
+          fs.readFileSync(outPipestatus, "utf8").trim(),
+          "shell echo 1 0 1 0 1 1",
+          "Caller PIPESTATUS array must be forwarded into wrapped stage",
+        );
+
+        const outNullglob = path.join(noglobExecDir, "out-nullglob.txt");
+        const rewrittenNullglobExec = evaluateCommandGuard(
+          `shopt -s nullglob; for x in 1; do adb install *.missing_apk > "${outNullglob}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenNullglobExec.allowed, true);
+        const nullglobRes = spawnSync("bash", ["-c", rewrittenNullglobExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(nullglobRes.status, 0, nullglobRes.stderr);
+        assert.equal(
+          fs.readFileSync(outNullglob, "utf8").trim(),
+          "install",
+          "shopt -s nullglob must expand non-matching *.missing_apk to empty argument list inside wrapped stage",
+        );
+
+        const outExitStatus = path.join(noglobExecDir, "out-exit-status.txt");
+        const rewrittenExitStatusExec = evaluateCommandGuard(
+          `for x in 1; do false; adb shell echo "$?" > "${outExitStatus}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenExitStatusExec.allowed, true);
+        const exitStatusRes = spawnSync("sh", ["-c", rewrittenExitStatusExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(exitStatusRes.status, 0, exitStatusRes.stderr);
+        assert.equal(
+          fs.readFileSync(outExitStatus, "utf8").trim(),
+          "shell echo 1",
+          "Caller last exit status ($?) must be forwarded into wrapped stage",
+        );
+
+        const outNounset = path.join(noglobExecDir, "out-nounset.txt");
+        const rewrittenNounsetExec = evaluateCommandGuard(
+          `set -u; for x in 1; do adb shell rm -rf "$MISSING" > "${outNounset}"; done`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenNounsetExec.allowed, true);
+        const nounsetRes = spawnSync("sh", ["-c", rewrittenNounsetExec.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.notEqual(nounsetRes.status, 0, "set -u must abort when $MISSING is unset inside rewritten sh -c");
+        assert.equal(
+          fs.existsSync(outNounset) ? fs.readFileSync(outNounset, "utf8").trim() : "",
+          "",
+          "adb command must not execute when $MISSING is unset under set -u",
+        );
+
+        const outNounsetDefault = path.join(noglobExecDir, "out-nounset-default.txt");
+        const rewrittenCondDefault = evaluateCommandGuard(
+          `set -u; if false; then X=$(echo hi); fi; adb shell "\${X:-none}" > "${outNounsetDefault}"`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenCondDefault.allowed, true);
+        const condDefaultRes = spawnSync("sh", ["-c", rewrittenCondDefault.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.equal(condDefaultRes.status, 0, condDefaultRes.stderr);
+        assert.equal(fs.readFileSync(outNounsetDefault, "utf8").trim(), "shell none");
+
+        const outNounsetCondFail = path.join(noglobExecDir, "out-nounset-cond-fail.txt");
+        const rewrittenCondFail = evaluateCommandGuard(
+          `set -u; if false; then X=$(echo hi); fi; adb shell "$X" > "${outNounsetCondFail}"`,
+          {
+            sessionId: "loop-sess",
+            activeLeases,
+            platform: "linux",
+          },
+        );
+        assert.equal(rewrittenCondFail.allowed, true);
+        const condFailRes = spawnSync("sh", ["-c", rewrittenCondFail.rewrittenCommand], {
+          cwd: noglobExecDir,
+          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
+          encoding: "utf8",
+        });
+        assert.notEqual(
+          condFailRes.status,
+          0,
+          "set -u must abort when conditionally assigned dynamic variable $X remains unset",
+        );
+      } finally {
+        fs.rmSync(noglobExecDir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    clearKnownWindowsTreeDescendants(rootPgid);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(avdHome, { recursive: true, force: true });
   }
 });
 

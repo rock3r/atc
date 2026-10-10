@@ -30,13 +30,21 @@ import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spaw
 import {
   DEFAULT_CONFIG,
   addLeaseWorker,
+  archiveWindowsProcessGroupGeneration,
   avdHasRuntimeLockFiles,
   canJumpAhead,
+  commitState,
   computeEffectiveMaxEmulators,
   computeUsedEmulatorSlots,
+  getKnownPosixPgidStartToken,
+  getKnownWindowsTreePids,
+  getPosixProcessStartToken,
+  hasAliveProcessInGroup,
   isTicketStarvationProtected,
+  killProcessGroupTree,
   matchesProfile,
   offlineAvdHasRuntimeLockFiles,
+  queryWindowsProcessGroups,
   readState,
   reconcileOfflineLeases,
   recordDeviceBootedInState,
@@ -44,12 +52,74 @@ import {
   removeLeaseWorker,
   resolveSessionIdentity,
   resolveStableParentPid,
+  seedPosixPgidStartTokens,
+  snapshotProcessGroupsOutsideLock,
   syncLeaseWorkers,
   withStateTransaction,
 } from "./state.mjs";
 
 export const ATC_VERSION = "1.0.0";
 export { GUIDE_TOPICS, cmdGuide };
+
+function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {
+  const isQualified = typeof pgid === "string" && pgid.includes("@");
+  const keyStr = isQualified ? pgid.trim() : null;
+  const num = Number(isQualified ? keyStr.split("@")[0] : pgid);
+  if (!Number.isInteger(num) || num <= 1) return false;
+  if (num === options.callerWorkerPid) return false;
+  const descKey = isQualified ? keyStr : String(num);
+  const descEntries = lease?.workerDescendants?.[descKey];
+  if (Array.isArray(descEntries)) {
+    const rootEntry = descEntries.find(
+      (item) => item && typeof item === "object" && Number(item.pid ?? item.ProcessId) === num,
+    );
+    if (
+      rootEntry &&
+      (rootEntry.alive === false ||
+        String(rootEntry.creationDate ?? rootEntry.CreationDate ?? "").trim() === "__exited__")
+    ) {
+      return false;
+    }
+  }
+  if (!livenessCheck(num)) {
+    return false;
+  }
+  const effectivePlatform = options.platform || process.platform;
+  if (effectivePlatform === "win32") {
+    const targetKey = isQualified ? keyStr : num;
+    const qRes = queryWindowsProcessGroups(
+      [targetKey],
+      options.spawnSyncFn || options.runner,
+      {
+        knownDescendants: lease?.workerDescendants,
+        pgidStartTokens:
+          options.pgidStartTokens || lease?.workerPgidStartTokens || null,
+        lease,
+        triState: true,
+      },
+    );
+    if (qRes.refreshed && qRes.get(targetKey) !== null) {
+      return getKnownWindowsTreePids(targetKey, { liveOnly: true }).includes(num);
+    }
+    return true;
+  }
+  const expectedStartToken =
+    (isQualified ? keyStr.slice(keyStr.indexOf("@") + 1).trim() : null) ||
+    lease?.workerPgidStartTokens?.[String(num)] ||
+    getKnownPosixPgidStartToken(num) ||
+    null;
+  if (expectedStartToken) {
+    const actualStartToken = getPosixProcessStartToken(num, {
+      spawnSyncFn: options.spawnSyncFn || options.runner,
+      platform: effectivePlatform,
+      expectedToken: expectedStartToken,
+    });
+    if (actualStartToken !== null && actualStartToken !== expectedStartToken) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function parseBoolFlag(val) {
   if (val === undefined || val === null) return false;
@@ -2761,14 +2831,84 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const freeDiskMb =
     options.host?.freeDiskMb ?? (!flags.force ? readFreeDiskMb(avdHome) : 16384);
 
-  let outcome;
-  try {
-    outcome = withStateTransaction(stateDir, (state, { now }) => {
-      const identity = resolveSessionIdentity({
+  const terminatedPgids = [];
+  if (!options.deferOnBusyWorker) {
+    try {
+      const preLiveness = options.livenessCheck || isPidAlive;
+      const preState = readState(stateDir);
+      const preIdentity = resolveSessionIdentity({
         flags,
         env: options.env || process.env,
-        state,
+        state: preState,
         cwd: options.cwd || process.cwd(),
+        ppid: options.ppid ?? process.ppid,
+        ancestorPids: options.ancestorPids,
+        processChain: options.processChain,
+      });
+      const preLeases = Object.values(preState.leases || {});
+      const preMatches = [];
+      if (effectiveTarget) {
+        const found =
+          preLeases.find((l) => l.leaseId === effectiveTarget) ||
+          preLeases.find((l) => l.serial === effectiveTarget) ||
+          preLeases.find((l) => l.avd === effectiveTarget);
+        if (
+          found &&
+          (found.sessionId === preIdentity.sessionId ||
+            found.leaseId === effectiveTarget ||
+            parseBoolFlag(flags.force))
+        ) {
+          preMatches.push(found);
+        }
+      } else {
+        for (const l of preLeases) {
+          if (
+            l.sessionId === preIdentity.sessionId &&
+            (l.state === "active" || l.state === "starting")
+          ) {
+            preMatches.push(l);
+          }
+        }
+      }
+      for (const l of preMatches) {
+        if (!Array.isArray(l.workerPgids) || l.workerPgids.length === 0) continue;
+        const pgidSet = new Set(
+          l.workerPgids.map((p) => Number(String(p).split("@")[0])),
+        );
+        const hasLiveWrapperPid = (l.workerPids || []).some((p) => {
+          const num = Number(p);
+          return num !== options.callerWorkerPid && !pgidSet.has(num) && preLiveness(num);
+        });
+        const hasLiveLeaderPid = l.workerPgids.some((p) =>
+          isWorkerGroupLeaderAlive(p, l, preLiveness, options),
+        );
+        if (parseBoolFlag(flags.force) || (!hasLiveWrapperPid && !hasLiveLeaderPid)) {
+          const killedRes = killProcessGroupTree(l, "SIGKILL", {
+            spawnSyncFn: options.spawnSyncFn || options.runner,
+            platform: options.platform,
+            livenessCheck: preLiveness,
+            killFn: options.killFn,
+          });
+          if (Array.isArray(killedRes?.terminatedPgids)) {
+            terminatedPgids.push(...killedRes.terminatedPgids);
+          }
+        }
+      }
+    } catch {
+      // Best-effort pre-lock orphan tree termination
+    }
+  }
+
+  let outcome;
+  try {
+    outcome = withStateTransaction(
+      stateDir,
+      (state, { now }) => {
+        const identity = resolveSessionIdentity({
+          flags,
+          env: options.env || process.env,
+          state,
+          cwd: options.cwd || process.cwd(),
         ppid: options.ppid ?? process.ppid,
         ancestorPids: options.ancestorPids,
         processChain: options.processChain,
@@ -2951,7 +3091,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           busyErrors: options.deferOnBusyWorker ? [] : busyErrors,
         },
       };
-    }, options);
+    }, terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options);
   } catch (err) {
     if (err instanceof ResourceError) {
       return { exitCode: err.exitCode, error: err.message };
@@ -3303,6 +3443,20 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
       };
     }
 
+    const killCommittedAgeMs =
+      typeof lease.gcKillCommittedAtMs === "number" &&
+      Number.isFinite(lease.gcKillCommittedAtMs)
+        ? now - lease.gcKillCommittedAtMs
+        : -1;
+    if (killCommittedAgeMs >= 0 && killCommittedAgeMs < 30_000) {
+      return {
+        mutated: false,
+        value: { exitCode: 3, error: "No matching active lease found to renew." },
+      };
+    }
+
+    delete lease.gcReapingAtMs;
+    delete lease.gcKillCommittedAtMs;
     lease.renewedAtMs = now;
     lease.expiresAtMs =
       rawExplicitTtl !== undefined ? now + ttlMs : Math.max(lease.expiresAtMs || 0, now + ttlMs);
@@ -3744,6 +3898,17 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         check.lease.leaseId,
       );
       if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+        const killCommittedAgeMs =
+          typeof cur.gcKillCommittedAtMs === "number" &&
+          Number.isFinite(cur.gcKillCommittedAtMs)
+            ? now - cur.gcKillCommittedAtMs
+            : -1;
+        if (killCommittedAgeMs >= 0 && killCommittedAgeMs < 30_000) {
+          return { mutated: false };
+        }
+        delete cur.gcReapingAtMs;
+        delete cur.gcKillCommittedAtMs;
+        syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
         cur.renewedAtMs = now;
         cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
         return { mutated: true };
@@ -3753,9 +3918,31 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   };
 
   let spawnedChildPid = null;
-  const onChildSpawn = (childPid, { isProcessGroup } = {}) => {
+  let spawnedChildStartToken = null;
+  const onChildSpawn = (
+    childPid,
+    { isProcessGroup, freshGeneration, archivedGeneration, startToken } = {},
+  ) => {
     spawnedChildPid = childPid;
+    const effectivePlatform = options.platform || process.platform;
+    const isWin = effectivePlatform === "win32";
     try {
+      if (isProcessGroup && isWin && !archivedGeneration) {
+        archiveWindowsProcessGroupGeneration(childPid);
+      }
+      spawnedChildStartToken =
+        startToken ||
+        (isProcessGroup && !options.livenessCheck && !(isWin && archivedGeneration)
+          ? getPosixProcessStartToken(childPid, {
+              platform: effectivePlatform,
+              spawnSyncFn: options.spawnSyncFn || options.runner,
+              isSpawnCapture: true,
+            })
+          : null);
+      if (spawnedChildStartToken) {
+        seedPosixPgidStartTokens(childPid, spawnedChildStartToken);
+      }
+      const alreadyArchivedInMemory = Boolean(archivedGeneration || (isProcessGroup && isWin));
       withStateTransaction(
         stateDir,
         (state) => {
@@ -3767,12 +3954,31 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
             addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
               isProcessGroup: Boolean(isProcessGroup),
+              freshGeneration: Boolean(freshGeneration ?? true),
+              archivedGeneration: alreadyArchivedInMemory,
+              startToken: spawnedChildStartToken,
+              platform: effectivePlatform,
+              spawnSyncFn: options.spawnSyncFn || options.runner,
+              allowSubprocess: false,
             });
             return { mutated: true };
           }
           return { mutated: false };
         },
-        options,
+        {
+          ...options,
+          archivedGeneration: alreadyArchivedInMemory,
+          freshGenerationPgids:
+            isProcessGroup && isWin && !options.livenessCheck
+              ? [childPid]
+              : undefined,
+          freshGenerationStartTokens:
+            spawnedChildStartToken &&
+            spawnedChildStartToken !== "__exited__" &&
+            isProcessGroup
+              ? { [String(childPid)]: spawnedChildStartToken }
+              : undefined,
+        },
       );
     } catch {
       // Best-effort child PID registration
@@ -3795,6 +4001,19 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     return { exitCode };
   } finally {
     try {
+      let keepSpawnedChildGroup = false;
+      if (spawnedChildPid && !options.livenessCheck) {
+        try {
+          keepSpawnedChildGroup = hasAliveProcessInGroup(spawnedChildPid, {
+            allowSubprocess: true,
+            spawnSyncFn: options.spawnSyncFn,
+            platform: options.platform,
+            expectedStartToken: spawnedChildStartToken,
+          });
+        } catch {
+          keepSpawnedChildGroup = false;
+        }
+      }
       finishLeaseWorker(
         stateDir,
         check.lease.deviceKey,
@@ -3803,7 +4022,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         options,
         (cur) => {
           if (spawnedChildPid) {
-            removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+            if (keepSpawnedChildGroup) {
+              syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+            } else {
+              removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+            }
           }
         },
       );
@@ -3826,7 +4049,13 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   const discoveryStartedAtMs = Date.now();
   const rawInventory =
     options.inventory ||
-    discoverFleet({ runner, avdHome, cfg, platform: options.platform });
+    discoverFleet({
+      runner,
+      avdHome,
+      cfg,
+      platform: options.platform,
+      livenessCheck: options.livenessCheck,
+    });
   const inventory = options.inventory
     ? rawInventory
     : {
@@ -3843,38 +4072,49 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
     abi: flags.abi || null,
   };
 
-  return withStateTransaction(stateDir, (state, { now }) => {
-    reconcileOfflineLeases(state, inventory, null, now, options.livenessCheck || isPidAlive, avdHome);
-    const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
-    const usedSlots = computeUsedEmulatorSlots(state, inventory);
-    const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
-    const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
-    const creatable = (inventory.creatable || []).filter((d) =>
-      matchesProfile({ ...d, kind: d.kind || "emulator" }, req),
-    );
+  return withStateTransaction(
+    stateDir,
+    (state, { now }) => {
+      reconcileOfflineLeases(
+        state,
+        inventory,
+        null,
+        now,
+        options.livenessCheck || isPidAlive,
+        avdHome,
+      );
+      const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
+      const usedSlots = computeUsedEmulatorSlots(state, inventory);
+      const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
+      const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
+      const creatable = (inventory.creatable || []).filter((d) =>
+        matchesProfile({ ...d, kind: d.kind || "emulator" }, req),
+      );
 
-    return {
-      mutated: true,
-      value: {
-        exitCode: 0,
-        hostCapacity: {
-          ...inventory.host,
-          usedSlots,
-          effectiveMaxEmulators,
-          minFreeRamMb: state.config.minFreeRamMb,
-          minFreeDiskMb: state.config.minFreeDiskMb,
+      return {
+        mutated: true,
+        value: {
+          exitCode: 0,
+          hostCapacity: {
+            ...inventory.host,
+            usedSlots,
+            effectiveMaxEmulators,
+            minFreeRamMb: state.config.minFreeRamMb,
+            minFreeDiskMb: state.config.minFreeDiskMb,
+          },
+          fleet: {
+            running,
+            offline,
+            creatable,
+          },
+          leases: state.leases,
+          queue: state.queue,
+          config: state.config,
         },
-        fleet: {
-          running,
-          offline,
-          creatable,
-        },
-        leases: state.leases,
-        queue: state.queue,
-        config: state.config,
-      },
-    };
-  });
+      };
+    },
+    options,
+  );
 }
 
 export function cmdConfig(stateDir, action, key = null, val = null) {
@@ -3990,10 +4230,202 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
   });
 }
 
-export function cmdGc(stateDir) {
-  return withStateTransaction(stateDir, (_state, { pruned }) => {
-    return { mutated: true, value: { exitCode: 0, pruned } };
-  });
+export function cmdGc(stateDir, options = {}) {
+  const terminatedPgids = [];
+  let confirmedKillTargets = [];
+  try {
+    const preLiveness = options.livenessCheck || isPidAlive;
+    const preState = readState(stateDir, { quarantine: false });
+    const now = options.now ?? Date.now();
+    const cfg = preState.config || DEFAULT_CONFIG;
+    const maxTtlMs = (cfg.maxTtlSec || 3600) * 1000;
+    const candidates = [];
+    for (const [deviceKey, lease] of Object.entries(preState.leases || {})) {
+      if (!lease || typeof lease !== "object") continue;
+      if (!Array.isArray(lease.workerPgids) || lease.workerPgids.length === 0) continue;
+      const pgidSet = new Set(
+        lease.workerPgids.map((p) => Number(String(p).split("@")[0])),
+      );
+      const hasLiveWrapperPid = (lease.workerPids || []).some((p) => {
+        const num = Number(p);
+        return !pgidSet.has(num) && preLiveness(num);
+      });
+      if (hasLiveWrapperPid) continue;
+      const lastRenewedMs =
+        typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;
+      const isExpired =
+        now >= lease.expiresAtMs ||
+        now < lease.claimedAtMs ||
+        (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
+      const isDeadAnchor =
+        lease.anchorPid !== null &&
+        lease.anchorPid !== undefined &&
+        !preLiveness(lease.anchorPid);
+      if (!isExpired && !isDeadAnchor && !lease.releaseOnWorkerExit) continue;
+      const hasLiveLeaderPid = (lease.workerPgids || []).some((p) =>
+        isWorkerGroupLeaderAlive(p, lease, preLiveness, options),
+      );
+      if (hasLiveLeaderPid) continue;
+      candidates.push({
+        deviceKey,
+        leaseId: lease.leaseId,
+        expectedPgids: new Set(lease.workerPgids.map((p) => String(p).trim())),
+      });
+    }
+    if (candidates.length > 0) {
+      confirmedKillTargets = withLock(
+        stateDir,
+        (lockHandle) => {
+          const lockedNow = options.now ?? Date.now();
+          const lockedState = readState(stateDir, { lockHandle });
+          const lockedCfg = lockedState.config || DEFAULT_CONFIG;
+          const lockedMaxTtlMs = (lockedCfg.maxTtlSec || 3600) * 1000;
+          const targets = [];
+          let mutated = false;
+          for (const cand of candidates) {
+            const cur = lockedState.leases?.[cand.deviceKey];
+            if (!cur || typeof cur !== "object" || cur.leaseId !== cand.leaseId) continue;
+            if (!Array.isArray(cur.workerPgids) || cur.workerPgids.length === 0) continue;
+            const hasNewPgid = cur.workerPgids.some(
+              (p) => !cand.expectedPgids.has(String(p).trim()),
+            );
+            if (hasNewPgid) continue;
+            const curPgidSet = new Set(
+              cur.workerPgids.map((p) => Number(String(p).split("@")[0])),
+            );
+            const curLiveWrapper = (cur.workerPids || []).some((p) => {
+              const num = Number(p);
+              return !curPgidSet.has(num) && preLiveness(num);
+            });
+            if (curLiveWrapper) continue;
+            const curLastRenewedMs =
+              typeof cur.renewedAtMs === "number" ? cur.renewedAtMs : cur.claimedAtMs;
+            const curExpired =
+              lockedNow >= cur.expiresAtMs ||
+              lockedNow < cur.claimedAtMs ||
+              (typeof curLastRenewedMs === "number" &&
+                lockedNow > curLastRenewedMs + lockedMaxTtlMs);
+            const curDeadAnchor =
+              cur.anchorPid !== null &&
+              cur.anchorPid !== undefined &&
+              !preLiveness(cur.anchorPid);
+            if (!curExpired && !curDeadAnchor && !cur.releaseOnWorkerExit) continue;
+            cur.gcReapingAtMs = lockedNow;
+            targets.push(structuredClone(cur));
+            mutated = true;
+          }
+          if (mutated) {
+            commitState(stateDir, lockedState, lockHandle);
+          }
+          return targets;
+        },
+        options.lockTimeoutMs,
+        "atc.lock",
+        undefined,
+        options,
+      );
+      for (const targetLease of confirmedKillTargets) {
+        const expectedTargetPgids = new Set(
+          (targetLease.workerPgids || []).map((p) => String(p).trim()),
+        );
+        const killedRes = killProcessGroupTree(targetLease, "SIGKILL", {
+          spawnSyncFn: options.spawnSyncFn || options.runner,
+          platform: options.platform,
+          livenessCheck: preLiveness,
+          killFn: options.killFn,
+          beforeKill: () =>
+            withLock(
+              stateDir,
+              (lockHandle) => {
+                const lockedNow = options.now ?? Date.now();
+                const lockedState = readState(stateDir, { lockHandle });
+                const lockedCfg = lockedState.config || DEFAULT_CONFIG;
+                const lockedMaxTtlMs = (lockedCfg.maxTtlSec || 3600) * 1000;
+                const cur = lockedState.leases?.[targetLease.deviceKey];
+                if (
+                  !cur ||
+                  typeof cur !== "object" ||
+                  cur.leaseId !== targetLease.leaseId ||
+                  cur.gcReapingAtMs !== targetLease.gcReapingAtMs
+                ) {
+                  return false;
+                }
+                if (!Array.isArray(cur.workerPgids) || cur.workerPgids.length === 0) {
+                  return false;
+                }
+                const hasNewPgid = cur.workerPgids.some(
+                  (p) => !expectedTargetPgids.has(String(p).trim()),
+                );
+                if (hasNewPgid) return false;
+                const curPgidSet = new Set(
+                  cur.workerPgids.map((p) => Number(String(p).split("@")[0])),
+                );
+                const curLiveWrapper = (cur.workerPids || []).some((p) => {
+                  const num = Number(p);
+                  return !curPgidSet.has(num) && preLiveness(num);
+                });
+                if (curLiveWrapper) return false;
+                const curLastRenewedMs =
+                  typeof cur.renewedAtMs === "number" ? cur.renewedAtMs : cur.claimedAtMs;
+                const curExpired =
+                  lockedNow >= cur.expiresAtMs ||
+                  lockedNow < cur.claimedAtMs ||
+                  (typeof curLastRenewedMs === "number" &&
+                    lockedNow > curLastRenewedMs + lockedMaxTtlMs);
+                const curDeadAnchor =
+                  cur.anchorPid !== null &&
+                  cur.anchorPid !== undefined &&
+                  !preLiveness(cur.anchorPid);
+                if (!curExpired && !curDeadAnchor && !cur.releaseOnWorkerExit) {
+                  return false;
+                }
+                if (cur.gcKillCommittedAtMs !== lockedNow) {
+                  cur.gcKillCommittedAtMs = lockedNow;
+                  commitState(stateDir, lockedState, lockHandle);
+                }
+                return true;
+              },
+              options.lockTimeoutMs,
+              "atc.lock",
+              undefined,
+              options,
+            ),
+        });
+        if (Array.isArray(killedRes?.terminatedPgids)) {
+          terminatedPgids.push(...killedRes.terminatedPgids);
+        }
+      }
+    }
+  } catch {
+    // Best-effort pre-lock orphan tree termination
+  }
+  return withStateTransaction(
+    stateDir,
+    (state, { now, pruned }) => {
+      for (const lease of Object.values(state.leases || {})) {
+        if (lease && typeof lease === "object") {
+          const matchedOwnTarget = confirmedKillTargets.some(
+            (t) =>
+              t.leaseId === lease.leaseId && t.gcReapingAtMs === lease.gcReapingAtMs,
+          );
+          if ("gcReapingAtMs" in lease) {
+            const ageMs = now - Number(lease.gcReapingAtMs);
+            if (matchedOwnTarget || !Number.isFinite(ageMs) || ageMs < 0 || ageMs >= 30_000) {
+              delete lease.gcReapingAtMs;
+            }
+          }
+          if ("gcKillCommittedAtMs" in lease) {
+            const ageMs = now - Number(lease.gcKillCommittedAtMs);
+            if (matchedOwnTarget || !Number.isFinite(ageMs) || ageMs < 0 || ageMs >= 30_000) {
+              delete lease.gcKillCommittedAtMs;
+            }
+          }
+        }
+      }
+      return { mutated: true, value: { exitCode: 0, pruned } };
+    },
+    terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options,
+  );
 }
 
 export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
