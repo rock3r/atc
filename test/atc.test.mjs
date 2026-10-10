@@ -60,6 +60,7 @@ import {
   cmdConfig,
   cmdGuard,
   parseCliArgs,
+  runCli,
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
 
@@ -2573,6 +2574,78 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           assert.equal(prunedAfterDeadline.leases.length, 1);
           assert.equal(prunedAfterDeadline.leases[0].reason, "deadline_exceeded");
           assert.equal(orphanTransState.leases["avd:Pixel_8_API_35"], undefined);
+
+          // 7. `atc free --help` / `atc free -h` short-circuits help without releasing active leases
+          const helpDir = makeTempStateDir();
+          try {
+            const helpClaim = cmdClaim(
+              helpDir,
+              { session: "help-sess", api: "35" },
+              { inventory: npxInv },
+            );
+            assert.equal(helpClaim.exitCode, 0);
+            const helpExit1 = await runCli(["free", "--help"], {
+              ...process.env,
+              ATC_STATE_DIR: helpDir,
+              ATC_SESSION_ID: "help-sess",
+            });
+            assert.equal(helpExit1, 0);
+            const helpExit2 = await runCli(["free", "-h"], {
+              ...process.env,
+              ATC_STATE_DIR: helpDir,
+              ATC_SESSION_ID: "help-sess",
+            });
+            assert.equal(helpExit2, 0);
+            assert.ok(readState(helpDir).leases["avd:Pixel_8_API_35"]);
+          } finally {
+            fs.rmSync(helpDir, { recursive: true, force: true });
+          }
+
+          // 8. reconcileOfflineLeases preserves offline leases while registered workers remain alive
+          const offlineWorkerState = createDefaultState();
+          offlineWorkerState.leases["phys:R58N123456A"] = {
+            leaseId: "lease-rebooting-phys",
+            deviceKey: "phys:R58N123456A",
+            serial: "R58N123456A",
+            kind: "physical",
+            state: "active",
+            sessionId: "sess-reboot",
+            workerPid: 77001,
+            workerPids: [77001],
+            firstSeenOfflineAtMs: tTrans - 30_000,
+          };
+          reconcileOfflineLeases(
+            offlineWorkerState,
+            { running: [], offline: [], onlineSerials: [], probes: { emulatorListOk: true, adbDevicesOk: true } },
+            "other-sess",
+            tTrans,
+            (pid) => pid === 77001,
+          );
+          assert.ok(offlineWorkerState.leases["phys:R58N123456A"]);
+
+          // Once worker exits, offline reconciliation after graceMs deletes the lease
+          reconcileOfflineLeases(
+            offlineWorkerState,
+            { running: [], offline: [], onlineSerials: [], probes: { emulatorListOk: true, adbDevicesOk: true } },
+            "other-sess",
+            tTrans,
+            () => false,
+          );
+          assert.equal(offlineWorkerState.leases["phys:R58N123456A"], undefined);
+
+          // 9. Compound POSIX device commands rewrite only the device segment so caller shell syntax (`[[ ... ]]`) is preserved
+          const bashCompoundGuard = evaluateCommandGuard("[[ -f app.apk ]] && adb install app.apk", {
+            sessionId: "bash-sess",
+            anchorPid: 4321,
+            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+            runningCount: 1,
+            platform: "linux",
+          });
+          assert.equal(bashCompoundGuard.allowed, true);
+          assert.equal(
+            bashCompoundGuard.rewrittenCommand,
+            "[[ -f app.apk ]] && ATC_SESSION_ID=bash-sess ATC_ANCHOR_PID=4321 atc exec --serial emulator-5554 -- adb install app.apk",
+          );
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }

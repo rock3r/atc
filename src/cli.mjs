@@ -553,6 +553,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           inventory,
           identity.sessionId,
           now,
+          options.livenessCheck || isPidAlive,
         );
 
         // Step 3: Idempotent Re-Claim (Same Session)
@@ -1991,7 +1992,7 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   };
 
   return withStateTransaction(stateDir, (state, { now }) => {
-    reconcileOfflineLeases(state, inventory, null, now);
+    reconcileOfflineLeases(state, inventory, null, now, options.livenessCheck || isPidAlive);
     const effectiveMaxEmulators = computeEffectiveMaxEmulators(state.config, inventory.host);
     const usedSlots = computeUsedEmulatorSlots(state, inventory);
     const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
@@ -2195,6 +2196,25 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
 export async function runCli(argv = process.argv.slice(2), env = process.env) {
   const parsed = parseCliArgs(argv);
   const stateDir = resolveStateDir(env.ATC_STATE_DIR);
+
+  if (parsed.flags.help || parsed.flags.h || parsed.subcommand === "help") {
+    process.stdout.write(
+      `Android Traffic Control (atc)\n\n` +
+        `Usage:\n` +
+        `  atc claim [--type <type>] [--api <spec>] [--play|--no-play] [--snapshot-load <name>] [--ttl <sec>] [--wait <sec>]\n` +
+        `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
+        `  atc renew [<target>] [--ttl <sec>]\n` +
+        `  atc snapshot <list|save|load|delete> [<name>]\n` +
+        `  atc exec -- <command> [args...]\n` +
+        `  atc status [--type <type>] [--api <spec>] [--json]\n` +
+        `  atc config <get|set> [key] [val]\n` +
+        `  atc gc\n` +
+        `  atc guard [--format=json] <command>\n` +
+        `  atc hook <pre-tool-use|stop>\n` +
+        `  atc mcp\n`,
+    );
+    return 0;
+  }
 
   switch (parsed.subcommand) {
     case "claim": {

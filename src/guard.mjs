@@ -908,13 +908,20 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
   return { kind: "ignore", parsed };
 }
 
-function rewriteWindowsCommand(command, { sessionId, anchorPid, execSerial }) {
+function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, platform = "win32" }) {
+  const isWin = platform === "win32";
   const sessionFlag = sessionId
     ? anchorPid
       ? ` --session ${sessionId} --anchor-pid ${anchorPid}`
       : ` --session ${sessionId}`
     : "";
   const sessionFlags = sessionFlag.trim();
+  const posixEnvPrefix =
+    !isWin && sessionId
+      ? anchorPid
+        ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
+        : `ATC_SESSION_ID=${sessionId} `
+      : "";
   const tokens = [];
   let cur = "";
   let inSingle = false;
@@ -966,7 +973,16 @@ function rewriteWindowsCommand(command, { sessionId, anchorPid, execSerial }) {
       const c = classifySegment(trimmed, shellVars);
       Object.assign(shellVars, c.parsed?.envVars || {});
       if (c.kind === "device_action" && execSerial) {
-        return `atc exec${sessionFlag} --serial ${execSerial} -- ${trimmed}`;
+        if (isWin) {
+          return `atc exec${sessionFlag} --serial ${execSerial} -- ${trimmed}`;
+        }
+        const isSimpleStage =
+          !/[<>|&;`$()\r\n]/.test(trimmed) && !tokenizeSegment(trimmed)[0]?.includes("=");
+        if (isSimpleStage) {
+          return `${posixEnvPrefix}atc exec --serial ${execSerial} -- ${trimmed}`;
+        }
+        const escaped = `'${String(trimmed).replace(/'/g, `'\\''`)}'`;
+        return `${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =
@@ -1121,10 +1137,11 @@ export function evaluateCommandGuard(
       !/[<>|&;`$()\r\n]/.test(command) &&
       !tokenizeSegment(command)[0]?.includes("=");
     if (isWin) {
-      rewrittenCommand = rewriteWindowsCommand(command, {
+      rewrittenCommand = rewriteCompoundCommand(command, {
         sessionId,
         anchorPid,
         execSerial,
+        platform: "win32",
       });
     } else {
       const envPrefix = sessionId
@@ -1134,6 +1151,13 @@ export function evaluateCommandGuard(
         : "";
       if (isSimpleSingleCommand) {
         rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- ${command}`;
+      } else if (segments.length > 1) {
+        rewrittenCommand = rewriteCompoundCommand(command, {
+          sessionId,
+          anchorPid,
+          execSerial,
+          platform,
+        });
       } else {
         const escaped = `'${String(command).replace(/'/g, `'\\''`)}'`;
         rewrittenCommand = `${envPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}`;
@@ -1141,10 +1165,11 @@ export function evaluateCommandGuard(
     }
   } else if (needsAtcRewrite && sessionId) {
     if (isWin) {
-      rewrittenCommand = rewriteWindowsCommand(command, {
+      rewrittenCommand = rewriteCompoundCommand(command, {
         sessionId,
         anchorPid,
         execSerial: null,
+        platform: "win32",
       });
     } else if (segments.length > 1) {
       const exportVars = anchorPid

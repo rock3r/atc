@@ -450,7 +450,13 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
   return pruned;
 }
 
-export function reconcileOfflineLeases(state, inventory, callerSessionId, now = Date.now()) {
+export function reconcileOfflineLeases(
+  state,
+  inventory,
+  callerSessionId,
+  now = Date.now(),
+  livenessCheck = isPidAlive,
+) {
   if (!inventory) return false;
   let mutated = false;
   const graceMs = state.config?.offlineGraceMs ?? 5000;
@@ -505,6 +511,10 @@ export function reconcileOfflineLeases(state, inventory, callerSessionId, now = 
       if (!emulatorListOk || !adbDevicesOk) {
         continue;
       }
+    }
+
+    if (syncLeaseWorkers(lease, livenessCheck).length > 0) {
+      continue;
     }
 
     if (lease.sessionId === callerSessionId) {
