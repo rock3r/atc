@@ -4741,6 +4741,156 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       assert.ok(winFreeHeld);
       assert.equal(winFreeHeld.state, "stopping");
       assert.equal(winFreeHeld.workerPid, null);
+
+      // 10. Windows coldBoot/wipeData restart stop-wait timeout keeps the lease in "stopping" (even if upgrading an owned previousLease)
+      const rebootTimeoutDir = makeTempStateDir();
+      try {
+        withStateTransaction(rebootTimeoutDir, (s) => {
+          s.config.stopTimeoutSec = 1;
+          return { mutated: true };
+        });
+        const prevClaim = cmdClaim(
+          rebootTimeoutDir,
+          {
+            session: "win-reboot-timeout-sess",
+            avd: "Pixel_Rollback_AVD",
+            wait: 0,
+            force: true,
+          },
+          {
+            platform: "win32",
+            avdHome,
+            inventory: {
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+              running: [
+                {
+                  deviceKey: "avd:Pixel_Rollback_AVD",
+                  kind: "emulator",
+                  avd: "Pixel_Rollback_AVD",
+                  serial: "emulator-5574",
+                  online: true,
+                  profile: { deviceType: "phone", apiLevel: "android-35" },
+                },
+              ],
+              offline: [],
+              creatable: [],
+            },
+          },
+        );
+        assert.equal(prevClaim.exitCode, 0);
+        const rebootTimeoutClaim = cmdClaim(
+          rebootTimeoutDir,
+          {
+            session: "win-reboot-timeout-sess",
+            avd: "Pixel_Rollback_AVD",
+            cold: true,
+            wait: 0,
+            force: true,
+          },
+          {
+            platform: "win32",
+            avdHome,
+            runner: (cmd, args) => {
+              if (cmd === "adb" && args.includes("emu") && args.includes("kill")) {
+                return { status: 0, stdout: "OK\n", stderr: "" };
+              }
+              if (cmd === "adb" && args[0] === "devices") {
+                return {
+                  status: 0,
+                  stdout: "List of devices attached\nemulator-5574\tdevice\n",
+                  stderr: "",
+                };
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            },
+            inventory: {
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+              running: [
+                {
+                  deviceKey: "avd:Pixel_Rollback_AVD",
+                  kind: "emulator",
+                  avd: "Pixel_Rollback_AVD",
+                  serial: "emulator-5574",
+                  online: true,
+                  profile: { deviceType: "phone", apiLevel: "android-35" },
+                },
+              ],
+              offline: [],
+              creatable: [],
+            },
+          },
+        );
+        assert.equal(rebootTimeoutClaim.exitCode, 1);
+        const rebootHeld = readState(rebootTimeoutDir).leases["avd:Pixel_Rollback_AVD"];
+        assert.ok(rebootHeld);
+        assert.equal(rebootHeld.state, "stopping");
+        assert.equal(rebootHeld.workerPid, null);
+      } finally {
+        fs.rmSync(rebootTimeoutDir, { recursive: true, force: true });
+      }
+
+      // 11. Windows victim eviction stop-wait timeout keeps the victim reservation in "stopping"
+      withStateTransaction(rollbackHoldDir, (s) => {
+        delete s.leases["avd:Pixel_Rollback_AVD"];
+        s.config.maxRunningEmulators = 1;
+        s.config.stopTimeoutSec = 1;
+        return { mutated: true };
+      });
+      const victimTimeoutClaim = cmdClaim(
+        rollbackHoldDir,
+        {
+          session: "win-evict-timeout-sess",
+          avd: "Pixel_Target_AVD",
+          wait: 0,
+          force: true,
+        },
+        {
+          platform: "win32",
+          avdHome,
+          runner: (cmd, args) => {
+            if (cmd === "adb" && args.includes("emu") && args.includes("kill")) {
+              return { status: 0, stdout: "OK\n", stderr: "" };
+            }
+            if (cmd === "adb" && args[0] === "devices") {
+              return {
+                status: 0,
+                stdout: "List of devices attached\nemulator-5576\tdevice\n",
+                stderr: "",
+              };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [
+              {
+                deviceKey: "avd:Pixel_Victim_AVD",
+                kind: "emulator",
+                avd: "Pixel_Victim_AVD",
+                serial: "emulator-5576",
+                online: true,
+                profile: { deviceType: "phone", apiLevel: "android-34" },
+              },
+            ],
+            offline: [
+              {
+                deviceKey: "avd:Pixel_Target_AVD",
+                kind: "emulator",
+                avd: "Pixel_Target_AVD",
+                serial: null,
+                online: false,
+                profile: { deviceType: "phone", apiLevel: "android-35" },
+              },
+            ],
+            creatable: [],
+          },
+        },
+      );
+      assert.equal(victimTimeoutClaim.exitCode, 1);
+      const victimAfterTimeout = readState(rollbackHoldDir).leases["avd:Pixel_Victim_AVD"];
+      assert.ok(victimAfterTimeout, "Victim reservation must stay in stopping after Windows kill wait timeout");
+      assert.equal(victimAfterTimeout.state, "stopping");
+      assert.equal(victimAfterTimeout.workerPid, null);
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
     }

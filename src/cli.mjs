@@ -1512,6 +1512,8 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
   let resolvedSerial = candidate.serial;
   let bootedNewEmulator = false;
   let stoppedExistingEmulator = false;
+  let victimStopWaitTimedOut = false;
+  let rebootStopWaitTimedOut = false;
 
   const isWin = (platform || process.platform) === "win32";
   const assertReservationStillOwned = () => {
@@ -1573,12 +1575,17 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         );
       }
       if (isWin && selection.victim.serial) {
-        waitForEmulatorOffline(
-          runner,
-          avdHome,
-          { serial: selection.victim.serial, avd: selection.victim.avd },
-          effectiveStopTimeoutMs,
-        );
+        try {
+          waitForEmulatorOffline(
+            runner,
+            avdHome,
+            { serial: selection.victim.serial, avd: selection.victim.avd },
+            effectiveStopTimeoutMs,
+          );
+        } catch (err) {
+          victimStopWaitTimedOut = true;
+          throw err;
+        }
       }
       victimHbTimer?.stop();
       withStateTransaction(stateDir, (state, { now }) => {
@@ -1807,16 +1814,21 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             `Failed to stop emulator ${candidate.avd} before reboot: ${rebootStopRes.stderr || rebootStopRes.stdout}`,
           );
         }
-        if (isWin && candidate.serial) {
-          waitForEmulatorOffline(
-            runner,
-            avdHome,
-            { serial: candidate.serial, avd: candidate.avd },
-            effectiveStopTimeoutMs,
-          );
-        }
         stoppedExistingEmulator = true;
         resolvedSerial = null;
+        if (isWin && candidate.serial) {
+          try {
+            waitForEmulatorOffline(
+              runner,
+              avdHome,
+              { serial: candidate.serial, avd: candidate.avd },
+              effectiveStopTimeoutMs,
+            );
+          } catch (err) {
+            rebootStopWaitTimedOut = true;
+            throw err;
+          }
+        }
       }
       if (req.wipeData) {
         assertReservationStillOwned();
@@ -1998,7 +2010,13 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         let migratedToOtherLease = false;
 
         if (owned) {
-          if (previousLease && !shouldRelease) {
+          if (rebootStopWaitTimedOut) {
+            current.state = "stopping";
+            removeLeaseWorker(current, process.pid, livenessCheck);
+            current.replacingAvd = null;
+            current.serial = candidate.serial || current.serial || null;
+            current.deadlineMs = now + effectiveStopTimeoutMs;
+          } else if (previousLease && !shouldRelease) {
             state.leases[lease.deviceKey] = {
               ...previousLease,
               serial: stoppedExistingEmulator
@@ -2037,7 +2055,13 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         if (selection.victim) {
           const vCurrent = state.leases[selection.victim.deviceKey];
           if (vCurrent && vCurrent.leaseId === victimLeaseId) {
-            delete state.leases[selection.victim.deviceKey];
+            if (victimStopWaitTimedOut) {
+              vCurrent.state = "stopping";
+              removeLeaseWorker(vCurrent, process.pid, livenessCheck);
+              vCurrent.deadlineMs = now + effectiveStopTimeoutMs;
+            } else {
+              delete state.leases[selection.victim.deviceKey];
+            }
           }
         }
         const otherLeaseOwnsDevice = Object.values(state.leases || {}).some(
@@ -2049,12 +2073,18 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         );
         const stopBootedEmulator = Boolean(
           owned &&
+            !rebootStopWaitTimedOut &&
             (!previousLease || shouldRelease) &&
             !migratedToOtherLease &&
             !otherLeaseOwnsDevice &&
             needsStopOnRollback,
         );
-        if (owned && (!previousLease || shouldRelease) && !migratedToOtherLease) {
+        if (
+          owned &&
+          !rebootStopWaitTimedOut &&
+          (!previousLease || shouldRelease) &&
+          !migratedToOtherLease
+        ) {
           if (stopBootedEmulator) {
             current.state = "stopping";
             current.workerPid = process.pid;
