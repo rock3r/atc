@@ -34,6 +34,7 @@ Use `tools/check-versions.sh` to inspect or bump all 8 locations in one command:
    - GitHub owner/repository: `rock3r/atc`
    - Workflow filename: `release.yml`
    - Environment name: `npm`
+   - Allowed actions: check **Allow `npm publish`**
 4. Set package publishing access on npmjs.com to require two-factor authentication and disallow traditional tokens so GitHub Actions publishes via OIDC with provenance (`id-token: write`, `npm@11`, `--access public`).
 
 ## Release Gates

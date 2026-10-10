@@ -37,7 +37,7 @@
     "node": ">=20.0.0"
   },
   "bin": {
-    "atc": "./bin/atc.mjs"
+    "atc": "bin/atc.mjs"
   },
   "files": [
     "bin/",
