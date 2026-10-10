@@ -8250,6 +8250,35 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       bareArithVarRedir.rewrittenCommand,
       /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x \+ 1\)\) > \/tmp\/out\.txt' ; done$/,
     );
+
+    // 3l. mapfile / readarray loop destination arrays (and default MAPFILE) are tracked and forwarded
+    const mapfileNamedRedir = evaluateCommandGuard(
+      'while mapfile -t -n 1 parts; do adb shell echo "${parts[0]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(mapfileNamedRedir.allowed, true);
+    assert.match(
+      mapfileNamedRedir.rewrittenCommand,
+      /do __atc_arr_parts_0="\$\{parts\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
+    const readarrayDefaultRedir = evaluateCommandGuard(
+      'while readarray -t -n 1; do adb shell echo "${MAPFILE[0]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readarrayDefaultRedir.allowed, true);
+    assert.match(
+      readarrayDefaultRedir.rewrittenCommand,
+      /do __atc_arr_MAPFILE_0="\$\{MAPFILE\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_MAPFILE_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

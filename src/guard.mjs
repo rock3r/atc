@@ -2146,6 +2146,65 @@ function extractStageLoopVariables(stageText) {
         vars.add(rv);
       }
     }
+  } else if (
+    idx < tokens.length &&
+    (tokens[idx] === "mapfile" || tokens[idx] === "readarray")
+  ) {
+    idx++;
+    let optionsEnded = false;
+    const mapfileVars = [];
+    while (idx < tokens.length) {
+      const tok = tokens[idx++];
+      if (
+        tok === "<" ||
+        tok === "<<" ||
+        tok === "<<<" ||
+        tok === ">" ||
+        tok === ">>" ||
+        tok === "<&" ||
+        tok === ">&" ||
+        tok === "<>" ||
+        tok === "&>" ||
+        tok === "&>>"
+      ) {
+        if (idx < tokens.length) idx++;
+        continue;
+      }
+      if (/^[0-9]*[<>]/.test(tok) || tok.startsWith("&>") || tok.startsWith("&>>")) {
+        continue;
+      }
+      if (!optionsEnded && tok === "--") {
+        optionsEnded = true;
+        continue;
+      }
+      if (!optionsEnded && tok.startsWith("-") && tok.length > 1) {
+        if (/^-t*[dnOsuCc]$/.test(tok)) {
+          if (idx < tokens.length) idx++;
+        }
+        continue;
+      }
+      optionsEnded = true;
+      const cleaned = tok.replace(/^['"]|['"]$/g, "").replace(/\[.*$/, "");
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(cleaned)) {
+        mapfileVars.push(cleaned);
+      }
+    }
+    if (mapfileVars.length === 0) {
+      vars.add("MAPFILE");
+    } else {
+      for (const mv of mapfileVars) {
+        vars.add(mv);
+      }
+    }
+  }
+
+  for (const tok of tokens) {
+    const arrOrAppendMatch =
+      tok.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\]\+?|\+)=/) ||
+      tok.match(/^([A-Za-z_][A-Za-z0-9_]*)=\(/);
+    if (arrOrAppendMatch) {
+      vars.add(arrOrAppendMatch[1]);
+    }
   }
 
   return Array.from(vars);
