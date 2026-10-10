@@ -19,7 +19,6 @@ import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs"
 import {
   isPidAlive,
   randomNonce,
-  renewLock,
   resolveStateDir,
   sleepSync,
   withLock,
@@ -1594,20 +1593,11 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
 
     // 2. Auto-create missing AVD if Priority 4
     if (selection.createAvd) {
-      const createLockStaleMs = Math.max(600_000, (bootTimeoutMs || 180_000) * 3);
       withLock(
         stateDir,
-        (createLockHandle) => {
-          const refreshCreateLock = () => {
-            if (!renewLock(createLockHandle, createLockStaleMs)) {
-              throw new Error(
-                `AVD creation lock was lost before completing creation for ${candidate.profile.deviceName}.`,
-              );
-            }
-          };
+        () => {
           assertReservationStillOwned();
           const preCreateFleet = discoverFleet({ runner, avdHome });
-          refreshCreateLock();
           const preFleetAvds = new Set(
             [
               ...(preCreateFleet.offline || []),
@@ -1633,10 +1623,8 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               `Failed to create AVD for profile ${candidate.profile.deviceName}: ${createRes.stderr || createRes.stdout}`,
             );
           }
-          refreshCreateLock();
 
           const postCreateFleet = discoverFleet({ runner, avdHome });
-          refreshCreateLock();
           const allPostAvds = [
             ...(postCreateFleet.offline || []),
             ...(postCreateFleet.running || []),
@@ -1761,7 +1749,8 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         },
         bootTimeoutMs || 180_000,
         "atc.create.lock",
-        createLockStaleMs,
+        bootTimeoutMs || 180_000,
+        { allowLivePidExpiry: false },
       );
     }
 
@@ -2403,6 +2392,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   for (const item of stoppingItems) {
     const { lease, saveSnap, loadSnap, doStop, stopTimeoutMs } = item;
     let itemFailed = false;
+    let windowsStopWaitTimedOut = false;
     const checkAndRefreshStopping = () =>
       withStateTransaction(stateDir, (state, { now }) => {
         let mutated = false;
@@ -2521,6 +2511,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               );
             } catch (err) {
               itemFailed = true;
+              windowsStopWaitTimedOut = true;
               actionErrors.push(err.message);
             }
           }
@@ -2538,20 +2529,26 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           if (cur && cur.leaseId === lease.leaseId) {
             if (itemFailed) {
               const livenessCheck = options.livenessCheck || isPidAlive;
-              cur.state = "active";
               removeLeaseWorker(cur, process.pid, livenessCheck);
-              cur.releaseOnWorkerExit = false;
-              if (
-                cur.anchorPid !== null &&
-                cur.anchorPid !== undefined &&
-                !livenessCheck(cur.anchorPid)
-              ) {
-                cur.anchorPid = null;
+              if (windowsStopWaitTimedOut) {
+                cur.state = "stopping";
+                cur.pendingFsLockCheck = true;
+                cur.deadlineMs = now + stopTimeoutMs;
+              } else {
+                cur.state = "active";
+                cur.releaseOnWorkerExit = false;
+                if (
+                  cur.anchorPid !== null &&
+                  cur.anchorPid !== undefined &&
+                  !livenessCheck(cur.anchorPid)
+                ) {
+                  cur.anchorPid = null;
+                }
+                cur.deadlineMs = null;
+                const ttlMs = (state.config?.defaultTtlSec || 600) * 1000;
+                cur.renewedAtMs = now;
+                cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
               }
-              cur.deadlineMs = null;
-              const ttlMs = (state.config?.defaultTtlSec || 600) * 1000;
-              cur.renewedAtMs = now;
-              cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + ttlMs);
             } else {
               if (doStop) {
                 recordDeviceStoppedInState(state, cur, now);

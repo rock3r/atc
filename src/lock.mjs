@@ -129,7 +129,12 @@ function isOwnerEntryName(name) {
   return name === "owner.json" || /^owner\.[A-Za-z0-9_-]+\.json$/.test(name);
 }
 
-function inspectOwnerFile(ownerPath, now, fallbackStaleMs = STALE_LOCK_MS) {
+function inspectOwnerFile(
+  ownerPath,
+  now,
+  fallbackStaleMs = STALE_LOCK_MS,
+  allowLivePidExpiry = true,
+) {
   try {
     const raw = fs.readFileSync(ownerPath, "utf8");
     const owner = JSON.parse(raw);
@@ -147,7 +152,9 @@ function inspectOwnerFile(ownerPath, now, fallbackStaleMs = STALE_LOCK_MS) {
         owner.staleAfterMs > 0
           ? owner.staleAfterMs
           : fallbackStaleMs;
-      const stale = !isPidAlive(owner.pid) || now - owner.createdAtMs > ownerStaleMs;
+      const pidAlive = isPidAlive(owner.pid);
+      const stale =
+        !pidAlive || (allowLivePidExpiry && now - owner.createdAtMs > ownerStaleMs);
       return { valid: true, stale, nonce: owner.nonce };
     }
     return { valid: false, missing: false, raw };
@@ -171,9 +178,11 @@ export function acquireLock(
   timeoutMs = DEFAULT_LOCK_TIMEOUT_MS,
   lockName = "atc.lock",
   staleLockMs = STALE_LOCK_MS,
+  options = {},
 ) {
   ensureSafeDirectory(stateDir);
   const lockDir = path.join(stateDir, lockName);
+  const allowLivePidExpiry = options?.allowLivePidExpiry !== false;
   const effectiveStaleMs =
     typeof staleLockMs === "number" && Number.isFinite(staleLockMs) && staleLockMs > 0
       ? Math.max(STALE_LOCK_MS, staleLockMs)
@@ -198,7 +207,7 @@ export function acquireLock(
     for (const entry of entries) {
       const entryPath = path.join(lockDir, entry);
       if (isOwnerEntryName(entry)) {
-        const info = inspectOwnerFile(entryPath, now, effectiveStaleMs);
+        const info = inspectOwnerFile(entryPath, now, effectiveStaleMs, allowLivePidExpiry);
         if (info.missing) {
           continue;
         }
@@ -213,7 +222,12 @@ export function acquireLock(
               }
             } else {
               // Legacy/test `owner.json` without nonce in filename (never created by acquireLock)
-              const info2 = inspectOwnerFile(entryPath, Date.now(), effectiveStaleMs);
+              const info2 = inspectOwnerFile(
+                entryPath,
+                Date.now(),
+                effectiveStaleMs,
+                allowLivePidExpiry,
+              );
               if (info2.valid && info2.stale && info2.nonce === info.nonce) {
                 try {
                   fs.unlinkSync(entryPath);
@@ -327,30 +341,6 @@ export function verifyLockOwnership(lockHandle) {
   }
 }
 
-export function renewLock(lockHandle, staleAfterMs = STALE_LOCK_MS) {
-  if (!verifyLockOwnership(lockHandle)) return false;
-  const effectiveStaleMs =
-    typeof staleAfterMs === "number" && Number.isFinite(staleAfterMs) && staleAfterMs > 0
-      ? Math.max(STALE_LOCK_MS, staleAfterMs)
-      : STALE_LOCK_MS;
-  try {
-    const payload = JSON.stringify({
-      pid: process.pid,
-      createdAtMs: Date.now(),
-      staleAfterMs: effectiveStaleMs,
-      nonce: lockHandle.nonce,
-    });
-    writeFileAtomic(lockHandle.ownerPath, payload, randomNonce(), () => {
-      if (!verifyLockOwnership(lockHandle)) {
-        throw new Error("Lock ownership lost before renewal");
-      }
-    });
-    return verifyLockOwnership(lockHandle);
-  } catch {
-    return false;
-  }
-}
-
 export function releaseLock(lockHandle) {
   if (!lockHandle || !lockHandle.ownerPath) return;
   if (!verifyLockOwnership(lockHandle)) {
@@ -369,8 +359,9 @@ export function withLock(
   timeoutMs = DEFAULT_LOCK_TIMEOUT_MS,
   lockName = "atc.lock",
   staleLockMs = STALE_LOCK_MS,
+  options = {},
 ) {
-  const handle = acquireLock(stateDir, timeoutMs, lockName, staleLockMs);
+  const handle = acquireLock(stateDir, timeoutMs, lockName, staleLockMs, options);
   try {
     return fn(handle);
   } finally {

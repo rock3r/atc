@@ -8,7 +8,6 @@ import path from "node:path";
 import {
   acquireLock,
   releaseLock,
-  renewLock,
   verifyLockOwnership,
   withLock,
   writeFileAtomic,
@@ -4644,14 +4643,93 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
         undefined,
       );
 
-      // 8. renewLock refreshes owner file timestamp while preserving nonce ownership
-      const renewHandle = acquireLock(rollbackHoldDir, 2000, "atc.create.lock", 15000);
+      // 8. allowLivePidExpiry: false prevents breaking a lock held by a live PID even past staleLockMs
+      const liveHandle = acquireLock(
+        rollbackHoldDir,
+        2000,
+        "atc.create.lock",
+        10000,
+        { allowLivePidExpiry: false },
+      );
       try {
-        assert.equal(renewLock(renewHandle, 30000), true);
-        assert.equal(verifyLockOwnership(renewHandle), true);
+        const ownerObj = JSON.parse(fs.readFileSync(liveHandle.ownerPath, "utf8"));
+        ownerObj.createdAtMs = Date.now() - 120_000;
+        ownerObj.staleAfterMs = 10_000;
+        fs.writeFileSync(liveHandle.ownerPath, JSON.stringify(ownerObj), "utf8");
+        assert.throws(
+          () =>
+            acquireLock(rollbackHoldDir, 60, "atc.create.lock", 10000, {
+              allowLivePidExpiry: false,
+            }),
+          /Timed out waiting/,
+        );
+        assert.equal(verifyLockOwnership(liveHandle), true);
       } finally {
-        releaseLock(renewHandle);
+        releaseLock(liveHandle);
       }
+
+      // 9. Windows cmdFree --stop timeout preserves "stopping" with pendingFsLockCheck
+      const winFreeClaim = cmdClaim(
+        rollbackHoldDir,
+        {
+          session: "win-free-timeout-sess",
+          avd: "Pixel_Rollback_AVD",
+          wait: 0,
+          force: true,
+        },
+        {
+          platform: "win32",
+          avdHome,
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [
+              {
+                deviceKey: "avd:Pixel_Rollback_AVD",
+                kind: "emulator",
+                avd: "Pixel_Rollback_AVD",
+                serial: "emulator-5572",
+                online: true,
+                profile: { deviceType: "phone", apiLevel: "android-35" },
+              },
+            ],
+            offline: [],
+            creatable: [],
+          },
+        },
+      );
+      assert.equal(winFreeClaim.exitCode, 0);
+      withStateTransaction(rollbackHoldDir, (s) => {
+        s.config.stopTimeoutSec = 1;
+        return { mutated: true };
+      });
+      const winFreeFail = cmdFree(
+        rollbackHoldDir,
+        winFreeClaim.lease.leaseId,
+        { session: "win-free-timeout-sess", stop: true },
+        {
+          platform: "win32",
+          avdHome,
+          runner: (cmd, args) => {
+            if (cmd === "adb" && args.includes("emu") && args.includes("kill")) {
+              return { status: 0, stdout: "OK\n", stderr: "" };
+            }
+            if (cmd === "adb" && args[0] === "devices") {
+              return {
+                status: 0,
+                stdout: "List of devices attached\nemulator-5572\tdevice\n",
+                stderr: "",
+              };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      assert.equal(winFreeFail.exitCode, 1);
+      const winFreeHeld = readState(rollbackHoldDir).leases["avd:Pixel_Rollback_AVD"];
+      assert.ok(winFreeHeld);
+      assert.equal(winFreeHeld.state, "stopping");
+      assert.equal(winFreeHeld.pendingFsLockCheck, true);
+      assert.equal(winFreeHeld.workerPid, null);
     } finally {
       fs.rmSync(rollbackHoldDir, { recursive: true, force: true });
     }
