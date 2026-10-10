@@ -1036,6 +1036,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           const alreadyRunning = (inventory.running || []).some(
             (d) =>
               d.kind === "emulator" &&
+              (!entry.serial || d.serial === entry.serial) &&
               ((entry.deviceKey && d.deviceKey === entry.deviceKey) ||
                 (entry.avd && d.avd === entry.avd) ||
                 (entry.serial && d.serial === entry.serial)),
@@ -1080,6 +1081,20 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             }
           }
           for (const b of staleBooted) {
+            const runningMatch = nextRunning.find(
+              (r) =>
+                (b.avd && r.avd === b.avd) ||
+                (b.deviceKey && r.deviceKey === b.deviceKey) ||
+                (b.serial && r.serial === b.serial),
+            );
+            nextRunning = nextRunning.filter(
+              (r) =>
+                !(
+                  (b.avd && r.avd === b.avd) ||
+                  (b.deviceKey && r.deviceKey === b.deviceKey) ||
+                  (b.serial && r.serial === b.serial)
+                ),
+            );
             const offlineMatch = nextOffline.find(
               (o) =>
                 (b.avd && o.avd === b.avd) || (b.deviceKey && o.deviceKey === b.deviceKey),
@@ -1091,21 +1106,22 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   (b.deviceKey && o.deviceKey === b.deviceKey)
                 ),
             );
+            const baseMatch = offlineMatch || runningMatch || {};
             nextRunning.push({
-              ...(offlineMatch || {}),
+              ...baseMatch,
               deviceKey:
                 b.deviceKey ||
-                offlineMatch?.deviceKey ||
+                baseMatch.deviceKey ||
                 (b.avd ? `avd:${b.avd}` : `serial:${b.serial}`),
               kind: "emulator",
-              avd: b.avd || offlineMatch?.avd || null,
+              avd: b.avd || baseMatch.avd || null,
               serial: b.serial || null,
               online: true,
-              profile: b.profile || offlineMatch?.profile || {},
-              ramSizeMb: b.ramSizeMb || offlineMatch?.ramSizeMb || 2048,
+              profile: b.profile || baseMatch.profile || {},
+              ramSizeMb: b.ramSizeMb || baseMatch.ramSizeMb || 2048,
               requiredRamMb:
                 b.requiredRamMb ||
-                offlineMatch?.requiredRamMb ||
+                baseMatch.requiredRamMb ||
                 2048 + (state.config?.qemuOverheadRamMb ?? 1024),
             });
           }
@@ -1384,6 +1400,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   status: "needs_boot_or_prep",
                   lease: startingLease,
                   previousLease: existingOwnLease,
+                  hasExplicitTtl: rawTtl !== undefined,
                   selection,
                   victimLeaseId,
                   ttlMs,
@@ -1704,6 +1721,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
   const {
     lease,
     previousLease,
+    hasExplicitTtl,
     selection,
     victimLeaseId,
     ttlMs,
@@ -2297,7 +2315,9 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         current.activatedAtMs = now;
         current.activatedEpoch = state.fleetEpoch || 0;
         current.renewedAtMs = now;
-        current.expiresAtMs = now + ttlMs;
+        current.expiresAtMs = hasExplicitTtl
+          ? now + ttlMs
+          : Math.max(current.expiresAtMs || 0, previousLease?.expiresAtMs || 0, now + ttlMs);
         current.deadlineMs = null;
       },
     );

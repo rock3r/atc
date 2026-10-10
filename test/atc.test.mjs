@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,7 @@ import { Worker } from "node:worker_threads";
 
 import {
   acquireLock,
+  isProcessGroupAlive,
   releaseLock,
   sleepSync,
   verifyLockOwnership,
@@ -2171,11 +2172,15 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       }
 
       // Windows resolveExecutable and buildSpawnConfig treat npm `atc` shim as batch (.cmd) launched via cmd.exe
-      const winAtcResolved = resolveExecutable("atc", { PATH: "" }, winDir, "win32");
+      const fakeNpmBin = path.join(winDir, "npm-bin");
+      fs.mkdirSync(fakeNpmBin, { recursive: true });
+      const fakeAtcShim = path.join(fakeNpmBin, "atc.cmd");
+      fs.writeFileSync(fakeAtcShim, "@echo off\r\n", "utf8");
+      const winAtcResolved = resolveExecutable("atc", { PATH: fakeNpmBin }, winDir, "win32");
       assert.equal(winAtcResolved.isBatch, true);
-      assert.equal(winAtcResolved.executable, "atc.cmd");
+      assert.equal(winAtcResolved.executable, fakeAtcShim);
       const winAtcSpawn = buildSpawnConfig("atc", ["free", "--session", "pi-1"], {
-        env: { PATH: "", ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+        env: { PATH: fakeNpmBin, ComSpec: "C:\\Windows\\System32\\cmd.exe" },
         cwd: winDir,
         platform: "win32",
       });
@@ -2897,18 +2902,30 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             );
             assert.equal(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"], undefined);
 
-            // 17. resolveExecutable("atc", ...) does not execute a repository-local atc.cmd in cwd on Windows
+            // 17. resolveExecutable("atc", ...) fails instead of falling back to a bare atc.cmd that cmd.exe would resolve in cwd
             const untrustedRepoDir = makeTempStateDir();
             try {
               const repoAtcCmd = path.join(untrustedRepoDir, "atc.cmd");
               fs.writeFileSync(repoAtcCmd, "@echo off\r\necho hacked\r\n");
-              const resolvedAtcWin = resolveExecutable(
-                "atc",
-                { PATH: "", APPDATA: untrustedRepoDir, LOCALAPPDATA: untrustedRepoDir },
-                untrustedRepoDir,
-                "win32",
+              assert.throws(
+                () =>
+                  resolveExecutable(
+                    "atc",
+                    { PATH: "", APPDATA: untrustedRepoDir, LOCALAPPDATA: untrustedRepoDir },
+                    untrustedRepoDir,
+                    "win32",
+                  ),
+                /Executable not found in PATH/,
               );
-              assert.notEqual(resolvedAtcWin.executable, repoAtcCmd);
+              assert.throws(
+                () =>
+                  buildSpawnConfig("atc", ["status"], {
+                    env: { PATH: "", APPDATA: untrustedRepoDir, LOCALAPPDATA: untrustedRepoDir },
+                    cwd: untrustedRepoDir,
+                    platform: "win32",
+                  }),
+                /Executable not found in PATH/,
+              );
             } finally {
               fs.rmSync(untrustedRepoDir, { recursive: true, force: true });
             }
@@ -6433,6 +6450,219 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         const heldRollbackLease = readState(r21Dir).leases["avd:Pixel_Posix_Stop_Fail"];
         assert.ok(heldRollbackLease, "Failed POSIX rollback stop must keep stopping reservation");
         assert.equal(heldRollbackLease.awaitOfflineReconcile, true);
+
+        // Astra #22 Finding 1: Cached inventory with pre-restart serial is updated when bootedDevices has a newer serial
+        withStateTransaction(r21Dir, (s) => {
+          s.leases = {};
+          s.fleetEpoch = 50;
+          s.stoppedDevices = {};
+          s.bootedDevices = {
+            "avd:Pixel_Restarted_Serial": {
+              avd: "Pixel_Restarted_Serial",
+              deviceKey: "avd:Pixel_Restarted_Serial",
+              serial: "emulator-5568",
+              epoch: 50,
+              bootedAtMs: Date.now(),
+            },
+          };
+          return { mutated: true };
+        });
+        const restartedSerialClaim = cmdClaim(
+          r21Dir,
+          { avd: "Pixel_Restarted_Serial", session: "restart-serial-sess", wait: 0 },
+          {
+            avdHome,
+            inventory: {
+              avdHome,
+              fleetEpoch: 40,
+              running: [
+                {
+                  deviceKey: "avd:Pixel_Restarted_Serial",
+                  kind: "emulator",
+                  avd: "Pixel_Restarted_Serial",
+                  serial: "emulator-5554",
+                  online: true,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+              ],
+              offline: [],
+              creatable: [],
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            runner: () => ({ status: 0, stdout: "", stderr: "" }),
+          },
+        );
+        assert.equal(restartedSerialClaim.exitCode, 0);
+        assert.equal(restartedSerialClaim.lease.serial, "emulator-5568");
+
+        // Astra #22 Finding 2: Bare `adb reconnect` is denied while `adb reconnect device` is allowed
+        const bareReconnectGuard = evaluateCommandGuard("adb reconnect", {
+          sessionId: "reconn-sess",
+          activeLeases: [{ leaseId: "lease_reconn", serial: "emulator-5554" }],
+        });
+        assert.equal(bareReconnectGuard.allowed, false);
+        assert.match(bareReconnectGuard.reason, /adb reconnect/);
+        const execBareReconnectGuard = evaluateCommandGuard("atc exec -- adb reconnect", {
+          sessionId: "reconn-sess",
+          activeLeases: [{ leaseId: "lease_reconn", serial: "emulator-5554" }],
+        });
+        assert.equal(execBareReconnectGuard.allowed, false);
+        assert.throws(
+          () =>
+            buildChildInvocation(
+              "adb",
+              ["reconnect"],
+              { leaseId: "lease_reconn", serial: "emulator-5554", avd: "Pixel_8_API_35" },
+              "reconn-sess",
+              {},
+            ),
+          /Bare "adb reconnect" is disabled under ATC/,
+        );
+        const deviceReconnectGuard = evaluateCommandGuard("adb reconnect device", {
+          sessionId: "reconn-sess",
+          activeLeases: [{ leaseId: "lease_reconn", serial: "emulator-5554" }],
+        });
+        assert.equal(deviceReconnectGuard.allowed, true);
+        assert.match(deviceReconnectGuard.rewrittenCommand, /atc exec.*adb reconnect device/);
+        const deviceReconnectInv = buildChildInvocation(
+          "adb",
+          ["reconnect", "device"],
+          { leaseId: "lease_reconn", serial: "emulator-5554", avd: "Pixel_8_API_35" },
+          "reconn-sess",
+          {},
+        );
+        assert.equal(deviceReconnectInv.cmd, "adb");
+
+        // Astra #22 Finding 3: Background separator `&` rewrites subsequent device stages with `atc exec`
+        const bgGuard = evaluateCommandGuard("echo ready & adb shell pm clear com.example", {
+          sessionId: "bg-sess",
+          activeLeases: [{ leaseId: "lease_bg", serial: "emulator-5554" }],
+        });
+        assert.equal(bgGuard.allowed, true);
+        assert.match(
+          bgGuard.rewrittenCommand,
+          /^echo ready & .*atc exec --serial emulator-5554 -- adb shell pm clear com\.example$/,
+        );
+
+        // Astra #22 Finding 5: Cold reclaim without explicit --ttl preserves a longer existing lease expiration
+        const longExpiryMs = Date.now() + 3_000_000;
+        withStateTransaction(r21Dir, (s, { now }) => {
+          s.leases = {
+            "avd:Pixel_Cold_Preserve_Ttl": {
+              leaseId: "lease_long_ttl",
+              deviceKey: "avd:Pixel_Cold_Preserve_Ttl",
+              kind: "emulator",
+              avd: "Pixel_Cold_Preserve_Ttl",
+              serial: "emulator-5572",
+              profile: { apiLevel: "android-35", deviceType: "phone" },
+              sessionId: "long-ttl-sess",
+              anchorPid: process.pid,
+              state: "active",
+              claimedAtMs: now - 10_000,
+              activatedAtMs: now - 9_000,
+              renewedAtMs: now - 1_000,
+              expiresAtMs: longExpiryMs,
+            },
+          };
+          return { mutated: true };
+        });
+        const coldPreserveRes = cmdClaim(
+          r21Dir,
+          { avd: "Pixel_Cold_Preserve_Ttl", session: "long-ttl-sess", cold: true, wait: 0 },
+          {
+            avdHome,
+            platform: "linux",
+            inventory: {
+              avdHome,
+              running: [
+                {
+                  deviceKey: "avd:Pixel_Cold_Preserve_Ttl",
+                  kind: "emulator",
+                  avd: "Pixel_Cold_Preserve_Ttl",
+                  serial: "emulator-5572",
+                  online: true,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+              ],
+              offline: [],
+              creatable: [],
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            runner: (cmd, args) => {
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                return { status: 0, stdout: "Stopped\n", stderr: "" };
+              }
+              if (cmd === "adb" && args[0] === "devices") {
+                return { status: 0, stdout: "List of devices attached\n\n", stderr: "" };
+              }
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                return { status: 0, stdout: "Started emulator-5572\n", stderr: "" };
+              }
+              return { status: 0, stdout: "", stderr: "" };
+            },
+          },
+        );
+        assert.equal(coldPreserveRes.exitCode, 0);
+        assert.ok(
+          coldPreserveRes.lease.expiresAtMs >= longExpiryMs,
+          `Expected cold reclaim without --ttl to preserve expiresAtMs >= ${longExpiryMs}, got ${coldPreserveRes.lease.expiresAtMs}`,
+        );
+
+        // Codex PR comment: isProcessGroupAlive returns false when only zombie (Z) processes remain in the group
+        if (process.platform !== "win32") {
+          const parentHolder = spawn(
+            process.execPath,
+            [
+              "-e",
+              `
+              const { spawn } = require("node:child_process");
+              const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 120)"], {
+                detached: true,
+                stdio: "ignore",
+              });
+              process.stdout.write(String(child.pid) + "\\n");
+              setInterval(() => {}, 10000);
+              `,
+            ],
+            { stdio: ["ignore", "pipe", "ignore"] },
+          );
+          try {
+            const childPgid = await new Promise((resolve, reject) => {
+              let buf = "";
+              parentHolder.stdout.on("data", (d) => {
+                buf += d.toString("utf8");
+                const nl = buf.indexOf("\n");
+                if (nl !== -1) {
+                  resolve(Number(buf.slice(0, nl).trim()));
+                }
+              });
+              parentHolder.once("error", reject);
+              parentHolder.once("exit", () => reject(new Error("parentHolder exited early")));
+            });
+            assert.ok(Number.isInteger(childPgid) && childPgid > 1);
+            // Freeze parentHolder so libuv cannot waitpid() on child when child exits
+            process.kill(parentHolder.pid, "SIGSTOP");
+            const deadline = Date.now() + 3000;
+            while (Date.now() < deadline && isProcessGroupAlive(childPgid)) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            assert.equal(
+              isProcessGroupAlive(childPgid),
+              false,
+              "Zombie-only process group must not be reported alive",
+            );
+          } finally {
+            try {
+              process.kill(parentHolder.pid, "SIGKILL");
+            } catch {
+              // Ignore
+            }
+          }
+        }
       } finally {
         fs.rmSync(r21Dir, { recursive: true, force: true });
       }

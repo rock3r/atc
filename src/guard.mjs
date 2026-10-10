@@ -333,7 +333,24 @@ function splitOutsideQuotes(str, sepType) {
           i++;
           continue;
         }
-        if (ch === ";" || ch === "\n" || ch === "&") {
+        if (ch === ";") {
+          if (cur.trim()) parts.push(cur.trim());
+          cur = "";
+          if (str[i + 1] === ";" && str[i + 2] === "&") {
+            i += 2;
+          } else if (str[i + 1] === ";" || str[i + 1] === "&") {
+            i += 1;
+          }
+          continue;
+        }
+        if (
+          ch === "\n" ||
+          (ch === "&" &&
+            str[i + 1] !== ">" &&
+            str[i - 1] !== ">" &&
+            str[i - 1] !== "<" &&
+            str[i - 1] !== "|")
+        ) {
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
           continue;
@@ -346,6 +363,9 @@ function splitOutsideQuotes(str, sepType) {
         ) {
           if (cur.trim()) parts.push(cur.trim());
           cur = "";
+          if (str[i + 1] === "&") {
+            i++;
+          }
           continue;
         }
       }
@@ -1332,13 +1352,24 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
         parsed,
       };
     }
-    if (adbSub === "reconnect" && adbRest.includes("offline")) {
-      return {
-        kind: "deny_lifecycle",
-        reason:
-          'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
-        parsed,
-      };
+    if (adbSub === "reconnect") {
+      const reconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (reconnectTargets.includes("offline")) {
+        return {
+          kind: "deny_lifecycle",
+          reason:
+            'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
+          parsed,
+        };
+      }
+      if (reconnectTargets.length !== 1 || reconnectTargets[0] !== "device") {
+        return {
+          kind: "deny_lifecycle",
+          reason:
+            'Bare "adb reconnect" is disabled under ATC because it resets host-side ADB connections across the host; use "adb reconnect device" inside "atc exec --" instead.',
+          parsed,
+        };
+      }
     }
     if (adbSub === "emu" && adbRest[0] === "kill") {
       return {
@@ -1908,12 +1939,31 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         cur = "";
         continue;
       }
+      if (ch === "\n") {
+        tokens.push({ type: "stage", text: cur });
+        tokens.push({ type: "sep", text: "\n" });
+        cur = "";
+        continue;
+      }
+      if (ch === "|" && !isCasePatternAlternationPipe(cur, command.slice(i + 1))) {
+        tokens.push({ type: "stage", text: cur });
+        if (command[i + 1] === "&") {
+          tokens.push({ type: "sep", text: " |& " });
+          i += 1;
+        } else {
+          tokens.push({ type: "sep", text: " | " });
+        }
+        cur = "";
+        continue;
+      }
       if (
-        ch === "\n" ||
-        (ch === "|" && !isCasePatternAlternationPipe(cur, command.slice(i + 1)))
+        ch === "&" &&
+        command[i + 1] !== ">" &&
+        command[i - 1] !== ">" &&
+        command[i - 1] !== "<"
       ) {
         tokens.push({ type: "stage", text: cur });
-        tokens.push({ type: "sep", text: ch === "\n" ? "\n" : ` ${ch} ` });
+        tokens.push({ type: "sep", text: " & " });
         cur = "";
         continue;
       }
@@ -1930,7 +1980,8 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
   return tokens
     .map((tok) => {
       if (tok.type !== "stage") {
-        if (tok.text.trim() === "|") {
+        const sepTrimmed = tok.text.trim();
+        if (sepTrimmed === "|" || sepTrimmed === "|&") {
           inPipeline = true;
         } else {
           pipeUpstreamArgs = [];

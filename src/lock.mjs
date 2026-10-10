@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -29,11 +30,62 @@ export function isProcessGroupAlive(pgid) {
   }
   try {
     process.kill(-pgid, 0);
-    return true;
   } catch (err) {
-    if (err && err.code === "EPERM") return true;
-    return false;
+    if (!err || err.code !== "EPERM") return false;
   }
+  if (process.platform === "linux") {
+    try {
+      const entries = fs.readdirSync("/proc");
+      let inspectedAny = false;
+      for (const name of entries) {
+        if (!/^\d+$/.test(name)) continue;
+        try {
+          const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
+          const closeParen = stat.lastIndexOf(")");
+          if (closeParen === -1) continue;
+          const fields = stat.slice(closeParen + 1).trim().split(/\s+/);
+          const state = fields[0];
+          const pgrp = Number(fields[2]);
+          if (!Number.isInteger(pgrp)) continue;
+          inspectedAny = true;
+          if (pgrp === pgid && state && !state.toUpperCase().startsWith("Z")) {
+            return true;
+          }
+        } catch {
+          // Process exited or unreadable; continue scanning
+        }
+      }
+      if (inspectedAny) {
+        return false;
+      }
+    } catch {
+      // Fall back to ps below if /proc is unavailable
+    }
+  }
+  try {
+    const res = spawnSync("ps", ["-axo", "pgid=,stat="], {
+      encoding: "utf8",
+      timeout: 1500,
+    });
+    if (res && res.status === 0 && typeof res.stdout === "string") {
+      for (const line of res.stdout.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const [pgidStr, statStr] = trimmed.split(/\s+/, 2);
+        if (
+          Number(pgidStr) === pgid &&
+          statStr &&
+          !statStr.toUpperCase().startsWith("Z")
+        ) {
+          return true;
+        }
+      }
+      return false;
+    }
+  } catch {
+    // Ignore ps failures and fall back to kill(-pgid, 0) result
+  }
+  return true;
 }
 
 export function resolveStateDir(overrideDir = process.env.ATC_STATE_DIR) {

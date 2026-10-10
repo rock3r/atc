@@ -74,28 +74,39 @@ export function resolveExecutable(
   const hasPathSep = command.includes("/") || command.includes("\\");
   const normalizedCommand = hasPathSep ? command.replace(/\//g, path.sep) : command;
   const lower = normalizedCommand.toLowerCase();
-  if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
-    const resolvedCmd = hasPathSep ? path.resolve(cwd, normalizedCommand) : normalizedCommand;
-    return { executable: resolvedCmd, isBatch: true };
+  const isGradlew =
+    lower === "gradlew" || lower === "gradlew.bat" || lower === "gradlew.cmd";
+  if (hasPathSep && (lower.endsWith(".cmd") || lower.endsWith(".bat"))) {
+    return { executable: path.resolve(cwd, normalizedCommand), isBatch: true };
   }
-  if (lower.endsWith(".exe") || lower.endsWith(".com")) {
-    const resolvedCmd = hasPathSep ? path.resolve(cwd, normalizedCommand) : normalizedCommand;
-    return { executable: resolvedCmd, isBatch: false };
+  if (hasPathSep && (lower.endsWith(".exe") || lower.endsWith(".com"))) {
+    return { executable: path.resolve(cwd, normalizedCommand), isBatch: false };
   }
 
   // Check relative / project-local candidates in cwd first only for explicit path separators or gradlew
-  if (hasPathSep || lower === "gradlew") {
-    for (const ext of extensions) {
-      const localCandidate = path.resolve(cwd, normalizedCommand + ext);
+  if (hasPathSep || isGradlew) {
+    if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
+      const localBatch = path.resolve(cwd, normalizedCommand);
       try {
-        if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
-          return {
-            executable: localCandidate,
-            isBatch: ext === ".cmd" || ext === ".bat",
-          };
+        if (fs.existsSync(localBatch) && fs.statSync(localBatch).isFile()) {
+          return { executable: localBatch, isBatch: true };
         }
       } catch {
         // Ignore inaccessible local entry
+      }
+    } else {
+      for (const ext of extensions) {
+        const localCandidate = path.resolve(cwd, normalizedCommand + ext);
+        try {
+          if (fs.existsSync(localCandidate) && fs.statSync(localCandidate).isFile()) {
+            return {
+              executable: localCandidate,
+              isBatch: ext === ".cmd" || ext === ".bat",
+            };
+          }
+        } catch {
+          // Ignore inaccessible local entry
+        }
       }
     }
   }
@@ -114,7 +125,24 @@ export function resolveExecutable(
     path.join(os.homedir(), ".local", "bin"),
   );
 
+  const hasExplicitBatchExt = lower.endsWith(".cmd") || lower.endsWith(".bat");
+  const hasExplicitBinExt = lower.endsWith(".exe") || lower.endsWith(".com");
+
   for (const dir of pathDirs) {
+    if (hasExplicitBatchExt || hasExplicitBinExt) {
+      const candidate = path.join(dir, normalizedCommand);
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          return {
+            executable: candidate,
+            isBatch: hasExplicitBatchExt,
+          };
+        }
+      } catch {
+        // Ignore inaccessible PATH entry
+      }
+      continue;
+    }
     for (const ext of extensions) {
       const candidate = path.join(dir, normalizedCommand + ext);
       try {
@@ -130,8 +158,8 @@ export function resolveExecutable(
     }
   }
 
-  if (lower === "atc") {
-    return { executable: "atc.cmd", isBatch: true };
+  if (hasExplicitBatchExt || lower === "atc") {
+    throw new Error(`Executable not found in PATH: ${command}`);
   }
 
   return { executable: command, isBatch: false };
@@ -156,6 +184,9 @@ export function buildSpawnConfig(command, args = [], options = {}) {
   const resolved = resolveExecutable(command, env, cwd, platform);
 
   if (platform === "win32" && resolved.isBatch) {
+    if (!path.win32.isAbsolute(resolved.executable)) {
+      throw new Error(`Executable not found in PATH: ${command}`);
+    }
     validateBatchArgs(args, Boolean(options.strictInternal));
     const comspec = env.ComSpec || "cmd.exe";
     const quotedCmd = `"${resolved.executable}" ${args.map((a) => `"${String(a).replace(/"/g, '""')}"`).join(" ")}`;
@@ -418,10 +449,18 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
       );
     }
-    if (adbSub === "reconnect" && adbRest.includes("offline")) {
-      throw new Error(
-        'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
-      );
+    if (adbSub === "reconnect") {
+      const reconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (reconnectTargets.includes("offline")) {
+        throw new Error(
+          'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
+        );
+      }
+      if (reconnectTargets.length !== 1 || reconnectTargets[0] !== "device") {
+        throw new Error(
+          'Bare "adb reconnect" is disabled under ATC because it resets host-side ADB connections across the host; use "adb reconnect device" instead.',
+        );
+      }
     }
     if (adbSub === "emu" && adbRest[0] === "kill") {
       throw new Error(
