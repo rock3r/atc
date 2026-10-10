@@ -126,7 +126,7 @@ export function sleepSync(ms) {
 }
 
 function isOwnerEntryName(name) {
-  return name === "owner.json" || /^owner\.[A-Za-z0-9_-]+\.json$/.test(name);
+  return name === "owner.json";
 }
 
 function inspectOwnerFile(
@@ -136,6 +136,7 @@ function inspectOwnerFile(
   allowLivePidExpiry = true,
 ) {
   try {
+    const st = fs.lstatSync(ownerPath);
     const raw = fs.readFileSync(ownerPath, "utf8");
     const owner = JSON.parse(raw);
     if (
@@ -157,18 +158,26 @@ function inspectOwnerFile(
         !pidAlive || (allowLivePidExpiry && now - owner.createdAtMs > ownerStaleMs);
       return { valid: true, stale, nonce: owner.nonce };
     }
-    return { valid: false, missing: false, raw };
+    const ageMs = now - (st.mtimeMs || st.ctimeMs || 0);
+    return { valid: false, missing: false, stale: ageMs >= MISSING_OWNER_STALE_MS, raw };
   } catch (err) {
     if (err && err.code === "ENOENT") {
-      return { valid: false, missing: true, raw: null };
+      return { valid: false, missing: true, stale: false, raw: null };
     }
     try {
-      return { valid: false, missing: false, raw: fs.readFileSync(ownerPath, "utf8") };
+      const st = fs.lstatSync(ownerPath);
+      const ageMs = now - (st.mtimeMs || st.ctimeMs || 0);
+      return {
+        valid: false,
+        missing: false,
+        stale: ageMs >= MISSING_OWNER_STALE_MS,
+        raw: fs.readFileSync(ownerPath, "utf8"),
+      };
     } catch (readErr) {
       if (readErr && readErr.code === "ENOENT") {
-        return { valid: false, missing: true, raw: null };
+        return { valid: false, missing: true, stale: false, raw: null };
       }
-      return { valid: false, missing: false, raw: "" };
+      return { valid: false, missing: false, stale: false, raw: "" };
     }
   }
 }
@@ -182,146 +191,139 @@ export function acquireLock(
 ) {
   ensureSafeDirectory(stateDir);
   const lockDir = path.join(stateDir, lockName);
+  const ownerPath = path.join(lockDir, "owner.json");
   const allowLivePidExpiry = options?.allowLivePidExpiry !== false;
   const effectiveStaleMs =
     typeof staleLockMs === "number" && Number.isFinite(staleLockMs) && staleLockMs > 0
       ? Math.max(STALE_LOCK_MS, staleLockMs)
       : STALE_LOCK_MS;
   const startMs = Date.now();
-  const invalidSeenAtMs = new Map();
+  const observedUnownedAtMs = new Map();
 
   while (true) {
-    fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-    const now = Date.now();
-    let entries = [];
     try {
-      entries = fs.readdirSync(lockDir);
-    } catch {
-      entries = [];
-    }
-
-    let hasLiveOwner = false;
-    let unlinkedStale = false;
-    const seenInvalidKeys = new Set();
-
-    for (const entry of entries) {
-      const entryPath = path.join(lockDir, entry);
-      if (isOwnerEntryName(entry)) {
-        const info = inspectOwnerFile(entryPath, now, effectiveStaleMs, allowLivePidExpiry);
-        if (info.missing) {
-          continue;
-        }
-        if (info.valid) {
-          if (info.stale) {
-            if (entry === `owner.${info.nonce}.json`) {
-              try {
-                fs.unlinkSync(entryPath);
-                unlinkedStale = true;
-              } catch {
-                // Already unlinked by owner or competing breaker
-              }
-            } else {
-              const info2 = inspectOwnerFile(
-                entryPath,
-                Date.now(),
-                effectiveStaleMs,
-                allowLivePidExpiry,
-              );
-              if (info2.valid && info2.stale && info2.nonce === info.nonce) {
-                try {
-                  fs.unlinkSync(entryPath);
-                  unlinkedStale = true;
-                } catch {
-                  // Ignore concurrent unlink
-                }
-              }
-            }
-          } else {
-            hasLiveOwner = true;
-          }
-        } else {
-          const invKey = `${entry}:${info.raw ?? ""}`;
-          seenInvalidKeys.add(invKey);
-          const firstSeen = invalidSeenAtMs.get(invKey);
-          if (firstSeen === undefined) {
-            invalidSeenAtMs.set(invKey, now);
-          } else if (now - firstSeen >= MISSING_OWNER_STALE_MS) {
-            const recheck = inspectOwnerFile(
-              entryPath,
-              Date.now(),
-              effectiveStaleMs,
-              allowLivePidExpiry,
-            );
-            if (!recheck.valid && !recheck.missing && `${entry}:${recheck.raw ?? ""}` === invKey) {
-              try {
-                fs.unlinkSync(entryPath);
-                invalidSeenAtMs.delete(invKey);
-                unlinkedStale = true;
-              } catch {
-                // Ignore concurrent unlink
-              }
-            }
-          } else {
-            hasLiveOwner = true;
-          }
-        }
-      } else if (entry.includes(".tmp.")) {
-        try {
-          const st = fs.lstatSync(entryPath);
-          if (now - (st.mtimeMs || st.ctimeMs || 0) >= MISSING_OWNER_STALE_MS) {
-            fs.unlinkSync(entryPath);
-          }
-        } catch {
-          // Ignore transient temp file
-        }
-      }
-    }
-
-    for (const k of Array.from(invalidSeenAtMs.keys())) {
-      if (!seenInvalidKeys.has(k)) {
-        invalidSeenAtMs.delete(k);
-      }
-    }
-
-    if (unlinkedStale && !hasLiveOwner) {
-      continue;
-    }
-
-    if (!hasLiveOwner) {
+      fs.mkdirSync(lockDir, { mode: 0o700 });
       const myNonce = randomNonce();
-      const myFileName = `owner.${myNonce}.json`;
-      const myOwnerPath = path.join(lockDir, myFileName);
       const myCreatedAtMs = Date.now();
-      let wroteCandidate = false;
+      const ownerPayload = JSON.stringify({
+        pid: process.pid,
+        createdAtMs: myCreatedAtMs,
+        staleAfterMs: effectiveStaleMs,
+        nonce: myNonce,
+      });
+      writeFileAtomic(ownerPath, ownerPayload, myNonce);
+      const handle = {
+        lockDir,
+        ownerPath,
+        nonce: myNonce,
+      };
+      if (
+        Date.now() - myCreatedAtMs < Math.floor(effectiveStaleMs / 2) &&
+        verifyLockOwnership(handle)
+      ) {
+        return handle;
+      }
+      releaseLock(handle);
+    } catch (err) {
+      if (!err || err.code !== "EEXIST") {
+        throw err;
+      }
+    }
+
+    const now = Date.now();
+    const info = inspectOwnerFile(ownerPath, now, effectiveStaleMs, allowLivePidExpiry);
+    let candidateStale = false;
+    let candidateUnownedKey = null;
+
+    if (info.valid) {
+      observedUnownedAtMs.clear();
+      candidateStale = info.stale;
+    } else if (info.missing) {
       try {
-        const ownerPayload = JSON.stringify({
-          pid: process.pid,
-          createdAtMs: myCreatedAtMs,
-          staleAfterMs: effectiveStaleMs,
-          nonce: myNonce,
-        });
-        writeFileAtomic(myOwnerPath, ownerPayload, myNonce);
-        wroteCandidate = true;
-        const postEntries = fs.readdirSync(lockDir).filter(isOwnerEntryName);
-        if (
-          postEntries.length === 1 &&
-          postEntries[0] === myFileName &&
-          Date.now() - myCreatedAtMs < Math.floor(effectiveStaleMs / 2)
-        ) {
-          return {
-            lockDir,
-            ownerPath: myOwnerPath,
-            nonce: myNonce,
-          };
+        const dirSt = fs.lstatSync(lockDir);
+        const dirKey = `missing:${dirSt.ino || 0}:${dirSt.ctimeMs || dirSt.mtimeMs || 0}`;
+        candidateUnownedKey = dirKey;
+        const firstSeen = observedUnownedAtMs.get(dirKey);
+        if (firstSeen === undefined) {
+          observedUnownedAtMs.set(dirKey, now);
+        } else if (now - firstSeen >= MISSING_OWNER_STALE_MS) {
+          candidateStale = true;
         }
       } catch {
-        // Fall through to cleanup and retry
+        // Lock directory disappeared concurrently
       }
-      if (wroteCandidate) {
+    } else {
+      const invKey = `invalid:${info.raw ?? ""}`;
+      candidateUnownedKey = invKey;
+      const firstSeen = observedUnownedAtMs.get(invKey);
+      if (firstSeen === undefined) {
+        observedUnownedAtMs.set(invKey, now);
+      } else if (now - firstSeen >= MISSING_OWNER_STALE_MS || info.stale) {
+        candidateStale = true;
+      }
+    }
+
+    if (candidateStale) {
+      if (info.missing) {
         try {
-          fs.unlinkSync(myOwnerPath);
+          fs.rmdirSync(lockDir);
+          observedUnownedAtMs.clear();
+          continue;
         } catch {
-          // Ignore if already removed
+          // Directory is non-empty (e.g. an owner or .tmp file was just created); fall through
+        }
+      } else {
+        const stageDir = path.join(
+          lockDir,
+          `.break.${process.pid}.${randomNonce()}`,
+        );
+        let stagedDirCreated = false;
+        try {
+          fs.mkdirSync(stageDir, { mode: 0o700 });
+          stagedDirCreated = true;
+          const stagedOwnerPath = path.join(stageDir, "owner.json");
+          fs.linkSync(ownerPath, stagedOwnerPath);
+          const verifyInfo = inspectOwnerFile(
+            stagedOwnerPath,
+            Date.now(),
+            effectiveStaleMs,
+            allowLivePidExpiry,
+          );
+          const verifiedStale = info.valid
+            ? verifyInfo.valid && verifyInfo.stale && verifyInfo.nonce === info.nonce
+            : !verifyInfo.valid &&
+              !verifyInfo.missing &&
+              `invalid:${verifyInfo.raw ?? ""}` === candidateUnownedKey;
+
+          if (verifiedStale) {
+            const staleDir = path.join(
+              stateDir,
+              `${lockName}.stale.${process.pid}.${randomNonce()}`,
+            );
+            fs.renameSync(lockDir, staleDir);
+            observedUnownedAtMs.clear();
+            try {
+              fs.rmSync(staleDir, { recursive: true, force: true });
+            } catch {
+              // Swept later by orphan sweep
+            }
+            continue;
+          }
+          try {
+            fs.unlinkSync(stagedOwnerPath);
+          } catch {
+            // Ignore cleanup failure
+          }
+        } catch {
+          // Another process broke or updated the lock
+        } finally {
+          if (stagedDirCreated) {
+            try {
+              fs.rmSync(stageDir, { recursive: true, force: true });
+            } catch {
+              // Ignore if parent lockDir was renamed and removed
+            }
+          }
         }
       }
     }
@@ -330,7 +332,7 @@ export function acquireLock(
       throw new Error(`Timed out waiting ${timeoutMs}ms to acquire ${lockDir}`);
     }
 
-    sleepSync(10 + Math.floor(Math.random() * 30));
+    sleepSync(15 + Math.floor(Math.random() * 35));
   }
 }
 
@@ -350,10 +352,42 @@ export function releaseLock(lockHandle) {
   if (!verifyLockOwnership(lockHandle)) {
     return;
   }
-  try {
-    fs.unlinkSync(lockHandle.ownerPath);
-  } catch {
-    // Ignore if already unlinked
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.unlinkSync(lockHandle.ownerPath);
+      break;
+    } catch (err) {
+      if (err && err.code === "ENOENT") break;
+      if (attempt === 4) {
+        try {
+          fs.writeFileSync(lockHandle.ownerPath, "{}", "utf8");
+        } catch {
+          // Best-effort invalidation
+        }
+      } else {
+        sleepSync(10);
+      }
+    }
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.rmdirSync(lockHandle.lockDir);
+      break;
+    } catch (err) {
+      if (err && err.code === "ENOENT") break;
+      if (
+        process.platform === "win32" &&
+        err &&
+        (err.code === "EBUSY" || err.code === "EPERM" || err.code === "ENOTEMPTY")
+      ) {
+        if (attempt < 4) {
+          sleepSync(10);
+          continue;
+        }
+        return;
+      }
+      break;
+    }
   }
 }
 

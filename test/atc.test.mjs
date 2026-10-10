@@ -4429,6 +4429,8 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       );
       const lockFile = path.join(winAvdDir, "hardware-qemu.ini.lock");
       fs.writeFileSync(lockFile, "locked");
+      // Persistent advisory lock file (multiinstance.lock) must NOT block shutdown confirmation once hardware-qemu.ini.lock is removed
+      fs.writeFileSync(path.join(winAvdDir, "multiinstance.lock"), "");
 
       const claimWin = cmdClaim(
         winShutdownDir,

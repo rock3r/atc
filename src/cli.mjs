@@ -509,7 +509,12 @@ function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60
         if (fs.existsSync(avdDir)) {
           hasLockFiles = fs
             .readdirSync(avdDir)
-            .some((entry) => entry.endsWith(".lock"));
+            .some(
+              (entry) =>
+                entry === "hardware-qemu.ini.lock" ||
+                entry === "snapshot.lock" ||
+                entry === "modem-nv-ram-5554.lock",
+            );
         }
       } catch {
         hasLockFiles = true;
@@ -1714,13 +1719,22 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 return { mutated: true, value: true };
               });
             if (canRemoveMismatched) {
+              const effectiveRemoveTimeoutMs = stopTimeoutMs || 60_000;
+              const mismatchHbTimer = startWorkerDeadlineHeartbeat(
+                stateDir,
+                mismatchKey,
+                mismatchLeaseId,
+                effectiveRemoveTimeoutMs,
+              );
               try {
                 runner("android", ["emulator", "remove", newlyCreated.avd], {
                   strictInternal: true,
+                  timeoutMs: effectiveRemoveTimeoutMs,
                 });
               } catch {
                 // Best-effort cleanup of mismatched created AVD
               } finally {
+                mismatchHbTimer.stop();
                 withStateTransaction(stateDir, (state) => {
                   if (state.leases[mismatchKey]?.leaseId === mismatchLeaseId) {
                     delete state.leases[mismatchKey];
