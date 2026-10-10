@@ -928,8 +928,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         if (selection.priority !== null) {
           const dev = selection.candidate;
           const existingOwnLease =
-            state.leases[dev.deviceKey]?.sessionId === identity.sessionId
-              ? state.leases[dev.deviceKey]
+            state.leases[dev.deviceKey]?.sessionId === identity.sessionId &&
+            state.leases[dev.deviceKey]?.state === "active"
+              ? { ...state.leases[dev.deviceKey] }
               : null;
           const leaseId = existingOwnLease?.leaseId || `lease_${randomNonce().slice(0, 12)}`;
           const bootTimeoutMs = (state.config.bootTimeoutSec || 180) * 1000;
@@ -979,7 +980,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             workerPid: process.pid,
             replacingAvd: selection.victim ? selection.victim.avd : null,
             requiredRamMb: computeRequiredRam(dev),
-            loadedSnapshot: req.snapshotLoad || null,
+            loadedSnapshot: req.resetApp ? null : req.snapshotLoad || null,
             saveSnapshotOnFree: req.snapshotSaveOnFree || null,
             claimedAtMs: now,
             activatedAtMs: null,
@@ -1003,6 +1004,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             value: {
               status: "needs_boot_or_prep",
               lease: startingLease,
+              previousLease: existingOwnLease,
               selection,
               victimLeaseId,
               ttlMs,
@@ -1200,6 +1202,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
 function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHome, platform }) {
   const {
     lease,
+    previousLease,
     selection,
     victimLeaseId,
     ttlMs,
@@ -1225,6 +1228,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       : null;
   let resolvedSerial = candidate.serial;
   let bootedNewEmulator = false;
+  let stoppedExistingEmulator = false;
 
   const isWin = (platform || process.platform) === "win32";
 
@@ -1405,6 +1409,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
             `Failed to stop emulator ${candidate.avd} before reboot: ${rebootStopRes.stderr || rebootStopRes.stdout}`,
           );
         }
+        stoppedExistingEmulator = true;
         resolvedSerial = null;
       }
       if (req.wipeData) {
@@ -1499,6 +1504,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       current.workerPids = [];
       current.replacingAvd = null;
       current.serial = resolvedSerial;
+      current.loadedSnapshot = req.resetApp ? null : req.snapshotLoad || null;
       current.activatedAtMs = now;
       current.renewedAtMs = now;
       current.expiresAtMs = now + ttlMs;
@@ -1510,7 +1516,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
   } catch (err) {
     hbTimer.stop();
     victimHbTimer?.stop();
-    if (bootedNewEmulator) {
+    if (bootedNewEmulator && !previousLease) {
       try {
         if (isWin) {
           let cleanupSerial = resolvedSerial;
@@ -1533,10 +1539,25 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
         // Best-effort cleanup of newly booted emulator
       }
     }
-    withStateTransaction(stateDir, (state) => {
+    withStateTransaction(stateDir, (state, { now }) => {
       const current = state.leases[lease.deviceKey];
       if (current && current.leaseId === lease.leaseId) {
-        delete state.leases[lease.deviceKey];
+        if (previousLease) {
+          state.leases[lease.deviceKey] = {
+            ...previousLease,
+            serial: resolvedSerial || previousLease.serial,
+            state: "active",
+            workerPid: null,
+            workerPids: [],
+            replacingAvd: null,
+            loadedSnapshot: stoppedExistingEmulator ? null : previousLease.loadedSnapshot,
+            renewedAtMs: now,
+            expiresAtMs: Math.max(previousLease.expiresAtMs || 0, now + ttlMs),
+            deadlineMs: null,
+          };
+        } else {
+          delete state.leases[lease.deviceKey];
+        }
       }
       if (selection.victim) {
         const vCurrent = state.leases[selection.victim.deviceKey];
@@ -2464,7 +2485,20 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
           state.config.defaultTtlSec = parsedVal;
         }
       } else if (typeof DEFAULT_CONFIG[key] === "boolean") {
-        parsedVal = String(val).toLowerCase() === "true" || String(val) === "1";
+        const norm = String(val).trim().toLowerCase();
+        if (norm === "true" || norm === "1") {
+          parsedVal = true;
+        } else if (norm === "false" || norm === "0") {
+          parsedVal = false;
+        } else {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `Config key "${key}" requires a boolean value ("true" or "false").`,
+            },
+          };
+        }
       }
       state.config[key] = parsedVal;
       return { mutated: true, value: { exitCode: 0, key, value: parsedVal } };

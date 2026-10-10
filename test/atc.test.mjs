@@ -3271,6 +3271,68 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             });
             assert.equal(missingFreeRes.exitCode, 3);
             assert.match(missingFreeRes.error, /No matching active lease found for "lease_does_not_exist"/);
+
+            // 31. Failed in-place --cold reclaim restores the caller's original active lease
+            const failedColdReclaim = cmdClaim(
+              coldRediscoverDir,
+              { session: "target-sess", avd: "Pixel_9_API_36", cold: true, wait: 0 },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: singleMatchInv,
+                runner: () => ({ status: 1, stdout: "", stderr: "stop failed" }),
+              },
+            );
+            assert.equal(failedColdReclaim.exitCode, 1);
+            const restoredAfterFail = readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"];
+            assert.ok(restoredAfterFail, "Caller's active lease should be restored after failed reset");
+            assert.equal(restoredAfterFail.state, "active");
+            assert.equal(restoredAfterFail.leaseId, l2.lease.leaseId);
+            assert.equal(restoredAfterFail.sessionId, "target-sess");
+
+            // 32. Non-idempotent claim combining --snapshot-load and --reset-app clears loadedSnapshot
+            const comboSnapReset = cmdClaim(
+              coldRediscoverDir,
+              {
+                session: "target-sess",
+                avd: "Pixel_9_API_36",
+                cold: true,
+                snapshotLoad: "clean",
+                resetApp: "com.example.app",
+                wait: 0,
+              },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: singleMatchInv,
+                runner: (cmd, args) => {
+                  const full = [cmd, ...args].join(" ");
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                    return { status: 0, stdout: "Started on emulator-5556\n", stderr: "" };
+                  }
+                  if (full.includes("sys.boot_completed")) {
+                    return { status: 0, stdout: "1\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "OK\n", stderr: "" };
+                },
+              },
+            );
+            assert.equal(comboSnapReset.exitCode, 0);
+            assert.equal(comboSnapReset.lease.loadedSnapshot, null);
+
+            // 33. Invalid boolean config values are rejected
+            const invalidBoolCfg = cmdConfig(
+              coldRediscoverDir,
+              "set",
+              "autoStopIdleOnContention",
+              "treu",
+            );
+            assert.equal(invalidBoolCfg.exitCode, 1);
+            assert.match(
+              invalidBoolCfg.error,
+              /Config key "autoStopIdleOnContention" requires a boolean value/,
+            );
+            assert.equal(readState(coldRediscoverDir).config.autoStopIdleOnContention, true);
           } finally {
             fs.rmSync(coldRediscoverDir, { recursive: true, force: true });
           }
