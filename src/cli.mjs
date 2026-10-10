@@ -38,6 +38,7 @@ import {
   offlineAvdHasRuntimeLockFiles,
   readState,
   reconcileOfflineLeases,
+  recordDeviceBootedInState,
   recordDeviceStoppedInState,
   removeLeaseWorker,
   resolveSessionIdentity,
@@ -746,9 +747,10 @@ export function selectCandidateUnderLock(
   let firstResourceErr = null;
 
   for (const dev of bootPool) {
-    const slotAvailable = dev.online || usedSlots < effectiveMax;
+    const callerOwnedResettable = isCallerOwnedResettable(dev);
+    const slotAvailable = dev.online || callerOwnedResettable || usedSlots < effectiveMax;
     if (!slotAvailable) continue;
-    if (!isCallerOwnedResettable(dev) && isReservedForEarlierTicket(dev, true)) continue;
+    if (!callerOwnedResettable && isReservedForEarlierTicket(dev, true)) continue;
     try {
       checkResourceAdmission(dev, inventory.host, state, inventory, {
         replacingAvd: dev.online ? dev : null,
@@ -980,11 +982,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
   let rawInventory =
     options.inventory ||
     discoverFleet({ runner, avdHome, cfg: initialCfg, platform: options.platform });
-  let inventory = {
-    ...rawInventory,
-    discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
-    fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
-  };
+  let inventory = options.inventory
+    ? rawInventory
+    : {
+        ...rawInventory,
+        discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+        fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+      };
   const startWaitMs = Date.now();
   let retainedTicketTiming = null;
   const heartbeatQueuedTicket = () => {
@@ -1010,38 +1014,64 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     let txOutcome;
     try {
       txOutcome = withStateTransaction(stateDir, (state, { now }) => {
+        const invEpoch = inventory.fleetEpoch ?? inventoryEpoch;
         const stoppedMap = state.stoppedDevices || {};
+        const bootedMap = state.bootedDevices || {};
         const isStoppedSinceInventory = (d) => {
           if (!d || d.kind === "physical") return false;
           const byKey = d.deviceKey ? stoppedMap[d.deviceKey] : null;
           const byAvd = d.avd ? stoppedMap[`avd:${d.avd}`] : null;
           const bySerial = d.serial ? stoppedMap[`serial:${d.serial}`] : null;
           return Boolean(
-            (byKey && byKey.epoch > inventoryEpoch) ||
-              (byAvd && byAvd.epoch > inventoryEpoch) ||
-              (bySerial && bySerial.epoch > inventoryEpoch),
+            (byKey && byKey.epoch > invEpoch) ||
+              (byAvd && byAvd.epoch > invEpoch) ||
+              (bySerial && bySerial.epoch > invEpoch),
           );
         };
         const staleRunning = (inventory.running || []).filter(isStoppedSinceInventory);
+        const staleBootedByKey = new Map();
+        for (const entry of Object.values(bootedMap)) {
+          if (!entry || !(entry.epoch > invEpoch)) continue;
+          if (isStoppedSinceInventory(entry)) continue;
+          const alreadyRunning = (inventory.running || []).some(
+            (d) =>
+              d.kind === "emulator" &&
+              ((entry.deviceKey && d.deviceKey === entry.deviceKey) ||
+                (entry.avd && d.avd === entry.avd) ||
+                (entry.serial && d.serial === entry.serial)),
+          );
+          if (alreadyRunning) continue;
+          const dedupKey =
+            entry.avd ? `avd:${entry.avd}` : entry.deviceKey || `serial:${entry.serial}`;
+          const prev = staleBootedByKey.get(dedupKey);
+          if (!prev || entry.epoch > prev.epoch) {
+            staleBootedByKey.set(dedupKey, entry);
+          }
+        }
+        const staleBooted = Array.from(staleBootedByKey.values());
         const staleStopping = Object.values(state.leases || {}).some(
           (l) =>
             l &&
             l.state === "stopping" &&
             l.awaitOfflineReconcile &&
-            (l.stoppingEpoch || 0) > inventoryEpoch,
+            (l.stoppingEpoch || 0) > invEpoch,
         );
-        if ((staleRunning.length > 0 || staleStopping) && !options.inventory) {
+        if (
+          (staleRunning.length > 0 || staleBooted.length > 0 || staleStopping) &&
+          !options.inventory
+        ) {
           return {
             mutated: false,
             value: { status: "stale_inventory" },
           };
         }
         let effectiveInventory = inventory;
-        if (staleRunning.length > 0) {
-          const staleOffline = [...(inventory.offline || [])];
+        if (staleRunning.length > 0 || staleBooted.length > 0) {
+          let nextRunning = (inventory.running || []).filter((d) => !isStoppedSinceInventory(d));
+          let nextOffline = [...(inventory.offline || [])];
           for (const d of staleRunning) {
-            if (d.avd && !staleOffline.some((o) => o.avd === d.avd || o.deviceKey === d.deviceKey)) {
-              staleOffline.push({
+            if (d.avd && !nextOffline.some((o) => o.avd === d.avd || o.deviceKey === d.deviceKey)) {
+              nextOffline.push({
                 ...d,
                 deviceKey: `avd:${d.avd}`,
                 serial: null,
@@ -1049,10 +1079,40 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               });
             }
           }
+          for (const b of staleBooted) {
+            const offlineMatch = nextOffline.find(
+              (o) =>
+                (b.avd && o.avd === b.avd) || (b.deviceKey && o.deviceKey === b.deviceKey),
+            );
+            nextOffline = nextOffline.filter(
+              (o) =>
+                !(
+                  (b.avd && o.avd === b.avd) ||
+                  (b.deviceKey && o.deviceKey === b.deviceKey)
+                ),
+            );
+            nextRunning.push({
+              ...(offlineMatch || {}),
+              deviceKey:
+                b.deviceKey ||
+                offlineMatch?.deviceKey ||
+                (b.avd ? `avd:${b.avd}` : `serial:${b.serial}`),
+              kind: "emulator",
+              avd: b.avd || offlineMatch?.avd || null,
+              serial: b.serial || null,
+              online: true,
+              profile: b.profile || offlineMatch?.profile || {},
+              ramSizeMb: b.ramSizeMb || offlineMatch?.ramSizeMb || 2048,
+              requiredRamMb:
+                b.requiredRamMb ||
+                offlineMatch?.requiredRamMb ||
+                2048 + (state.config?.qemuOverheadRamMb ?? 1024),
+            });
+          }
           effectiveInventory = {
             ...inventory,
-            running: (inventory.running || []).filter((d) => !isStoppedSinceInventory(d)),
-            offline: staleOffline,
+            running: nextRunning,
+            offline: nextOffline,
           };
         }
 
@@ -1072,7 +1132,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
         const ttlSec = clampTtlSec(rawTtl, state.config);
         const ttlMs = ttlSec * 1000;
 
-        const reconciledMutated = reconcileOfflineLeases(
+        let reconciledMutated = reconcileOfflineLeases(
           state,
           effectiveInventory,
           identity.sessionId,
@@ -1626,11 +1686,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             platform: options.platform,
             onProgress: heartbeatQueuedTicket,
           });
-        inventory = {
-          ...rawInventory,
-          discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
-          fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
-        };
+        inventory = options.inventory
+          ? rawInventory
+          : {
+              ...rawInventory,
+              discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+              fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+            };
         break;
       }
     }
@@ -2220,16 +2282,23 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 current.anchorPid !== undefined &&
                 !livenessCheck(current.anchorPid)),
           );
+        if (releasedDuringBoot && !previousLease) {
+          current.saveSnapshotOnFree = null;
+        }
         current.state = "active";
         current.replacingAvd = null;
         current.serial = resolvedSerial;
         current.loadedSnapshot = req.resetApp ? null : req.snapshotLoad || null;
+        if (bootedNewEmulator) {
+          recordDeviceBootedInState(state, current, now);
+        } else {
+          clearDeviceStoppedInState(state, current);
+        }
         current.activatedAtMs = now;
         current.activatedEpoch = state.fleetEpoch || 0;
         current.renewedAtMs = now;
         current.expiresAtMs = now + ttlMs;
         current.deadlineMs = null;
-        clearDeviceStoppedInState(state, current);
       },
     );
     if (!activeLease) {
@@ -2287,6 +2356,20 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         );
         const targetAvd = candidate.avd || lease.avd || null;
         let migratedToOtherLease = false;
+        if (bootedNewEmulator) {
+          recordDeviceBootedInState(
+            state,
+            {
+              deviceKey: lease.deviceKey,
+              avd: targetAvd,
+              serial: resolvedSerial || candidate.serial || null,
+              profile: candidate.profile || lease.profile,
+              ramSizeMb: candidate.ramSizeMb || 2048,
+              requiredRamMb: lease.requiredRamMb || candidate.requiredRamMb || 0,
+            },
+            now,
+          );
+        }
 
         if (owned) {
           if (rebootStopWaitTimedOut) {
@@ -2525,17 +2608,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             } else if (cur && cur.leaseId === lease.leaseId) {
               removeLeaseWorker(cur, process.pid, livenessCheck);
               cur.serial = cleanupSerial || resolvedSerial || cur.serial || null;
-              if (isWin) {
-                markStoppingAwaitOfflineReconcile(
-                  state,
-                  cur,
-                  now,
-                  now + effectiveStopTimeoutMs,
-                );
-              } else {
-                cur.state = "stopping";
-                cur.deadlineMs = now + effectiveStopTimeoutMs;
-              }
+              markStoppingAwaitOfflineReconcile(
+                state,
+                cur,
+                now,
+                now + effectiveStopTimeoutMs,
+              );
             } else if (!cur) {
               const recreated = {
                 ...lease,
@@ -2546,14 +2624,12 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 serial: cleanupSerial || resolvedSerial || lease.serial || null,
                 deadlineMs: now + effectiveStopTimeoutMs,
               };
-              if (isWin) {
-                markStoppingAwaitOfflineReconcile(
-                  state,
-                  recreated,
-                  now,
-                  now + effectiveStopTimeoutMs,
-                );
-              }
+              markStoppingAwaitOfflineReconcile(
+                state,
+                recreated,
+                now,
+                now + effectiveStopTimeoutMs,
+              );
               state.leases[lease.deviceKey] = recreated;
             }
             return { mutated: true };
@@ -2661,15 +2737,24 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         for (const l of leasesList) {
           if (
             l.sessionId === identity.sessionId &&
-            (l.state === "active" || (l.state === "starting" && l.activatedAtMs !== null))
+            (l.state === "active" || l.state === "starting")
           ) {
             matches.push(l);
           }
         }
       }
 
+      const prevQueueLen = Array.isArray(state.queue) ? state.queue.length : 0;
+      if (!effectiveTarget && Array.isArray(state.queue) && prevQueueLen > 0) {
+        state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+      }
+      const prunedOwnTickets = prevQueueLen !== (state.queue?.length || 0);
+
       if (matches.length === 0) {
-        return { mutated: false, value: { status: "empty", freed: [] } };
+        return {
+          mutated: prunedOwnTickets,
+          value: { status: "empty", freed: [] },
+        };
       }
 
       const livenessCheck = options.livenessCheck || isPidAlive;
@@ -3567,11 +3652,13 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
   const rawInventory =
     options.inventory ||
     discoverFleet({ runner, avdHome, cfg, platform: options.platform });
-  const inventory = {
-    ...rawInventory,
-    discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
-    fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
-  };
+  const inventory = options.inventory
+    ? rawInventory
+    : {
+        ...rawInventory,
+        discoveredAtMs: rawInventory.discoveredAtMs ?? discoveryStartedAtMs,
+        fleetEpoch: rawInventory.fleetEpoch ?? inventoryEpoch,
+      };
   const req = {
     kind: flags.kind || "any",
     deviceType: flags.type || null,

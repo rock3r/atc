@@ -4657,6 +4657,7 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       // Clear stopping lease for subsequent test cases in rollbackHoldDir
       withStateTransaction(rollbackHoldDir, (s) => {
         delete s.leases["avd:Pixel_Rollback_AVD"];
+        s.bootedDevices = {};
         return { mutated: true };
       });
 
@@ -5981,9 +5982,10 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
       let stopCalls = 0;
       const claimRes = cmdClaim(
         partialBootDir,
-        { avd: "Pixel_Partial", session: "partial-sess", wait: 0 },
+        { avd: "Pixel_Partial", session: "partial-sess", wait: 0, force: true },
         {
           avdHome,
+          platform: "linux",
           runner: (cmd, args) => {
             if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
               // Simulate emulator spawning QEMU (creating lock file) before start command times out
@@ -6125,9 +6127,10 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
       // Cold reclaim of own lease preserves saveSnapshotOnFree, reason, claimedAtMs, and longer expiresAtMs
       const coldReclaimRes = cmdClaim(
         snapStateDir,
-        { avd: "Pixel_Snap", cold: true, session: "snap-sess", ttl: 60 },
+        { avd: "Pixel_Snap", cold: true, session: "snap-sess", ttl: 60, force: true },
         {
           avdHome,
+          platform: "linux",
           inventory: {
             avdHome,
             running: [
@@ -6195,6 +6198,244 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         null,
         "Failed snapshot load during free must clear loadedSnapshot",
       );
+
+      // 10. Astra #21 Finding #1: Concurrent boot-and-release recorded in state.bootedDevices prevents exceeding maxRunningEmulators
+      const bootCapDir = makeTempStateDir();
+      try {
+        cmdConfig(bootCapDir, "set", "maxRunningEmulators", "1");
+        // Session A boots Pixel_Boot_1 and immediately frees it warm
+        const boot1Res = cmdClaim(
+          bootCapDir,
+          { avd: "Pixel_Boot_1", session: "boot-sess-a", wait: 0, force: true },
+          {
+            avdHome,
+            platform: "linux",
+            inventory: {
+              avdHome,
+              fleetEpoch: 0,
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Boot_1",
+                  kind: "emulator",
+                  avd: "Pixel_Boot_1",
+                  online: false,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+                {
+                  deviceKey: "avd:Pixel_Boot_2",
+                  kind: "emulator",
+                  avd: "Pixel_Boot_2",
+                  online: false,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+              ],
+              creatable: [],
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            runner: (cmd, args) => {
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
+              }
+              return { status: 0, stdout: "emulator-5554\tdevice\n", stderr: "" };
+            },
+          },
+        );
+        assert.equal(boot1Res.exitCode, 0);
+        assert.equal(cmdFree(bootCapDir, null, { session: "boot-sess-a" }).exitCode, 0);
+        // Session B has a stale pre-boot inventory (fleetEpoch: 0, running: []) and requests Pixel_Boot_2 with autoStopIdleOnContention=false
+        cmdConfig(bootCapDir, "set", "autoStopIdleOnContention", "false");
+        const boot2Res = cmdClaim(
+          bootCapDir,
+          { avd: "Pixel_Boot_2", session: "boot-sess-b", wait: 0, force: true },
+          {
+            avdHome,
+            platform: "linux",
+            inventory: {
+              avdHome,
+              fleetEpoch: 0,
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Boot_1",
+                  kind: "emulator",
+                  avd: "Pixel_Boot_1",
+                  online: false,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+                {
+                  deviceKey: "avd:Pixel_Boot_2",
+                  kind: "emulator",
+                  avd: "Pixel_Boot_2",
+                  online: false,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+              ],
+              creatable: [],
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+          },
+        );
+        assert.equal(
+          boot2Res.exitCode,
+          2,
+          "Stale inventory must incorporate state.bootedDevices so maxRunningEmulators=1 is enforced",
+        );
+      } finally {
+        fs.rmSync(bootCapDir, { recursive: true, force: true });
+      }
+
+      // 11. Astra #21 Finding #3 & #4 & Codex 4237550997:
+      // - Failed-restart recovery with serial: null succeeds when maxRunningEmulators=1
+      // - Targetless cmdFree marks in-progress initial claims (activatedAtMs: null) with releaseOnWorkerExit
+      // - Failed POSIX rollback stop sets awaitOfflineReconcile so GC does not drop the reservation
+      const r21Dir = makeTempStateDir();
+      try {
+        cmdConfig(r21Dir, "set", "maxRunningEmulators", "1");
+        withStateTransaction(r21Dir, (s, { now }) => {
+          s.leases["avd:Pixel_Serial_Null"] = {
+            leaseId: "lease_serial_null",
+            deviceKey: "avd:Pixel_Serial_Null",
+            kind: "emulator",
+            avd: "Pixel_Serial_Null",
+            serial: null,
+            state: "active",
+            sessionId: "recover-sess",
+            claimedAtMs: now - 5_000,
+            activatedAtMs: now - 5_000,
+            renewedAtMs: now,
+            expiresAtMs: now + 300_000,
+            profile: { apiLevel: "android-35", deviceType: "phone" },
+          };
+          return { mutated: true };
+        });
+        const recoverRes = cmdClaim(
+          r21Dir,
+          { avd: "Pixel_Serial_Null", session: "recover-sess", wait: 0, force: true },
+          {
+            avdHome,
+            platform: "linux",
+            inventory: {
+              avdHome,
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Serial_Null",
+                  kind: "emulator",
+                  avd: "Pixel_Serial_Null",
+                  online: false,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+              ],
+              creatable: [],
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            runner: (cmd, args) => {
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                return { status: 0, stdout: "Started emulator-5554\n", stderr: "" };
+              }
+              return { status: 0, stdout: "emulator-5554\tdevice\n", stderr: "" };
+            },
+          },
+        );
+        assert.equal(recoverRes.exitCode, 0);
+        assert.equal(recoverRes.lease.serial, "emulator-5554");
+
+        // Targetless cmdFree with deferOnBusyWorker marks starting lease (activatedAtMs: null) for releaseOnWorkerExit
+        withStateTransaction(r21Dir, (s, { now }) => {
+          s.leases = {
+            "avd:Pixel_Initial_Starting": {
+              leaseId: "lease_init_starting",
+              deviceKey: "avd:Pixel_Initial_Starting",
+              kind: "emulator",
+              avd: "Pixel_Initial_Starting",
+              serial: null,
+              state: "starting",
+              workerPid: process.pid,
+              workerPids: [process.pid],
+              sessionId: "starting-sess",
+              claimedAtMs: now,
+              activatedAtMs: null,
+              deadlineMs: now + 60_000,
+              expiresAtMs: now + 300_000,
+            },
+          };
+          return { mutated: true };
+        });
+        const deferFreeRes = cmdFree(
+          r21Dir,
+          null,
+          { session: "starting-sess", stop: true },
+          { deferOnBusyWorker: true },
+        );
+        assert.equal(deferFreeRes.exitCode, 0);
+        const deferLease = readState(r21Dir).leases["avd:Pixel_Initial_Starting"];
+        assert.equal(deferLease.releaseOnWorkerExit, true);
+        assert.equal(deferLease.pendingStop, true);
+
+        // POSIX rollback stop failure sets awaitOfflineReconcile: true
+        withStateTransaction(r21Dir, (s) => {
+          s.leases = {};
+          return { mutated: true };
+        });
+        const posixFailRollbackRes = cmdClaim(
+          r21Dir,
+          {
+            avd: "Pixel_Posix_Stop_Fail",
+            session: "posix-rb-sess",
+            resetApp: "com.example.app",
+            wait: 0,
+            force: true,
+          },
+          {
+            avdHome,
+            platform: "linux",
+            inventory: {
+              avdHome,
+              running: [],
+              offline: [
+                {
+                  deviceKey: "avd:Pixel_Posix_Stop_Fail",
+                  kind: "emulator",
+                  avd: "Pixel_Posix_Stop_Fail",
+                  online: false,
+                  profile: { apiLevel: "android-35", deviceType: "phone" },
+                  ramSizeMb: 2048,
+                },
+              ],
+              creatable: [],
+              host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 32768, cpuCores: 8 },
+              probes: { emulatorListOk: true, adbDevicesOk: true },
+            },
+            runner: (cmd, args) => {
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+                return { status: 0, stdout: "Started emulator-5570\n", stderr: "" };
+              }
+              if (cmd === "adb" && args.includes("pm") && args.includes("clear")) {
+                return { status: 1, stdout: "", stderr: "Failed: package not found" };
+              }
+              if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+                return { status: 1, stdout: "", stderr: "Failed to stop emulator" };
+              }
+              return { status: 0, stdout: "emulator-5570\tdevice\n", stderr: "" };
+            },
+          },
+        );
+        assert.notEqual(posixFailRollbackRes.exitCode, 0);
+        const heldRollbackLease = readState(r21Dir).leases["avd:Pixel_Posix_Stop_Fail"];
+        assert.ok(heldRollbackLease, "Failed POSIX rollback stop must keep stopping reservation");
+        assert.equal(heldRollbackLease.awaitOfflineReconcile, true);
+      } finally {
+        fs.rmSync(r21Dir, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(snapStateDir, { recursive: true, force: true });
     }

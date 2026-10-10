@@ -543,6 +543,21 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
     }
   }
 
+  if (state.stoppedDevices && typeof state.stoppedDevices === "object") {
+    for (const [k, entry] of Object.entries(state.stoppedDevices)) {
+      if (!entry || typeof entry.stoppedAtMs !== "number" || now - entry.stoppedAtMs > 120_000) {
+        delete state.stoppedDevices[k];
+      }
+    }
+  }
+  if (state.bootedDevices && typeof state.bootedDevices === "object") {
+    for (const [k, entry] of Object.entries(state.bootedDevices)) {
+      if (!entry || typeof entry.bootedAtMs !== "number" || now - entry.bootedAtMs > 120_000) {
+        delete state.bootedDevices[k];
+      }
+    }
+  }
+
   if (stateDir && (!state.lastOrphanSweepAtMs || now - state.lastOrphanSweepAtMs > 60_000)) {
     state.lastOrphanSweepAtMs = now;
     sweepOrphanFiles(stateDir, now);
@@ -623,6 +638,45 @@ export function recordDeviceStoppedInState(state, deviceInfo, now = Date.now()) 
   }
   if (deviceInfo.serial) {
     state.stoppedDevices[`serial:${deviceInfo.serial}`] = entry;
+  }
+  if (state.bootedDevices && typeof state.bootedDevices === "object") {
+    if (deviceInfo.deviceKey) delete state.bootedDevices[deviceInfo.deviceKey];
+    if (deviceInfo.avd) delete state.bootedDevices[`avd:${deviceInfo.avd}`];
+    if (deviceInfo.serial) delete state.bootedDevices[`serial:${deviceInfo.serial}`];
+  }
+}
+
+export function recordDeviceBootedInState(state, deviceInfo, now = Date.now()) {
+  if (!state || !deviceInfo || deviceInfo.kind === "physical") return;
+  state.fleetEpoch = (state.fleetEpoch || 0) + 1;
+  if (!state.bootedDevices || typeof state.bootedDevices !== "object") {
+    state.bootedDevices = {};
+  }
+  const entry = {
+    epoch: state.fleetEpoch,
+    bootedAtMs: now,
+    deviceKey:
+      deviceInfo.deviceKey ||
+      (deviceInfo.avd ? `avd:${deviceInfo.avd}` : deviceInfo.serial ? `serial:${deviceInfo.serial}` : null),
+    avd: deviceInfo.avd || null,
+    serial: deviceInfo.serial || null,
+    profile: deviceInfo.profile || null,
+    ramSizeMb: deviceInfo.ramSizeMb || 2048,
+    requiredRamMb: deviceInfo.requiredRamMb || 0,
+  };
+  if (entry.deviceKey) {
+    state.bootedDevices[entry.deviceKey] = entry;
+  }
+  if (deviceInfo.avd) {
+    state.bootedDevices[`avd:${deviceInfo.avd}`] = entry;
+  }
+  if (deviceInfo.serial) {
+    state.bootedDevices[`serial:${deviceInfo.serial}`] = entry;
+  }
+  if (state.stoppedDevices && typeof state.stoppedDevices === "object") {
+    if (deviceInfo.deviceKey) delete state.stoppedDevices[deviceInfo.deviceKey];
+    if (deviceInfo.avd) delete state.stoppedDevices[`avd:${deviceInfo.avd}`];
+    if (deviceInfo.serial) delete state.stoppedDevices[`serial:${deviceInfo.serial}`];
   }
 }
 

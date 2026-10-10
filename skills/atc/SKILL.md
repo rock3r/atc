@@ -10,17 +10,17 @@ Always coordinate Android emulator and physical device access through `atc` so c
 ## Golden Rules
 
 1. **Never run `adb` or `emulator` without an active `atc` lease.**
-2. **Use `atc exec` for test runs or one-off commands** — it automatically sets `ANDROID_SERIAL=<serial>`, injects `--device=<serial>` for `android` CLI commands, and renews the lease heartbeat in the background every 15 seconds while the command runs:
+2. **Use `atc exec` for test runs or one-off commands** — it automatically sets `ANDROID_SERIAL=<serial>`, injects `--device=<serial>` for `android` CLI commands, and renews the lease heartbeat in the background every 15 seconds while the command runs (install globally via `npm install -g android-traffic-control` or invoke via `npx --package android-traffic-control atc ...`):
    ```bash
-   npx atc exec --session builder-1 -- ./gradlew connectedDebugAndroidTest
-   npx atc exec --session builder-1 -- adb shell am start -n com.example/.MainActivity
+   atc exec --session builder-1 -- ./gradlew connectedDebugAndroidTest
+   atc exec --session builder-1 -- adb shell am start -n com.example/.MainActivity
    ```
 3. **Or claim explicitly when running multiple interactive steps:**
    ```bash
-   npx atc claim --session builder-1 --api 35 --type phone --json
+   atc claim --session builder-1 --api 35 --type phone --json
    ```
    When finished, release the lease immediately:
    ```bash
-   npx atc free --session builder-1
+   atc free --session builder-1
    ```
 4. **Never start, boot, kill, or wipe an emulator directly** (`emulator -avd ...`, `adb emu kill`, `android emulator start`). Let `atc claim` and `atc free --stop` manage device lifecycle and clean snapshots (`atc-clean-base`).
