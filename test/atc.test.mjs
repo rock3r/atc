@@ -7046,11 +7046,24 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     assert.match(archText, /atc\.lock/);
 
     const pkgJson = JSON.parse(fs.readFileSync(new URL("package.json", rootDir), "utf8"));
-    assert.equal(pkgJson.version, "1.0.0");
+    assert.match(pkgJson.version, /^\d+\.\d+\.\d+$/);
+    assert.equal(pkgJson.publishConfig?.access, "public");
+    assert.equal(pkgJson.publishConfig?.provenance, true);
+
+    const skillSource = JSON.parse(fs.readFileSync(new URL("skills/atc/skill-source.json", rootDir), "utf8"));
+    assert.equal(skillSource.schemaVersion, 1);
+    assert.equal(skillSource.skill, "atc");
+    assert.equal(skillSource.sources[0].type, "local-original-content");
+    assert.equal(skillSource.sources[0].role, "original-content");
+    assert.equal(skillSource.sources[0].versionSource, "frontmatter");
+    assert.equal(skillSource.sources[0].version, pkgJson.version);
+
+    const releasingText = fs.readFileSync(new URL("docs/RELEASING.md", rootDir), "utf8");
+    assert.match(releasingText, /tools\/check-versions\.sh/);
 
     const agentPlugin = JSON.parse(fs.readFileSync(new URL("plugin.json", rootDir), "utf8"));
     assert.equal(agentPlugin.name, "atc");
-    assert.equal(agentPlugin.version, "1.0.0");
+    assert.equal(agentPlugin.version, pkgJson.version);
     assert.equal(agentPlugin.skills, "./skills/");
     assert.equal(agentPlugin.hooks, "./hooks/hooks.json");
 
@@ -7060,7 +7073,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
     const claudePlugin = JSON.parse(fs.readFileSync(new URL(".claude-plugin/plugin.json", rootDir), "utf8"));
     assert.equal(claudePlugin.name, "atc");
-    assert.equal(claudePlugin.version, "1.0.0");
+    assert.equal(claudePlugin.version, pkgJson.version);
     assert.equal(claudePlugin.skills, "./skills/");
 
     const marketplace = JSON.parse(fs.readFileSync(new URL(".claude-plugin/marketplace.json", rootDir), "utf8"));
@@ -7069,7 +7082,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
     const codexPlugin = JSON.parse(fs.readFileSync(new URL(".codex-plugin/plugin.json", rootDir), "utf8"));
     assert.equal(codexPlugin.name, "atc");
-    assert.equal(codexPlugin.version, "1.0.0");
+    assert.equal(codexPlugin.version, pkgJson.version);
     assert.equal(codexPlugin.mcpServers, "./.mcp.json");
 
     const mcpManifest = JSON.parse(fs.readFileSync(new URL(".mcp.json", rootDir), "utf8"));

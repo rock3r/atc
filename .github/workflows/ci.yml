@@ -5,9 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Test (${{ matrix.os }}, Node ${{ matrix.node }})
+    name: Test & Package (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -25,3 +32,9 @@ jobs:
 
       - name: Run quality gate
         run: npm run check
+
+      - name: Verify release metadata and version lockstep
+        run: npm run release:verify
+
+      - name: Smoke-test packed npm tarball
+        run: npm run package:smoke

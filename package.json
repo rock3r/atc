@@ -7,9 +7,32 @@
   "homepage": "https://specs.sebastiano.dev/atc/",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rock3r/atc.git"
+    "url": "git+https://github.com/rock3r/atc.git"
   },
+  "bugs": {
+    "url": "https://github.com/rock3r/atc/issues"
+  },
+  "keywords": [
+    "android",
+    "adb",
+    "emulator",
+    "avd",
+    "atc",
+    "agent-plugins",
+    "claude-code",
+    "codex",
+    "mcp"
+  ],
   "type": "module",
+  "main": "./src/cli.mjs",
+  "exports": {
+    ".": "./src/cli.mjs",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "engines": {
     "node": ">=20.0.0"
   },
@@ -38,6 +61,9 @@
   ],
   "scripts": {
     "test": "node --test",
-    "check": "node -e \"import('node:fs').then(async({readdirSync})=>{const{spawnSync}=await import('node:child_process');for(const d of['bin','src','test'])for(const f of readdirSync(d))if(f.endsWith('.mjs')){const r=spawnSync(process.execPath,['--check',d+'/'+f],{stdio:'inherit'});if(r.status!==0)process.exit(r.status)}})\" && node --test"
+    "check": "node -e \"import('node:fs').then(async({readdirSync})=>{const{spawnSync}=await import('node:child_process');for(const d of['bin','src','scripts','test'])for(const f of readdirSync(d))if(f.endsWith('.mjs')){const r=spawnSync(process.execPath,['--check',d+'/'+f],{stdio:'inherit'});if(r.status!==0)process.exit(r.status)}})\" && node --test",
+    "package:smoke": "node scripts/package-smoke.mjs",
+    "release:verify": "node scripts/verify-release-version.mjs",
+    "prepack": "npm run release:verify"
   }
 }

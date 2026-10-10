@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "skill": "atc",
+  "sources": [
+    {
+      "type": "local-original-content",
+      "role": "original-content",
+      "label": "Android Traffic Control (atc) multi-agent device lease workflow and guardrails",
+      "version": "1.0.0",
+      "versionSource": "frontmatter",
+      "fetchedAt": "2026-10-10",
+      "license": "Apache-2.0"
+    }
+  ]
+}
