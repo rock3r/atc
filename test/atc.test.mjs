@@ -8838,6 +8838,28 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
           { targetPid: -posixVerifiedPgid, sig: "SIGKILL" },
         ]);
         assert.equal(readState(dir).leases["avd:Pixel_Posix_Verified"], undefined);
+
+        // Case D: `addLeaseWorker` does not spawn a subprocess on macOS when `startToken` is null (default `allowSubprocess: false`)
+        let addWorkerSpawnCalled = false;
+        const noSubLease = {
+          leaseId: "lease_no_sub",
+          deviceKey: "avd:Pixel_No_Sub",
+          workerPids: [],
+          workerPid: null,
+        };
+        addLeaseWorker(noSubLease, process.pid, undefined, {
+          isProcessGroup: true,
+          platform: "darwin",
+          spawnSyncFn: () => {
+            addWorkerSpawnCalled = true;
+            return { status: 0, stdout: `${recordedToken}\n`, stderr: "" };
+          },
+        });
+        assert.equal(
+          addWorkerSpawnCalled,
+          false,
+          "addLeaseWorker must not spawn a subprocess under atc.lock by default when startToken is omitted",
+        );
       } finally {
         clearKnownPosixPgidStartTokens(posixReusedPgid);
         clearKnownPosixPgidStartTokens(posixUnverifiablePgid);
@@ -8886,6 +8908,21 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.match(
       backtickCmdSubLoop.rewrittenCommand,
       /^for x in a b ; do echo `x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'` ; done$/,
+    );
+
+    // 3q. Extended-glob alternation (`@(foo|bar)`) is not split as a pipeline and uses `bash -c`
+    const extglobLoopRedir = evaluateCommandGuard(
+      'for x in 1; do adb shell echo @(foo|bar) > /tmp/out.txt; done',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(extglobLoopRedir.allowed, true);
+    assert.match(
+      extglobLoopRedir.rewrittenCommand,
+      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
     );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);

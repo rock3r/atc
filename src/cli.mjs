@@ -3928,6 +3928,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               startToken: spawnedChildStartToken,
               platform: effectivePlatform,
               spawnSyncFn: options.spawnSyncFn || options.runner,
+              allowSubprocess: false,
             });
             return { mutated: true };
           }

@@ -341,6 +341,52 @@ export function hasAndroidOrAtcTokens(command) {
   return false;
 }
 
+function isExtglobOpen(str, i, curStage = "") {
+  const ch = str[i];
+  if (str[i + 1] !== "(") return false;
+  if (ch !== "@" && ch !== "*" && ch !== "+" && ch !== "?" && ch !== "!") {
+    return false;
+  }
+  if (ch === "!") {
+    const strippedCur = String(curStage || "")
+      .replace(LEADING_CONTROL_PREFIX_RE, "")
+      .trim();
+    const inCaseHeader = /(?:^|\s)case\s+\S+\s+in(?:\s|$)/.test(
+      String(curStage || ""),
+    );
+    if (!strippedCur && !inCaseHeader) {
+      return false;
+    }
+  }
+  let depth = 1;
+  let qSingle = false;
+  let qDouble = false;
+  for (let j = i + 2; j < str.length; j++) {
+    const c = str[j];
+    if (c === "\\" && !qSingle && j + 1 < str.length) {
+      j++;
+      continue;
+    }
+    if (c === "'" && !qDouble) {
+      qSingle = !qSingle;
+      continue;
+    }
+    if (c === '"' && !qSingle) {
+      qDouble = !qDouble;
+      continue;
+    }
+    if (!qSingle && !qDouble) {
+      if (c === ";" || c === "\n") return false;
+      if (c === "(") depth++;
+      else if (c === ")") {
+        depth--;
+        if (depth === 0) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function splitOutsideQuotes(str, sepType) {
   const parts = [];
   let cur = "";
@@ -382,7 +428,10 @@ function splitOutsideQuotes(str, sepType) {
         cur += ch;
         continue;
       }
-      if ((ch === "$" || ch === "<" || ch === ">") && str[i + 1] === "(") {
+      if (
+        ((ch === "$" || ch === "<" || ch === ">") && str[i + 1] === "(") ||
+        isExtglobOpen(str, i, cur)
+      ) {
         subParenDepth++;
         cur += ch + "(";
         i++;
@@ -2355,6 +2404,9 @@ function stageRequiresBashShell(cmdBody) {
       if ((ch === "<" || ch === ">") && s[i + 1] === "(") {
         return true;
       }
+      if (isExtglobOpen(s, i, s.slice(0, i))) {
+        return true;
+      }
       if (ch === "<" && s[i + 1] === "<" && s[i + 2] === "<") {
         return true;
       }
@@ -2467,7 +2519,10 @@ function rewriteCompoundCommand(
           i++;
           continue;
         }
-        if ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(") {
+        if (
+          ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(") ||
+          (!inDouble && isExtglobOpen(command, i, cur))
+        ) {
           subParenDepth++;
           cur += ch + "(";
           i++;

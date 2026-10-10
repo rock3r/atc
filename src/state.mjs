@@ -660,7 +660,7 @@ export function addLeaseWorker(lease, pid, livenessCheck = isPidAlive, options =
           ? getPosixProcessStartToken(numericPid, {
               platform: effectivePlatform,
               spawnSyncFn: options.spawnSyncFn || options.runner,
-              allowSubprocess: options.allowSubprocess !== false,
+              allowSubprocess: Boolean(options.allowSubprocess),
             })
           : null);
       if (startToken) {
