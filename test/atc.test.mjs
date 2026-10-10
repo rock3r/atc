@@ -7561,6 +7561,20 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       /do __atc_arr_parts_1="\$\{parts\[1\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_1\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
     );
 
+    const readWholeArrayRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb install-multiple "${parts[@]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readWholeArrayRedir.allowed, true);
+    assert.match(
+      readWholeArrayRedir.rewrittenCommand,
+      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb install-multiple "\$@" > \/tmp\/out\.txt' sh "\$\{parts\[@\]\}" ; done < rows\.txt$/,
+    );
+
     // 1f. Tombstoned root identity when initial Windows snapshot misses already-exited root PID
     const missedRootPgid = 730001;
     clearKnownWindowsTreeDescendants(missedRootPgid);

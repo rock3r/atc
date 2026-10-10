@@ -2423,7 +2423,45 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           ),
         );
         const arrayEnvEntries = new Map();
+        const atArrayExprs = [];
+        const atArrayNames = [];
         if (dynamicVarNames.size > 0 && cmdBody.includes("${")) {
+          const atExprSet = new Set();
+          const atNameSet = new Set();
+          let scanInSingle = false;
+          for (let i = 0; i < cmdBody.length; i++) {
+            const ch = cmdBody[i];
+            if (ch === "\\" && !scanInSingle && i + 1 < cmdBody.length) {
+              i++;
+              continue;
+            }
+            if (ch === "'") {
+              scanInSingle = !scanInSingle;
+              continue;
+            }
+            if (!scanInSingle && ch === "$" && cmdBody[i + 1] === "{") {
+              const closeIdx = cmdBody.indexOf("}", i + 2);
+              if (closeIdx !== -1) {
+                const inner = cmdBody.slice(i + 2, closeIdx);
+                const arrMatch = inner.match(/^(#?)([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\](.*)$/);
+                if (arrMatch && dynamicVarNames.has(arrMatch[2])) {
+                  const [, hashPrefix, arrName, subscript] = arrMatch;
+                  if (!hashPrefix && subscript === "@") {
+                    if (!atExprSet.has(inner)) {
+                      atExprSet.add(inner);
+                      atArrayExprs.push(inner);
+                    }
+                    if (!atNameSet.has(arrName)) {
+                      atNameSet.add(arrName);
+                      atArrayNames.push(arrName);
+                    }
+                  }
+                }
+                i = closeIdx;
+              }
+            }
+          }
+
           let rewrittenArrBody = "";
           let arrInSingle = false;
           let aliasSeq = 0;
@@ -2446,21 +2484,26 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
                 const arrMatch = inner.match(/^(#?)([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\](.*)$/);
                 if (arrMatch && dynamicVarNames.has(arrMatch[2])) {
                   const [, hashPrefix, arrName, subscript, modifier] = arrMatch;
+                  if (!hashPrefix && subscript === "@") {
+                    if (atArrayExprs.length === 1) {
+                      rewrittenArrBody += "$@";
+                    } else {
+                      rewrittenArrBody += `\${${inner}}`;
+                    }
+                    i = closeIdx;
+                    continue;
+                  }
                   let aliasName;
                   if (hashPrefix === "#" && (subscript === "@" || subscript === "*")) {
                     aliasName = `__atc_arr_${arrName}_len`;
-                  } else if (!hashPrefix && !modifier && (subscript === "@" || subscript === "*")) {
+                  } else if (!hashPrefix && !modifier && subscript === "*") {
                     aliasName = `__atc_arr_${arrName}_all`;
                   } else if (!hashPrefix && !modifier && /^[A-Za-z0-9_]+$/.test(subscript)) {
                     aliasName = `__atc_arr_${arrName}_${subscript}`;
                   } else {
                     aliasName = `__atc_arr_${arrName}_${aliasSeq++}`;
                   }
-                  const outerExpr =
-                    !hashPrefix && subscript === "@"
-                      ? `${arrName}[*]${modifier}`
-                      : inner;
-                  arrayEnvEntries.set(aliasName, outerExpr);
+                  arrayEnvEntries.set(aliasName, inner);
                   rewrittenArrBody += `\${${aliasName}}`;
                   i = closeIdx;
                   continue;
@@ -2480,8 +2523,24 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           )
           .map((k) => `${k}="$${k}" `)
           .join("");
+        if (atArrayExprs.length > 1) {
+          const prelude =
+            atArrayNames
+              .map(
+                (name) =>
+                  `__atc_n=$1; shift; ${name}=("\${@:1:$__atc_n}"); shift "$__atc_n"`,
+              )
+              .join("; ") + "; ";
+          const escaped = `'${String(prelude + cmdBody).replace(/'/g, `'\\''`)}'`;
+          const trailingArrays = atArrayNames
+            .map((name) => `"\${#${name}[@]}" "\${${name}[@]}"`)
+            .join(" ");
+          return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- bash -c ${escaped} bash ${trailingArrays}${suffix}`;
+        }
         const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;
-        return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
+        const trailingAtArgs =
+          atArrayExprs.length === 1 ? ` sh "\${${atArrayExprs[0]}}"` : "";
+        return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =
