@@ -2668,13 +2668,104 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
           cmdBody = rewrittenArrBody;
           arrayEnvEntries.hasUnquotedAlias = hasUnquotedAlias;
         }
+        const bareArithVarNames = new Set();
+        if (
+          (dynamicVarNames.size > 0 || Object.keys(staticShellVars).length > 0) &&
+          (cmdBody.includes("((") || cmdBody.includes("$["))
+        ) {
+          let arithInSingle = false;
+          let arithInDouble = false;
+          let arithRewritten = "";
+          let arithAliasSeq = arrayEnvEntries.size;
+          for (let i = 0; i < cmdBody.length; i++) {
+            const ch = cmdBody[i];
+            if (ch === "\\" && !arithInSingle && i + 1 < cmdBody.length) {
+              arithRewritten += ch + cmdBody[i + 1];
+              i++;
+              continue;
+            }
+            if (ch === "'" && !arithInDouble) {
+              arithInSingle = !arithInSingle;
+              arithRewritten += ch;
+              continue;
+            }
+            if (ch === '"' && !arithInSingle) {
+              arithInDouble = !arithInDouble;
+              arithRewritten += ch;
+              continue;
+            }
+            const isDollarArith =
+              !arithInSingle && ch === "$" && cmdBody[i + 1] === "(" && cmdBody[i + 2] === "(";
+            const isBareArithCmd =
+              !arithInSingle && !arithInDouble && ch === "(" && cmdBody[i + 1] === "(";
+            const isBracketArith = !arithInSingle && ch === "$" && cmdBody[i + 1] === "[";
+            if (isDollarArith || isBareArithCmd || isBracketArith) {
+              const openToken = isDollarArith ? "$((" : isBareArithCmd ? "((" : "$[";
+              const startOffset = openToken.length;
+              let depth = isBracketArith ? 1 : 2;
+              let j = i + startOffset;
+              for (; j < cmdBody.length; j++) {
+                if (isBracketArith) {
+                  if (cmdBody[j] === "[") depth++;
+                  else if (cmdBody[j] === "]") {
+                    depth--;
+                    if (depth === 0) break;
+                  }
+                } else {
+                  if (cmdBody[j] === "(") depth++;
+                  else if (cmdBody[j] === ")") {
+                    depth--;
+                    if (depth === 0) break;
+                  }
+                }
+              }
+              if (j < cmdBody.length) {
+                const closeToken = isBracketArith ? "]" : "))";
+                const rawArithInner = cmdBody.slice(
+                  i + startOffset,
+                  isBracketArith ? j : j - 1,
+                );
+                const rewrittenArithInner = rawArithInner.replace(
+                  /(?<![${A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\]/g,
+                  (full, arrName, subscript) => {
+                    if (!dynamicVarNames.has(arrName)) return full;
+                    const aliasName = /^[A-Za-z0-9_]+$/.test(subscript)
+                      ? `__atc_arr_${arrName}_${subscript}`
+                      : `__atc_arr_${arrName}_arith_${arithAliasSeq++}`;
+                    arrayEnvEntries.set(aliasName, `${arrName}[${subscript}]`);
+                    return aliasName;
+                  },
+                );
+                for (const idMatch of rewrittenArithInner.matchAll(
+                  /\b([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\[)/g,
+                )) {
+                  const varName = idMatch[1];
+                  if (
+                    dynamicVarNames.has(varName) ||
+                    Object.prototype.hasOwnProperty.call(staticShellVars, varName)
+                  ) {
+                    dynamicVarNames.add(varName);
+                    bareArithVarNames.add(varName);
+                  }
+                }
+                arithRewritten += `${openToken}${rewrittenArithInner}${closeToken}`;
+                i = j;
+                continue;
+              }
+            }
+            arithRewritten += ch;
+          }
+          cmdBody = arithRewritten;
+        }
         const hasUnquotedAlias = Boolean(arrayEnvEntries.hasUnquotedAlias);
         const arrayEnvAssigns = Array.from(arrayEnvEntries.entries())
           .map(([alias, expr]) => `${alias}="\${${expr}}" `)
           .join("");
         const dynamicEnvAssigns = Array.from(dynamicVarNames)
-          .filter((k) =>
-            new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}\\[][^}]*\\})|${k}\\b)`).test(cmdBody),
+          .filter(
+            (k) =>
+              bareArithVarNames.has(k) ||
+              new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}\\[][^}]*\\})|${k}\\b)`).test(cmdBody),
           )
           .map((k) => `${k}="$${k}" `)
           .join("");

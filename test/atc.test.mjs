@@ -8235,6 +8235,21 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       unquotedPlainVarIfs.rewrittenCommand,
       /do __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$x > \/tmp\/out\.txt' ; done$/,
     );
+
+    // 3k. Bare arithmetic variables ($((x + 1))) and array subscripts ($((parts[1] + 1))) are forwarded into rewritten shells
+    const bareArithVarRedir = evaluateCommandGuard(
+      "for x in 1 2; do adb shell echo $((x + 1)) > /tmp/out.txt; done",
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(bareArithVarRedir.allowed, true);
+    assert.match(
+      bareArithVarRedir.rewrittenCommand,
+      /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x \+ 1\)\) > \/tmp\/out\.txt' ; done$/,
+    );
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });
