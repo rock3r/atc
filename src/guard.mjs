@@ -650,6 +650,9 @@ function expandSingleBraceExpression(full, inner, vars, opaqueFallback) {
   }
   const key = m[1];
   const hasKey = Object.prototype.hasOwnProperty.call(vars, key);
+  if (!hasKey && opaqueFallback === null) {
+    return failValue;
+  }
   const val = hasKey ? String(vars[key]) : "";
   const rest = m[2].replace(/\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, (rawRef, k) =>
     Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : rawRef,
@@ -2121,8 +2124,17 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         }
         const { body: strippedBody, suffix } = splitTrailingControlClosers(cmdBody);
         cmdBody = strippedBody;
-        if (Object.keys(shellVars).length > 0 && cmdBody.includes("$")) {
-          cmdBody = expandVariables(cmdBody, shellVars, { opaqueFallback: null });
+        const staticShellVars = Object.fromEntries(
+          Object.entries(shellVars).filter(
+            ([k, v]) =>
+              !k.startsWith("__atc_") &&
+              typeof v === "string" &&
+              !v.includes("__atc_cmd_sub__") &&
+              /^[A-Za-z0-9._:/@=-]+$/.test(v),
+          ),
+        );
+        if (Object.keys(staticShellVars).length > 0 && cmdBody.includes("$")) {
+          cmdBody = expandVariables(cmdBody, staticShellVars, { opaqueFallback: null });
         }
         if (isWin) {
           return `${prefix}atc exec${sessionFlag} --serial ${execSerial} -- ${cmdBody}${suffix}`;
@@ -2132,8 +2144,18 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         if (isSimpleStage) {
           return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
+        const dynamicEnvAssigns = Object.entries(shellVars)
+          .filter(
+            ([k]) =>
+              !k.startsWith("__atc_") &&
+              /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) &&
+              !Object.prototype.hasOwnProperty.call(staticShellVars, k) &&
+              new RegExp(`\\$(?:\\{${k}[^}]*\\}|${k}\\b)`).test(cmdBody),
+          )
+          .map(([k]) => `${k}="$${k}" `)
+          .join("");
         const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;
-        return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
+        return `${prefix}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =

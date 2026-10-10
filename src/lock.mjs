@@ -27,20 +27,20 @@ export function isPidAlive(pid) {
 let activePgidLivenessSnapshot = null;
 const winKnownTreeDescendants = new Map();
 
-function queryWindowsProcessGroups(pgids) {
+export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync) {
   const result = new Map();
   for (const pgid of pgids) {
-    result.set(pgid, false);
+    result.set(pgid, true);
   }
   try {
     const psCmd =
       "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress";
-    const res = spawnSync(
+    const res = spawnSyncFn(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", psCmd],
       { encoding: "utf8", timeout: 2500, windowsHide: true },
     );
-    if (res && res.status === 0 && res.stdout) {
+    if (res && res.status === 0 && typeof res.stdout === "string" && res.stdout.trim()) {
       const parsed = JSON.parse(res.stdout.trim());
       const rows = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
       const alivePids = new Set();
@@ -96,7 +96,7 @@ function queryWindowsProcessGroups(pgids) {
       }
     }
   } catch {
-    // Ignore PowerShell query errors
+    // Preserve conservative alive (true) default when PowerShell fails or times out
   }
   return result;
 }
@@ -116,6 +116,14 @@ export function isProcessGroupAlive(pgid, { allowSubprocess = true } = {}) {
     }
     if (isPidAlive(pgid)) {
       return true;
+    }
+    const knownDescendants = winKnownTreeDescendants.get(pgid);
+    if (knownDescendants) {
+      for (const descPid of knownDescendants) {
+        if (isPidAlive(descPid)) {
+          return true;
+        }
+      }
     }
     if (!allowSubprocess) {
       return false;

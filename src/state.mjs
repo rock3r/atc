@@ -1122,6 +1122,18 @@ export function computeUsedEmulatorSlots(state, inventory = {}) {
       }
     }
   }
+  for (const dev of inventory.offline || []) {
+    if (
+      dev.kind === "emulator" &&
+      (dev.hasLockFiles ||
+        (inventory.avdHome && dev.avd && avdHasRuntimeLockFiles(dev.avd, inventory.avdHome)))
+    ) {
+      const key = dev.avd || dev.deviceKey;
+      if (key) {
+        runningOrStopping.add(key);
+      }
+    }
+  }
   for (const lease of Object.values(state.leases || {})) {
     if (
       lease.kind === "emulator" &&

@@ -841,6 +841,8 @@ export function selectCandidateUnderLock(
         ramSizeMb: 2048,
         requiredRamMb: 2048 + (cfg.qemuOverheadRamMb ?? 1024),
         dataDiskMb: 6656,
+        freeDiskMb: inventory.host?.freeDiskMb,
+        fsDev: inventory.host?.fsDev ?? null,
         profile: {
           deviceType: baseProfile.deviceType || req.deviceType || "phone",
           deviceName: profileName,
@@ -1313,6 +1315,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                 workerPid: null,
                 replacingAvd: null,
                 requiredRamMb: dev.requiredRamMb || 0,
+                fsDev: dev.fsDev ?? effectiveInventory.host?.fsDev ?? null,
+                avdPath: dev.avdPath || null,
                 loadedSnapshot: req.snapshotLoad || null,
                 saveSnapshotOnFree: req.snapshotSaveOnFree || null,
                 claimedAtMs: now,
@@ -1365,6 +1369,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   workerPid: process.pid,
                   replacingAvd: null,
                   requiredRamMb: computeRequiredRam(selection.victim),
+                  fsDev: selection.victim.fsDev ?? effectiveInventory.host?.fsDev ?? null,
+                  avdPath: selection.victim.avdPath || null,
                   claimedAtMs: now,
                   deadlineMs: now + stopTimeoutMs,
                 };
@@ -1387,6 +1393,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                 workerPid: process.pid,
                 replacingAvd: selection.victim ? selection.victim.avd : null,
                 requiredRamMb: computeRequiredRam(dev),
+                requiredDiskMb:
+                  Boolean(req.wipeData) || Boolean(selection.createAvd)
+                    ? dev.dataDiskMb || 6656
+                    : dev.ramSizeMb || 2048,
+                fsDev: dev.fsDev ?? effectiveInventory.host?.fsDev ?? null,
+                avdPath: dev.avdPath || null,
                 loadedSnapshot: req.resetApp ? null : req.snapshotLoad || null,
                 saveSnapshotOnFree:
                   req.snapshotSaveOnFree || existingOwnLease?.saveSnapshotOnFree || null,
@@ -2803,7 +2815,36 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       const freedImmediate = [];
       const busyErrors = [];
       const stopTimeoutMs = (state.config.stopTimeoutSec || 60) * 1000;
-      let cumulativeSnapshotMb = 0;
+      const cumulativeSnapshotMbByFs = new Map();
+      const matchedKeys = new Set(matches.map((m) => m.deviceKey));
+      for (const otherLease of Object.values(state.leases || {})) {
+        if (!otherLease || otherLease.kind !== "emulator" || matchedKeys.has(otherLease.deviceKey)) {
+          continue;
+        }
+        const otherFsKey =
+          options.host?.freeDiskMb !== undefined
+            ? "__injected_host__"
+            : otherLease.fsDev || otherLease.avdPath || avdHome || "default";
+        if (
+          otherLease.state === "starting" &&
+          typeof otherLease.requiredDiskMb === "number" &&
+          otherLease.requiredDiskMb > 0
+        ) {
+          cumulativeSnapshotMbByFs.set(
+            otherFsKey,
+            (cumulativeSnapshotMbByFs.get(otherFsKey) || 0) + otherLease.requiredDiskMb,
+          );
+        } else if (
+          otherLease.state === "stopping" &&
+          typeof otherLease.pendingSnapshotDiskMb === "number" &&
+          otherLease.pendingSnapshotDiskMb > 0
+        ) {
+          cumulativeSnapshotMbByFs.set(
+            otherFsKey,
+            (cumulativeSnapshotMbByFs.get(otherFsKey) || 0) + otherLease.pendingSnapshotDiskMb,
+          );
+        }
+      }
 
       for (const lease of matches) {
         const activeWorkers = syncLeaseWorkers(lease, livenessCheck).filter(
@@ -2835,13 +2876,22 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             Boolean(lease.pendingStop)) &&
           lease.kind === "emulator";
 
-        if (saveSnap && !isForced && lease.kind === "emulator") {
-          const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
-          cumulativeSnapshotMb += meta.ramSizeMb;
-          if (freeDiskMb < cumulativeSnapshotMb + (state.config.minFreeDiskMb ?? 2048)) {
+        const meta =
+          saveSnap && lease.kind === "emulator"
+            ? readLocalAvdMetadata(lease.avd, avdHome, state.config)
+            : null;
+        if (saveSnap && !isForced && lease.kind === "emulator" && meta) {
+          const fsKey =
+            options.host?.freeDiskMb !== undefined
+              ? "__injected_host__"
+              : meta.fsDev || meta.avdPath || avdHome || "default";
+          const fsFreeDiskMb = options.host?.freeDiskMb ?? meta.freeDiskMb ?? freeDiskMb;
+          const nextCumulativeMb = (cumulativeSnapshotMbByFs.get(fsKey) || 0) + meta.ramSizeMb;
+          cumulativeSnapshotMbByFs.set(fsKey, nextCumulativeMb);
+          if (fsFreeDiskMb < nextCumulativeMb + (state.config.minFreeDiskMb ?? 2048)) {
             throw new ResourceError(
               5,
-              `Insufficient disk space to save snapshot "${saveSnap}" on ${lease.avd}: needs ${cumulativeSnapshotMb + (state.config.minFreeDiskMb ?? 2048)}MB free.`,
+              `Insufficient disk space to save snapshot "${saveSnap}" on ${lease.avd}: needs ${nextCumulativeMb + (state.config.minFreeDiskMb ?? 2048)}MB free.`,
             );
           }
         }
@@ -2850,6 +2900,10 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           lease.state = "stopping";
           lease.workerPid = process.pid;
           lease.deadlineMs = now + stopTimeoutMs;
+          if (saveSnap && meta) {
+            lease.pendingSnapshotDiskMb = meta.ramSizeMb || 2048;
+            lease.fsDev = meta.fsDev ?? lease.fsDev ?? null;
+          }
           stoppingQueue.push({
             lease: { ...lease },
             saveSnap,
@@ -3357,12 +3411,46 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     if (effectiveAction === "save" && !parseBoolFlag(flags.force)) {
       const meta = readLocalAvdMetadata(lease.avd, avdHome, state.config);
       const minDisk = state.config.minFreeDiskMb ?? 2048;
-      if (freeDiskMb < meta.ramSizeMb + minDisk) {
+      const targetFsKey =
+        options.host?.freeDiskMb !== undefined
+          ? "__injected_host__"
+          : meta.fsDev || meta.avdPath || avdHome || "default";
+      let reservedDiskMb = 0;
+      for (const otherLease of Object.values(state.leases || {})) {
+        if (
+          !otherLease ||
+          otherLease.kind !== "emulator" ||
+          otherLease.deviceKey === lease.deviceKey
+        ) {
+          continue;
+        }
+        const otherFsKey =
+          options.host?.freeDiskMb !== undefined
+            ? "__injected_host__"
+            : otherLease.fsDev || otherLease.avdPath || avdHome || "default";
+        if (otherFsKey !== targetFsKey) continue;
+        if (
+          otherLease.state === "starting" &&
+          typeof otherLease.requiredDiskMb === "number" &&
+          otherLease.requiredDiskMb > 0
+        ) {
+          reservedDiskMb += otherLease.requiredDiskMb;
+        } else if (
+          otherLease.state === "stopping" &&
+          typeof otherLease.pendingSnapshotDiskMb === "number" &&
+          otherLease.pendingSnapshotDiskMb > 0
+        ) {
+          reservedDiskMb += otherLease.pendingSnapshotDiskMb;
+        }
+      }
+      const effectiveFreeDiskMb =
+        (options.host?.freeDiskMb ?? meta.freeDiskMb ?? freeDiskMb) - reservedDiskMb;
+      if (effectiveFreeDiskMb < meta.ramSizeMb + minDisk) {
         return {
           mutated: false,
           value: {
             exitCode: 5,
-            error: `Insufficient disk space (${freeDiskMb}MB free) to save snapshot "${effectiveName}" on ${lease.avd}: needs ${meta.ramSizeMb + minDisk}MB free. Pass --force to bypass.`,
+            error: `Insufficient disk space (${effectiveFreeDiskMb}MB free) to save snapshot "${effectiveName}" on ${lease.avd}: needs ${meta.ramSizeMb + minDisk}MB free. Pass --force to bypass.`,
           },
         };
       }

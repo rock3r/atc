@@ -93,8 +93,10 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   if (fs.existsSync(iniPath)) {
     try {
       const rootIni = parseIniFile(fs.readFileSync(iniPath, "utf8"));
-      if (rootIni.path && fs.existsSync(rootIni.path)) {
+      if (rootIni.path && (fs.existsSync(rootIni.path) || !fs.existsSync(avdPath))) {
         avdPath = rootIni.path;
+      } else if (rootIni["path.rel"] && !fs.existsSync(avdPath)) {
+        avdPath = path.resolve(avdHome, rootIni["path.rel"]);
       }
       if (rootIni.target) {
         targetApi = normalizeApiLevel(rootIni.target);
@@ -128,6 +130,7 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
   const sdcardMb = parseSizeMb(configIni["sdcard.size"], 512, "B");
   const dataDiskMb = dataPartitionMb + sdcardMb;
   const requiredRamMb = ramSizeMb + (cfg.qemuOverheadRamMb ?? 1024);
+  const diskInfo = readDiskVolumeInfo(avdPath, avdHome);
 
   let snapshots = [];
   const snapDir = path.join(avdPath, "snapshots");
@@ -160,6 +163,8 @@ export function readLocalAvdMetadata(avdId, avdHome = resolveAvdHome(), cfg = DE
     requiredRamMb,
     cpuCores,
     dataDiskMb,
+    freeDiskMb: diskInfo.freeDiskMb,
+    fsDev: diskInfo.fsDev,
     snapshots,
   };
 }
@@ -399,16 +404,41 @@ export function parseCreatableProfilesOutput(stdout) {
   return profiles;
 }
 
-export function readFreeDiskMb(avdHome = resolveAvdHome()) {
+function resolveExistingDiskTarget(targetPath, fallbackDir = os.homedir()) {
+  let cur = targetPath ? path.resolve(String(targetPath)) : "";
+  while (cur) {
+    if (fs.existsSync(cur)) {
+      return cur;
+    }
+    const parent = path.dirname(cur);
+    if (!parent || parent === cur) break;
+    cur = parent;
+  }
+  if (fallbackDir && fs.existsSync(fallbackDir)) {
+    return fallbackDir;
+  }
+  return os.homedir();
+}
+
+export function readDiskVolumeInfo(targetPath = resolveAvdHome(), fallbackDir = os.homedir()) {
   let freeDiskMb = 16384;
+  let fsDev = null;
   try {
-    const targetDir = fs.existsSync(avdHome) ? avdHome : os.homedir();
+    const targetDir = resolveExistingDiskTarget(targetPath, fallbackDir);
     const stat = fs.statfsSync(targetDir);
     freeDiskMb = Math.round((Number(stat.bavail) * Number(stat.bsize)) / (1024 * 1024));
+    const dirStat = fs.statSync(targetDir);
+    if (dirStat && (typeof dirStat.dev === "number" || typeof dirStat.dev === "bigint")) {
+      fsDev = String(dirStat.dev);
+    }
   } catch {
     // Fallback
   }
-  return freeDiskMb;
+  return { freeDiskMb, fsDev };
+}
+
+export function readFreeDiskMb(avdHome = resolveAvdHome()) {
+  return readDiskVolumeInfo(avdHome).freeDiskMb;
 }
 
 export function readHostResources(avdHome = resolveAvdHome()) {
@@ -449,10 +479,12 @@ export function readHostResources(avdHome = resolveAvdHome()) {
     }
   }
 
+  const diskInfo = readDiskVolumeInfo(avdHome);
   return {
     totalRamMb,
     availableRamMb,
-    freeDiskMb: readFreeDiskMb(avdHome),
+    freeDiskMb: diskInfo.freeDiskMb,
+    fsDev: diskInfo.fsDev,
     cpuCores: os.availableParallelism(),
   };
 }
@@ -473,10 +505,19 @@ export function checkResourceAdmission(
       : candidate.requiredRamMb || 2048 + overheadMb;
   const neededDiskMb = wipeOrCreate ? candidate.dataDiskMb || 6656 : candidate.ramSizeMb || 2048;
 
+  const candidateDiskInfo =
+    typeof candidate.freeDiskMb === "number"
+      ? { freeDiskMb: candidate.freeDiskMb, fsDev: candidate.fsDev ?? host?.fsDev ?? null }
+      : candidate.avdPath
+        ? readDiskVolumeInfo(candidate.avdPath, inventory?.avdHome || resolveAvdHome())
+        : { freeDiskMb: host?.freeDiskMb ?? 16384, fsDev: candidate.fsDev ?? host?.fsDev ?? null };
+  const candidateFsKey = candidateDiskInfo.fsDev || candidate.avdPath || "default";
+
   const onlineAvds = new Set(
     (inventory?.running || []).filter((d) => d.kind === "emulator").map((d) => d.avd),
   );
   let unaccountedRamMb = 0;
+  let unaccountedDiskMb = 0;
   for (const lease of Object.values(state.leases || {})) {
     if (lease.kind !== "emulator" || lease.avd === candidate.avd) continue;
     const isStarting = lease.state === "starting" && !onlineAvds.has(lease.avd);
@@ -487,6 +528,18 @@ export function checkResourceAdmission(
       now - lease.activatedAtMs < 30_000;
     if (isStarting || isRecentlyActivated) {
       unaccountedRamMb += lease.requiredRamMb || 2048 + overheadMb;
+    }
+    const leaseFsKey = lease.fsDev || host?.fsDev || lease.avdPath || "default";
+    if (leaseFsKey === candidateFsKey) {
+      if (isStarting && typeof lease.requiredDiskMb === "number" && lease.requiredDiskMb > 0) {
+        unaccountedDiskMb += lease.requiredDiskMb;
+      } else if (
+        lease.state === "stopping" &&
+        typeof lease.pendingSnapshotDiskMb === "number" &&
+        lease.pendingSnapshotDiskMb > 0
+      ) {
+        unaccountedDiskMb += lease.pendingSnapshotDiskMb;
+      }
     }
   }
 
@@ -505,14 +558,15 @@ export function checkResourceAdmission(
     );
   }
 
-  if ((host.freeDiskMb ?? 16384) < neededDiskMb + (cfg.minFreeDiskMb ?? 2048)) {
+  const projectedFreeDiskMb = (candidateDiskInfo.freeDiskMb ?? 16384) - unaccountedDiskMb;
+  if (projectedFreeDiskMb < neededDiskMb + (cfg.minFreeDiskMb ?? 2048)) {
     throw new ResourceError(
       5,
-      `Insufficient disk space for AVD "${candidate.avd}": needs ${neededDiskMb}MB (+${cfg.minFreeDiskMb ?? 2048}MB reserve), only ${host.freeDiskMb}MB free. Pass --force to bypass.`,
+      `Insufficient disk space for AVD "${candidate.avd}": needs ${neededDiskMb}MB (+${cfg.minFreeDiskMb ?? 2048}MB reserve), only ${projectedFreeDiskMb}MB free. Pass --force to bypass.`,
     );
   }
 
-  return { ok: true, projectedAvailableRamMb };
+  return { ok: true, projectedAvailableRamMb, projectedFreeDiskMb };
 }
 
 export function isAndroidEmulatorCliUnavailable(res, platform = process.platform) {

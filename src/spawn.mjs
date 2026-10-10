@@ -173,8 +173,17 @@ export function resolveExecutable(
     }
   }
 
-  if (hasExplicitBatchExt || lower === "atc") {
-    throw new Error(`Executable not found in PATH: ${command}`);
+  const bareBase = lower.replace(/\.(exe|cmd|bat|com)$/, "");
+  if (
+    hasExplicitBatchExt ||
+    bareBase === "atc" ||
+    bareBase === "adb" ||
+    bareBase === "android" ||
+    bareBase === "emulator"
+  ) {
+    const err = new Error(`Executable not found in PATH: ${command}`);
+    err.code = "ENOENT";
+    throw err;
   }
 
   return { executable: command, isBatch: false };
@@ -196,11 +205,15 @@ export function buildSpawnConfig(command, args = [], options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || process.cwd();
   const platform = options.platform || process.platform;
+  const effectiveEnv =
+    platform === "win32" ? { NoDefaultCurrentDirectoryInExePath: "1", ...env } : env;
   const resolved = resolveExecutable(command, env, cwd, platform);
 
   if (platform === "win32" && resolved.isBatch) {
     if (!path.win32.isAbsolute(resolved.executable)) {
-      throw new Error(`Executable not found in PATH: ${command}`);
+      const err = new Error(`Executable not found in PATH: ${command}`);
+      err.code = "ENOENT";
+      throw err;
     }
     validateBatchArgs(args, Boolean(options.strictInternal));
     const comspec = env.ComSpec || "cmd.exe";
@@ -210,7 +223,7 @@ export function buildSpawnConfig(command, args = [], options = {}) {
       args: ["/d", "/s", "/c", `"${quotedCmd}"`],
       options: {
         ...options,
-        env,
+        env: effectiveEnv,
         shell: false,
         windowsVerbatimArguments: true,
       },
@@ -222,7 +235,7 @@ export function buildSpawnConfig(command, args = [], options = {}) {
     args: args.map(String),
     options: {
       ...options,
-      env,
+      env: effectiveEnv,
       shell: false,
     },
   };
@@ -230,12 +243,26 @@ export function buildSpawnConfig(command, args = [], options = {}) {
 
 export function runCommandSync(command, args = [], options = {}) {
   if (options.detached) {
-    const cfg = buildSpawnConfig(command, args, {
-      ...options,
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    let cfg;
+    try {
+      cfg = buildSpawnConfig(command, args, {
+        ...options,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        return {
+          status: 1,
+          signal: null,
+          stdout: "",
+          stderr: `ENOENT: ${err.message}`,
+          error: err,
+        };
+      }
+      throw err;
+    }
     const launcherScript = [
       'const { spawn } = require("node:child_process");',
       "const payload = JSON.parse(process.argv[1]);",
@@ -293,11 +320,25 @@ export function runCommandSync(command, args = [], options = {}) {
       error: launchRes.error || null,
     };
   }
-  const cfg = buildSpawnConfig(command, args, {
-    encoding: "utf8",
-    timeout: options.timeoutMs ?? 15_000,
-    ...options,
-  });
+  let cfg;
+  try {
+    cfg = buildSpawnConfig(command, args, {
+      encoding: "utf8",
+      timeout: options.timeoutMs ?? 15_000,
+      ...options,
+    });
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return {
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: `ENOENT: ${err.message}`,
+        error: err,
+      };
+    }
+    throw err;
+  }
   const res = spawnSync(cfg.command, cfg.args, cfg.options);
   return {
     status: res.status ?? (res.error || res.signal ? 1 : 0),

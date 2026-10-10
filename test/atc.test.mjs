@@ -9,6 +9,7 @@ import { Worker } from "node:worker_threads";
 import {
   acquireLock,
   isProcessGroupAlive,
+  queryWindowsProcessGroups,
   releaseLock,
   sleepSync,
   verifyLockOwnership,
@@ -5973,7 +5974,7 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
           [
             process.execPath,
             "-e",
-            `const { spawn } = require("node:child_process"); const c = spawn(process.execPath, ["-e", "setTimeout(() => { require('node:fs').writeFileSync(process.argv[1], 'done'); }, 250)", process.argv[1]], { stdio: "ignore" }); c.unref(); process.exit(0);`,
+            `const { spawn } = require("node:child_process"); const c = spawn(process.execPath, ["-e", "setTimeout(() => { require('node:fs').writeFileSync(process.argv[1], 'done'); }, 350)", process.argv[1]], { detached: process.platform === "win32", stdio: "ignore", windowsHide: true }); c.once("spawn", () => { c.unref(); process.exit(0); });`,
             markerFile,
           ],
           { session: "exec-pg-sess" },
@@ -6825,6 +6826,134 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         );
         assert.equal(unwrappedInv.cmd, "android");
         assert.ok(unwrappedInv.args.includes("--device=emulator-5554"));
+
+        // Astra #25 Finding 1: queryWindowsProcessGroups defaults to alive (true) when PowerShell fails or returns invalid JSON
+        const winFailedQuery = queryWindowsProcessGroups([424242], () => ({
+          status: 1,
+          stdout: "",
+          stderr: "PowerShell failed",
+        }));
+        assert.equal(winFailedQuery.get(424242), true);
+        const winInvalidJsonQuery = queryWindowsProcessGroups([424242], () => ({
+          status: 0,
+          stdout: "{not-json",
+          stderr: "",
+        }));
+        assert.equal(winInvalidJsonQuery.get(424242), true);
+        const winConfirmedDeadQuery = queryWindowsProcessGroups([424242], () => ({
+          status: 0,
+          stdout: JSON.stringify([{ ProcessId: 100, ParentProcessId: 4 }]),
+          stderr: "",
+        }));
+        assert.equal(winConfirmedDeadQuery.get(424242), false);
+
+        // Astra #25 Finding 2: Windows resolveExecutable fails closed for adb/android/emulator when missing from PATH/SDK
+        const winLocalTrapDir = makeTempStateDir();
+        try {
+          fs.writeFileSync(path.join(winLocalTrapDir, "adb.exe"), "MZ");
+          fs.writeFileSync(path.join(winLocalTrapDir, "android.exe"), "MZ");
+          fs.writeFileSync(path.join(winLocalTrapDir, "emulator.exe"), "MZ");
+          const isolatedWinEnv = {
+            PATH: path.join(winLocalTrapDir, "empty-path"),
+            ANDROID_HOME: path.join(winLocalTrapDir, "empty-sdk"),
+            ANDROID_SDK_ROOT: path.join(winLocalTrapDir, "empty-sdk"),
+            LOCALAPPDATA: path.join(winLocalTrapDir, "empty-localappdata"),
+            APPDATA: path.join(winLocalTrapDir, "empty-appdata"),
+            USERPROFILE: path.join(winLocalTrapDir, "empty-profile"),
+          };
+          for (const tool of ["adb", "android", "emulator", "adb.exe"]) {
+            assert.throws(
+              () => resolveExecutable(tool, isolatedWinEnv, winLocalTrapDir, "win32"),
+              /Executable not found in PATH/,
+            );
+          }
+          const runMissingWinTool = runCommandSync("android", ["emulator", "list"], {
+            env: isolatedWinEnv,
+            cwd: winLocalTrapDir,
+            platform: "win32",
+          });
+          assert.equal(runMissingWinTool.status, 1);
+          assert.match(runMissingWinTool.stderr, /ENOENT/);
+        } finally {
+          fs.rmSync(winLocalTrapDir, { recursive: true, force: true });
+        }
+
+        // Astra #25 Finding 3: Command rewriting keeps unknown command-substitution variables symbolic instead of emitting __atc_cmd_sub__
+        const cmdSubApkGuard = evaluateCommandGuard(
+          "APK=$(find app/build -name '*.apk' | head -1); adb install \"$APK\"",
+          {
+            sessionId: "apk-sub-sess",
+            activeLeases: [{ leaseId: "lease_apk", serial: "emulator-5554" }],
+            platform: "linux",
+          },
+        );
+        assert.equal(cmdSubApkGuard.allowed, true);
+        assert.doesNotMatch(cmdSubApkGuard.rewrittenCommand, /__atc_cmd_sub__/);
+        assert.match(
+          cmdSubApkGuard.rewrittenCommand,
+          /APK="\$APK" ATC_SESSION_ID=apk-sub-sess atc exec --serial emulator-5554 -- sh -c 'adb install "\$APK"'$/,
+        );
+
+        // Astra #25 Finding 4: Relocated AVD disk admission and per-filesystem reservation aggregation
+        const relocatedState = createDefaultState();
+        relocatedState.leases["avd:Starting_On_Ext"] = {
+          leaseId: "lease_ext_starting",
+          deviceKey: "avd:Starting_On_Ext",
+          kind: "emulator",
+          avd: "Starting_On_Ext",
+          state: "starting",
+          requiredRamMb: 3072,
+          requiredDiskMb: 6656,
+          fsDev: "vol-ext",
+        };
+        assert.throws(
+          () =>
+            checkResourceAdmission(
+              {
+                avd: "Relocated_On_Ext",
+                ramSizeMb: 2048,
+                requiredRamMb: 3072,
+                dataDiskMb: 6656,
+                freeDiskMb: 9000,
+                fsDev: "vol-ext",
+              },
+              { availableRamMb: 32768, freeDiskMb: 65536, fsDev: "vol-home" },
+              relocatedState,
+              { running: [] },
+            ),
+          (err) => err instanceof ResourceError && err.exitCode === 5,
+        );
+        // Same freeDiskMb on a different volume ("vol-other") without the starting reservation succeeds
+        const otherVolAdmission = checkResourceAdmission(
+          {
+            avd: "Relocated_On_Other",
+            ramSizeMb: 2048,
+            requiredRamMb: 3072,
+            dataDiskMb: 6656,
+            freeDiskMb: 9000,
+            fsDev: "vol-other",
+          },
+          { availableRamMb: 32768, freeDiskMb: 65536, fsDev: "vol-home" },
+          relocatedState,
+          { running: [] },
+        );
+        assert.equal(otherVolAdmission.ok, true);
+
+        // Astra #25 Finding 5: Offline emulator holding runtime QEMU lock files counts toward computeUsedEmulatorSlots
+        const lockSlotState = createDefaultState();
+        const usedWithLockedOffline = computeUsedEmulatorSlots(lockSlotState, {
+          running: [],
+          offline: [
+            {
+              deviceKey: "avd:Locked_Offline_Avd",
+              avd: "Locked_Offline_Avd",
+              kind: "emulator",
+              online: false,
+              hasLockFiles: true,
+            },
+          ],
+        });
+        assert.equal(usedWithLockedOffline, 1);
       } finally {
         fs.rmSync(r21Dir, { recursive: true, force: true });
       }
