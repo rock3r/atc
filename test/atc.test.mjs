@@ -2371,6 +2371,100 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(capturedStopTimeoutMs, 95_000);
             cmdFree(stopTimeoutDir, coldRestartRes.lease.leaseId, { session: `cold-sess-${testPlatform}` });
           }
+
+          // 1. Reject ADB detach/attach targeting another serial
+          assert.throws(
+            () =>
+              buildChildInvocation(
+                "adb",
+                ["detach", "R58N999999Z"],
+                { serial: "emulator-5554", leaseId: "lease-1" },
+                "ppid-5050",
+              ),
+            /Conflicting device selector "R58N999999Z"/,
+          );
+          const detachOtherGuard = evaluateCommandGuard("atc exec -- adb detach R58N999999Z", {
+            sessionId: "ppid-5050",
+            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+          });
+          assert.equal(detachOtherGuard.allowed, false);
+          assert.match(detachOtherGuard.reason, /R58N999999Z/);
+
+          // 2. Reject untracked remote-device lifecycle commands (`android device remote remove ...`)
+          const remoteRemoveGuard = evaluateCommandGuard("android device remote remove res-123", {
+            sessionId: "ppid-5050",
+            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
+          });
+          assert.equal(remoteRemoveGuard.allowed, false);
+          assert.match(remoteRemoveGuard.reason, /android device remote remove/);
+          assert.throws(
+            () =>
+              buildChildInvocation(
+                "android",
+                ["device", "remote", "remove", "res-123"],
+                { serial: "emulator-5554", leaseId: "lease-1" },
+                "ppid-5050",
+              ),
+            /android device remote remove/,
+          );
+
+          // 3. Preserve destination lease if another session concurrently reserves the created AVD key during key migration
+          const collisionDir = makeTempStateDir();
+          try {
+            const createOnlyInv = {
+              running: [],
+              offline: [],
+              creatable: [
+                {
+                  kind: "emulator",
+                  deviceName: "pixel_9",
+                  profile: {
+                    deviceType: "phone",
+                    deviceName: "pixel_9",
+                    apiLevel: "android-35",
+                    numericApi: 35,
+                    services: "google_apis",
+                    playStore: false,
+                    abi: "arm64-v8a",
+                  },
+                },
+              ],
+            };
+            const colRes = cmdClaim(
+              collisionDir,
+              { session: "creator-sess", type: "phone", api: "35", createIfMissing: true, force: true, wait: 0 },
+              {
+                avdHome,
+                inventory: createOnlyInv,
+                runner: (cmd, args) => {
+                  if (cmd === "android" && args[0] === "emulator" && args[1] === "create") {
+                    // Simulate another session reserving avd:Pixel_9_API_35 while create was running outside the lock
+                    const st = readState(collisionDir);
+                    st.leases["avd:Pixel_9_API_35"] = {
+                      leaseId: "lease_other_session",
+                      sessionId: "other-session",
+                      state: "starting",
+                      kind: "emulator",
+                      avd: "Pixel_9_API_35",
+                      deviceKey: "avd:Pixel_9_API_35",
+                      workerPid: process.pid,
+                      deadlineMs: Date.now() + 60_000,
+                    };
+                    fs.writeFileSync(path.join(collisionDir, "state.json"), JSON.stringify(st));
+                    return { status: 0, stdout: "Created AVD 'Pixel_9_API_35'\n", stderr: "" };
+                  }
+                  return { status: 0, stdout: "", stderr: "" };
+                },
+              },
+            );
+            assert.equal(colRes.exitCode, 1);
+            assert.match(colRes.error, /concurrently reserved by another session/);
+            const postCollisionState = readState(collisionDir);
+            assert.equal(postCollisionState.leases["avd:Pixel_9_API_35"]?.leaseId, "lease_other_session");
+            assert.equal(postCollisionState.leases["avd:pixel_9"], undefined);
+          } finally {
+            fs.rmSync(collisionDir, { recursive: true, force: true });
+          }
         } finally {
           fs.rmSync(stopTimeoutDir, { recursive: true, force: true });
         }

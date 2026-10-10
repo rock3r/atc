@@ -1049,22 +1049,35 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, { runner, avdHom
       if (createdAvdName !== candidate.avd || newlyCreated) {
         const oldKey = lease.deviceKey;
         const newKey = `avd:${createdAvdName}`;
-        withStateTransaction(stateDir, (state) => {
+        const migrationConflict = withStateTransaction(stateDir, (state) => {
           const current = state.leases[oldKey];
-          if (current && current.leaseId === lease.leaseId) {
-            if (oldKey !== newKey) {
-              delete state.leases[oldKey];
-            }
-            current.deviceKey = newKey;
-            current.avd = createdAvdName;
-            if (newlyCreated?.profile) {
-              current.profile = newlyCreated.profile;
-            }
-            state.leases[newKey] = current;
-            return { mutated: true };
+          if (!current || current.leaseId !== lease.leaseId) {
+            return {
+              mutated: false,
+              value: `Lease reservation ${lease.leaseId} was lost during AVD creation.`,
+            };
           }
-          return { mutated: false };
+          const destLease = state.leases[newKey];
+          if (destLease && destLease.leaseId !== lease.leaseId) {
+            return {
+              mutated: false,
+              value: `Created AVD "${createdAvdName}" was concurrently reserved by another session (${destLease.sessionId}).`,
+            };
+          }
+          if (oldKey !== newKey) {
+            delete state.leases[oldKey];
+          }
+          current.deviceKey = newKey;
+          current.avd = createdAvdName;
+          if (newlyCreated?.profile) {
+            current.profile = newlyCreated.profile;
+          }
+          state.leases[newKey] = current;
+          return { mutated: true, value: null };
         });
+        if (migrationConflict) {
+          throw new Error(migrationConflict);
+        }
         candidate.avd = createdAvdName;
         candidate.deviceKey = newKey;
         if (newlyCreated?.profile) {

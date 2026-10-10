@@ -264,15 +264,34 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         'Direct emulator launch is disabled under ATC. Use "atc claim --type <type> --api <api>" instead.',
       );
     }
-  } else if (base === "android" && androidParsed.sub === "emulator") {
-    const emuAction = androidParsed.action;
-    if (
-      ["start", "stop", "remove", "create"].includes(emuAction) &&
-      !(emuAction === "create" && args.includes("--list-profiles"))
-    ) {
-      throw new Error(
-        `Direct "android emulator ${emuAction}" is disabled under ATC. Use "atc claim" or "atc free --stop" instead.`,
-      );
+  } else if (base === "android") {
+    if (androidParsed.sub === "emulator") {
+      const emuAction = androidParsed.action;
+      if (
+        ["start", "stop", "remove", "create"].includes(emuAction) &&
+        !(emuAction === "create" && args.includes("--list-profiles"))
+      ) {
+        throw new Error(
+          `Direct "android emulator ${emuAction}" is disabled under ATC. Use "atc claim" or "atc free --stop" instead.`,
+        );
+      }
+    } else if (androidParsed.sub === "device" && androidParsed.action === "remote") {
+      const remoteActions = args
+        .slice(androidParsed.actIdx + 1)
+        .map(String)
+        .filter((a) => !a.startsWith("-"));
+      const remoteAction = remoteActions[0] || "";
+      if (
+        ["remove", "delete", "disconnect", "stop", "release", "create", "reserve", "connect", "add"].includes(
+          remoteAction,
+        ) &&
+        !args.includes("--help") &&
+        !args.includes("-h")
+      ) {
+        throw new Error(
+          `Direct "android device remote ${remoteAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
+        );
+      }
     }
   } else if (base === "adb") {
     let subIdx = 0;
@@ -314,6 +333,24 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       throw new Error(
         'Direct "adb emu kill" is disabled under ATC. Use "atc free --stop" instead.',
       );
+    }
+    if (adbSub === "attach" || adbSub === "detach") {
+      const usbTargets = adbRest.filter((a) => !a.startsWith("-"));
+      if (usbTargets.length === 0) {
+        if (!lease.serial) {
+          throw new Error(
+            `Bare "adb ${adbSub}" is disabled under ATC when the lease has no bound serial; specify the leased target serial explicitly.`,
+          );
+        }
+      } else {
+        for (const target of usbTargets) {
+          if (lease.serial && target !== lease.serial) {
+            throw new Error(
+              `Conflicting device selector "${target}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+            );
+          }
+        }
+      }
     }
     if (adbSub === "disconnect") {
       const disconnectTargets = adbRest.filter((a) => !a.startsWith("-"));

@@ -618,7 +618,7 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       }
     }
     const action = String(args[actIdx] || args[subIdx + 1] || "");
-    return { subIdx, sub, action };
+    return { subIdx, sub, actIdx, action };
   })();
 
   if (baseCmd === "emulator" || (baseCmd === "android" && androidSubInfo.sub === "emulator")) {
@@ -646,6 +646,34 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
     }
     if (emuAction === "list" || emuAction === "--help" || emuAction === "-h") {
       return { kind: "read_only", parsed };
+    }
+  }
+
+  if (baseCmd === "android" && androidSubInfo.sub === "device" && androidSubInfo.action === "remote") {
+    const remoteRest = args
+      .slice(androidSubInfo.actIdx + 1)
+      .map(String)
+      .filter((a) => !a.startsWith("-"));
+    const remoteAction = remoteRest[0] || "";
+    if (
+      args.includes("--help") ||
+      args.includes("-h") ||
+      remoteAction === "list" ||
+      remoteAction === "status" ||
+      !remoteAction
+    ) {
+      return { kind: "read_only", parsed };
+    }
+    if (
+      ["remove", "delete", "disconnect", "stop", "release", "create", "reserve", "connect", "add"].includes(
+        remoteAction,
+      )
+    ) {
+      return {
+        kind: "deny_lifecycle",
+        reason: `Direct "android device remote ${remoteAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
+        parsed,
+      };
     }
   }
 
@@ -680,6 +708,23 @@ export function classifySegment(segment, inheritedVars = {}, depth = 0) {
       return {
         kind: "deny_lifecycle",
         reason: 'Direct "adb emu kill" is disabled under ATC. Use "atc free --stop" instead.',
+        parsed,
+      };
+    }
+    if (adbSub === "attach" || adbSub === "detach") {
+      const usbTargets = adbRest.filter((a) => !a.startsWith("-"));
+      const explicitSel = extractTargetSerial(parsed);
+      const allTargets = Array.from(
+        new Set([...(explicitSel ? [explicitSel] : []), ...usbTargets]),
+      );
+      return {
+        kind: "device_action",
+        targetSerial:
+          allTargets.length === 0
+            ? null
+            : allTargets.length === 1
+              ? allTargets[0]
+              : allTargets.join(","),
         parsed,
       };
     }
