@@ -7540,6 +7540,113 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       mutatedWhileLoop.rewrittenCommand,
       /do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$i" > "\/tmp\/iter_\$i\.txt"' ; i=\$\(\(i \+ 1\)\) ; done$/,
     );
+
+    // 3d. `read -ra parts` array subscript preservation across `sh -c` rewrites
+    const readArrayRedir = evaluateCommandGuard(
+      'while read -ra parts; do adb shell echo "${parts[1]}" > /tmp/out.txt; done < rows.txt',
+      {
+        sessionId: "loop-sess",
+        activeLeases,
+        platform: "linux",
+      },
+    );
+    assert.equal(readArrayRedir.allowed, true);
+    assert.doesNotMatch(
+      readArrayRedir.rewrittenCommand,
+      /\bparts="\$parts"/,
+      "Array variable from read -ra must not be flattened into scalar parts=\"$parts\"",
+    );
+    assert.match(
+      readArrayRedir.rewrittenCommand,
+      /do __atc_arr_parts_1="\$\{parts\[1\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_1\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
+    );
+
+    // 1f. Tombstoned root identity when initial Windows snapshot misses already-exited root PID
+    const missedRootPgid = 730001;
+    clearKnownWindowsTreeDescendants(missedRootPgid);
+    try {
+      // Snapshot 1: root (730001) already exited, but child (730002) is alive
+      const mapMissed1 = queryWindowsProcessGroups([missedRootPgid], () => ({
+        status: 0,
+        stdout: JSON.stringify([
+          { ProcessId: 730002, ParentProcessId: 730001, CreationDate: "20261010170001.000000+000" },
+        ]),
+        stderr: "",
+      }));
+      assert.equal(mapMissed1.get(missedRootPgid), true);
+      const knownMissed1 = getKnownWindowsTreeDescendants(missedRootPgid);
+      assert.deepEqual(
+        knownMissed1.find((e) => e.pid === missedRootPgid),
+        { pid: missedRootPgid, creationDate: "__exited__" },
+      );
+
+      // Snapshot 2: child (730002) exits, and Windows reuses root PID (730001) for an unrelated process with its own child (730099)
+      clearKnownWindowsTreeDescendants(missedRootPgid);
+      seedWindowsKnownDescendants({ [String(missedRootPgid)]: knownMissed1 });
+      const mapMissed2 = queryWindowsProcessGroups([missedRootPgid], () => ({
+        status: 0,
+        stdout: JSON.stringify([
+          { ProcessId: 730001, ParentProcessId: 9000, CreationDate: "20261010170999.000000+000" },
+          { ProcessId: 730099, ParentProcessId: 730001, CreationDate: "20261010171000.000000+000" },
+        ]),
+        stderr: "",
+      }));
+      assert.equal(
+        mapMissed2.get(missedRootPgid),
+        false,
+        "Tombstoned root PID missed on initial snapshot must not be adopted if reused later",
+      );
+    } finally {
+      clearKnownWindowsTreeDescendants(missedRootPgid);
+    }
+
+    // 1g. cmdGc preserves live group leader on releaseOnWorkerExit lease
+    const liveLeaderPgid = 740001;
+    const liveGcState = createDefaultState();
+    liveGcState.leases["serial:emulator-5558"] = {
+      leaseId: "lease_live_leader_gc",
+      deviceKey: "serial:emulator-5558",
+      kind: "emulator",
+      avd: "Pixel_Live_GC",
+      serial: "emulator-5558",
+      profile: { apiLevel: "android-35", deviceType: "phone" },
+      sessionId: "live-gc-sess",
+      anchorPid: process.pid,
+      workerPid: liveLeaderPgid,
+      workerPids: [liveLeaderPgid],
+      workerPgids: [liveLeaderPgid],
+      releaseOnWorkerExit: true,
+      state: "active",
+      claimedAtMs: now - 5_000,
+      activatedAtMs: now - 4_000,
+      renewedAtMs: now - 1_000,
+      expiresAtMs: now + 300_000,
+    };
+    withLock(dir, (h) => commitState(dir, liveGcState, h));
+    const liveGcKilled = [];
+    const liveGcRes = cmdGc(dir, {
+      platform: "win32",
+      livenessCheck: (pid) => pid === process.pid || pid === liveLeaderPgid,
+      runner: (cmd, args) => {
+        if (cmd === "powershell.exe") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { ProcessId: liveLeaderPgid, ParentProcessId: process.pid, CreationDate: "20261010180000.000000+000" },
+            ]),
+            stderr: "",
+          };
+        }
+        if (cmd === "taskkill") {
+          liveGcKilled.push(Number(args[args.indexOf("/PID") + 1]));
+          return { status: 0, stdout: "", stderr: "" };
+        }
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(liveGcRes.exitCode, 0);
+    assert.deepEqual(liveGcKilled, [], "cmdGc must not kill an active worker group leader while it is still alive");
+    assert.ok(readState(dir).leases["serial:emulator-5558"], "Lease with live worker leader must remain active during GC");
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
     fs.rmSync(dir, { recursive: true, force: true });

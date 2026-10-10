@@ -4118,7 +4118,8 @@ export function cmdGc(stateDir, options = {}) {
         const num = Number(p);
         return !pgidSet.has(num) && preLiveness(num);
       });
-      if (hasLiveWrapperPid) continue;
+      const hasLiveLeaderPid = (lease.workerPgids || []).some((p) => preLiveness(Number(p)));
+      if (hasLiveWrapperPid || hasLiveLeaderPid) continue;
       const lastRenewedMs =
         typeof lease.renewedAtMs === "number" ? lease.renewedAtMs : lease.claimedAtMs;
       const isExpired =

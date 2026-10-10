@@ -2414,18 +2414,74 @@ function rewriteCompoundCommand(command, { sessionId, anchorPid, execSerial, pla
         if (isSimpleStage) {
           return `${prefix}${posixEnvPrefix}atc exec --serial ${execSerial} -- ${cmdBody}${suffix}`;
         }
-        const dynamicEnvAssigns = Object.entries(shellVars)
-          .filter(
-            ([k]) =>
+        const dynamicVarNames = new Set(
+          Object.keys(shellVars).filter(
+            (k) =>
               !k.startsWith("__atc_") &&
               /^[A-Za-z_][A-Za-z0-9_]*$/.test(k) &&
-              !Object.prototype.hasOwnProperty.call(staticShellVars, k) &&
-              new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}][^}]*\\})|${k}\\b)`).test(cmdBody),
+              !Object.prototype.hasOwnProperty.call(staticShellVars, k),
+          ),
+        );
+        const arrayEnvEntries = new Map();
+        if (dynamicVarNames.size > 0 && cmdBody.includes("${")) {
+          let rewrittenArrBody = "";
+          let arrInSingle = false;
+          let aliasSeq = 0;
+          for (let i = 0; i < cmdBody.length; i++) {
+            const ch = cmdBody[i];
+            if (ch === "\\" && !arrInSingle && i + 1 < cmdBody.length) {
+              rewrittenArrBody += ch + cmdBody[i + 1];
+              i++;
+              continue;
+            }
+            if (ch === "'") {
+              arrInSingle = !arrInSingle;
+              rewrittenArrBody += ch;
+              continue;
+            }
+            if (!arrInSingle && ch === "$" && cmdBody[i + 1] === "{") {
+              const closeIdx = cmdBody.indexOf("}", i + 2);
+              if (closeIdx !== -1) {
+                const inner = cmdBody.slice(i + 2, closeIdx);
+                const arrMatch = inner.match(/^(#?)([A-Za-z_][A-Za-z0-9_]*)\[([^\]]+)\](.*)$/);
+                if (arrMatch && dynamicVarNames.has(arrMatch[2])) {
+                  const [, hashPrefix, arrName, subscript, modifier] = arrMatch;
+                  let aliasName;
+                  if (hashPrefix === "#" && (subscript === "@" || subscript === "*")) {
+                    aliasName = `__atc_arr_${arrName}_len`;
+                  } else if (!hashPrefix && !modifier && (subscript === "@" || subscript === "*")) {
+                    aliasName = `__atc_arr_${arrName}_all`;
+                  } else if (!hashPrefix && !modifier && /^[A-Za-z0-9_]+$/.test(subscript)) {
+                    aliasName = `__atc_arr_${arrName}_${subscript}`;
+                  } else {
+                    aliasName = `__atc_arr_${arrName}_${aliasSeq++}`;
+                  }
+                  const outerExpr =
+                    !hashPrefix && subscript === "@"
+                      ? `${arrName}[*]${modifier}`
+                      : inner;
+                  arrayEnvEntries.set(aliasName, outerExpr);
+                  rewrittenArrBody += `\${${aliasName}}`;
+                  i = closeIdx;
+                  continue;
+                }
+              }
+            }
+            rewrittenArrBody += ch;
+          }
+          cmdBody = rewrittenArrBody;
+        }
+        const arrayEnvAssigns = Array.from(arrayEnvEntries.entries())
+          .map(([alias, expr]) => `${alias}="\${${expr}}" `)
+          .join("");
+        const dynamicEnvAssigns = Array.from(dynamicVarNames)
+          .filter((k) =>
+            new RegExp(`\\$(?:\\{#?${k}(?:\\}|[^A-Za-z0-9_}\\[][^}]*\\})|${k}\\b)`).test(cmdBody),
           )
-          .map(([k]) => `${k}="$${k}" `)
+          .map((k) => `${k}="$${k}" `)
           .join("");
         const escaped = `'${String(cmdBody).replace(/'/g, `'\\''`)}'`;
-        return `${prefix}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
+        return `${prefix}${arrayEnvAssigns}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${execSerial} -- sh -c ${escaped}${suffix}`;
       }
       if (c.kind === "atc" && sessionFlags) {
         const hasSession =

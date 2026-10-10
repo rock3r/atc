@@ -83,10 +83,16 @@ export function seedWindowsKnownDescendants(pgidOrMap, entries) {
           item.creationDate ?? item.CreationDate ?? item.startToken ?? null,
         );
         const prev = known.get(pid);
+        const effectiveCreation = creationDate ?? prev?.creationDate ?? null;
         known.set(pid, {
           pid,
-          creationDate: creationDate ?? prev?.creationDate ?? null,
-          alive: item.alive !== undefined ? Boolean(item.alive) : (prev?.alive ?? true),
+          creationDate: effectiveCreation,
+          alive:
+            item.alive !== undefined
+              ? Boolean(item.alive)
+              : effectiveCreation === "__exited__"
+                ? false
+                : (prev?.alive ?? true),
         });
       }
     }
@@ -153,8 +159,9 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
           }
         }
       }
-      const isSameProcessInstance = (pid, expectedCreation) => {
+      const isSameProcessInstance = (pid, expectedCreation, prevAlive = true) => {
         if (!alivePids.has(pid)) return false;
+        if (prevAlive === false || expectedCreation === "__exited__") return false;
         if (!expectedCreation) return true;
         const actualCreation = creationByPid.get(pid) ?? null;
         if (!actualCreation) return true;
@@ -174,22 +181,28 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
           prevRootEntry?.creationDate ?? creationByPid.get(pgid) ?? null;
         const rootReused =
           alivePids.has(pgid) &&
-          Boolean(prevRootEntry?.creationDate) &&
-          !isSameProcessInstance(pgid, prevRootEntry.creationDate);
-        if (!rootReused) {
+          Boolean(prevRootEntry) &&
+          !isSameProcessInstance(pgid, prevRootEntry.creationDate, prevRootEntry.alive);
+        if (rootReused) {
+          nextKnown.set(pgid, {
+            pid: pgid,
+            creationDate: prevRootEntry.creationDate ?? "__exited__",
+            alive: false,
+          });
+        } else {
           queue.push(pgid);
           visited.add(pgid);
-          if (isSameProcessInstance(pgid, prevRootEntry?.creationDate)) {
+          if (isSameProcessInstance(pgid, prevRootEntry?.creationDate, prevRootEntry?.alive)) {
             liveMembers.add(pgid);
             nextKnown.set(pgid, {
               pid: pgid,
               creationDate: creationByPid.get(pgid) ?? rootCreation,
               alive: true,
             });
-          } else if (prevRootEntry) {
+          } else {
             nextKnown.set(pgid, {
               pid: pgid,
-              creationDate: prevRootEntry.creationDate,
+              creationDate: prevRootEntry?.creationDate ?? "__exited__",
               alive: false,
             });
           }
@@ -198,7 +211,7 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
         for (const [kPid, prevMeta] of prevKnown.entries()) {
           if (kPid === pgid) continue;
           const expectedCreation = prevMeta?.creationDate ?? null;
-          if (isSameProcessInstance(kPid, expectedCreation)) {
+          if (isSameProcessInstance(kPid, expectedCreation, prevMeta?.alive)) {
             liveMembers.add(kPid);
             nextKnown.set(kPid, {
               pid: kPid,
@@ -214,13 +227,20 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
             // so surviving multi-hop children with ParentProcessId === kPid are discovered.
             nextKnown.set(kPid, {
               pid: kPid,
-              creationDate: expectedCreation,
+              creationDate: expectedCreation ?? "__exited__",
               alive: false,
             });
             if (!visited.has(kPid)) {
               visited.add(kPid);
               queue.push(kPid);
             }
+          } else {
+            // PID was reused by an unrelated process; keep tombstone without traversing children.
+            nextKnown.set(kPid, {
+              pid: kPid,
+              creationDate: expectedCreation ?? "__exited__",
+              alive: false,
+            });
           }
         }
 
@@ -230,7 +250,7 @@ export function queryWindowsProcessGroups(pgids, spawnSyncFn = spawnSync, option
           for (const kid of kids) {
             const prevKidMeta = prevKnown.get(kid);
             const expectedKidCreation = prevKidMeta?.creationDate ?? null;
-            if (isSameProcessInstance(kid, expectedKidCreation)) {
+            if (isSameProcessInstance(kid, expectedKidCreation, prevKidMeta?.alive)) {
               liveMembers.add(kid);
               nextKnown.set(kid, {
                 pid: kid,
