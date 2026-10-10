@@ -35,6 +35,7 @@ import {
   checkResourceAdmission,
   deterministicCreatedAvdId,
   discoverFleet,
+  inferDeviceType,
   resolveAvdHome,
   readLocalAvdMetadata,
 } from "../src/android.mjs";
@@ -1244,7 +1245,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         }
       );
       assert.equal(winFree.exitCode, 0);
-      assert.deepEqual(winFreeCalls, ["adb -s emulator-5554 emu kill"]);
+      assert.equal(winFreeCalls[0], "adb -s emulator-5554 emu kill");
 
       // cmdStatus filters creatable profiles and reconciles offline leases
       withStateTransaction(winDir, (state, { now }) => {
@@ -2372,6 +2373,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           fs.writeFileSync(path.join(stopTimeoutDir, "state.json"), JSON.stringify(customState));
           for (const testPlatform of ["darwin", "win32"]) {
             let capturedStopTimeoutMs = null;
+            let winKilled = false;
             const coldRestartRes = cmdClaim(
               stopTimeoutDir,
               { session: `cold-sess-${testPlatform}`, avd: "Pixel_8_API_35", cold: true, force: true, wait: 0 },
@@ -2384,16 +2386,24 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                     (cmd === "adb" && args.includes("emu") && args.includes("kill"))
                   ) {
                     capturedStopTimeoutMs = opts?.timeoutMs;
+                    winKilled = true;
                     return { status: 0, stdout: "", stderr: "" };
                   }
                   if (
                     (cmd === "android" && args[0] === "emulator" && args[1] === "start") ||
                     cmd === "emulator"
                   ) {
+                    winKilled = false;
                     return { status: 0, stdout: JSON.stringify({ serial: "emulator-5554" }), stderr: "" };
                   }
                   if (cmd === "adb" && args[0] === "devices") {
-                    return { status: 0, stdout: "List of devices attached\nemulator-5554\tdevice\n", stderr: "" };
+                    return {
+                      status: 0,
+                      stdout: winKilled
+                        ? "List of devices attached\n"
+                        : "List of devices attached\nemulator-5554\tdevice\n",
+                      stderr: "",
+                    };
                   }
                   if (cmd === "adb") {
                     return { status: 0, stdout: "1\n", stderr: "" };
@@ -4235,6 +4245,275 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     } finally {
       fs.rmSync(winDir, { recursive: true, force: true });
     }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(avdHome, { recursive: true, force: true });
+  }
+});
+
+test("regression: Astra review hardening (rollback stopping state, stale lock breaker serialization, auto-create baseline isolation, Windows shutdown wait, and ADB post-subcommand -s)", () => {
+  const dir = makeTempStateDir();
+  const avdHome = makeTempStateDir();
+  try {
+    // 1. Rollback keeps lease in "stopping" state until emulator stop finishes, preventing concurrent claim
+    let concurrentClaimDuringStop = null;
+    const rollbackRes = cmdClaim(
+      dir,
+      { session: "rollback-sess", avd: "Pixel_8_API_35", resetApp: "com.example.fail", wait: 0, force: true },
+      {
+        platform: "darwin",
+        avdHome,
+        inventory: {
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+          running: [],
+          offline: [
+            {
+              deviceKey: "avd:Pixel_8_API_35",
+              avd: "Pixel_8_API_35",
+              serial: null,
+              kind: "emulator",
+              online: false,
+              profile: { deviceType: "phone", apiLevel: "android-35" },
+            },
+          ],
+          creatable: [],
+        },
+        runner: (cmd, args) => {
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+            return { status: 0, stdout: "Started on emulator-5554\n", stderr: "" };
+          }
+          if (cmd === "adb" && args.includes("clear")) {
+            return { status: 1, stdout: "", stderr: "Failed to clear package\n" };
+          }
+          if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
+            const midStopState = readState(dir);
+            assert.equal(midStopState.leases["avd:Pixel_8_API_35"]?.state, "stopping");
+            assert.equal(midStopState.leases["avd:Pixel_8_API_35"]?.serial, "emulator-5554");
+            concurrentClaimDuringStop = cmdClaim(
+              dir,
+              { session: "racing-sess", avd: "Pixel_8_API_35", wait: 0, force: true },
+              {
+                platform: "darwin",
+                avdHome,
+                inventory: {
+                  host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+                  running: [
+                    {
+                      deviceKey: "avd:Pixel_8_API_35",
+                      avd: "Pixel_8_API_35",
+                      serial: "emulator-5554",
+                      kind: "emulator",
+                      online: true,
+                      profile: { deviceType: "phone", apiLevel: "android-35" },
+                    },
+                  ],
+                  offline: [],
+                  creatable: [],
+                },
+              },
+            );
+            return { status: 0, stdout: "Stopped\n", stderr: "" };
+          }
+          return { status: 0, stdout: "OK\n", stderr: "" };
+        },
+      },
+    );
+    assert.equal(rollbackRes.exitCode, 1);
+    assert.equal(concurrentClaimDuringStop?.exitCode, 2);
+    assert.equal(readState(dir).leases["avd:Pixel_8_API_35"], undefined);
+
+    // 2. Stale-lock breaking is serialized via breaker lock and commitState/writeFileAtomic re-verifies lock nonce before rename
+    const lockTestDir = makeTempStateDir();
+    try {
+      const lockInfo = acquireLock(lockTestDir, 1000);
+      // Tamper with owner.json nonce to simulate lock loss before commit
+      fs.writeFileSync(
+        lockInfo.ownerPath,
+        JSON.stringify({ pid: process.pid, nonce: "forged-nonce", createdAtMs: Date.now() }),
+      );
+      assert.throws(
+        () => commitState(lockTestDir, createDefaultState(), lockInfo),
+        /Lock ownership nonce lost before state\.json commit/,
+      );
+      fs.rmSync(lockInfo.lockDir, { recursive: true, force: true });
+    } finally {
+      fs.rmSync(lockTestDir, { recursive: true, force: true });
+    }
+
+    // 3. Auto-create snapshots pre-create fleet inside atc.create.lock and never deletes pre-existing or other-session AVDs
+    const createIsoDir = makeTempStateDir();
+    try {
+      let removeCalled = false;
+      const createIsoRes = cmdClaim(
+        createIsoDir,
+        { session: "create-iso-sess", type: "phone", api: "36", createIfMissing: true, wait: 0, force: true },
+        {
+          platform: "darwin",
+          avdHome,
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [],
+            offline: [],
+            creatable: [
+              {
+                kind: "emulator",
+                deviceName: "pixel_9",
+                profile: { deviceType: "phone", deviceName: "pixel_9", apiLevel: "android-36" },
+              },
+            ],
+          },
+          runner: (cmd, args) => {
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "list") {
+              // Other_Session_API_34 was already created by another session before our `create` ran
+              return {
+                status: 0,
+                stdout:
+                  "AVD                 Status    Serial          API\nOther_Session_API_34 offline   -               android-34\n",
+                stderr: "",
+              };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "create") {
+              return { status: 0, stdout: "Created AVD 'Pixel_9_API_36'\n", stderr: "" };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "remove") {
+              removeCalled = true;
+              return { status: 0, stdout: "", stderr: "" };
+            }
+            if (cmd === "android" && args[0] === "emulator" && args[1] === "start") {
+              return { status: 0, stdout: "Started on emulator-5558\n", stderr: "" };
+            }
+            return { status: 0, stdout: "OK\n", stderr: "" };
+          },
+        },
+      );
+      assert.equal(createIsoRes.exitCode, 0);
+      assert.equal(removeCalled, false);
+      assert.equal(createIsoRes.lease.avd, "Pixel_9_API_36");
+    } finally {
+      fs.rmSync(createIsoDir, { recursive: true, force: true });
+    }
+
+    // 4. Windows adb emu kill waits for emulator to go offline and release .lock files
+    const winShutdownDir = makeTempStateDir();
+    try {
+      const winAvdDir = path.join(avdHome, "Pixel_Win_API_35.avd");
+      fs.mkdirSync(winAvdDir, { recursive: true });
+      const lockFile = path.join(winAvdDir, "hardware-qemu.ini.lock");
+      fs.writeFileSync(lockFile, "locked");
+
+      const claimWin = cmdClaim(
+        winShutdownDir,
+        { session: "win-wait-sess", avd: "Pixel_Win_API_35", wait: 0, force: true },
+        {
+          platform: "win32",
+          avdHome,
+          inventory: {
+            host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+            running: [
+              {
+                deviceKey: "avd:Pixel_Win_API_35",
+                avd: "Pixel_Win_API_35",
+                serial: "emulator-5564",
+                kind: "emulator",
+                online: true,
+                profile: { deviceType: "phone", apiLevel: "android-35" },
+              },
+            ],
+            offline: [],
+            creatable: [],
+          },
+        },
+      );
+      assert.equal(claimWin.exitCode, 0);
+
+      let adbPollCount = 0;
+      const freeWin = cmdFree(
+        winShutdownDir,
+        claimWin.lease.leaseId,
+        { session: "win-wait-sess", stop: true },
+        {
+          platform: "win32",
+          avdHome,
+          runner: (cmd, args) => {
+            if (cmd === "adb" && args.includes("emu") && args.includes("kill")) {
+              return { status: 0, stdout: "OK\n", stderr: "" };
+            }
+            if (cmd === "adb" && args[0] === "devices") {
+              adbPollCount += 1;
+              if (adbPollCount === 1) {
+                return {
+                  status: 0,
+                  stdout: "List of devices attached\nemulator-5564\tdevice\n",
+                  stderr: "",
+                };
+              }
+              if (fs.existsSync(lockFile)) {
+                fs.rmSync(lockFile, { force: true });
+              }
+              return { status: 0, stdout: "List of devices attached\n", stderr: "" };
+            }
+            return { status: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      assert.equal(freeWin.exitCode, 0);
+      assert.ok(adbPollCount >= 2);
+    } finally {
+      fs.rmSync(winShutdownDir, { recursive: true, force: true });
+    }
+
+    // 5. ADB payload arguments (-s after subcommand) are not mistaken for device selectors
+    const guardLsDashS = evaluateCommandGuard("adb shell ls -s /sdcard", {
+      sessionId: "sess-ls",
+      activeLeases: [{ leaseId: "lease-ls", serial: "emulator-5554" }],
+      runningCount: 1,
+      platform: "darwin",
+    });
+    assert.equal(guardLsDashS.allowed, true);
+
+    const guardInstallDashS = evaluateCommandGuard("adb install -r -s app.apk", {
+      sessionId: "sess-ls",
+      activeLeases: [{ leaseId: "lease-ls", serial: "emulator-5554" }],
+      runningCount: 1,
+      platform: "darwin",
+    });
+    assert.equal(guardInstallDashS.allowed, true);
+
+    const execLsDashS = buildChildInvocation(
+      "adb",
+      ["shell", "ls", "-s", "/sdcard"],
+      { serial: "emulator-5554", leaseId: "lease-ls" },
+      "sess-ls",
+    );
+    assert.deepEqual(execLsDashS.args, ["shell", "ls", "-s", "/sdcard"]);
+
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "adb",
+          ["-s", "emulator-5556", "shell", "ls", "-s", "/sdcard"],
+          { serial: "emulator-5554", leaseId: "lease-ls" },
+          "sess-ls",
+        ),
+      /Conflicting device selector "emulator-5556"/,
+    );
+
+    // 6. Real-world physical getprop `nosdcard` is not misclassified as `automotive`, and wrapped `android emulator list --long` lines do not emit phantom "Offline" AVDs
+    assert.equal(inferDeviceType("Pixel 7 Pro", "nosdcard", "nosdcard"), "phone");
+    assert.equal(inferDeviceType("Pixel Watch 3", "nosdcard,watch", "nosdcard,watch"), "wear");
+    assert.equal(inferDeviceType("Automotive_1080p", "android-automotive", "automotive"), "automotive");
+    const wrappedList = parseAndroidEmulatorListOutput(
+      [
+        "AVD ID                   AVD Name                      API Level      Status         Serial",
+        "Pixel_3a_API_33_arm64-v8aPixel_3a_API_33_arm64-v8a     android-33     Offline",
+        "Medium_Phone             Medium Phone                  android-canary-20260805",
+        "                                                                      Offline",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      wrappedList.map((a) => a.avd),
+      ["Pixel_3a_API_33_arm64-v8a", "Medium_Phone"],
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(avdHome, { recursive: true, force: true });

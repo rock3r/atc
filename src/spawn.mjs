@@ -15,6 +15,45 @@ export function resolveExecutable(
     throw new Error("Command must be a non-empty string");
   }
   if (platform !== "win32") {
+    if (
+      (command === "android" || command === "adb" || command === "emulator") &&
+      !command.includes("/")
+    ) {
+      const posixPathDirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
+      const inPath = posixPathDirs.some((dir) => {
+        try {
+          const p = path.join(dir, command);
+          return fs.existsSync(p) && fs.statSync(p).isFile();
+        } catch {
+          return false;
+        }
+      });
+      if (!inPath) {
+        const home = env.HOME || os.homedir();
+        const sdkRoot =
+          env.ANDROID_HOME ||
+          env.ANDROID_SDK_ROOT ||
+          (platform === "darwin"
+            ? path.join(home, "Library", "Android", "sdk")
+            : path.join(home, "Android", "Sdk"));
+        const fallbackDirs = [
+          path.join(home, ".local", "bin"),
+          path.join(sdkRoot, "platform-tools"),
+          path.join(sdkRoot, "emulator"),
+          path.join(sdkRoot, "cmdline-tools", "latest", "bin"),
+        ];
+        for (const dir of fallbackDirs) {
+          try {
+            const candidate = path.join(dir, command);
+            if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+              return { executable: candidate, isBatch: false };
+            }
+          } catch {
+            // Ignore inaccessible fallback dir
+          }
+        }
+      }
+    }
     return { executable: command, isBatch: false };
   }
 
@@ -344,6 +383,16 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         subIdx += 1;
         continue;
       }
+      if (a === "-s" && subIdx + 1 < args.length) {
+        const explicitSerial = String(args[subIdx + 1]);
+        if (lease.serial && explicitSerial !== lease.serial) {
+          throw new Error(
+            `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          );
+        }
+        subIdx += 2;
+        continue;
+      }
       if (a === "-s" || a === "-H" || a === "-P" || a === "-L") {
         subIdx += 2;
       } else if (a.startsWith("-")) {
@@ -406,15 +455,16 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     }
   }
 
-  if (base === "adb" || base === "android") {
+  if (base === "android") {
     for (let i = 0; i < args.length; i++) {
       const a = String(args[i]);
+      if (a === "--") break;
       let explicitSerial = null;
-      if (base === "android" && a.startsWith("--device=")) {
+      if (a.startsWith("--device=")) {
         explicitSerial = a.slice("--device=".length);
-      } else if (base === "android" && a === "--device" && i + 1 < args.length) {
+      } else if (a === "--device" && i + 1 < args.length) {
         explicitSerial = String(args[i + 1]);
-      } else if (base === "adb" && a === "-s" && i + 1 < args.length) {
+      } else if (a === "-s" && i + 1 < args.length) {
         explicitSerial = String(args[i + 1]);
       }
       if (explicitSerial && lease.serial && explicitSerial !== lease.serial) {

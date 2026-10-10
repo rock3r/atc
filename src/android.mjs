@@ -43,9 +43,9 @@ export function parseIniFile(content) {
 export function inferDeviceType(deviceName = "", sysDir = "", tagId = "") {
   const combined = `${deviceName} ${sysDir} ${tagId}`.toLowerCase();
   if (combined.includes("xr") || combined.includes("glasses")) return "xr";
-  if (combined.includes("wear")) return "wear";
+  if (combined.includes("wear") || /(?:^|[\s,_-])watch(?:$|[\s,_-])/.test(combined)) return "wear";
   if (combined.includes("tv") || combined.includes("atv")) return "tv";
-  if (combined.includes("auto") || combined.includes("car")) return "automotive";
+  if (/(?:^|[\s,_-])(automotive|auto|car)(?:$|[\s,_-])/.test(combined)) return "automotive";
   if (combined.includes("desktop")) return "desktop";
   if (combined.includes("fold")) return "foldable";
   if (combined.includes("tablet") || combined.includes("pixel_c")) return "tablet";
@@ -221,12 +221,37 @@ export function parseAndroidEmulatorListOutput(stdout) {
       continue;
     }
     const tokens = line.split(/\s+/).filter(Boolean);
+    if (
+      /^\s+/.test(raw) &&
+      avds.length > 0 &&
+      /^(online|offline)$/i.test(tokens[0] || "")
+    ) {
+      const prev = avds[avds.length - 1];
+      prev.online = tokens[0].toLowerCase() === "online";
+      const serialMatch = line.match(/\b(emulator-\d+)\b/);
+      if (serialMatch) {
+        prev.serial = serialMatch[1];
+      }
+      continue;
+    }
+    if (tokens.length === 1 && /^(online|offline)$/i.test(tokens[0])) {
+      if (avds.length > 0) {
+        avds[avds.length - 1].online = tokens[0].toLowerCase() === "online";
+      }
+      continue;
+    }
     if (tokens.length === 1 && /^[A-Za-z0-9._-]+$/.test(tokens[0])) {
       avds.push({ avd: tokens[0], online: false, serial: null, apiLevel: null });
       continue;
     }
     if (tokens.length >= 2) {
-      const avd = tokens[0];
+      let avd = tokens[0];
+      if (avd.length % 2 === 0 && avd.length >= 16) {
+        const half = avd.length / 2;
+        if (avd.slice(0, half) === avd.slice(half)) {
+          avd = avd.slice(0, half);
+        }
+      }
       const secondLast =
         tokens.length >= 4 ? tokens[tokens.length - 2].toLowerCase() : "";
       const second = tokens[1].toLowerCase();
@@ -581,7 +606,13 @@ export function discoverFleet({
           props["ro.product.cpu.abi"] || props["ro.product.cpu.abilist"]?.split(",")[0];
         const model = props["ro.product.model"] || "";
         const characteristics = props["ro.build.characteristics"] || "";
-        const gmsVersion = props["ro.com.google.gmsversion"] || "";
+        const gmsVersion =
+          props["ro.com.google.gmsversion"] ||
+          props["ro.com.google.clientidbase"] ||
+          (props["ro.error.receiver.system.apps"]?.includes("com.google.android.gms")
+            ? "gms"
+            : "") ||
+          (props["ro.atrace.core.services"]?.includes("com.google.android.gms") ? "gms" : "");
         const hasProps = Object.keys(props).length > 0;
         physicalDevices.push({
           deviceKey: `serial:${dev.serial}`,

@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { Worker } from "node:worker_threads";
 import {
   ResourceError,
@@ -13,7 +15,7 @@ import {
 } from "./android.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
-import { isPidAlive, randomNonce, resolveStateDir, sleepSync } from "./lock.mjs";
+import { isPidAlive, randomNonce, resolveStateDir, sleepSync, withLock } from "./lock.mjs";
 import { startMcpServer } from "./mcp.mjs";
 import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
@@ -420,6 +422,39 @@ function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
     sleepSync(250);
   }
   throw new Error(`Timed out waiting for emulator ${serial} to finish restoring snapshot.`);
+}
+
+function waitForEmulatorOffline(runner, avdHome, { serial, avd }, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const fleet = discoverFleet({ runner, avdHome });
+    const stillRunning = (fleet.running || []).some(
+      (d) =>
+        d.kind === "emulator" &&
+        ((serial && d.serial === serial) || (avd && d.avd === avd)),
+    );
+    let hasLockFiles = false;
+    if (avd && avdHome) {
+      try {
+        const avdDir = path.join(avdHome, `${avd}.avd`);
+        if (fs.existsSync(avdDir)) {
+          hasLockFiles = fs
+            .readdirSync(avdDir)
+            .some((entry) => entry.endsWith(".lock"));
+        }
+      } catch {
+        // Ignore transient directory read errors while QEMU exits
+      }
+    }
+    if (!stillRunning && !hasLockFiles) {
+      return true;
+    }
+    if (Date.now() + 250 >= deadline) break;
+    sleepSync(250);
+  }
+  throw new Error(
+    `Timed out waiting for emulator ${avd || serial} to shut down.`,
+  );
 }
 
 export function selectCandidateUnderLock(
@@ -1465,12 +1500,21 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               ["emulator", "stop", selection.victim.serial || selection.victim.avd],
               { strictInternal: true, timeoutMs: effectiveStopTimeoutMs },
             );
-      victimHbTimer?.stop();
       if (stopRes.status !== 0) {
+        victimHbTimer?.stop();
         throw new Error(
           `Failed to stop idle victim emulator ${selection.victim.avd}: ${stopRes.stderr || stopRes.stdout}`,
         );
       }
+      if (isWin && selection.victim.serial) {
+        waitForEmulatorOffline(
+          runner,
+          avdHome,
+          { serial: selection.victim.serial, avd: selection.victim.avd },
+          effectiveStopTimeoutMs,
+        );
+      }
+      victimHbTimer?.stop();
       withStateTransaction(stateDir, (state, { now }) => {
         const vLease = state.leases[selection.victim.deviceKey];
         recordDeviceStoppedInState(state, selection.victim, now);
@@ -1483,106 +1527,163 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
 
     // 2. Auto-create missing AVD if Priority 4
     if (selection.createAvd) {
-      assertReservationStillOwned();
-      const createRes = runner(
-        "android",
-        ["emulator", "create", candidate.profile.deviceName],
-        { strictInternal: true },
-      );
-      if (createRes.status !== 0) {
-        throw new Error(
-          `Failed to create AVD for profile ${candidate.profile.deviceName}: ${createRes.stderr || createRes.stdout}`,
-        );
-      }
+      withLock(
+        stateDir,
+        () => {
+          assertReservationStillOwned();
+          const preCreateFleet = discoverFleet({ runner, avdHome });
+          const preFleetAvds = new Set(
+            [
+              ...(preCreateFleet.offline || []),
+              ...(preCreateFleet.running || []),
+            ]
+              .filter((d) => d.kind === "emulator" && d.avd)
+              .map((d) => d.avd),
+          );
+          const preCreateState = readState(stateDir);
+          const leasedByOthers = new Set(
+            Object.values(preCreateState.leases || {})
+              .filter((l) => l && l.leaseId !== lease.leaseId && l.avd)
+              .map((l) => l.avd),
+          );
 
-      const postCreateFleet = discoverFleet({ runner, avdHome });
-      const allPostAvds = [
-        ...(postCreateFleet.offline || []),
-        ...(postCreateFleet.running || []),
-      ].filter((d) => d.kind === "emulator" && d.avd);
-      const reqWithoutAvd = { ...req, avd: null };
-      const newlyCreated =
-        allPostAvds.find((d) => !knownAvdNames?.has(d.avd) && matchesProfile(d, reqWithoutAvd)) ||
-        allPostAvds.find((d) => !knownAvdNames?.has(d.avd));
+          const createRes = runner(
+            "android",
+            ["emulator", "create", candidate.profile.deviceName],
+            { strictInternal: true },
+          );
+          if (createRes.status !== 0) {
+            throw new Error(
+              `Failed to create AVD for profile ${candidate.profile.deviceName}: ${createRes.stderr || createRes.stdout}`,
+            );
+          }
 
-      let createdAvdName = newlyCreated?.avd || null;
-      if (!createdAvdName && createRes.stdout) {
-        const m =
-          createRes.stdout.match(/Created AVD\s+['"]?([A-Za-z0-9._-]+)['"]?/i) ||
-          createRes.stdout.trim().match(/^([A-Za-z0-9._-]+)$/);
-        if (m) {
-          createdAvdName = m[1];
-        }
-      }
-      createdAvdName = createdAvdName || candidate.avd;
+          const postCreateFleet = discoverFleet({ runner, avdHome });
+          const allPostAvds = [
+            ...(postCreateFleet.offline || []),
+            ...(postCreateFleet.running || []),
+          ].filter((d) => d.kind === "emulator" && d.avd);
 
-      if (
-        newlyCreated &&
-        newlyCreated.profile?.apiLevel &&
-        newlyCreated.profile.apiLevel !== "unknown" &&
-        !matchesProfile(newlyCreated, { ...reqWithoutAvd, snapshotLoad: null })
-      ) {
-        try {
-          runner("android", ["emulator", "remove", newlyCreated.avd], { strictInternal: true });
-        } catch {
-          // Best-effort cleanup of mismatched created AVD
-        }
-        throw new Error(
-          `Created AVD "${newlyCreated.avd}" (${newlyCreated.profile.apiLevel}) does not satisfy requested profile constraints.`,
-        );
-      }
+          const postCreateState = readState(stateDir);
+          for (const l of Object.values(postCreateState.leases || {})) {
+            if (l && l.leaseId !== lease.leaseId && l.avd) {
+              leasedByOthers.add(l.avd);
+            }
+          }
+          const strictBaseline = new Set([
+            ...(knownAvdNames || []),
+            ...preFleetAvds,
+            ...leasedByOthers,
+          ]);
 
-      if (req.avd && createdAvdName !== req.avd) {
-        throw new Error(
-          `Created AVD "${createdAvdName}" does not match requested --avd "${req.avd}".`,
-        );
-      }
+          let stdoutAvdName = null;
+          if (createRes.stdout) {
+            const m =
+              createRes.stdout.match(/Created AVD\s+['"]?([A-Za-z0-9._-]+)['"]?/i) ||
+              createRes.stdout.trim().match(/^([A-Za-z0-9._-]+)$/);
+            if (m) {
+              stdoutAvdName = m[1];
+            }
+          }
 
-      if (createdAvdName !== candidate.avd || newlyCreated) {
-        const oldKey = lease.deviceKey;
-        const newKey = `avd:${createdAvdName}`;
-        const migrationConflict = withStateTransaction(stateDir, (state) => {
-          const current = state.leases[oldKey];
+          const reqWithoutAvd = { ...req, avd: null };
+          const newlyCreated =
+            allPostAvds.find(
+              (d) => !strictBaseline.has(d.avd) && matchesProfile(d, reqWithoutAvd),
+            ) ||
+            allPostAvds.find((d) => !strictBaseline.has(d.avd)) ||
+            (stdoutAvdName && !leasedByOthers.has(stdoutAvdName)
+              ? allPostAvds.find((d) => d.avd === stdoutAvdName)
+              : null);
+
+          let createdAvdName = newlyCreated?.avd || stdoutAvdName || candidate.avd;
+
           if (
-            !current ||
-            current.leaseId !== lease.leaseId ||
-            current.state !== "starting" ||
-            current.workerPid !== process.pid
+            newlyCreated &&
+            newlyCreated.profile?.apiLevel &&
+            newlyCreated.profile.apiLevel !== "unknown" &&
+            !matchesProfile(newlyCreated, { ...reqWithoutAvd, snapshotLoad: null })
           ) {
-            return {
-              mutated: false,
-              value: `Lease reservation ${lease.leaseId} was lost during AVD creation.`,
-            };
+            const canRemoveMismatched =
+              !preFleetAvds.has(newlyCreated.avd) &&
+              withStateTransaction(stateDir, (state) => {
+                const ownedByOther = Object.values(state.leases || {}).some(
+                  (l) =>
+                    l &&
+                    l.leaseId !== lease.leaseId &&
+                    l.avd === newlyCreated.avd,
+                );
+                return { mutated: false, value: !ownedByOther };
+              });
+            if (canRemoveMismatched) {
+              try {
+                runner("android", ["emulator", "remove", newlyCreated.avd], {
+                  strictInternal: true,
+                });
+              } catch {
+                // Best-effort cleanup of mismatched created AVD
+              }
+            }
+            throw new Error(
+              `Created AVD "${newlyCreated.avd}" (${newlyCreated.profile.apiLevel}) does not satisfy requested profile constraints.`,
+            );
           }
-          const destLease = state.leases[newKey];
-          if (destLease && destLease.leaseId !== lease.leaseId) {
-            return {
-              mutated: false,
-              value: `Created AVD "${createdAvdName}" was concurrently reserved by another session (${destLease.sessionId}).`,
-            };
+
+          if (req.avd && createdAvdName !== req.avd) {
+            throw new Error(
+              `Created AVD "${createdAvdName}" does not match requested --avd "${req.avd}".`,
+            );
           }
-          if (oldKey !== newKey) {
-            delete state.leases[oldKey];
+
+          if (createdAvdName !== candidate.avd || newlyCreated) {
+            const oldKey = lease.deviceKey;
+            const newKey = `avd:${createdAvdName}`;
+            const migrationConflict = withStateTransaction(stateDir, (state) => {
+              const current = state.leases[oldKey];
+              if (
+                !current ||
+                current.leaseId !== lease.leaseId ||
+                current.state !== "starting" ||
+                current.workerPid !== process.pid
+              ) {
+                return {
+                  mutated: false,
+                  value: `Lease reservation ${lease.leaseId} was lost during AVD creation.`,
+                };
+              }
+              const destLease = state.leases[newKey];
+              if (destLease && destLease.leaseId !== lease.leaseId) {
+                return {
+                  mutated: false,
+                  value: `Created AVD "${createdAvdName}" was concurrently reserved by another session (${destLease.sessionId}).`,
+                };
+              }
+              if (oldKey !== newKey) {
+                delete state.leases[oldKey];
+              }
+              current.deviceKey = newKey;
+              current.avd = createdAvdName;
+              if (newlyCreated?.profile) {
+                current.profile = newlyCreated.profile;
+              }
+              state.leases[newKey] = current;
+              return { mutated: true, value: null };
+            });
+            if (migrationConflict) {
+              throw new Error(migrationConflict);
+            }
+            candidate.avd = createdAvdName;
+            candidate.deviceKey = newKey;
+            if (newlyCreated?.profile) {
+              candidate.profile = newlyCreated.profile;
+            }
+            lease.avd = createdAvdName;
+            lease.deviceKey = newKey;
           }
-          current.deviceKey = newKey;
-          current.avd = createdAvdName;
-          if (newlyCreated?.profile) {
-            current.profile = newlyCreated.profile;
-          }
-          state.leases[newKey] = current;
-          return { mutated: true, value: null };
-        });
-        if (migrationConflict) {
-          throw new Error(migrationConflict);
-        }
-        candidate.avd = createdAvdName;
-        candidate.deviceKey = newKey;
-        if (newlyCreated?.profile) {
-          candidate.profile = newlyCreated.profile;
-        }
-        lease.avd = createdAvdName;
-        lease.deviceKey = newKey;
-      }
+        },
+        bootTimeoutMs || 180_000,
+        "atc.create.lock",
+      );
     }
 
     // 3. Warm state preparation vs Cold/Wipe boot
@@ -1618,23 +1719,32 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
     } else {
       if (candidate.online && (req.wipeData || req.coldBoot)) {
         assertReservationStillOwned();
+        const effectiveStopTimeoutMs = stopTimeoutMs || 60_000;
         const rebootStopRes =
           isWin && candidate.serial
             ? runner("adb", ["-s", candidate.serial, "emu", "kill"], {
                 strictInternal: true,
-                timeoutMs: stopTimeoutMs || 60_000,
+                timeoutMs: effectiveStopTimeoutMs,
               })
             : runner(
                 "android",
                 ["emulator", "stop", candidate.serial || candidate.avd],
                 {
                   strictInternal: true,
-                  timeoutMs: stopTimeoutMs || 60_000,
+                  timeoutMs: effectiveStopTimeoutMs,
                 },
               );
         if (rebootStopRes.status !== 0) {
           throw new Error(
             `Failed to stop emulator ${candidate.avd} before reboot: ${rebootStopRes.stderr || rebootStopRes.stdout}`,
+          );
+        }
+        if (isWin && candidate.serial) {
+          waitForEmulatorOffline(
+            runner,
+            avdHome,
+            { serial: candidate.serial, avd: candidate.avd },
+            effectiveStopTimeoutMs,
           );
         }
         stoppedExistingEmulator = true;
@@ -1665,9 +1775,9 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           timeoutMs: bootTimeoutMs,
         });
       }
-      if (bootRes.status !== 0) {
+      if (bootRes.status !== 0 || /\bError:\s+/i.test(bootRes.stdout || "")) {
         throw new Error(
-          `Failed to boot emulator ${candidate.avd}: ${bootRes.stderr || bootRes.stdout}`,
+          `Failed to boot emulator ${candidate.avd}: ${(bootRes.stderr || bootRes.stdout || "").trim()}`,
         );
       }
       bootedNewEmulator = true;
@@ -1795,7 +1905,8 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         // Ignore discovery failure during rollback
       }
     }
-    const livenessCheck = execOptions.livenessCheck || isPidAlive;
+        const livenessCheck = execOptions.livenessCheck || isPidAlive;
+    const effectiveStopTimeoutMs = stopTimeoutMs || 60_000;
     const rollbackInfo = withStateTransaction(
       stateDir,
       (state, { now }) => {
@@ -1814,7 +1925,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 !livenessCheck(current.anchorPid))),
         );
         const pendingStop = Boolean(current?.pendingStop);
+        const needsStopOnRollback = Boolean(bootedNewEmulator || pendingStop);
+        const targetAvd = candidate.avd || lease.avd || null;
         let migratedToOtherLease = false;
+
         if (owned) {
           if (previousLease && !shouldRelease) {
             state.leases[lease.deviceKey] = {
@@ -1832,8 +1946,6 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               deadlineMs: null,
             };
           } else {
-            delete state.leases[lease.deviceKey];
-            const targetAvd = candidate.avd || lease.avd || null;
             if (targetAvd && lease.deviceKey === `avd:${targetAvd}`) {
               const pendingSerialEntry = Object.entries(state.leases || {}).find(
                 ([k, l]) =>
@@ -1860,7 +1972,6 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             delete state.leases[selection.victim.deviceKey];
           }
         }
-        const targetAvd = candidate.avd || lease.avd || null;
         const otherLeaseOwnsDevice = Object.values(state.leases || {}).some(
           (l) =>
             l &&
@@ -1868,25 +1979,49 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             ((resolvedSerial && l.serial === resolvedSerial) ||
               (targetAvd && l.avd === targetAvd)),
         );
+        const stopBootedEmulator = Boolean(
+          owned &&
+            (!previousLease || shouldRelease) &&
+            !migratedToOtherLease &&
+            !otherLeaseOwnsDevice &&
+            needsStopOnRollback,
+        );
+        if (owned && (!previousLease || shouldRelease) && !migratedToOtherLease) {
+          if (stopBootedEmulator) {
+            current.state = "stopping";
+            current.workerPid = process.pid;
+            current.workerPids = [process.pid];
+            current.replacingAvd = null;
+            if (resolvedSerial) {
+              current.serial = resolvedSerial;
+            }
+            current.deadlineMs = now + effectiveStopTimeoutMs;
+          } else {
+            delete state.leases[lease.deviceKey];
+          }
+        }
         return {
           mutated: true,
           value: {
             owned,
             pendingStop,
-            stopBootedEmulator:
-              owned &&
-              (!previousLease || shouldRelease) &&
-              !migratedToOtherLease &&
-              !otherLeaseOwnsDevice,
+            stopBootedEmulator,
           },
         };
       },
       execOptions,
     );
     if ((bootedNewEmulator || rollbackInfo.pendingStop) && rollbackInfo.stopBootedEmulator) {
+      const rollbackHbTimer = startWorkerDeadlineHeartbeat(
+        stateDir,
+        lease.deviceKey,
+        lease.leaseId,
+        effectiveStopTimeoutMs,
+      );
+      let stoppedCleanly = false;
+      let cleanupSerial = resolvedSerial;
       try {
         if (isWin) {
-          let cleanupSerial = resolvedSerial;
           if (!cleanupSerial) {
             const refreshed = discoverFleet({ runner, avdHome });
             const booted = (refreshed.running || []).find(
@@ -1895,31 +2030,59 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             cleanupSerial = booted?.serial || null;
           }
           if (cleanupSerial) {
-            runner("adb", ["-s", cleanupSerial, "emu", "kill"], { strictInternal: true });
+            const killRes = runner("adb", ["-s", cleanupSerial, "emu", "kill"], {
+              strictInternal: true,
+              timeoutMs: effectiveStopTimeoutMs,
+            });
+            if (killRes.status === 0) {
+              waitForEmulatorOffline(
+                runner,
+                avdHome,
+                { serial: cleanupSerial, avd: candidate.avd || lease.avd },
+                effectiveStopTimeoutMs,
+              );
+              stoppedCleanly = true;
+            }
           }
         } else {
-          runner("android", ["emulator", "stop", resolvedSerial || candidate.avd], {
-            strictInternal: true,
-          });
+          const stopRes = runner(
+            "android",
+            ["emulator", "stop", resolvedSerial || candidate.avd],
+            {
+              strictInternal: true,
+              timeoutMs: effectiveStopTimeoutMs,
+            },
+          );
+          if (stopRes.status === 0) {
+            stoppedCleanly = true;
+          }
         }
+      } catch {
+        // Best-effort cleanup of newly booted emulator
+      } finally {
+        rollbackHbTimer.stop();
         withStateTransaction(
           stateDir,
           (state, { now }) => {
-            recordDeviceStoppedInState(
-              state,
-              {
-                deviceKey: lease.deviceKey,
-                avd: candidate.avd || lease.avd,
-                serial: resolvedSerial || candidate.serial,
-              },
-              now,
-            );
+            if (stoppedCleanly) {
+              recordDeviceStoppedInState(
+                state,
+                {
+                  deviceKey: lease.deviceKey,
+                  avd: candidate.avd || lease.avd,
+                  serial: cleanupSerial || resolvedSerial || candidate.serial,
+                },
+                now,
+              );
+            }
+            const cur = state.leases[lease.deviceKey];
+            if (cur && cur.leaseId === lease.leaseId) {
+              delete state.leases[lease.deviceKey];
+            }
             return { mutated: true };
           },
           execOptions,
         );
-      } catch {
-        // Best-effort cleanup of newly booted emulator
       }
     }
     return { exitCode: 1, error: err.message };
@@ -2261,6 +2424,18 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             actionErrors.push(
               `Failed to stop emulator ${lease.avd || lease.serial}: ${stopRes.stderr || stopRes.stdout}`,
             );
+          } else if (isWin && lease.serial) {
+            try {
+              waitForEmulatorOffline(
+                runner,
+                avdHome,
+                { serial: lease.serial, avd: lease.avd },
+                stopTimeoutMs,
+              );
+            } catch (err) {
+              itemFailed = true;
+              actionErrors.push(err.message);
+            }
           }
         }
       }

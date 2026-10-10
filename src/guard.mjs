@@ -1010,18 +1010,22 @@ export function extractTargetSerial(parsed) {
         subIdx += 2;
       } else if (a.startsWith("-")) {
         subIdx += 1;
+      } else if (a.startsWith("wait-for-") && subIdx + 1 < args.length) {
+        subIdx += 1;
       } else {
         break;
       }
     }
-  }
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a.startsWith("--device=")) {
-      return a.slice("--device=".length);
-    }
-    if ((a === "--device" || a === "-s") && i + 1 < args.length) {
-      return args[i + 1];
+  } else {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--") break;
+      if (a.startsWith("--device=")) {
+        return a.slice("--device=".length);
+      }
+      if ((a === "--device" || a === "-s") && i + 1 < args.length) {
+        return args[i + 1];
+      }
     }
   }
   if (parsed.envVars.ANDROID_SERIAL) {

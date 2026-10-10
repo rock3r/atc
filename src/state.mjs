@@ -272,18 +272,24 @@ export function readState(stateDir) {
 }
 
 export function commitState(stateDir, state, lockHandle) {
-  if (!verifyLockOwnership(lockHandle)) {
-    throw new Error("Lock ownership nonce lost before state.json commit; aborting write");
-  }
+  const assertOwned = () => {
+    if (!verifyLockOwnership(lockHandle)) {
+      throw new Error("Lock ownership nonce lost before state.json commit; aborting write");
+    }
+  };
+  assertOwned();
   const statePath = path.join(stateDir, "state.json");
-  writeFileAtomic(statePath, JSON.stringify(state, null, 2) + "\n", lockHandle.nonce);
+  writeFileAtomic(statePath, JSON.stringify(state, null, 2) + "\n", lockHandle.nonce, assertOwned);
 }
 
 export function sweepOrphanFiles(stateDir, now = Date.now()) {
   try {
     const entries = fs.readdirSync(stateDir);
     for (const name of entries) {
-      if (!name.startsWith("state.json.tmp.") && !name.startsWith("atc.lock.stale.")) {
+      if (
+        !name.startsWith("state.json.tmp.") &&
+        !/^atc\.(?:create\.)?lock(?:\.break)?\.stale\./.test(name)
+      ) {
         continue;
       }
       const fullPath = path.join(stateDir, name);
