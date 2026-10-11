@@ -1,6 +1,6 @@
 {
   "name": "@rock3r/atc",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Daemonless Android emulator and physical device leases, bounded-window warm-affinity wait queue, snapshots, and multi-agent guardrails around the official android CLI.",
   "license": "Apache-2.0",
   "author": "Sebastiano Poggi <me@sebastiano.dev>",

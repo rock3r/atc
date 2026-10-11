@@ -4,7 +4,7 @@ description: Coordinate exclusive Android emulator (AVD) and physical USB/Wi-Fi 
 license: Apache-2.0
 compatibility: Needs Node.js >= 20 on macOS, Linux, or Windows, and the Android SDK (`adb`, `emulator`, and/or the official `android` CLI) for live fleet discovery.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   author: "Sebastiano Poggi"
 ---
 

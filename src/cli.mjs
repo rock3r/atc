@@ -58,7 +58,7 @@ import {
   withStateTransaction,
 } from "./state.mjs";
 
-export const ATC_VERSION = "1.0.0";
+export const ATC_VERSION = "1.1.0";
 export { GUIDE_TOPICS, cmdGuide };
 
 function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {

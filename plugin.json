@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "atc",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Coordinate exclusive Android emulator (AVD) and physical device leases across concurrent coding agents with the atc CLI, PreToolUse/SessionEnd hooks, and stdio MCP server.",
   "author": {
     "name": "Sebastiano Poggi"
