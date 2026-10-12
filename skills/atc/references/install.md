@@ -61,7 +61,16 @@ Copilot fires `sessionEnd` with `reason: "complete"` after every agent turn, so 
 
 Experimental: VS Code hooks are in Preview. VS Code can load Claude-format plugins (`.claude-plugin/plugin.json` + `hooks/hooks.json`), or you can enable `chat.useClaudeHooks` and wire `atc hook pre-tool-use` / `atc hook stop` in `.claude/settings.json`.
 
-### Gemini CLI & Antigravity
+### Antigravity
+
+Copy or symlink the `atc` package/repository root into `~/.gemini/config/plugins/atc` (or register its `plugin.json` path in `~/.gemini/plugins.json`). Antigravity automatically loads `plugin.json`, the `skills/atc/SKILL.md` skill, the `PreToolUse` / `Stop` guardrail hooks in `hooks.json`, and the `atc mcp` server in `mcp_config.json`:
+
+```bash
+mkdir -p ~/.gemini/config/plugins
+ln -s "$(npm root -g)/@rock3r/atc" ~/.gemini/config/plugins/atc
+```
+
+### Gemini CLI
 
 Copy or symlink `skills/atc` into your skills directory (`~/.gemini/skills/atc` or `~/.agents/skills/atc`), and wire `atc hook pre-tool-use` / `atc hook stop` in your hook configuration.
 

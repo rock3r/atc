@@ -46,16 +46,37 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
       payload.toolCall.args && typeof payload.toolCall.args === "object"
         ? payload.toolCall.args
         : {};
+    const isLazyMcpWrapper = name === "call_mcp_tool" && typeof args.ToolName === "string";
+    const mcpToolName = isLazyMcpWrapper
+      ? matchAtcMcpTool(args.ToolName)
+      : matchAtcMcpTool(name);
+    const mcpToolInput = isLazyMcpWrapper
+      ? args.Arguments && typeof args.Arguments === "object"
+        ? args.Arguments
+        : {}
+      : args;
     const command = args.CommandLine ?? args.command ?? "";
     const rawSession = payload.conversationId || payload.session_id || `ppid-${ppid}`;
+    const payloadCwd =
+      typeof args.Cwd === "string" && args.Cwd.trim()
+        ? args.Cwd.trim()
+        : typeof payload.cwd === "string" && payload.cwd.trim()
+          ? payload.cwd.trim()
+          : Array.isArray(payload.workspacePaths) &&
+              typeof payload.workspacePaths[0] === "string" &&
+              payload.workspacePaths[0].trim()
+            ? payload.workspacePaths[0].trim()
+            : null;
     return {
       hostFormat: "antigravity",
       isShellTool: name === "run_command" || name === "bash" || name === "shell",
-      mcpToolName: matchAtcMcpTool(name),
+      isLazyMcpWrapper,
+      mcpToolName,
       command: typeof command === "string" ? command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
-      toolInput: args,
+      toolInput: mcpToolName ? mcpToolInput : args,
+      cwd: payloadCwd,
     };
   }
 
@@ -148,6 +169,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     );
     const cwd =
       options.cwd ||
+      norm.cwd ||
       (typeof payload?.cwd === "string" && payload.cwd.trim() ? payload.cwd : process.cwd());
     withStateTransaction(
       stateDir,
@@ -171,9 +193,12 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
       !norm.toolInput?.role
     ) {
       const updatedArgs = { ...norm.toolInput, session: norm.sessionId };
+      const antigravityOverwrite = norm.isLazyMcpWrapper
+        ? { Arguments: updatedArgs }
+        : updatedArgs;
       const allowMcpJson =
         norm.hostFormat === "antigravity"
-          ? { overwrite: updatedArgs }
+          ? { decision: "allow", overwrite: antigravityOverwrite }
           : norm.hostFormat === "copilot"
             ? { permissionDecision: "allow", modifiedArgs: updatedArgs }
             : {
@@ -204,7 +229,10 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   getAncestorPids(rawPpid);
   const norm = normalizeHookPayload(payload, resolveStableParentPid(rawPpid, options.processChain));
 
-  const cwd = options.cwd || process.cwd();
+  const cwd =
+    options.cwd ||
+    norm.cwd ||
+    (typeof payload?.cwd === "string" && payload.cwd.trim() ? payload.cwd : process.cwd());
   const inventory = options.inventory || null;
   let probedRunningCount = inventory ? (inventory.running || []).length : 0;
   let probedAndroidRunning = 0;
@@ -364,7 +392,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   if (!evalResult.allowed) {
     const denyJson =
       norm.hostFormat === "antigravity"
-        ? { decision: "block", reason: evalResult.reason }
+        ? { decision: "deny", reason: evalResult.reason }
         : norm.hostFormat === "cursor"
           ? {
               permission: "deny",
@@ -383,7 +411,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
                 },
               };
     return {
-      exitCode: 2,
+      exitCode: norm.hostFormat === "antigravity" ? 0 : 2,
       stdout: JSON.stringify(denyJson) + "\n",
       stderr: evalResult.reason + "\n",
     };
@@ -393,6 +421,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
     const allowJson =
       norm.hostFormat === "antigravity"
         ? {
+            decision: "allow",
             overwrite: {
               CommandLine: evalResult.rewrittenCommand,
             },

@@ -16,7 +16,7 @@ Agents claim a device by hardware/OS profile, run `adb`, `./gradlew connected*`,
 | Component | What it does |
 |---|---|
 | `atc` CLI | Discovers running, offline, and creatable Android & iOS devices; manages TTL leases (including dual-lease Kotlin Multiplatform / KMP sessions) and a 120-second warm-affinity wait queue; injects target flags in `atc exec`; and manages QEMU and APFS snapshots. |
-| `atc` skill & hooks | Agent skill (`skills/atc/SKILL.md`) plus `PreToolUse` and `Stop` hooks (`hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, `extensions/atc/index.ts`) that block unscoped device access and rewrite commands into `atc exec`. |
+| `atc` skill & hooks | Agent skill (`skills/atc/SKILL.md`) plus `PreToolUse` and `Stop` hooks (`hooks.json`, `hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, `extensions/atc/index.ts`) that block unscoped device access and rewrite commands into `atc exec`. |
 | `atc mcp` | Optional stdio JSON-RPC 2.0 MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`). |
 
 ## Requirements and install
@@ -33,7 +33,8 @@ atc status
 | Claude Code | `/plugin marketplace add rock3r/atc` then `/plugin install atc@atc` |
 | Codex | `codex plugin marketplace add rock3r/atc && codex plugin add atc@atc` |
 | GitHub Copilot CLI / app | `copilot plugin marketplace add rock3r/atc && copilot plugin install atc@atc` |
-| Gemini CLI / Antigravity | Copy `skills/atc` into `~/.gemini/skills/atc` and wire `atc hook pre-tool-use` + `atc hook stop` |
+| Antigravity | Symlink or copy package root into `~/.gemini/config/plugins/atc` (loads `plugin.json`, `skills/atc`, `hooks.json`, and `mcp_config.json`) |
+| Gemini CLI | Copy `skills/atc` into `~/.gemini/skills/atc` and wire `atc hook pre-tool-use` + `atc hook stop` |
 | Cursor | Copy `.cursor/hooks.json` into `.cursor/hooks.json` (and optional `.mcp.json`) |
 | Pi | Load `extensions/atc/index.ts` |
 
