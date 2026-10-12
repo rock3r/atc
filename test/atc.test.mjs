@@ -7615,49 +7615,51 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
         assert.equal(agStopRes.status, 0);
         assert.deepEqual(JSON.parse(agStopRes.stdout), { decision: "allow" });
 
-        // Antigravity mcp_config.json launches packaged bin/atc.mjs when copied to ~/.gemini/config/plugins/atc without global atc on PATH
-        const fakeHome = makeTempStateDir();
-        try {
-          const fakePluginDir = path.join(fakeHome, ".gemini", "config", "plugins", "atc");
-          fs.mkdirSync(fakePluginDir, { recursive: true });
-          fs.cpSync(path.join(repoRootPath, "bin"), path.join(fakePluginDir, "bin"), {
-            recursive: true,
-          });
-          fs.cpSync(path.join(repoRootPath, "src"), path.join(fakePluginDir, "src"), {
-            recursive: true,
-          });
-          fs.cpSync(
-            path.join(repoRootPath, "package.json"),
-            path.join(fakePluginDir, "package.json"),
-          );
-          const agMcpServerRes = spawnSync(
-            process.execPath,
-            antigravityMcp.mcpServers.atc.args,
-            {
-              cwd: fakeWs,
-              input:
-                JSON.stringify({
-                  jsonrpc: "2.0",
-                  id: 1,
-                  method: "initialize",
-                  params: {},
-                }) + "\n",
-              encoding: "utf8",
-              env: {
-                ...process.env,
-                HOME: fakeHome,
-                USERPROFILE: fakeHome,
-                PATH: path.dirname(process.execPath),
-                ATC_STATE_DIR: dir,
+        // Antigravity mcp_config.json launches packaged bin/atc.mjs when installed in ~/.gemini/config/plugins/atc or ~/.gemini/antigravity-cli/plugins/atc without global atc on PATH
+        for (const subDir of ["config", "antigravity-cli"]) {
+          const fakeHome = makeTempStateDir();
+          try {
+            const fakePluginDir = path.join(fakeHome, ".gemini", subDir, "plugins", "atc");
+            fs.mkdirSync(fakePluginDir, { recursive: true });
+            fs.cpSync(path.join(repoRootPath, "bin"), path.join(fakePluginDir, "bin"), {
+              recursive: true,
+            });
+            fs.cpSync(path.join(repoRootPath, "src"), path.join(fakePluginDir, "src"), {
+              recursive: true,
+            });
+            fs.cpSync(
+              path.join(repoRootPath, "package.json"),
+              path.join(fakePluginDir, "package.json"),
+            );
+            const agMcpServerRes = spawnSync(
+              process.execPath,
+              antigravityMcp.mcpServers.atc.args,
+              {
+                cwd: fakeWs,
+                input:
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "initialize",
+                    params: {},
+                  }) + "\n",
+                encoding: "utf8",
+                env: {
+                  ...process.env,
+                  HOME: fakeHome,
+                  USERPROFILE: fakeHome,
+                  PATH: path.dirname(process.execPath),
+                  ATC_STATE_DIR: dir,
+                },
+                timeout: 5000,
               },
-              timeout: 5000,
-            },
-          );
-          assert.equal(agMcpServerRes.status, 0);
-          const mcpInitReply = JSON.parse(agMcpServerRes.stdout.trim());
-          assert.equal(mcpInitReply.result.serverInfo.name, "android-traffic-control");
-        } finally {
-          fs.rmSync(fakeHome, { recursive: true, force: true });
+            );
+            assert.equal(agMcpServerRes.status, 0);
+            const mcpInitReply = JSON.parse(agMcpServerRes.stdout.trim());
+            assert.equal(mcpInitReply.result.serverInfo.name, "android-traffic-control");
+          } finally {
+            fs.rmSync(fakeHome, { recursive: true, force: true });
+          }
         }
 
         // Claude Code & OpenAI Codex & Gemini CLI (hooks/hooks.json)
