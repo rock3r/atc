@@ -691,6 +691,345 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
   }
 });
 
+test("guard: tool names embedded in paths or longer words do not fail closed", () => {
+  const opts = { sessionId: "sess-unleased", activeLeases: [], runningCount: 1 };
+  // A tool name glued into a path, filename, or package spec is not a nested device command
+  for (const cmd of [
+    "sed -n 430,470p test/atc.test.mjs",
+    "sed -n 1,20p bin/atc.mjs",
+    "node --test test/atc.test.mjs",
+    "node --check bin/atc.mjs",
+    "copilot plugin install atc@atc",
+    `node -e 'require("/repo/atc/com.github.copilot/hooks/hooks.json")'`,
+    "node /plugins/review/scripts/render-html.mjs /work/my-android-app/review.json",
+    "python3 render.py --root /work/my-android-app",
+    "bin/search --scope project:my-android-app notes",
+    "node scripts/build.mjs --out dist/gradle-report.html",
+    "node script.mjs 'a\\\ndb shell'",
+    `node -e 'process.stdout.write("ok")' # a\\\ndb kill-server`,
+    `node -e 'process.stdout.write("ok")' # adb kill-server`,
+    "cat <<'EOF'\na\\\ndb shell\nEOF",
+    "cat <<EOF\na\\\ndb shell\nEOF",
+    "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
+    "tee /tmp/script <<EOF\nadb kill-server\nEOF",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
+  }
+  // Standalone tool words inside interpreters and executable-passive tools still fail closed
+  for (const cmd of [
+    `node -e 'require("child_process").execSync("adb shell pm clear com.x")'`,
+    `node -e 'require("child_process").execSync("/opt/sdk/platform-tools/adb shell pm clear com.x")'`,
+    `node -e 'require("child_process").execSync("a""db shell pm clear com.x")'`,
+    `python3 -c "import os; os.system('adb shell pm clear com.x')"`,
+    `python3 -c "import subprocess; subprocess.run(['adb','shell','pm','clear','com.x'])"`,
+    `sed -n 'e adb shell pm clear com.x' /dev/null`,
+    `perl -e 'system("adb.exe shell input tap 1 1")'`,
+    "node -e 'spawn(...[adb,shell,input])'",
+    "ruby -e 'system(%w{adb shell input tap 1 1})'",
+    `python3 -c "import subprocess; subprocess.run([r'C:\\sdk\\platform-tools\\adb.exe','shell','input','keyevent','82'])"`,
+    `node -e 'require("child_process").execSync("C:\\\\sdk\\\\platform-tools\\\\a\\"\\"db.exe shell pm clear com.x")'`,
+    `node -e 'require("child_process").execSync("adb</dev/null shell input keyevent 82")'`,
+    `node -e 'require("child_process").execSync("adb>/dev/null shell input keyevent 82")'`,
+    "perl -e 'qx!adb shell pm clear com.x!'",
+    "perl -e 'qx/adb shell pm clear com.x/'",
+    "ruby -e '%x+adb shell pm clear com.x+'",
+    "ruby -e 'system(*%w-adb shell input tap 1 1-)'",
+    `"/opt/Android SDK (tools)/platform-tools/adb" shell getprop`,
+    `"C:\\\\Program Files (x86)\\\\Android\\\\android-sdk\\\\platform-tools\\\\adb.exe" shell getprop`,
+    `"/tmp/s h" -c 'adb shell pm clear com.x'`,
+    "node scripts/adb.js shell pm clear com.x",
+    "python3 scripts/adb.py shell pm clear com.x",
+    "perl scripts/adb.pl shell pm clear com.x",
+    "ruby scripts/adb.rb shell pm clear com.x",
+    "bash scripts/adb.command shell pm clear com.x",
+    "python3 scripts/adb.txt shell getprop",
+    "python3 scripts/adb.foo.bar shell getprop",
+    "./adb.log shell getprop",
+    "./adb.foo-bar shell getprop",
+    "./adb.foo.bar shell getprop",
+    "adb\\\n shell getprop",
+    "sh <<EOF\na\\\ndb shell\nEOF",
+    "sh <<'EOF'\na\\\ndb shell\nEOF",
+    "cat <<EOF | sh\na\\\ndb shell\nEOF",
+    "@adb shell pm clear com.x",
+    "npx adb@1.0.0 shell pm clear com.x",
+    "npm exec -- @scope/adb@2 shell pm clear com.x",
+    "npm exec -c 'adb shell getprop'",
+    "npx --call='adb shell getprop'",
+    "npm exec --package adb@2 -- adb shell getprop",
+    "pnpm dlx -c adb kill-server",
+    "pnpm -C adb@2 exec adb kill-server",
+    'cmd.exe /d /s /c "echo # & adb kill-server"',
+    "cmd /c echo # & adb kill-server",
+    `node --check --import 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' main.js`,
+    "node --check -r ./adb.js main.js",
+    "NODE_OPTIONS='--require ./adb.js' node --check main.js",
+    `node --test --test-reporter='data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
+    `node --test --test-reporter 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
+  }
+  const leasedOpts = {
+    sessionId: "sess-leased",
+    activeLeases: [{ serial: "emulator-5554", platform: "android" }],
+    runningCount: 1,
+  };
+  for (const cmd of [
+    `xargs "/opt/Android SDK/platform-tools/adb" kill-server </dev/null`,
+    "perl -e 'qx!adb kill-server!'",
+    "ruby -e 'system(*%w-adb kill-server-)'",
+    "python3 scripts/adb.py kill-server",
+    "python3 scripts/adb.json kill-server",
+    "python3 scripts/adb.foo.bar kill-server",
+    "./adb.foo-bar kill-server",
+    "./adb.foo.bar kill-server",
+    "@adb kill-server",
+    'cmd.exe /c "@adb kill-server"',
+    'cmd.exe /d /s /c "echo # & adb kill-server"',
+    "cmd /c echo # & adb kill-server",
+    `node --check --import 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' main.js`,
+    `NODE_OPTIONS='--import "data:text/javascript,import(\\"node:child_process\\").then(cp=>cp.execSync(\\"adb kill-server\\"))"' node --check main.js`,
+    `node --test --test-reporter='data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
+    `node --test --test-reporter 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
+    "npx adb@1.0.0 kill-server",
+    "npx @scope/adb@2 kill-server",
+    "npm exec -c 'adb kill-server'",
+    "npx --call='adb kill-server'",
+    "npm exec --package adb@2 -- adb kill-server",
+    "npx -p adb@2 -- adb kill-server",
+    "pnpm dlx -c adb kill-server",
+    "pnpm -C adb@2 exec adb kill-server",
+    "sh <<'EOF'\na\\\ndb kill-server\nEOF",
+    `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
+    `node --title adb -e 'require("node:child_process").execSync(process.title+" kill-server")'`,
+    `node --title=adb -e 'require("node:child_process").execSync(process.title+" kill-server")'`,
+    "cat <<$'EOF'\nbody\nEOF\nadb kill-server",
+    'cat <<$"EOF"\nbody\nEOF\nadb kill-server',
+    "cat <<$'\\e'\n\x1b\nadb kill-server",
+    "cat <<EOF\nbody\nE\\\nOF\nadb kill-server",
+    "cat <<EOF\n$\\\n(adb kill-server)\nEOF",
+    "cat >/tmp/x <<'EOF'\nadb kill-server\nEOF\nsh /tmp/x",
+    "env --chdir /tmp/cat sh <<'EOF'\nadb kill-server\nEOF",
+    "patch x <<'EOF'\n--- /dev/null\n+++ x\n@@ -0,0 +1 @@\n+adb kill-server\nEOF\nsh x",
+    "./adb-wrapper kill-server",
+    "./adb_wrapper kill-server",
+    "./my-adb kill-server",
+    "./wrapper.adb kill-server",
+    "./adb@wrapper kill-server",
+    "./wrapper@adb kill-server",
+    "./shim+adb-wrapper kill-server",
+    "python3 scripts/adb-wrapper.py kill-server",
+    "cat <<EOF > >(sh)\nadb kill-server\nEOF",
+    "cat <<'EOF' > >(sh)\na\\\ndb kill-server\nEOF",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
+  }
+  for (const cmd of [
+    "cat <<$'EOF'\nbody\nEOF\nadb shell getprop",
+    'cat <<$"EOF"\nbody\nEOF\nadb shell getprop',
+    "cat <<$'\\e'\n\x1b\nadb shell getprop",
+    "cat <<EOF\nbody\nE\\\nOF\nadb shell getprop",
+    "cat <<EOF\n$\\\n(adb shell getprop)\nEOF",
+    "cat >/tmp/x <<'EOF'\nadb shell getprop\nEOF\nsh /tmp/x",
+    "env --chdir /tmp/cat sh <<'EOF'\nadb shell getprop\nEOF",
+    "patch x <<'EOF'\n--- /dev/null\n+++ x\n@@ -0,0 +1 @@\n+adb shell getprop\nEOF\nsh x",
+    "./adb-wrapper shell getprop",
+    "./adb_wrapper shell getprop",
+    "./wrapper.adb shell getprop",
+    "./adb@wrapper shell getprop",
+    "./wrapper@adb shell getprop",
+    "./shim+adb-wrapper shell getprop",
+    `node --title adb -e 'require("node:child_process").execSync(process.title+" shell getprop")'`,
+    "python3 scripts/adb-wrapper.py shell getprop",
+    "cat <<EOF > >(sh)\nadb shell getprop\nEOF",
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
+  }
+  for (const cmd of [
+    "perl -e 'print q!adb kill-server!'",
+    "ruby -e 'puts %q!adb kill-server!'",
+    `node -e 'process.stdout.write("ok")' # a\\\ndb kill-server`,
+    `node -e 'process.stdout.write("ok")' # adb kill-server`,
+    "cat <<'EOF'\na\\\ndb shell\nEOF",
+    "cat <<EOF\na\\\ndb shell\nEOF",
+    "cat <<$'EOF'\nadb kill-server\nEOF",
+    'cat <<$"EOF"\nadb kill-server\nEOF',
+    "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
+    "tee /tmp/script <<EOF\nadb kill-server\nEOF",
+    `node -e 'console.log("android-app is cool")'`,
+  ]) {
+    assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
+  }
+  const wrapperLeasedRes = evaluateCommandGuard("./adb-wrapper shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(wrapperLeasedRes.allowed, true);
+  assert.equal(
+    wrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb-wrapper shell getprop",
+  );
+  const dotWrapperLeasedRes = evaluateCommandGuard("./wrapper.adb shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(dotWrapperLeasedRes.allowed, true);
+  assert.equal(
+    dotWrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./wrapper.adb shell getprop",
+  );
+  const atWrapperLeasedRes = evaluateCommandGuard("./adb@wrapper shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(atWrapperLeasedRes.allowed, true);
+  assert.equal(
+    atWrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb@wrapper shell getprop",
+  );
+  const plusWrapperLeasedRes = evaluateCommandGuard("./shim+adb-wrapper shell getprop", {
+    ...leasedOpts,
+    platform: "linux",
+  });
+  assert.equal(plusWrapperLeasedRes.allowed, true);
+  assert.equal(
+    plusWrapperLeasedRes.rewrittenCommand,
+    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./shim+adb-wrapper shell getprop",
+  );
+  const heredocFileExecRes = evaluateCommandGuard(
+    "cat >/tmp/x <<'EOF'\nadb shell getprop\nEOF\nsh /tmp/x",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(heredocFileExecRes.allowed, true);
+  assert.equal(
+    heredocFileExecRes.rewrittenCommand,
+    "cat >/tmp/x <<'EOF'\nATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop\nEOF\nsh /tmp/x",
+  );
+  const heredocSubRes = evaluateCommandGuard(
+    "cat <<EOF\n$(adb shell getprop ro.build.version.release)\nEOF",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(heredocSubRes.allowed, true);
+  assert.equal(
+    heredocSubRes.rewrittenCommand,
+    "cat <<EOF\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF",
+  );
+  const heredocContSubRes = evaluateCommandGuard(
+    "cat <<EOF\n$\\\n(adb shell getprop ro.build.version.release)\nEOF",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(heredocContSubRes.allowed, true);
+  assert.equal(
+    heredocContSubRes.rewrittenCommand,
+    "cat <<EOF\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF",
+  );
+  const heredocSingleQuoteSubRes = evaluateCommandGuard(
+    "cat <<EOF\n'$(adb shell getprop ro.build.version.release)'\nEOF",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(heredocSingleQuoteSubRes.allowed, true);
+  assert.equal(
+    heredocSingleQuoteSubRes.rewrittenCommand,
+    "cat <<EOF\n'$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)'\nEOF",
+  );
+  const multiHeredocSubRes = evaluateCommandGuard(
+    "cat <<EOF1 <<'EOF2'\n$(adb shell getprop ro.build.version.release)\nEOF1\n$(adb shell getprop ro.build.version.sdk)\nEOF2",
+    { ...leasedOpts, platform: "linux" },
+  );
+  assert.equal(multiHeredocSubRes.allowed, true);
+  assert.equal(
+    multiHeredocSubRes.rewrittenCommand,
+    "cat <<EOF1 <<'EOF2'\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF1\n$(adb shell getprop ro.build.version.sdk)\nEOF2",
+  );
+  const atcRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "linux" });
+  assert.equal(atcRes.allowed, true);
+  assert.match(atcRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
+  const atcNpxRes = evaluateCommandGuard("npx @rock3r/atc@2 free", {
+    ...opts,
+    platform: "linux",
+  });
+  assert.equal(atcNpxRes.allowed, true);
+  assert.match(atcNpxRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
+  const atcNpxWinRes = evaluateCommandGuard("npx @rock3r/atc@2 free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpxWinRes.allowed, true);
+  assert.equal(atcNpxWinRes.rewrittenCommand, "npx @rock3r/atc@2 free --session sess-unleased");
+  const atcNpxCallWinRes = evaluateCommandGuard("npx --call='atc free'", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpxCallWinRes.allowed, true);
+  assert.equal(
+    atcNpxCallWinRes.rewrittenCommand,
+    "npx --call='atc free --session sess-unleased'",
+  );
+  const atcNpmPkgWinRes = evaluateCommandGuard("npm exec --package @rock3r/atc@2 -- atc free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpmPkgWinRes.allowed, true);
+  assert.equal(
+    atcNpmPkgWinRes.rewrittenCommand,
+    "npm exec --package @rock3r/atc@2 -- atc free --session sess-unleased",
+  );
+  const atcNpmWsWinRes = evaluateCommandGuard("npm exec --workspace atc -- atc free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcNpmWsWinRes.allowed, true);
+  assert.equal(
+    atcNpmWsWinRes.rewrittenCommand,
+    "npm exec --workspace atc -- atc free --session sess-unleased",
+  );
+  const atcExecEchoWinRes = evaluateCommandGuard("atc exec -- echo atc", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcExecEchoWinRes.allowed, true);
+  assert.equal(
+    atcExecEchoWinRes.rewrittenCommand,
+    "atc exec --session sess-unleased -- echo atc",
+  );
+  const sshAtcWinRes = evaluateCommandGuard("ssh atc", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(sshAtcWinRes.allowed, true);
+  assert.equal(sshAtcWinRes.rewrittenCommand, "ssh atc");
+  const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
+  assert.equal(atcWinRes.allowed, true);
+  assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
+  const atcWinOptRes = evaluateCommandGuard("node bin/atc.mjs --anchor-pid 42 free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcWinOptRes.allowed, true);
+  assert.equal(
+    atcWinOptRes.rewrittenCommand,
+    "node bin/atc.mjs --session sess-unleased --anchor-pid 42 free",
+  );
+  const atcWinTitleRes = evaluateCommandGuard("node --title=atc.exe bin/atc.mjs free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcWinTitleRes.allowed, true);
+  assert.equal(
+    atcWinTitleRes.rewrittenCommand,
+    "node --title=atc.exe bin/atc.mjs free --session sess-unleased",
+  );
+  const atcWinSepTitleRes = evaluateCommandGuard("node --title atc.exe bin/atc.mjs free", {
+    ...opts,
+    platform: "win32",
+  });
+  assert.equal(atcWinSepTitleRes.allowed, true);
+  assert.equal(
+    atcWinSepTitleRes.rewrittenCommand,
+    "node --title atc.exe bin/atc.mjs free --session sess-unleased",
+  );
+});
+
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
   const dir = makeTempStateDir();
   try {
