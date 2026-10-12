@@ -79,7 +79,7 @@ import {
   withStateTransaction,
 } from "./state.mjs";
 
-export const ATC_VERSION = "2.0.0";
+export const ATC_VERSION = "2.1.0";
 export { GUIDE_TOPICS, cmdGuide };
 
 function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {
@@ -580,6 +580,11 @@ function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
   };
 }
 
+function isAdbEmuFailure(res) {
+  if (!res || res.status !== 0) return true;
+  return /(?:^|\r?\n)\s*KO:/i.test(`${res.stdout || ""}\n${res.stderr || ""}`);
+}
+
 function waitForEmulatorReady(runner, serial, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -982,8 +987,21 @@ export function selectCandidateUnderLock(
         l.state === "starting" &&
         !l.serial,
     );
+    const allowPhys = cfg.allowPhysicalDevices ?? "explicit";
+    const allowedSerials = Array.isArray(cfg.allowedPhysicalSerials)
+      ? cfg.allowedPhysicalSerials
+      : [];
+    const isPhysicalAllowed = (d) => {
+      if (d.kind !== "physical") return true;
+      if (allowPhys === "never" || allowPhys === false) return false;
+      if (allowedSerials.length > 0) {
+        return allowedSerials.some((s) => s === d.serial || s === d.udid);
+      }
+      return true;
+    };
     const warmCandidates = (inventory.running || []).filter(
       (d) =>
+        isPhysicalAllowed(d) &&
         !isDeviceOccupied(d) &&
         !(
           (d.platform || "android") === "android" &&
@@ -1041,7 +1059,11 @@ export function selectCandidateUnderLock(
     ...safeOfflineCandidates,
   ]
     .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, req))
-    .sort((a, b) => Number(isCallerOwnedResettable(b)) - Number(isCallerOwnedResettable(a)));
+    .sort(
+      (a, b) =>
+        Number(isCallerOwnedResettable(b)) - Number(isCallerOwnedResettable(a)) ||
+        Number(b.systemImagePresent !== false) - Number(a.systemImagePresent !== false),
+    );
 
   let firstResourceErr = null;
 
@@ -1552,8 +1574,51 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             avdHome,
           );
 
+          const allowPhysPolicy = state.config?.allowPhysicalDevices ?? "explicit";
+          const allowedPhysSerials = Array.isArray(state.config?.allowedPhysicalSerials)
+            ? state.config.allowedPhysicalSerials
+            : [];
+          const isPhysAllowedByPolicy = (d) => {
+            if (!d || d.kind !== "physical") return true;
+            if (allowPhysPolicy === "never" || allowPhysPolicy === false) return false;
+            if (allowedPhysSerials.length > 0) {
+              return allowedPhysSerials.some((s) => s === d.serial || s === d.udid);
+            }
+            return true;
+          };
+          const hasMatchingVirtualDevice = [
+            ...(effectiveInventory.running || []),
+            ...(effectiveInventory.offline || []),
+          ].some((d) => d.kind === "emulator" && matchesProfile(d, req));
+          const hasBlockedMatchingPhysical = (effectiveInventory.running || []).some(
+            (d) => d.kind === "physical" && matchesProfile(d, req) && !isPhysAllowedByPolicy(d),
+          );
+          const targetsPhysicalUnderNever =
+            (allowPhysPolicy === "never" || allowPhysPolicy === false) &&
+            (req.kind === "physical" ||
+              (!hasMatchingVirtualDevice &&
+                Boolean(
+                  hasBlockedMatchingPhysical ||
+                    (req.serial && !String(req.serial).startsWith("emulator-")) ||
+                    req.udid,
+                )));
+          if (targetsPhysicalUnderNever || (!hasMatchingVirtualDevice && hasBlockedMatchingPhysical)) {
+            return {
+              mutated: reconciledMutated,
+              value: {
+                status: "physical_forbidden",
+                error:
+                  `Physical device claim rejected by policy (allowPhysicalDevices=${allowPhysPolicy}). ` +
+                  `Use an emulator/simulator or update "atc config".`,
+              },
+            };
+          }
+
           // Step 3.1: Idempotent Re-Claim of Active Online Lease (Same Session)
           for (const lease of Object.values(state.leases)) {
+            if (!isPhysAllowedByPolicy(lease)) {
+              continue;
+            }
             if (isStoppedSinceInventory(lease)) {
               continue;
             }
@@ -2249,6 +2314,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       return {
         exitCode: 1,
         error: `Physical device "${txOutcome.serial}" disconnected while leased and cannot be restarted automatically. Your lease was released — run "atc status" to re-check what is available before claiming again.`,
+      };
+    }
+
+    if (txOutcome.status === "physical_forbidden") {
+      return {
+        exitCode: 6,
+        error: txOutcome.error,
       };
     }
 
@@ -3105,7 +3177,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
           { strictInternal: true, timeoutMs: bootTimeoutMs },
         );
-        if (snapRes.status !== 0) {
+        if (isAdbEmuFailure(snapRes)) {
           throw new Error(
             `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
           );
@@ -3286,7 +3358,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
           { strictInternal: true, timeoutMs: bootTimeoutMs },
         );
-        if (snapRes.status !== 0) {
+        if (isAdbEmuFailure(snapRes)) {
           throw new Error(
             `Failed to load snapshot "${req.snapshotLoad}" on ${resolvedSerial}: ${snapRes.stderr || snapRes.stdout}`,
           );
@@ -4196,7 +4268,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             ["-s", lease.serial, "emu", "avd", "snapshot", "save", saveSnap],
             { strictInternal: true, timeoutMs: stopTimeoutMs },
           );
-          if (saveRes.status !== 0) {
+          if (isAdbEmuFailure(saveRes)) {
             itemFailed = true;
             actionErrors.push(
               `Failed to save snapshot "${saveSnap}" on ${lease.serial}: ${saveRes.stderr || saveRes.stdout}`,
@@ -4234,7 +4306,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap],
             { strictInternal: true, timeoutMs: stopTimeoutMs },
           );
-          if (loadRes.status !== 0) {
+          if (isAdbEmuFailure(loadRes)) {
             itemFailed = true;
             actionErrors.push(
               `Failed to load snapshot "${loadSnap}" on ${lease.serial}: ${loadRes.stderr || loadRes.stdout}`,
@@ -4911,7 +4983,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     clearSnapshotWorker(false);
     return { exitCode: 1, error: err.message };
   }
-  if (res.status !== 0) {
+  if (isAdbEmuFailure(res)) {
     clearSnapshotWorker(false);
     return {
       exitCode: 1,
@@ -5502,6 +5574,23 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
             value: {
               exitCode: 1,
               error: `Config key "${key}" requires a boolean value ("true" or "false").`,
+            },
+          };
+        }
+      } else if (key === "allowPhysicalDevices") {
+        const norm = String(val).trim().toLowerCase();
+        if (norm === "explicit" || norm === "never" || norm === "always") {
+          parsedVal = norm;
+        } else if (norm === "false" || norm === "0") {
+          parsedVal = "never";
+        } else if (norm === "true" || norm === "1") {
+          parsedVal = "explicit";
+        } else {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `Config key "allowPhysicalDevices" must be "explicit", "never", or "always".`,
             },
           };
         }

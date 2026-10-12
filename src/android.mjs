@@ -122,6 +122,12 @@ export function readLocalAvdMetadata(
   }
 
   const sysDir = configIni["image.sysdir.1"] || "";
+  const sdkRoot = resolveSdkRoot();
+  const sysImagesRoot = sdkRoot ? path.join(sdkRoot, "system-images") : null;
+  const systemImagePresent =
+    !sysDir || !sysImagesRoot || !fs.existsSync(sysImagesRoot)
+      ? true
+      : fs.existsSync(path.join(sdkRoot, sysDir));
   const apiMatch = sysDir.match(/android-(\d+)/i);
   const apiLevel = apiMatch ? `android-${apiMatch[1]}` : targetApi || "unknown";
   const tagId = configIni["tag.id"] || "";
@@ -156,6 +162,7 @@ export function readLocalAvdMetadata(
     avd: avdId,
     avdPath,
     exists: fs.existsSync(avdPath) || fs.existsSync(iniPath),
+    systemImagePresent,
     hasLockFiles: avdHasRuntimeLockFiles(avdId, avdHome, livenessCheck),
     profile: {
       deviceType,

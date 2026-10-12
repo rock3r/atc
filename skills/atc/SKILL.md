@@ -4,7 +4,7 @@ description: Coordinate exclusive Android (AVD & physical adb) and iOS/watchOS/t
 license: Apache-2.0
 compatibility: Needs Node.js >= 20 on macOS, Linux, or Windows, plus the Android SDK (`adb`, `emulator`, `android` CLI) and/or Xcode (`xcrun simctl`, `xcrun devicectl`) on macOS.
 metadata:
-  version: "2.0.0"
+  version: "2.1.0"
   author: "Sebastiano Poggi"
 ---
 

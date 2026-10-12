@@ -2,7 +2,7 @@
 
 How the `atc` CLI, the lock-serialized state file, the 3-tier Android and iOS fleet discovery, the warm-affinity queue, and the multi-agent hooks fit together.
 
-Status: `v2.0.0` · Updated `2026-10-11` · Node.js >= 20 on macOS, Linux, and Windows.
+Status: `v2.1.0` · Updated `2026-10-12` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 

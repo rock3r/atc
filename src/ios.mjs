@@ -709,21 +709,45 @@ export function diagnosePlatformToolingError(targetPlatform, req = {}, inventory
   return null;
 }
 
+const SIM_TCC_PROTECTED_SUBDIRS = [
+  path.join("Library", "Spotlight"),
+  path.join("Library", "Caches", "locationd"),
+];
+
+function isBenignTccCloneError(stderr, destDir) {
+  if (!destDir || !fs.existsSync(destDir)) return false;
+  const lines = String(stderr || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.every(
+    (line) =>
+      /Operation not permitted/i.test(line) &&
+      (/\/Library\/Spotlight\//.test(line) || /\/Library\/Caches\/locationd\//.test(line)),
+  );
+}
+
 function cloneDirectoryApfsOrCopy(runner, srcDir, destDir, timeoutMs = 60_000, env = process.env) {
   const cpRes = runner("cp", ["-cR", srcDir, destDir], {
     strictInternal: true,
     timeoutMs,
     env,
   });
-  if (cpRes.status === 0) {
-    return cpRes;
+  if (cpRes.status === 0 || isBenignTccCloneError(cpRes.stderr, destDir)) {
+    return { ...cpRes, status: 0 };
   }
+  fs.rmSync(destDir, { recursive: true, force: true });
   // Fallback to cp -a if filesystem does not support APFS clonefile (e.g. tmpfs in tests)
-  return runner("cp", ["-a", srcDir, destDir], {
+  const fallbackRes = runner("cp", ["-a", srcDir, destDir], {
     strictInternal: true,
     timeoutMs,
     env,
   });
+  if (fallbackRes.status === 0 || isBenignTccCloneError(fallbackRes.stderr, destDir)) {
+    return { ...fallbackRes, status: 0 };
+  }
+  return fallbackRes;
 }
 
 export function saveIosSimulatorSnapshot(
@@ -772,17 +796,47 @@ export function saveIosSimulatorSnapshot(
     fs.mkdirSync(stageDir, { recursive: true });
     if (assertOwned) assertOwned();
     const stagedDataDir = path.join(stageDir, "data");
-    const cloneRes = cloneDirectoryApfsOrCopy(
-      runner,
-      srcDataDir,
-      stagedDataDir,
-      stopTimeoutMs,
-      env,
-    );
-    if (cloneRes.status !== 0) {
-      throw new Error(
-        `Failed to clone simulator data directory for snapshot "${name}": ${(cloneRes.stderr || cloneRes.stdout || "").trim()}`,
+    const movedTccDirs = [];
+    const parentSrcDir = path.dirname(srcDataDir);
+    try {
+      for (let i = 0; i < SIM_TCC_PROTECTED_SUBDIRS.length; i++) {
+        const rel = SIM_TCC_PROTECTED_SUBDIRS[i];
+        const origPath = path.join(srcDataDir, rel);
+        if (fs.existsSync(origPath)) {
+          const asidePath = path.join(
+            parentSrcDir,
+            `.atc-tcc-aside-${process.pid}-${Date.now()}-${i}`,
+          );
+          try {
+            fs.renameSync(origPath, asidePath);
+            movedTccDirs.push({ origPath, asidePath });
+          } catch {
+            // Best-effort TCC aside move
+          }
+        }
+      }
+      const cloneRes = cloneDirectoryApfsOrCopy(
+        runner,
+        srcDataDir,
+        stagedDataDir,
+        stopTimeoutMs,
+        env,
       );
+      if (cloneRes.status !== 0) {
+        throw new Error(
+          `Failed to clone simulator data directory for snapshot "${name}": ${(cloneRes.stderr || cloneRes.stdout || "").trim()}`,
+        );
+      }
+    } finally {
+      for (const { origPath, asidePath } of movedTccDirs) {
+        try {
+          if (fs.existsSync(asidePath)) {
+            fs.renameSync(asidePath, origPath);
+          }
+        } catch {
+          // Best-effort restore
+        }
+      }
     }
     const meta = {
       name,
@@ -915,10 +969,35 @@ export function loadIosSimulatorSnapshot(
     if (fs.existsSync(targetDataDir)) {
       fs.renameSync(targetDataDir, backupDataDir);
     }
+    const transferredTccDirs = [];
     try {
+      if (fs.existsSync(backupDataDir)) {
+        for (const rel of SIM_TCC_PROTECTED_SUBDIRS) {
+          const fromBackup = path.join(backupDataDir, rel);
+          const toStaged = path.join(stagedRestoreDir, rel);
+          if (fs.existsSync(fromBackup) && !fs.existsSync(toStaged)) {
+            try {
+              fs.mkdirSync(path.dirname(toStaged), { recursive: true });
+              fs.renameSync(fromBackup, toStaged);
+              transferredTccDirs.push({ fromBackup, toStaged });
+            } catch {
+              // Best-effort TCC directory preservation
+            }
+          }
+        }
+      }
       fs.renameSync(stagedRestoreDir, targetDataDir);
       fs.rmSync(backupDataDir, { recursive: true, force: true });
     } catch (swapErr) {
+      for (const { fromBackup, toStaged } of transferredTccDirs) {
+        try {
+          if (fs.existsSync(toStaged) && !fs.existsSync(fromBackup)) {
+            fs.renameSync(toStaged, fromBackup);
+          }
+        } catch {
+          // Ignore rollback error
+        }
+      }
       if (!fs.existsSync(targetDataDir) && fs.existsSync(backupDataDir)) {
         fs.renameSync(backupDataDir, targetDataDir);
       }

@@ -1,6 +1,6 @@
 {
   "name": "@rock3r/atc",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Daemonless Agent Traffic Control for Android emulators, iOS Simulators, and physical devices — leases, bounded-window warm-affinity wait queue, snapshots, crash recovery, and multi-agent guardrails.",
   "license": "Apache-2.0",
   "author": "Sebastiano Poggi <me@sebastiano.dev>",

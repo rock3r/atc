@@ -11110,6 +11110,87 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     assert.equal(kmpFreeAndroid.exitCode, 0);
     assert.deepEqual(kmpFreeAndroid.freed, [kmpAndroidClaim.lease.leaseId]);
     assert.ok(readState(dir).leases[iosClaim.lease.deviceKey]);
+
+    // 8. E2E 2.1.0 hardening: allowPhysicalDevices=never returns exitCode 6 (EPHYSICAL_FORBIDDEN),
+    //    systemImagePresent tie-breaking, and adb emu snapshot KO: error detection
+    assert.equal(cmdConfig(dir, "set", "allowPhysicalDevices", "bogus").exitCode, 1);
+    assert.equal(cmdConfig(dir, "set", "allowPhysicalDevices", "never").exitCode, 0);
+    const physForbiddenInv = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      queriedPlatforms: ["android"],
+      running: [
+        {
+          deviceKey: "serial:USB-PIXEL-99",
+          platform: "android",
+          kind: "physical",
+          avd: null,
+          serial: "USB-PIXEL-99",
+          online: true,
+          profile: {
+            platform: "android",
+            deviceType: "phone",
+            apiLevel: "android-36",
+            services: "play",
+            playStore: true,
+            abi: "arm64-v8a",
+          },
+        },
+      ],
+      offline: [],
+      creatable: [],
+      probes: { emulatorListOk: true, adbDevicesOk: true },
+    };
+    const forbiddenClaim = cmdClaim(
+      dir,
+      { android: true, serial: "USB-PIXEL-99", session: "sess-phys-never" },
+      { inventory: physForbiddenInv },
+    );
+    assert.equal(forbiddenClaim.exitCode, 6);
+    assert.match(forbiddenClaim.error, /allowPhysicalDevices=never/);
+    assert.equal(cmdConfig(dir, "set", "allowPhysicalDevices", "explicit").exitCode, 0);
+
+    // Offline AVD with systemImagePresent: true is preferred over stale AVD with systemImagePresent: false
+    const sysImgState = {
+      config: { maxRunningEmulators: 2, minFreeRamMb: 2048, minFreeDiskMb: 2048 },
+      leases: {},
+      queue: [],
+    };
+    const sysImgInv = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+      running: [],
+      offline: [
+        {
+          deviceKey: "avd:Stale_Pixel",
+          platform: "android",
+          kind: "emulator",
+          avd: "Stale_Pixel",
+          online: false,
+          systemImagePresent: false,
+          ramSizeMb: 2048,
+          requiredRamMb: 3072,
+          profile: { deviceType: "phone", apiLevel: "android-36", services: "play", playStore: true },
+        },
+        {
+          deviceKey: "avd:Ready_Opus",
+          platform: "android",
+          kind: "emulator",
+          avd: "Ready_Opus",
+          online: false,
+          systemImagePresent: true,
+          ramSizeMb: 2048,
+          requiredRamMb: 3072,
+          profile: { deviceType: "phone", apiLevel: "android-37", services: "play", playStore: true },
+        },
+      ],
+      creatable: [],
+      probes: { emulatorListOk: true, adbDevicesOk: true },
+    };
+    const sysImgSel = selectCandidateUnderLock(sysImgState, sysImgInv, {
+      platform: "android",
+      kind: "emulator",
+      deviceType: "phone",
+    });
+    assert.equal(sysImgSel.candidate?.avd, "Ready_Opus");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

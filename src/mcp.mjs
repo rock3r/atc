@@ -201,7 +201,7 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
         capabilities: { tools: {} },
         serverInfo: {
           name: "android-traffic-control",
-          version: "2.0.0",
+          version: "2.1.0",
         },
       },
     };
