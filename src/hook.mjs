@@ -159,7 +159,11 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const rawPpid = options.ppid ?? process.ppid;
   const fastNorm = normalizeHookPayload(payload, rawPpid);
   const cursorAllowOut =
-    fastNorm.hostFormat === "cursor" ? JSON.stringify({ permission: "allow" }) + "\n" : "";
+    fastNorm.hostFormat === "cursor"
+      ? JSON.stringify({ permission: "allow" }) + "\n"
+      : fastNorm.hostFormat === "antigravity"
+        ? JSON.stringify({ decision: "allow" }) + "\n"
+        : "";
 
   if (fastNorm.mcpToolName) {
     getAncestorPids(rawPpid);
@@ -453,14 +457,28 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 
 export function handleStopHook(stateDir, rawStdin, options = {}) {
   const payload = typeof rawStdin === "string" ? parseHookInput(rawStdin) : rawStdin;
+  const isAntigravityStop = Boolean(
+    options.hookType === "stop" ||
+      (payload &&
+        typeof payload === "object" &&
+        ("conversationId" in payload ||
+          "fullyIdle" in payload ||
+          "turnStatus" in payload ||
+          "workspacePaths" in payload ||
+          "agentResponse" in payload ||
+          "terminationReason" in payload ||
+          "executionNum" in payload)),
+  );
+  const stopStdout = isAntigravityStop ? JSON.stringify({ decision: "allow" }) + "\n" : "";
+
   if (payload && payload.fullyIdle === false) {
-    return { exitCode: 0, freed: [] };
+    return { exitCode: 0, freed: [], stdout: stopStdout, stderr: "" };
   }
   // GitHub Copilot fires sessionEnd with reason "complete" after every agent turn while the
   // session stays open (same sessionId, same host process). Keep the lease; TTL expiry and
   // dead-anchor GC reclaim it if the session never sends a terminal reason.
   if (payload && payload.reason === "complete") {
-    return { exitCode: 0, freed: [] };
+    return { exitCode: 0, freed: [], stdout: stopStdout, stderr: "" };
   }
   const rawPpid = options.ppid ?? process.ppid;
   getAncestorPids(rawPpid);
@@ -534,7 +552,7 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
   );
 
   if (!targetSessionId) {
-    return { exitCode: 0, freed: [] };
+    return { exitCode: 0, freed: [], stdout: stopStdout, stderr: "" };
   }
 
   const freeRes = cmdFree(
@@ -547,6 +565,8 @@ export function handleStopHook(stateDir, rawStdin, options = {}) {
     exitCode: freeRes.exitCode,
     freed: freeRes.freed || [],
     error: freeRes.error,
+    stdout: stopStdout,
+    stderr: "",
   };
 }
 

@@ -6147,7 +6147,9 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
         hookType === "session_end" ||
         hookType === "session_shutdown"
       ) {
-        const res = handleStopHook(stateDir, rawStdin);
+        const res = handleStopHook(stateDir, rawStdin, { hookType });
+        if (res.stderr) process.stderr.write(res.stderr);
+        if (res.stdout) process.stdout.write(res.stdout);
         return res.exitCode;
       }
       const res = handlePreToolUseHook(stateDir, rawStdin);

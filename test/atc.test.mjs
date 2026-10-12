@@ -797,7 +797,21 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
       { ppid: process.pid }
     );
     assert.equal(antigravityNonAtcLazyMcp.exitCode, 0);
-    assert.equal(antigravityNonAtcLazyMcp.stdout, "");
+    assert.deepEqual(JSON.parse(antigravityNonAtcLazyMcp.stdout), { decision: "allow" });
+
+    const antigravityFastAllow = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversationId: "conv-lazy-456",
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "echo hello" },
+        },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(antigravityFastAllow.exitCode, 0);
+    assert.deepEqual(JSON.parse(antigravityFastAllow.stdout), { decision: "allow" });
 
     // 2. PreToolUse rewrites `atc claim` to inject ATC_SESSION_ID in Claude/Codex format
     const preRewrite = handlePreToolUseHook(
@@ -7496,8 +7510,9 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
     assert.match(antigravityHooks.atc.Stop[0].command, /'hook', 'Stop'/);
 
     const antigravityMcp = JSON.parse(fs.readFileSync(new URL("mcp_config.json", rootDir), "utf8"));
-    assert.equal(antigravityMcp.mcpServers.atc.command, "atc");
-    assert.deepEqual(antigravityMcp.mcpServers.atc.args, ["mcp"]);
+    assert.equal(antigravityMcp.mcpServers.atc.command, "node");
+    assert.equal(antigravityMcp.mcpServers.atc.args[0], "-e");
+    assert.match(antigravityMcp.mcpServers.atc.args[1], /'mcp'/);
 
     const agentsMarketplace = JSON.parse(fs.readFileSync(new URL(".agents/plugins/marketplace.json", rootDir), "utf8"));
     assert.equal(agentsMarketplace.name, "atc");
@@ -7572,6 +7587,25 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
           overwrite: { Arguments: { type: "phone", session: "ag-e2e" } },
         });
 
+        const agNonAtcMcpRes = execHookManifestCmd(
+          antigravityHooks.atc.PreToolUse[0].hooks[0].command,
+          {
+            conversationId: "ag-e2e",
+            toolCall: {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: "chrome-devtools",
+                ToolName: "list_pages",
+                Arguments: {},
+              },
+            },
+          },
+          { ANTIGRAVITY_CONVERSATION_ID: "ag-e2e" },
+          repoRootPath,
+        );
+        assert.equal(agNonAtcMcpRes.status, 0);
+        assert.deepEqual(JSON.parse(agNonAtcMcpRes.stdout), { decision: "allow" });
+
         const agStopRes = execHookManifestCmd(
           antigravityHooks.atc.Stop[0].command,
           { conversationId: "ag-e2e", fullyIdle: true },
@@ -7579,6 +7613,52 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
           repoRootPath,
         );
         assert.equal(agStopRes.status, 0);
+        assert.deepEqual(JSON.parse(agStopRes.stdout), { decision: "allow" });
+
+        // Antigravity mcp_config.json launches packaged bin/atc.mjs when copied to ~/.gemini/config/plugins/atc without global atc on PATH
+        const fakeHome = makeTempStateDir();
+        try {
+          const fakePluginDir = path.join(fakeHome, ".gemini", "config", "plugins", "atc");
+          fs.mkdirSync(fakePluginDir, { recursive: true });
+          fs.cpSync(path.join(repoRootPath, "bin"), path.join(fakePluginDir, "bin"), {
+            recursive: true,
+          });
+          fs.cpSync(path.join(repoRootPath, "src"), path.join(fakePluginDir, "src"), {
+            recursive: true,
+          });
+          fs.cpSync(
+            path.join(repoRootPath, "package.json"),
+            path.join(fakePluginDir, "package.json"),
+          );
+          const agMcpServerRes = spawnSync(
+            process.execPath,
+            antigravityMcp.mcpServers.atc.args,
+            {
+              cwd: fakeWs,
+              input:
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "initialize",
+                  params: {},
+                }) + "\n",
+              encoding: "utf8",
+              env: {
+                ...process.env,
+                HOME: fakeHome,
+                USERPROFILE: fakeHome,
+                PATH: path.dirname(process.execPath),
+                ATC_STATE_DIR: dir,
+              },
+              timeout: 5000,
+            },
+          );
+          assert.equal(agMcpServerRes.status, 0);
+          const mcpInitReply = JSON.parse(agMcpServerRes.stdout.trim());
+          assert.equal(mcpInitReply.result.serverInfo.name, "android-traffic-control");
+        } finally {
+          fs.rmSync(fakeHome, { recursive: true, force: true });
+        }
 
         // Claude Code & OpenAI Codex & Gemini CLI (hooks/hooks.json)
         const stdHooks = JSON.parse(fs.readFileSync(new URL("hooks/hooks.json", rootDir), "utf8"));

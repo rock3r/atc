@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "atc": {
-      "command": "atc",
-      "args": ["mcp"]
+      "command": "node",
+      "args": [
+        "-e",
+        "const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path'); const { pathToFileURL } = require('node:url'); const cwd = path.resolve(process.cwd()); let realCwd = cwd; try { realCwd = fs.realpathSync(cwd); } catch {} const isOutsideCwd = (p) => { if (!p || !path.isAbsolute(p)) return false; const rp = path.resolve(p); let rrp = rp; try { rrp = fs.realpathSync(rp); } catch {} return rp !== cwd && !rp.startsWith(cwd + path.sep) && rp !== realCwd && !rp.startsWith(realCwd + path.sep) && rrp !== cwd && !rrp.startsWith(cwd + path.sep) && rrp !== realCwd && !rrp.startsWith(realCwd + path.sep); }; const safePathDirs = (process.env.PATH || '').split(path.delimiter).filter(isOutsideCwd); const roots = [...[process.env.CLAUDE_PLUGIN_ROOT, process.env.CODEX_PLUGIN_ROOT, process.env.GEMINI_EXTENSION_PATH, process.env.CURSOR_PLUGIN_ROOT].filter(isOutsideCwd), ...[path.join(os.homedir(), '.gemini', 'config', 'plugins', 'atc'), path.join(os.homedir(), '.gemini', 'jetski', 'plugins', 'atc'), path.join(os.homedir(), '.gemini', 'plugins', 'atc'), path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'npm', 'node_modules', '@rock3r', 'atc'), path.resolve(process.execPath, '..', '..', 'lib', 'node_modules', '@rock3r', 'atc'), path.resolve(process.execPath, '..', 'node_modules', '@rock3r', 'atc')].filter((p) => p && path.isAbsolute(p))]; let entry = roots.map((r) => path.join(r, 'bin', 'atc.mjs')).find((p) => fs.existsSync(p)); if (!entry) { for (const d of safePathDirs) { const p = path.resolve(d, '..', 'lib', 'node_modules', '@rock3r', 'atc', 'bin', 'atc.mjs'); if (fs.existsSync(p)) { entry = p; break; } const b = path.join(d, 'atc'); if (fs.existsSync(b)) { try { const rp = fs.realpathSync(b); if (rp.endsWith('.mjs') && isOutsideCwd(path.dirname(rp))) { entry = rp; break; } } catch {} } } } if (!entry) { process.stderr.write('[atc] Could not locate trusted bin/atc.mjs entry point.\\n'); process.exit(2); } process.argv = [process.execPath, entry, 'mcp']; import(pathToFileURL(entry).href).catch((err) => { process.stderr.write(String(err) + '\\n'); process.exit(2); });"
+      ]
     }
   }
 }
