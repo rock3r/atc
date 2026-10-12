@@ -56,6 +56,7 @@
     ".claude-plugin/",
     ".mcp.json",
     "mcp.json",
+    "mcp_config.json",
     "com.github.copilot/",
     "hooks.json",
     "plugin.json",

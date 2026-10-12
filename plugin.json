@@ -1,8 +1,14 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "atc",
+  "displayName": "Agent Traffic Control",
   "version": "2.0.0",
   "description": "Coordinate exclusive Android emulator (AVD), iOS Simulator, and physical device leases across concurrent coding agents with the atc CLI, PreToolUse/SessionEnd hooks, and stdio MCP server.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Claim an API 36 phone emulator and an iOS 18 simulator, then run KMP verification.",
+    "Check available Android and iOS devices and active leases with atc status."
+  ],
   "author": {
     "name": "Sebastiano Poggi"
   },
@@ -20,7 +26,6 @@
     "testing",
     "multi-agent"
   ],
-  "skills": "./skills/",
   "hooks": "./hooks/hooks.json",
   "extensions": {
     "com.openai": {

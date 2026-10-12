@@ -64,12 +64,11 @@ if (
 if (portableManifest.$schema !== "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json") {
   throw new Error("portable plugin must target Agent Plugins 1.0.0");
 }
-if (
-  portableManifest.skills !== "./skills/" ||
-  codexManifest.skills !== "./skills/" ||
-  claudeManifest.skills !== "./skills/"
-) {
-  throw new Error("Portable, Codex, and Claude plugin manifests must expose ./skills/");
+if (codexManifest.skills !== "./skills/" || claudeManifest.skills !== "./skills/") {
+  throw new Error("Codex and Claude plugin manifests must expose ./skills/");
+}
+if ("skills" in portableManifest && !Array.isArray(portableManifest.skills)) {
+  throw new Error("root plugin.json must not set skills to a string path (breaks Antigravity plugin loader)");
 }
 
 const frontmatterVersionMatch = skillMarkdown.match(/^---\r?\n[\s\S]*?\r?\n  version:\s*"([^"]+)"[\s\S]*?\r?\n---/);

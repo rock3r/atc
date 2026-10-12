@@ -48,7 +48,9 @@ Install the optional agent plugin so your coding agent loads the `atc` skill and
 |---|---|
 | Claude Code | `/plugin marketplace add rock3r/atc` then `/plugin install atc@atc` |
 | Codex | `codex plugin marketplace add rock3r/atc && codex plugin add atc@atc` |
-| Gemini CLI / Antigravity | Copy `skills/atc` to `~/.gemini/skills/atc` and wire `atc hook pre-tool-use` + `atc hook stop` |
+| GitHub Copilot CLI / app | `copilot plugin marketplace add rock3r/atc && copilot plugin install atc@atc` |
+| Antigravity | Symlink or copy package root to `~/.gemini/config/plugins/atc` (`plugin.json`, `skills/atc`, `hooks.json`, `mcp_config.json`) |
+| Gemini CLI | Copy `skills/atc` to `~/.gemini/skills/atc` and wire `atc hook pre-tool-use` + `atc hook stop` |
 | Cursor | Copy `.cursor/hooks.json` into `.cursor/hooks.json` (and optional `.mcp.json`) |
 | Pi | Load `extensions/atc/index.ts` |
 

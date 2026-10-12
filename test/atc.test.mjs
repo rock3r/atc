@@ -694,20 +694,124 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
   const dir = makeTempStateDir();
   try {
-    // 1. PreToolUse denies unleased adb shell in Antigravity format
+    // 1. PreToolUse denies unleased adb shell in Antigravity format (exitCode 0 + decision: "deny" so Antigravity parses stdout instead of ignoring ExitError)
     const preDeny = handlePreToolUseHook(
       dir,
       JSON.stringify({
         conversationId: "conv-123",
+        workspacePaths: ["/workspace/from-antigravity"],
         toolCall: {
           name: "run_command",
-          args: { CommandLine: "adb shell pm list packages" },
+          args: { CommandLine: "adb shell pm list packages", Cwd: "/workspace/from-tool-args" },
         },
       }),
       { ppid: process.pid }
     );
-    assert.equal(preDeny.exitCode, 2);
-    assert.equal(JSON.parse(preDeny.stdout).decision, "block");
+    assert.equal(preDeny.exitCode, 0);
+    const preDenyOut = JSON.parse(preDeny.stdout);
+    assert.equal(preDenyOut.decision, "deny");
+    assert.match(preDenyOut.reason, /atc claim/);
+    assert.equal(readState(dir).hookSessions[String(process.pid)]?.cwd, "/workspace/from-tool-args");
+
+    // 1b. PreToolUse rewrites `atc claim` in Antigravity format with decision: "allow" + overwrite.CommandLine
+    const antigravityRewrite = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversationId: "conv-123",
+        workspacePaths: ["/workspace/from-antigravity"],
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "atc claim --type phone" },
+        },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(antigravityRewrite.exitCode, 0);
+    const antigravityRewriteOut = JSON.parse(antigravityRewrite.stdout);
+    assert.equal(antigravityRewriteOut.decision, "allow");
+    assert.match(
+      antigravityRewriteOut.overwrite.CommandLine,
+      /(?:ATC_SESSION_ID=conv-123|--session conv-123)/
+    );
+    assert.equal(
+      readState(dir).hookSessions[String(process.pid)]?.cwd,
+      "/workspace/from-antigravity"
+    );
+
+    // 1c. PreToolUse injects session into Antigravity MCP tool calls with decision: "allow" + overwrite
+    const antigravityMcp = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversationId: "conv-123",
+        workspacePaths: ["/workspace/from-antigravity"],
+        toolCall: {
+          name: "mcp_atc_atc_claim",
+          args: { type: "phone" },
+        },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(antigravityMcp.exitCode, 0);
+    const antigravityMcpOut = JSON.parse(antigravityMcp.stdout);
+    assert.equal(antigravityMcpOut.decision, "allow");
+    assert.equal(antigravityMcpOut.overwrite.session, "conv-123");
+    assert.equal(antigravityMcpOut.overwrite.type, "phone");
+
+    // 1d. PreToolUse unwraps Antigravity lazy MCP calls (`call_mcp_tool`) and overwrites Arguments.session
+    const antigravityLazyMcp = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversationId: "conv-lazy-456",
+        workspacePaths: ["/workspace/from-antigravity"],
+        toolCall: {
+          name: "call_mcp_tool",
+          args: {
+            ServerName: "atc_atc",
+            ToolName: "atc_claim",
+            Arguments: { type: "phone", api: "36" },
+          },
+        },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(antigravityLazyMcp.exitCode, 0);
+    const antigravityLazyMcpOut = JSON.parse(antigravityLazyMcp.stdout);
+    assert.equal(antigravityLazyMcpOut.decision, "allow");
+    assert.deepEqual(antigravityLazyMcpOut.overwrite, {
+      Arguments: { type: "phone", api: "36", session: "conv-lazy-456" },
+    });
+
+    const antigravityNonAtcLazyMcp = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversationId: "conv-lazy-456",
+        toolCall: {
+          name: "call_mcp_tool",
+          args: {
+            ServerName: "chrome-devtools",
+            ToolName: "navigate_page",
+            Arguments: { url: "https://example.com" },
+          },
+        },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(antigravityNonAtcLazyMcp.exitCode, 0);
+    assert.deepEqual(JSON.parse(antigravityNonAtcLazyMcp.stdout), { decision: "allow" });
+
+    const antigravityFastAllow = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversationId: "conv-lazy-456",
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "echo hello" },
+        },
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(antigravityFastAllow.exitCode, 0);
+    assert.deepEqual(JSON.parse(antigravityFastAllow.stdout), { decision: "allow" });
 
     // 2. PreToolUse rewrites `atc claim` to inject ATC_SESSION_ID in Claude/Codex format
     const preRewrite = handlePreToolUseHook(
@@ -4297,6 +4401,33 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 assert.notEqual(hookRun.status, 99);
                 assert.equal(hookRun.stderr.includes("EVIL_NODE_EXECUTED"), false);
                 assert.equal(hookRun.status, 2);
+
+                const agHooksCfg = JSON.parse(
+                  fs.readFileSync(new URL("../hooks.json", import.meta.url), "utf8"),
+                );
+                const agPreHookCmd = agHooksCfg.atc.PreToolUse[0].hooks[0].command;
+                const agHookRun = spawnSync("/bin/sh", ["-c", agPreHookCmd], {
+                  cwd: repoRoot,
+                  input: JSON.stringify({
+                    conversationId: "antigravity-e2e-sess",
+                    workspacePaths: [evilWorkDir],
+                    toolCall: {
+                      name: "run_command",
+                      args: { CommandLine: "adb shell getprop", Cwd: evilWorkDir },
+                    },
+                  }),
+                  env: {
+                    ...process.env,
+                    ATC_STATE_DIR: coldRediscoverDir,
+                    ANTIGRAVITY_CONVERSATION_ID: "antigravity-e2e-sess",
+                    PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+                  },
+                  encoding: "utf8",
+                });
+                assert.equal(agHookRun.status, 0);
+                const agOut = JSON.parse(agHookRun.stdout);
+                assert.equal(agOut.decision, "deny");
+                assert.match(agOut.reason, /atc claim/);
               } finally {
                 fs.rmSync(evilWorkDir, { recursive: true, force: true });
               }
@@ -7362,9 +7493,26 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
     const agentPlugin = JSON.parse(fs.readFileSync(new URL("plugin.json", rootDir), "utf8"));
     assert.equal(agentPlugin.name, "atc");
+    assert.equal(agentPlugin.displayName, "Agent Traffic Control");
+    assert.equal(agentPlugin.logo, "assets/logo.svg");
+    assert.ok(Array.isArray(agentPlugin.suggestedPrompts) && agentPlugin.suggestedPrompts.length > 0);
     assert.equal(agentPlugin.version, pkgJson.version);
-    assert.equal(agentPlugin.skills, "./skills/");
+    assert.equal(agentPlugin.skills, undefined);
     assert.equal(agentPlugin.hooks, "./hooks/hooks.json");
+
+    const antigravityHooks = JSON.parse(fs.readFileSync(new URL("hooks.json", rootDir), "utf8"));
+    assert.ok(Array.isArray(antigravityHooks.atc?.PreToolUse));
+    assert.match(antigravityHooks.atc.PreToolUse[0].matcher, /run_command/);
+    assert.match(antigravityHooks.atc.PreToolUse[0].matcher, /call_mcp_tool/);
+    assert.match(antigravityHooks.atc.PreToolUse[0].hooks[0].command, /'hook', 'PreToolUse'/);
+    assert.ok(Array.isArray(antigravityHooks.atc?.Stop));
+    assert.equal(antigravityHooks.atc.Stop[0].type, "command");
+    assert.match(antigravityHooks.atc.Stop[0].command, /'hook', 'Stop'/);
+
+    const antigravityMcp = JSON.parse(fs.readFileSync(new URL("mcp_config.json", rootDir), "utf8"));
+    assert.equal(antigravityMcp.mcpServers.atc.command, "node");
+    assert.equal(antigravityMcp.mcpServers.atc.args[0], "-e");
+    assert.match(antigravityMcp.mcpServers.atc.args[1], /'mcp'/);
 
     const agentsMarketplace = JSON.parse(fs.readFileSync(new URL(".agents/plugins/marketplace.json", rootDir), "utf8"));
     assert.equal(agentsMarketplace.name, "atc");
@@ -7386,6 +7534,208 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
     const mcpManifest = JSON.parse(fs.readFileSync(new URL(".mcp.json", rootDir), "utf8"));
     assert.equal(mcpManifest.mcpServers.atc.command, "atc");
+
+    // 7. Execute the actual hook shell commands from every host manifest end-to-end
+    if (process.platform !== "win32") {
+      const repoRootPath = path.resolve(new URL(".", rootDir).pathname);
+      const fakeWs = makeTempStateDir();
+      try {
+        const execHookManifestCmd = (cmd, payloadObj, extraEnv = {}, cwd = fakeWs) =>
+          spawnSync("/bin/sh", ["-c", cmd], {
+            cwd,
+            input: JSON.stringify(payloadObj),
+            encoding: "utf8",
+            env: { ...process.env, ATC_STATE_DIR: dir, ...extraEnv },
+            timeout: 5000,
+          });
+
+        // Antigravity (hooks.json)
+        const agPreRes = execHookManifestCmd(
+          antigravityHooks.atc.PreToolUse[0].hooks[0].command,
+          {
+            conversationId: "ag-e2e",
+            toolCall: {
+              name: "run_command",
+              args: { CommandLine: "adb shell ls", Cwd: fakeWs },
+            },
+          },
+          { ANTIGRAVITY_CONVERSATION_ID: "ag-e2e" },
+          repoRootPath,
+        );
+        assert.equal(agPreRes.status, 0);
+        assert.equal(JSON.parse(agPreRes.stdout).decision, "deny");
+
+        const agMcpRes = execHookManifestCmd(
+          antigravityHooks.atc.PreToolUse[0].hooks[0].command,
+          {
+            conversationId: "ag-e2e",
+            toolCall: {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: "atc_atc",
+                ToolName: "atc_claim",
+                Arguments: { type: "phone" },
+              },
+            },
+          },
+          { ANTIGRAVITY_CONVERSATION_ID: "ag-e2e" },
+          repoRootPath,
+        );
+        assert.equal(agMcpRes.status, 0);
+        assert.deepEqual(JSON.parse(agMcpRes.stdout), {
+          decision: "allow",
+          overwrite: { Arguments: { type: "phone", session: "ag-e2e" } },
+        });
+
+        const agNonAtcMcpRes = execHookManifestCmd(
+          antigravityHooks.atc.PreToolUse[0].hooks[0].command,
+          {
+            conversationId: "ag-e2e",
+            toolCall: {
+              name: "call_mcp_tool",
+              args: {
+                ServerName: "chrome-devtools",
+                ToolName: "list_pages",
+                Arguments: {},
+              },
+            },
+          },
+          { ANTIGRAVITY_CONVERSATION_ID: "ag-e2e" },
+          repoRootPath,
+        );
+        assert.equal(agNonAtcMcpRes.status, 0);
+        assert.deepEqual(JSON.parse(agNonAtcMcpRes.stdout), { decision: "allow" });
+
+        const agStopRes = execHookManifestCmd(
+          antigravityHooks.atc.Stop[0].command,
+          { conversationId: "ag-e2e", fullyIdle: true },
+          { ANTIGRAVITY_CONVERSATION_ID: "ag-e2e" },
+          repoRootPath,
+        );
+        assert.equal(agStopRes.status, 0);
+        assert.deepEqual(JSON.parse(agStopRes.stdout), { decision: "allow" });
+
+        // Antigravity mcp_config.json launches packaged bin/atc.mjs when installed in ~/.gemini/config/plugins/atc or ~/.gemini/antigravity-cli/plugins/atc without global atc on PATH
+        for (const subDir of ["config", "antigravity-cli"]) {
+          const fakeHome = makeTempStateDir();
+          try {
+            const fakePluginDir = path.join(fakeHome, ".gemini", subDir, "plugins", "atc");
+            fs.mkdirSync(fakePluginDir, { recursive: true });
+            fs.cpSync(path.join(repoRootPath, "bin"), path.join(fakePluginDir, "bin"), {
+              recursive: true,
+            });
+            fs.cpSync(path.join(repoRootPath, "src"), path.join(fakePluginDir, "src"), {
+              recursive: true,
+            });
+            fs.cpSync(
+              path.join(repoRootPath, "package.json"),
+              path.join(fakePluginDir, "package.json"),
+            );
+            const agMcpServerRes = spawnSync(
+              process.execPath,
+              antigravityMcp.mcpServers.atc.args,
+              {
+                cwd: fakeWs,
+                input:
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "initialize",
+                    params: {},
+                  }) + "\n",
+                encoding: "utf8",
+                env: {
+                  ...process.env,
+                  HOME: fakeHome,
+                  USERPROFILE: fakeHome,
+                  PATH: path.dirname(process.execPath),
+                  ATC_STATE_DIR: dir,
+                },
+                timeout: 5000,
+              },
+            );
+            assert.equal(agMcpServerRes.status, 0);
+            const mcpInitReply = JSON.parse(agMcpServerRes.stdout.trim());
+            assert.equal(mcpInitReply.result.serverInfo.name, "android-traffic-control");
+          } finally {
+            fs.rmSync(fakeHome, { recursive: true, force: true });
+          }
+        }
+
+        // Claude Code & OpenAI Codex & Gemini CLI (hooks/hooks.json)
+        const stdHooks = JSON.parse(fs.readFileSync(new URL("hooks/hooks.json", rootDir), "utf8"));
+        const claudeDenyRes = execHookManifestCmd(
+          stdHooks.hooks.PreToolUse[0].hooks[0].command,
+          {
+            session_id: "claude-e2e",
+            tool_name: "Bash",
+            tool_input: { command: "adb shell ls" },
+          },
+          { CLAUDE_PLUGIN_ROOT: repoRootPath },
+        );
+        assert.equal(claudeDenyRes.status, 2);
+        assert.equal(
+          JSON.parse(claudeDenyRes.stdout).hookSpecificOutput.permissionDecision,
+          "deny",
+        );
+
+        const codexMcpRes = execHookManifestCmd(
+          stdHooks.hooks.PreToolUse[0].hooks[0].command,
+          {
+            session_id: "codex-e2e",
+            tool_name: "mcp__plugin__atc_claim",
+            tool_input: { type: "phone" },
+          },
+          { CODEX_PLUGIN_ROOT: repoRootPath },
+        );
+        assert.equal(codexMcpRes.status, 0);
+        assert.equal(
+          JSON.parse(codexMcpRes.stdout).hookSpecificOutput.updatedInput.session,
+          "codex-e2e",
+        );
+
+        const geminiStopRes = execHookManifestCmd(
+          stdHooks.hooks.SessionEnd[0].hooks[0].command,
+          { session_id: "codex-e2e" },
+          { GEMINI_EXTENSION_PATH: repoRootPath },
+        );
+        assert.equal(geminiStopRes.status, 0);
+
+        // Cursor (.cursor/hooks.json)
+        const cursorHooks = JSON.parse(
+          fs.readFileSync(new URL(".cursor/hooks.json", rootDir), "utf8"),
+        );
+        const cursorDenyRes = execHookManifestCmd(
+          cursorHooks.hooks.beforeShellExecution[0].command,
+          {
+            hook_event_name: "beforeShellExecution",
+            conversation_id: "cursor-e2e",
+            command: "adb shell ls",
+          },
+          { CURSOR_PLUGIN_ROOT: repoRootPath },
+        );
+        assert.equal(cursorDenyRes.status, 2);
+        assert.equal(JSON.parse(cursorDenyRes.stdout).permission, "deny");
+
+        // GitHub Copilot CLI (com.github.copilot/hooks/hooks.json)
+        const copilotHooks = JSON.parse(
+          fs.readFileSync(new URL("com.github.copilot/hooks/hooks.json", rootDir), "utf8"),
+        );
+        const copilotDenyRes = execHookManifestCmd(
+          copilotHooks.hooks.preToolUse[0].command,
+          {
+            sessionId: "copilot-e2e",
+            toolName: "bash",
+            toolArgs: { command: "adb shell ls" },
+          },
+          { CLAUDE_PLUGIN_ROOT: repoRootPath },
+        );
+        assert.equal(copilotDenyRes.status, 2);
+        assert.equal(JSON.parse(copilotDenyRes.stdout).permissionDecision, "deny");
+      } finally {
+        fs.rmSync(fakeWs, { recursive: true, force: true });
+      }
+    }
 
     const versionExit = await runCli(["version", "--json"], { ATC_STATE_DIR: dir });
     assert.equal(versionExit, 0);
