@@ -582,24 +582,151 @@ export function expandOrValidateShellPath(rawPath, envMap = process.env) {
   }
   if (p.includes("$")) {
     let unresolved = false;
-    p = p.replace(/\$(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (_m, braced, plain) => {
-      const varName = braced !== undefined ? braced : plain;
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) {
-        unresolved = true;
-        return "";
-      }
-      const val = envMap?.[varName];
+    p = p.replace(
+      /\$(?:\{(?:env:)?([^}]*)\}|(?:env:)?([A-Za-z_][A-Za-z0-9_]*))/gi,
+      (_m, braced, plain) => {
+        const varName = braced !== undefined ? braced : plain;
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) {
+          unresolved = true;
+          return "";
+        }
+        const val = envMap?.[varName] ?? envMap?.[varName.toUpperCase()];
+        if (val === undefined || val === null || String(val) === "") {
+          unresolved = true;
+          return "";
+        }
+        return String(val);
+      },
+    );
+    if (unresolved || p.includes("$")) {
+      return { resolved: null, unresolved: true };
+    }
+  }
+  if (p.includes("%")) {
+    let unresolved = false;
+    p = p.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (_m, varName) => {
+      const val = envMap?.[varName] ?? envMap?.[varName.toUpperCase()];
       if (val === undefined || val === null || String(val) === "") {
         unresolved = true;
         return "";
       }
       return String(val);
     });
-    if (unresolved || p.includes("$")) {
+    if (unresolved || p.includes("%")) {
       return { resolved: null, unresolved: true };
     }
   }
   return { resolved: p, unresolved: false };
+}
+
+function expandShellBuildClausePaths(cmd, args = [], envMap = process.env) {
+  let nextCmd = String(cmd || "");
+  if (
+    nextCmd.includes("/") ||
+    nextCmd.includes("\\") ||
+    nextCmd.includes("$") ||
+    nextCmd.startsWith("~") ||
+    nextCmd.includes("%")
+  ) {
+    const expCmd = expandOrValidateShellPath(nextCmd, envMap);
+    if (expCmd.unresolved) {
+      return { cmd: nextCmd, args, unresolved: true };
+    }
+    nextCmd = expCmd.resolved;
+  }
+  const tool = normalizeBuildToolName(nextCmd);
+  const nextArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
+  if (!tool) {
+    return { cmd: nextCmd, args: nextArgs, unresolved: false };
+  }
+  const expandArgVal = (rawVal) => expandOrValidateShellPath(rawVal, envMap);
+
+  if (tool === "gradle") {
+    const gradlePathFlags = new Set([
+      "-p",
+      "--project-dir",
+      "-c",
+      "--settings-file",
+      "-b",
+      "--build-file",
+      "-g",
+      "--gradle-user-home",
+    ]);
+    const gradleEqPrefixes = [
+      "--project-dir=",
+      "-p=",
+      "--settings-file=",
+      "-c=",
+      "--build-file=",
+      "-b=",
+      "--gradle-user-home=",
+      "-g=",
+    ];
+    for (let i = 0; i < nextArgs.length; i++) {
+      const a = nextArgs[i];
+      if (a === "--") break;
+      if (gradlePathFlags.has(a) && i + 1 < nextArgs.length) {
+        const exp = expandArgVal(nextArgs[i + 1]);
+        if (exp.unresolved) return { cmd: nextCmd, args: nextArgs, unresolved: true };
+        nextArgs[i + 1] = exp.resolved;
+        i++;
+        continue;
+      }
+      const eqPrefix = gradleEqPrefixes.find((p) => a.startsWith(p) && a.length > p.length);
+      if (eqPrefix) {
+        const exp = expandArgVal(a.slice(eqPrefix.length));
+        if (exp.unresolved) return { cmd: nextCmd, args: nextArgs, unresolved: true };
+        nextArgs[i] = `${eqPrefix}${exp.resolved}`;
+      }
+    }
+  } else if (tool === "bazel") {
+    const bazelPathFlags = new Set(["--output_base", "--output_user_root"]);
+    const bazelEqPrefixes = ["--output_base=", "--output_user_root="];
+    for (let i = 0; i < nextArgs.length; i++) {
+      const a = nextArgs[i];
+      if (bazelPathFlags.has(a) && i + 1 < nextArgs.length) {
+        const exp = expandArgVal(nextArgs[i + 1]);
+        if (exp.unresolved) return { cmd: nextCmd, args: nextArgs, unresolved: true };
+        nextArgs[i + 1] = exp.resolved;
+        i++;
+        continue;
+      }
+      const eqPrefix = bazelEqPrefixes.find((p) => a.startsWith(p));
+      if (eqPrefix) {
+        const exp = expandArgVal(a.slice(eqPrefix.length));
+        if (exp.unresolved) return { cmd: nextCmd, args: nextArgs, unresolved: true };
+        nextArgs[i] = `${eqPrefix}${exp.resolved}`;
+        continue;
+      }
+      if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
+        i++;
+        continue;
+      }
+      if (!a.startsWith("-") && BAZEL_SUBCOMMANDS.has(a.toLowerCase())) {
+        break;
+      }
+    }
+  } else if (tool === "xcodebuild") {
+    const xcodePathFlags = new Set(["-workspace", "-project", "-derivedDataPath"]);
+    const xcodeEqPrefixes = ["-workspace=", "-project=", "-derivedDataPath="];
+    for (let i = 0; i < nextArgs.length; i++) {
+      const a = nextArgs[i];
+      if (xcodePathFlags.has(a) && i + 1 < nextArgs.length) {
+        const exp = expandArgVal(nextArgs[i + 1]);
+        if (exp.unresolved) return { cmd: nextCmd, args: nextArgs, unresolved: true };
+        nextArgs[i + 1] = exp.resolved;
+        i++;
+        continue;
+      }
+      const eqPrefix = xcodeEqPrefixes.find((p) => a.startsWith(p));
+      if (eqPrefix) {
+        const exp = expandArgVal(a.slice(eqPrefix.length));
+        if (exp.unresolved) return { cmd: nextCmd, args: nextArgs, unresolved: true };
+        nextArgs[i] = `${eqPrefix}${exp.resolved}`;
+      }
+    }
+  }
+  return { cmd: nextCmd, args: nextArgs, unresolved: false };
 }
 
 export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
@@ -1166,15 +1293,21 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             continue;
           }
           const headTok = rawTokens[0];
+          const headLower = headTok.toLowerCase();
           if (
-            headTok === "export" ||
-            rawTokens.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
+            headLower === "export" ||
+            (base === "cmd" && headLower === "set" && rawTokens.length > 1) ||
+            rawTokens.every((t) => /^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*=/i.test(t))
           ) {
-            const assignTokens = headTok === "export" ? rawTokens.slice(1) : rawTokens;
+            const assignTokens =
+              headLower === "export" || (base === "cmd" && headLower === "set")
+                ? rawTokens.slice(1)
+                : rawTokens;
             for (const tok of assignTokens) {
-              if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+              if (/^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*=/i.test(tok)) {
                 const eqIdx = tok.indexOf("=");
-                const k = tok.slice(0, eqIdx);
+                const rawKey = tok.slice(0, eqIdx);
+                const k = rawKey.replace(/^\$env:/i, "");
                 const rawVal = tok.slice(eqIdx + 1);
                 const expVal = expandOrValidateShellPath(rawVal, shellEnv);
                 const finalVal = expVal.unresolved ? rawVal : expVal.resolved;
@@ -1185,7 +1318,22 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             popSubshells();
             continue;
           }
-          if (headTok === "unset") {
+          if (
+            (base === "powershell" || base === "pwsh") &&
+            /^\$env:[A-Za-z_][A-Za-z0-9_]*$/i.test(headTok) &&
+            rawTokens[1] === "=" &&
+            rawTokens.length >= 3
+          ) {
+            const k = headTok.replace(/^\$env:/i, "");
+            const rawVal = rawTokens.slice(2).join(" ");
+            const expVal = expandOrValidateShellPath(rawVal, shellEnv);
+            const finalVal = expVal.unresolved ? rawVal : expVal.resolved;
+            shellEnv[k] = finalVal;
+            envVars[k] = finalVal;
+            popSubshells();
+            continue;
+          }
+          if (headLower === "unset") {
             for (const tok of rawTokens.slice(1)) {
               if (!tok.startsWith("-")) {
                 delete shellEnv[tok];
@@ -1195,9 +1343,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             popSubshells();
             continue;
           }
-          if (headTok === "popd") {
+          if (headLower === "popd" || headLower === "pop-location") {
+            const hasNamedStack = rawTokens
+              .slice(1)
+              .some((t) => /^-stackname(?::|$)/i.test(t));
             let isAbsPop = false;
-            if (pushdStack.length > 0) {
+            if (!hasNamedStack && pushdStack.length > 0) {
               const popped = pushdStack.pop();
               curShellRelCwd = popped.cwd;
               curShellUnresolvedCwd = popped.unresolvedCwd;
@@ -1212,28 +1363,65 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             popSubshells();
             continue;
           }
-          if (headTok === "cd" || headTok === "pushd") {
+          const isPushdCmd = headLower === "pushd" || headLower === "push-location";
+          const isCdCmd =
+            headLower === "cd" ||
+            headLower === "chdir" ||
+            headLower === "sl" ||
+            headLower === "set-location" ||
+            headLower === "cd.." ||
+            headLower === "cd\\";
+          if (isCdCmd || isPushdCmd) {
             let dirIdx = 1;
-            while (dirIdx < rawTokens.length && rawTokens[dirIdx].startsWith("-")) {
-              if (rawTokens[dirIdx] === "-") break;
-              if (rawTokens[dirIdx] === "--") {
-                dirIdx++;
+            let stackNameUsed = false;
+            let implicitTargetDir =
+              headLower === "cd.." ? ".." : headLower === "cd\\" ? "\\" : null;
+            if (!implicitTargetDir) {
+              while (dirIdx < rawTokens.length) {
+                const tok = rawTokens[dirIdx];
+                if (/^\/d$/i.test(tok)) {
+                  dirIdx++;
+                  continue;
+                }
+                if (/^-(?:path|literalpath)$/i.test(tok)) {
+                  dirIdx++;
+                  break;
+                }
+                if (/^-passthru$/i.test(tok)) {
+                  dirIdx++;
+                  continue;
+                }
+                if (/^-stackname$/i.test(tok)) {
+                  stackNameUsed = true;
+                  dirIdx += 2;
+                  continue;
+                }
+                if (tok.startsWith("-")) {
+                  if (tok === "-") break;
+                  if (tok === "--") {
+                    dirIdx++;
+                    break;
+                  }
+                  dirIdx++;
+                  continue;
+                }
                 break;
               }
-              dirIdx++;
             }
             let isAbsTarget = false;
             const prevCwdForOldPwd =
               !curShellUnresolvedCwd && curShellRelCwd && path.isAbsolute(curShellRelCwd)
                 ? curShellRelCwd
                 : null;
-            if (dirIdx >= rawTokens.length) {
-              if (headTok === "cd") {
+            if (stackNameUsed) {
+              curShellUnresolvedCwd = true;
+            } else if (!implicitTargetDir && dirIdx >= rawTokens.length) {
+              if (isCdCmd) {
                 const home = shellEnv?.HOME || shellEnv?.USERPROFILE || os.homedir();
                 if (home) {
                   curShellRelCwd = home;
                   curShellUnresolvedCwd = false;
-                  isAbsTarget = path.isAbsolute(home);
+                  isAbsTarget = path.isAbsolute(home) || /^[A-Za-z]:[\\/]/.test(home);
                 } else {
                   curShellUnresolvedCwd = true;
                 }
@@ -1241,17 +1429,18 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 curShellUnresolvedCwd = true;
               }
             } else {
-              const targetDir = rawTokens[dirIdx];
+              const targetDir = implicitTargetDir || rawTokens[dirIdx];
               if (targetDir === "-") {
                 if (shellEnv?.OLDPWD && !curShellUnresolvedCwd) {
                   curShellRelCwd = shellEnv.OLDPWD;
                   curShellUnresolvedCwd = false;
-                  isAbsTarget = path.isAbsolute(shellEnv.OLDPWD);
+                  isAbsTarget =
+                    path.isAbsolute(shellEnv.OLDPWD) || /^[A-Za-z]:[\\/]/.test(shellEnv.OLDPWD);
                 } else {
                   curShellUnresolvedCwd = true;
                 }
               } else if (targetDir) {
-                if (headTok === "pushd") {
+                if (isPushdCmd) {
                   pushdStack.push({
                     cwd: curShellRelCwd,
                     unresolvedCwd: curShellUnresolvedCwd,
@@ -1262,7 +1451,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                   curShellUnresolvedCwd = true;
                 } else {
                   const resolvedDir = exp.resolved;
-                  if (path.isAbsolute(resolvedDir)) {
+                  if (path.isAbsolute(resolvedDir) || /^[A-Za-z]:[\\/]/.test(resolvedDir)) {
                     curShellRelCwd = resolvedDir;
                     curShellUnresolvedCwd = false;
                     isAbsTarget = true;
@@ -1291,9 +1480,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             env: shellEnv,
             inShell: true,
           });
-          if (normalizeBuildToolName(peeled.cmd)) {
+          const clauseEnv = { ...shellEnv, ...(peeled.envVars || {}) };
+          const expandedClause = expandShellBuildClausePaths(peeled.cmd, peeled.args, clauseEnv);
+          if (normalizeBuildToolName(expandedClause.cmd)) {
             const clauseUnresolvedCwd = Boolean(
               peeled.unresolvedDynamicCwd ||
+                expandedClause.unresolved ||
                 (curShellUnresolvedCwd && !(peeled.relCwd && path.isAbsolute(peeled.relCwd))),
             );
             const effectiveRelCwd = peeled.relCwd
@@ -1304,8 +1496,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                   : peeled.relCwd
               : curShellRelCwd || null;
             matchedClauses.push({
-              cmd: peeled.cmd,
-              args: peeled.args,
+              cmd: expandedClause.cmd,
+              args: expandedClause.args,
               relCwd: effectiveRelCwd,
               envVars: { ...envVars, ...(peeled.envVars || {}) },
               backgrounded: Boolean(clauseObj.backgrounded || peeled.backgrounded),

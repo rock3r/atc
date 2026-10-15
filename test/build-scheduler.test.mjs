@@ -1750,6 +1750,50 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       { jobsLimit: 4, reservedRamMb: 3072 },
     );
     assert.equal(heredocInv.args[1], heredocScript);
+
+    // Shell-expanded project path flags (-p "$PROJECT_DIR") resolve before locking and reject unset vars
+    const expandedFlagReqs = resolveBuildResources(
+      "sh",
+      ["-c", './gradlew -p "$PROJECT_DIR" build'],
+      wsDir,
+      { env: { ...process.env, PROJECT_DIR: subAppDir } },
+    );
+    assert.equal(expandedFlagReqs.kind, "pure_build");
+    assert.deepEqual(expandedFlagReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    const unresolvedFlagReqs = resolveBuildResources(
+      "sh",
+      ["-c", './gradlew -p "$UNSET_PROJECT_DIR" build'],
+      wsDir,
+      { env: {} },
+    );
+    assert.equal(unresolvedFlagReqs.kind, "deny_lifecycle");
+
+    // Windows cmd `cd /d` and PowerShell `Set-Location` / `Push-Location` / `Pop-Location`
+    const cmdCdDReqs = resolveBuildResources(
+      "cmd",
+      ["/c", "cd /d app && gradlew.bat build"],
+      wsDir,
+    );
+    assert.equal(cmdCdDReqs.kind, "pure_build");
+    assert.deepEqual(cmdCdDReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    const pwshSetLocReqs = resolveBuildResources(
+      "pwsh",
+      ["-Command", "Set-Location app; .\\gradlew.bat build"],
+      wsDir,
+    );
+    assert.equal(pwshSetLocReqs.kind, "pure_build");
+    assert.deepEqual(pwshSetLocReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    const pwshPushPopReqs = resolveBuildResources(
+      "pwsh",
+      ["-Command", "Push-Location -Path app; .\\gradlew.bat build; Pop-Location; .\\gradlew.bat test"],
+      wsDir,
+    );
+    assert.equal(pwshPushPopReqs.kind, "pure_build");
+    assert.ok(pwshPushPopReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
+    assert.ok(pwshPushPopReqs.resourceKeys.includes(`gradle:${canonicalWs}`));
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

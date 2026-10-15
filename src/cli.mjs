@@ -6453,8 +6453,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       );
       if (!postClaimTx?.ok) {
         if (postClaimTx?.deviceGone) {
-          coAllocatedDeviceLease = null;
-          coAllocatedDeviceCreated = false;
+          coAllocatedLeaseId = null;
+          coAllocatedDeviceKey = null;
         }
         // Build reservation or device lease was lost during cold device prep; re-enter admission loop
         continue;
