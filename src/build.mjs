@@ -13,13 +13,14 @@ export function canonicalizeBuildPath(targetPath) {
   }
 }
 
-export function tokenizeShellClause(clause) {
+export function tokenizeShellClauseWithSpans(clause) {
   const s = String(clause || "");
   const tokens = [];
   let cur = "";
   let inSingle = false;
   let inDouble = false;
   let hasToken = false;
+  let tokStart = -1;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (inSingle) {
@@ -42,16 +43,19 @@ export function tokenizeShellClause(clause) {
       continue;
     }
     if (ch === "'") {
+      if (!hasToken) tokStart = i;
       inSingle = true;
       hasToken = true;
       continue;
     }
     if (ch === '"') {
+      if (!hasToken) tokStart = i;
       inDouble = true;
       hasToken = true;
       continue;
     }
     if (ch === "\\" && i + 1 < s.length && /\s|['"\\]/.test(s[i + 1])) {
+      if (!hasToken) tokStart = i;
       cur += s[i + 1];
       hasToken = true;
       i++;
@@ -59,19 +63,130 @@ export function tokenizeShellClause(clause) {
     }
     if (/\s/.test(ch)) {
       if (hasToken || cur.length > 0) {
-        tokens.push(cur);
+        tokens.push({ value: cur, start: tokStart, end: i });
         cur = "";
         hasToken = false;
+        tokStart = -1;
       }
       continue;
     }
+    if (!hasToken) tokStart = i;
     cur += ch;
     hasToken = true;
   }
   if (hasToken || cur.length > 0) {
-    tokens.push(cur);
+    tokens.push({ value: cur, start: tokStart, end: s.length });
   }
   return tokens;
+}
+
+export function tokenizeShellClause(clause) {
+  return tokenizeShellClauseWithSpans(clause).map((t) => t.value);
+}
+
+function computeQuotedMask(s) {
+  const mask = new Uint8Array(s.length);
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inSingle) {
+      mask[i] = 1;
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      mask[i] = 1;
+      if (ch === "\\" && i + 1 < s.length) {
+        mask[i + 1] = 1;
+        i++;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      mask[i] = 1;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      mask[i] = 1;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) {
+      mask[i] = 1;
+      mask[i + 1] = 1;
+      i++;
+      continue;
+    }
+  }
+  return mask;
+}
+
+export function splitShellClauseRedirAndGroup(part) {
+  const s = String(part || "");
+  const trailingWs = s.match(/(\s*)$/)?.[1] || "";
+  let coreEnd = s.slice(0, s.length - trailingWs.length);
+  let suffix = "";
+  let closedSubshells = 0;
+
+  while (coreEnd.length > 0) {
+    const mask = computeQuotedMask(coreEnd);
+    const rMatch = coreEnd.match(
+      /(\s+(?:[0-9]*>>?\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|\S+)|2>&1))$/,
+    );
+    if (rMatch) {
+      const matchStart = coreEnd.length - rMatch[1].length;
+      const gtRel = rMatch[1].indexOf(">");
+      if (gtRel !== -1 && mask[matchStart + gtRel] === 0) {
+        suffix = rMatch[1] + suffix;
+        coreEnd = coreEnd.slice(0, matchStart);
+        continue;
+      }
+    }
+    const gMatch = coreEnd.match(/(\s*[)}]+)$/);
+    if (gMatch) {
+      const matchStart = coreEnd.length - gMatch[1].length;
+      let allUnquoted = true;
+      let parens = 0;
+      for (let i = matchStart; i < coreEnd.length; i++) {
+        if (coreEnd[i] === ")" || coreEnd[i] === "}") {
+          if (mask[i] === 1) {
+            allUnquoted = false;
+            break;
+          }
+          if (coreEnd[i] === ")") parens++;
+        }
+      }
+      if (allUnquoted) {
+        closedSubshells += parens;
+        suffix = gMatch[1] + suffix;
+        coreEnd = coreEnd.slice(0, matchStart);
+        continue;
+      }
+    }
+    break;
+  }
+
+  let leadingCore = coreEnd.trim();
+  let openedSubshells = 0;
+  while (leadingCore.length > 0 && /^[({]/.test(leadingCore)) {
+    if (leadingCore.startsWith("(")) {
+      openedSubshells++;
+    }
+    leadingCore = leadingCore.slice(1).trim();
+  }
+
+  return {
+    corePart: coreEnd,
+    strippedClause: leadingCore,
+    redirSuffix: suffix,
+    trailingWs,
+    openedSubshells,
+    closedSubshells,
+  };
 }
 
 export function splitShellScriptParts(script) {
@@ -293,6 +408,29 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       curArgs = curArgs.slice(i + 1);
       continue;
     }
+    if (base === "exec") {
+      let i = 0;
+      while (i < curArgs.length) {
+        const a = curArgs[i];
+        if (a === "--") {
+          i++;
+          break;
+        }
+        if (a === "-a" && i + 1 < curArgs.length) {
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          i++;
+          continue;
+        }
+        break;
+      }
+      if (i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      curArgs = curArgs.slice(i + 1);
+      continue;
+    }
     if (
       base === "sh" ||
       base === "bash" ||
@@ -321,29 +459,20 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           .filter(Boolean);
         const matchedClauses = [];
         let curShellRelCwd = relCwd;
+        let pushdStack = [];
         const cwdStack = [];
         for (const clause of clauses) {
-          let strippedClause = clause
-            .replace(/\s+[0-9]*>>?\s*\S+/g, "")
-            .replace(/\s+2>&1\b/g, "")
-            .trim();
-          while (/^[({]/.test(strippedClause)) {
-            if (strippedClause.startsWith("(")) {
-              cwdStack.push(curShellRelCwd);
-            }
-            strippedClause = strippedClause.slice(1).trim();
-          }
-          let closedSubshells = 0;
-          while (/[)}]$/.test(strippedClause)) {
-            if (strippedClause.endsWith(")")) {
-              closedSubshells++;
-            }
-            strippedClause = strippedClause.slice(0, -1).trim();
+          const { strippedClause, openedSubshells, closedSubshells } =
+            splitShellClauseRedirAndGroup(clause);
+          for (let s = 0; s < openedSubshells; s++) {
+            cwdStack.push({ cwd: curShellRelCwd, pushdStack: [...pushdStack] });
           }
           const popSubshells = () => {
             for (let s = 0; s < closedSubshells; s++) {
               if (cwdStack.length > 0) {
-                curShellRelCwd = cwdStack.pop();
+                const frame = cwdStack.pop();
+                curShellRelCwd = frame.cwd;
+                pushdStack = frame.pushdStack;
               }
             }
           };
@@ -353,6 +482,13 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             continue;
           }
           const headTok = rawTokens[0];
+          if (headTok === "popd") {
+            if (pushdStack.length > 0) {
+              curShellRelCwd = pushdStack.pop();
+            }
+            popSubshells();
+            continue;
+          }
           if ((headTok === "cd" || headTok === "pushd") && rawTokens.length >= 2) {
             let dirIdx = 1;
             while (dirIdx < rawTokens.length && rawTokens[dirIdx].startsWith("-")) {
@@ -361,6 +497,9 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             if (dirIdx < rawTokens.length) {
               const targetDir = rawTokens[dirIdx];
               if (targetDir && targetDir !== "-") {
+                if (headTok === "pushd") {
+                  pushdStack.push(curShellRelCwd);
+                }
                 curShellRelCwd = curShellRelCwd ? path.join(curShellRelCwd, targetDir) : targetDir;
               }
             }
@@ -516,6 +655,42 @@ const XCODEBUILD_VALUE_FLAGS = new Set([
   "-testPlan",
 ]);
 
+export function findBazelSubcommandIndex(args = [], allowedSubcommands = BAZEL_SUBCOMMANDS) {
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i]);
+    if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
+      i++;
+      continue;
+    }
+    if (a.startsWith("-")) continue;
+    if (allowedSubcommands.has(a.toLowerCase())) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = []) {
+  if (!injectedFlags || injectedFlags.length === 0) return corePart;
+  const s = String(corePart || "");
+  let leadingOffset = 0;
+  while (leadingOffset < s.length && /[\s({]/.test(s[leadingOffset])) {
+    leadingOffset++;
+  }
+  const spans = tokenizeShellClauseWithSpans(s.slice(leadingOffset));
+  const bazelIdx = spans.findIndex((t) => normalizeBuildToolName(t.value) === "bazel");
+  if (bazelIdx === -1) return corePart;
+  const afterBazel = spans.slice(bazelIdx + 1).map((t) => t.value);
+  const subRelIdx = findBazelSubcommandIndex(
+    afterBazel,
+    new Set(["build", "test", "run", "coverage"]),
+  );
+  if (subRelIdx === -1) return corePart;
+  const subSpan = spans[bazelIdx + 1 + subRelIdx];
+  const insertPos = leadingOffset + subSpan.end;
+  return `${s.slice(0, insertPos)} ${injectedFlags.join(" ")}${s.slice(insertPos)}`;
+}
+
 export function classifyBuildCommand(rawCmd, rawArgs = []) {
   const { cmd, args, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
   if (allBuildClauses && allBuildClauses.length > 1) {
@@ -654,21 +829,8 @@ export function classifyBuildCommand(rawCmd, rawArgs = []) {
   }
 
   if (tool === "bazel") {
-    let subcmd = null;
-    let subcmdIdx = -1;
-    for (let i = 0; i < strArgs.length; i++) {
-      const a = strArgs[i];
-      if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
-        i++;
-        continue;
-      }
-      if (a.startsWith("-")) continue;
-      if (BAZEL_SUBCOMMANDS.has(a)) {
-        subcmd = a;
-        subcmdIdx = i;
-        break;
-      }
-    }
+    const subcmdIdx = findBazelSubcommandIndex(strArgs, BAZEL_SUBCOMMANDS);
+    const subcmd = subcmdIdx >= 0 ? strArgs[subcmdIdx].toLowerCase() : null;
     const restArgs = subcmdIdx >= 0 ? strArgs.slice(subcmdIdx + 1) : strArgs;
     const dashDashIdx = restArgs.indexOf("--");
     const bazelFlags = dashDashIdx >= 0 ? restArgs.slice(0, dashDashIdx) : restArgs;

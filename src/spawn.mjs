@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   classifyBuildCommand,
+  findBazelSubcommandIndex,
+  injectBazelFlagsIntoShellClause,
+  normalizeBuildToolName,
   peelBuildWrapperTokens,
+  splitShellClauseRedirAndGroup,
   splitShellScriptParts,
   tokenizeShellClause,
 } from "./build.mjs";
@@ -829,29 +833,9 @@ export function buildChildInvocation(
           if (idx % 2 === 1) return part;
           const trimmed = part.trim();
           if (!trimmed) return part;
-          const trailingWs = part.match(/(\s*)$/)?.[1] || "";
-          const partNoTrail = part.slice(0, part.length - trailingWs.length);
-          let coreEnd = partNoTrail;
-          let groupAndRedirSuffix = "";
-          while (true) {
-            const rMatch = coreEnd.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1))$/);
-            if (rMatch) {
-              groupAndRedirSuffix = rMatch[1] + groupAndRedirSuffix;
-              coreEnd = coreEnd.slice(0, coreEnd.length - rMatch[1].length);
-              continue;
-            }
-            const gMatch = coreEnd.match(/(\s*[)}]+)$/);
-            if (gMatch) {
-              groupAndRedirSuffix = gMatch[1] + groupAndRedirSuffix;
-              coreEnd = coreEnd.slice(0, coreEnd.length - gMatch[1].length);
-              continue;
-            }
-            break;
-          }
-          const redirSuffix = groupAndRedirSuffix;
-          const corePart = coreEnd;
-          const leadingGroupStrip = corePart.trim().replace(/^[({]+\s*/, "");
-          const rawTokens = tokenizeShellClause(leadingGroupStrip);
+          const { corePart, strippedClause, redirSuffix, trailingWs } =
+            splitShellClauseRedirAndGroup(part);
+          const rawTokens = tokenizeShellClause(strippedClause);
           if (rawTokens.length === 0) return part;
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           const cClass = classifyBuildCommand(peeled.cmd, peeled.args);
@@ -915,10 +899,7 @@ export function buildChildInvocation(
             if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
             if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
             if (injected.length > 0) {
-              const rewrittenCore = corePart.replace(
-                /(\bbazel(?:isk|w)?(?:\.(?:exe|cmd|bat))?(?:\s+(?:"[^"]*"|'[^']*'|[^\s"'])+)*?\s+)(build|test|run|coverage)(?=\s|$)/i,
-                (_, prefix, sub) => `${prefix}${sub} ${injected.join(" ")}`,
-              );
+              const rewrittenCore = injectBazelFlagsIntoShellClause(corePart, injected);
               return `${rewrittenCore}${redirSuffix}${trailingWs}`;
             }
           }
@@ -951,7 +932,16 @@ export function buildChildInvocation(
       }
     } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "bazel") {
       const bazelBuildSubs = new Set(["build", "test", "run", "coverage"]);
-      const subIdx = nextArgs.findIndex((a) => bazelBuildSubs.has(String(a).toLowerCase()));
+      let subIdx = -1;
+      if (normalizeBuildToolName(effectiveCmd) === "bazel") {
+        subIdx = findBazelSubcommandIndex(nextArgs, bazelBuildSubs);
+      } else {
+        const bCmdIdx = nextArgs.findIndex((a) => normalizeBuildToolName(String(a)) === "bazel");
+        if (bCmdIdx !== -1) {
+          const relIdx = findBazelSubcommandIndex(nextArgs.slice(bCmdIdx + 1), bazelBuildSubs);
+          if (relIdx !== -1) subIdx = bCmdIdx + 1 + relIdx;
+        }
+      }
       if (subIdx !== -1) {
         const hasJobs = nextArgs.some((a) => {
           const s = String(a);

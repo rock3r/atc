@@ -78,25 +78,57 @@ export function flushAuditEvents(
     try {
       const st = fs.statSync(logPath);
       if (st.size >= maxFileBytes) {
-        const archiveCount = Math.max(1, Number(maxFiles || DEFAULT_MAX_LOG_FILES));
-        for (let idx = archiveCount - 1; idx >= 1; idx--) {
-          const srcArchive = path.join(logDir, `atc-audit.${idx}.jsonl`);
-          const dstArchive = path.join(logDir, `atc-audit.${idx + 1}.jsonl`);
-          if (fs.existsSync(srcArchive)) {
+        const rotateLockDir = path.join(logDir, ".atc-audit-rotate.lock");
+        let acquiredRotateLock = false;
+        try {
+          fs.mkdirSync(rotateLockDir, { mode: 0o700 });
+          acquiredRotateLock = true;
+        } catch (lockErr) {
+          if (lockErr?.code === "EEXIST") {
             try {
-              fs.rmSync(dstArchive, { force: true });
-              fs.renameSync(srcArchive, dstArchive);
+              const lockSt = fs.statSync(rotateLockDir);
+              if (Date.now() - lockSt.mtimeMs > 10_000) {
+                fs.rmSync(rotateLockDir, { recursive: true, force: true });
+                fs.mkdirSync(rotateLockDir, { mode: 0o700 });
+                acquiredRotateLock = true;
+              }
             } catch {
-              // Best-effort archive shift
+              // Another process is actively rotating or cleaned up the lock
             }
           }
         }
-        const rotatedPath = path.join(logDir, "atc-audit.1.jsonl");
-        try {
-          fs.rmSync(rotatedPath, { force: true });
-          fs.renameSync(logPath, rotatedPath);
-        } catch {
-          // Best-effort rotation
+        if (acquiredRotateLock) {
+          try {
+            const stAfterLock = fs.statSync(logPath);
+            if (stAfterLock.size >= maxFileBytes) {
+              const archiveCount = Math.max(1, Number(maxFiles || DEFAULT_MAX_LOG_FILES));
+              for (let idx = archiveCount - 1; idx >= 1; idx--) {
+                const srcArchive = path.join(logDir, `atc-audit.${idx}.jsonl`);
+                const dstArchive = path.join(logDir, `atc-audit.${idx + 1}.jsonl`);
+                if (fs.existsSync(srcArchive)) {
+                  try {
+                    fs.rmSync(dstArchive, { force: true });
+                    fs.renameSync(srcArchive, dstArchive);
+                  } catch {
+                    // Best-effort archive shift
+                  }
+                }
+              }
+              const rotatedPath = path.join(logDir, "atc-audit.1.jsonl");
+              try {
+                fs.rmSync(rotatedPath, { force: true });
+                fs.renameSync(logPath, rotatedPath);
+              } catch {
+                // Best-effort rotation
+              }
+            }
+          } finally {
+            try {
+              fs.rmSync(rotateLockDir, { recursive: true, force: true });
+            } catch {
+              // Best-effort lock removal
+            }
+          }
         }
       }
     } catch {

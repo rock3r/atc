@@ -1331,6 +1331,70 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       }),
     });
     assert.equal(matchingJavaProbe.warm, true);
+
+    // Peel shell exec builtin
+    const execBuiltinReqs = resolveBuildResources(
+      "sh",
+      ["-c", "exec ./gradlew connectedCheck"],
+      spacedAppDir,
+    );
+    assert.equal(execBuiltinReqs.kind, "device_coupled_build");
+    assert.ok(execBuiltinReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
+
+    // Track pushd and popd across shell clauses
+    fs.writeFileSync(path.join(tmpRoot, "settings.gradle.kts"), "");
+    const canonicalTmpRoot = canonicalizeBuildPath(tmpRoot);
+    const pushdPopdReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'pushd "my app" && ./gradlew assembleDebug && popd && ./gradlew test'],
+      tmpRoot,
+    );
+    assert.ok(pushdPopdReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
+    assert.ok(pushdPopdReqs.resourceKeys.includes(`gradle:${canonicalTmpRoot}`));
+
+    // Quoted > inside arguments is not treated as a shell redirection
+    const quotedRedirInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build -Pfilter='a > b'"],
+      null,
+      "sess-round11",
+      process.env,
+      buildLease,
+    );
+    assert.equal(
+      quotedRedirInv.args[1],
+      "./gradlew build -Pfilter='a > b' -Dorg.gradle.workers.max=4",
+    );
+
+    // Bazel separate startup-option value named "build" does not confuse subcommand location
+    const bazelDirectOutBaseInv = buildChildInvocation(
+      "bazel",
+      ["--output_base", "build", "build", "//app"],
+      null,
+      "sess-round11",
+      process.env,
+      buildLease,
+    );
+    assert.deepEqual(bazelDirectOutBaseInv.args, [
+      "--output_base",
+      "build",
+      "build",
+      "--jobs=4",
+      "--local_ram_resources=3072",
+      "//app",
+    ]);
+    const bazelShellOutBaseInv = buildChildInvocation(
+      "sh",
+      ["-c", "bazel --output_base build build //app"],
+      null,
+      "sess-round11",
+      process.env,
+      buildLease,
+    );
+    assert.equal(
+      bazelShellOutBaseInv.args[1],
+      "bazel --output_base build build --jobs=4 --local_ram_resources=3072 //app",
+    );
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
