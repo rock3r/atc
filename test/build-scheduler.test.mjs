@@ -2729,6 +2729,36 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.match(invalidRam.error, /Invalid --ram-mb/);
 
     // 7. cmdBatch multi-step DAG runner: cycle detection, pre-flight validation, topological execution
+    const failIfStdinRead = () => {
+      throw new Error("readStdinFn must not be called when batch flags are invalid");
+    };
+    const bogusBatchFlag = await cmdBatch(
+      stateDir,
+      null,
+      { bogus: true },
+      { cwd: dirA, readStdinFn: failIfStdinRead },
+    );
+    assert.equal(bogusBatchFlag.exitCode, 1);
+    assert.match(bogusBatchFlag.error, /Unknown option "--bogus"/);
+
+    const missingFileBatchFlag = await cmdBatch(
+      stateDir,
+      null,
+      { file: true },
+      { cwd: dirA, readStdinFn: failIfStdinRead },
+    );
+    assert.equal(missingFileBatchFlag.exitCode, 1);
+    assert.match(missingFileBatchFlag.error, /Option "--file" requires a (file path|value)/);
+
+    const missingWsBatchFlag = await cmdBatch(
+      stateDir,
+      null,
+      { workspace: true },
+      { cwd: dirA, readStdinFn: failIfStdinRead },
+    );
+    assert.equal(missingWsBatchFlag.exitCode, 1);
+    assert.match(missingWsBatchFlag.error, /Option "--workspace" requires a directory path/);
+
     const cycleRes = await cmdBatch(
       stateDir,
       {
@@ -2771,6 +2801,18 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(fs.existsSync(markerFile), false, "Step 1 must not run if Step 2 fails pre-flight");
 
     const orderLog = path.join(wsDir, "dag-order.txt");
+    const fakeBatchInventory = {
+      host: {
+        cpuCores: 8,
+        totalRamMb: 32768,
+        availableRamMb: 16384,
+        freeDiskMb: 50000,
+        sampledAtMs: Date.now(),
+      },
+      running: [],
+      offline: [],
+      creatable: [],
+    };
     const dagRes = await cmdBatch(
       stateDir,
       {
@@ -2810,7 +2852,7 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
         ],
       },
       { session: "sess-batch", json: true },
-      { cwd: dirA },
+      { cwd: dirA, inventory: fakeBatchInventory },
     );
     assert.equal(dagRes.exitCode, 0);
     assert.equal(dagRes.status, "completed");

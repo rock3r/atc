@@ -7585,9 +7585,29 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
 }
 
 export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {}) {
-  const unknownFlagErr = validateCommandFlags(flags, BATCH_ALLOWED_FLAGS, "batch");
+  const subcmdName = options.subcommand || "batch";
+  const unknownFlagErr = validateCommandFlags(flags, BATCH_ALLOWED_FLAGS, subcmdName);
   if (unknownFlagErr) {
     return { exitCode: 1, error: unknownFlagErr };
+  }
+
+  if (flags.file !== undefined && flags.file !== null) {
+    if (typeof flags.file === "boolean" || !String(flags.file).trim()) {
+      return { exitCode: 1, error: 'Option "--file" requires a file path.' };
+    }
+  }
+  if (flags.spec !== undefined && flags.spec !== null) {
+    if (typeof flags.spec === "boolean" || (typeof flags.spec === "string" && !flags.spec.trim())) {
+      return { exitCode: 1, error: 'Option "--spec" requires a JSON specification.' };
+    }
+  }
+  if (
+    flags.file !== undefined &&
+    flags.file !== null &&
+    flags.spec !== undefined &&
+    flags.spec !== null
+  ) {
+    return { exitCode: 1, error: 'Cannot combine "--file" with "--spec".' };
   }
 
   let defaultBatchWorkspace = null;
@@ -7622,8 +7642,33 @@ export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {})
   }
 
   let spec = null;
-  const effectiveSpecInput =
-    rawSpecInput || (typeof flags.spec === "string" ? flags.spec : null);
+  let effectiveSpecInput = null;
+  if (rawSpecInput !== undefined && rawSpecInput !== null) {
+    effectiveSpecInput = rawSpecInput;
+  } else if (flags.spec !== undefined && flags.spec !== null) {
+    effectiveSpecInput = flags.spec;
+  } else if (
+    flags.file !== undefined &&
+    flags.file !== null &&
+    String(flags.file).trim() !== "-"
+  ) {
+    const fileArg = String(flags.file).trim();
+    try {
+      effectiveSpecInput = fs.readFileSync(
+        path.resolve(options.cwd || process.cwd(), fileArg),
+        "utf8",
+      );
+    } catch (err) {
+      return {
+        exitCode: 1,
+        error: `Failed to read batch file "${fileArg}": ${err.message}`,
+      };
+    }
+  } else {
+    const readStdin =
+      typeof options.readStdinFn === "function" ? options.readStdinFn : readStdinSync;
+    effectiveSpecInput = readStdin();
+  }
   if (
     effectiveSpecInput &&
     typeof effectiveSpecInput === "object" &&
@@ -8398,7 +8443,8 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
     case "plan": {
       if (
         parsed.positionals.length > 1 ||
-        (parsed.positionals.length > 0 && parsed.flags.file !== undefined)
+        (parsed.positionals.length > 0 && parsed.flags.file !== undefined) ||
+        (parsed.positionals.length > 0 && parsed.flags.spec !== undefined)
       ) {
         const extra =
           parsed.positionals.length > 1 ? parsed.positionals[1] : parsed.positionals[0];
@@ -8407,23 +8453,15 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
         );
         return 1;
       }
-      const fileArg =
-        parsed.positionals[0] ||
-        (typeof parsed.flags.file === "string" ? parsed.flags.file : null);
-      let rawSpec = "";
-      if (typeof parsed.flags.spec === "string") {
-        rawSpec = parsed.flags.spec;
-      } else if (fileArg && fileArg !== "-") {
-        try {
-          rawSpec = fs.readFileSync(path.resolve(options.cwd || process.cwd(), fileArg), "utf8");
-        } catch (err) {
-          process.stderr.write(`[atc] Failed to read batch file "${fileArg}": ${err.message}\n`);
-          return 1;
-        }
-      } else {
-        rawSpec = readStdinSync();
-      }
-      const res = await cmdBatch(stateDir, rawSpec, parsed.flags, { env, ...options });
+      const batchFlags =
+        parsed.positionals.length > 0
+          ? { ...parsed.flags, file: parsed.positionals[0] }
+          : parsed.flags;
+      const res = await cmdBatch(stateDir, null, batchFlags, {
+        env,
+        ...options,
+        subcommand: parsed.subcommand,
+      });
       if (parsed.flags.json) {
         process.stdout.write(JSON.stringify(res, null, 2) + "\n");
       } else if (res.error) {
