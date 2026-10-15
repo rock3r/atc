@@ -3611,6 +3611,21 @@ export function resolveBuildResources(
           : null);
     let propsDaemonDisabled = false;
     let propsHeapMb = 0;
+    const daemonJvmCriteriaPath = path.join(
+      canonicalRoot,
+      "gradle",
+      "gradle-daemon-jvm.properties",
+    );
+    try {
+      if (
+        fs.existsSync(daemonJvmCriteriaPath) &&
+        parseJavaProperties(fs.readFileSync(daemonJvmCriteriaPath, "utf8")).size > 0
+      ) {
+        propsDaemonDisabled = true;
+      }
+    } catch {
+      // Ignore daemon JVM criteria read errors
+    }
     const gradlePropsFiles = [
       path.join(canonicalRoot, "gradle.properties"),
       ...(resolvedGradleUserHome ? [path.join(resolvedGradleUserHome, "gradle.properties")] : []),
@@ -4708,9 +4723,53 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
       }
       return false;
     };
+    const isGradleCompatibilityJvmArg = (tok) => {
+      if (!tok || !tok.startsWith("-")) return false;
+      if (
+        tok === "-cp" ||
+        tok === "-classpath" ||
+        tok === "--class-path" ||
+        tok.startsWith("--class-path=")
+      ) {
+        return false;
+      }
+      if (
+        tok.startsWith("-Dgradle.user.home=") ||
+        tok.startsWith("-Duser.dir=") ||
+        tok.startsWith("-Dorg.gradle.appname=")
+      ) {
+        return false;
+      }
+      return (
+        tok.startsWith("-Xm") ||
+        tok.startsWith("-XX:") ||
+        tok.startsWith("-Xss") ||
+        tok.startsWith("-D") ||
+        tok.startsWith("-javaagent:") ||
+        tok.startsWith("-agentlib:") ||
+        tok.startsWith("-agentpath:") ||
+        tok === "-ea" ||
+        tok.startsWith("-ea:") ||
+        tok === "-enableassertions" ||
+        tok.startsWith("-enableassertions:") ||
+        tok === "-da" ||
+        tok.startsWith("-da:") ||
+        tok === "-disableassertions" ||
+        tok.startsWith("-disableassertions:") ||
+        tok === "-esa" ||
+        tok === "-dsa"
+      );
+    };
     let expectedGradleJvmArgs = [];
     if (buildReqs.tool === "gradle" && wsRoot) {
       try {
+        const daemonJvmCriteriaPath = path.join(wsRoot, "gradle", "gradle-daemon-jvm.properties");
+        if (
+          fs.existsSync(daemonJvmCriteriaPath) &&
+          parseJavaProperties(fs.readFileSync(daemonJvmCriteriaPath, "utf8")).size > 0
+        ) {
+          return { warm: false, daemonPids: [] };
+        }
         const wrapperPropsPath = path.join(wsRoot, "gradle", "wrapper", "gradle-wrapper.properties");
         if (fs.existsSync(wrapperPropsPath)) {
           const content = fs.readFileSync(wrapperPropsPath, "utf8");
@@ -4839,10 +4898,21 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           } else if (cmdLine.includes("-Dgradle.user.home=")) {
             continue;
           }
-          if (
-            expectedGradleJvmArgs.length > 0 &&
-            !expectedGradleJvmArgs.every((arg) => matchesCmdTokenBoundary(cmdLine, arg))
-          ) {
+          const expectedCompatJvmArgs = expectedGradleJvmArgs.filter(
+            (arg) => !arg.startsWith("-Dgradle.user.home=") && !arg.startsWith("-Duser.dir="),
+          );
+          const daemonMainIdx = cmdLine.search(
+            /\b(?:org\.gradle\.launcher\.daemon\.bootstrap\.)?GradleDaemon\b/,
+          );
+          const preMainCmd = daemonMainIdx >= 0 ? cmdLine.slice(0, daemonMainIdx) : cmdLine;
+          const preMainTokens = splitShellWords(preMainCmd);
+          const daemonCompatJvmArgs = preMainTokens
+            .slice(1)
+            .filter((tok) => isGradleCompatibilityJvmArg(tok) || expectedCompatJvmArgs.includes(tok));
+          const jvmArgsMatch =
+            expectedCompatJvmArgs.every((arg) => daemonCompatJvmArgs.includes(arg)) &&
+            daemonCompatJvmArgs.every((arg) => expectedCompatJvmArgs.includes(arg));
+          if (!jvmArgsMatch) {
             continue;
           }
           const matchesWorkspaceOrWrapper =

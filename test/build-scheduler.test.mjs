@@ -47,6 +47,10 @@ function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "atc-build-test-"));
 }
 
+delete process.env.GRADLE_OPTS;
+delete process.env.JAVA_OPTS;
+delete process.env.GRADLE_USER_HOME;
+
 test("classifyBuildCommand & resolveBuildResources handle gradle, bazel, xcodebuild, and build-brief wrappers", () => {
   const tmp = makeTempDir();
   const wsDir = path.join(tmp, "repo");
@@ -1213,15 +1217,26 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       path.join(wrapperDir, "gradle-wrapper.properties"),
       "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n",
     );
-    const gradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], spacedAppDir);
+    const gradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], spacedAppDir, {
+      env: { PATH: "", GRADLE_OPTS: "", JAVA_OPTS: "" },
+    });
     const warmGradle = probeWarmBuildDaemons(gradleReqs, {
-      env: { PATH: "" },
+      env: { PATH: "", GRADLE_OPTS: "", JAVA_OPTS: "" },
       runner: () => ({
         stdout: "  44123 /Library/Java/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
       }),
     });
     assert.equal(warmGradle.warm, true);
     assert.deepEqual(warmGradle.daemonPids, [44123]);
+
+    const extraJvmArgsGradle = probeWarmBuildDaemons(gradleReqs, {
+      env: { PATH: "", GRADLE_OPTS: "", JAVA_OPTS: "" },
+      runner: () => ({
+        stdout:
+          "  44123 /Library/Java/bin/java -Xmx8g -Dfile.encoding=US-ASCII org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
+      }),
+    });
+    assert.equal(extraJvmArgsGradle.warm, false);
 
     const mismatchedGradle = probeWarmBuildDaemons(gradleReqs, {
       env: { PATH: "" },
@@ -1396,7 +1411,7 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       platform: "darwin",
       runner: () => ({
         status: 0,
-        stdout: "54321 /opt/jdk-21/bin/java -Xmx4g -XX:MaxMetaspaceSize=512m org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
+        stdout: "54321 /opt/jdk-21/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
       }),
     });
     assert.equal(matchingJavaProbe.warm, true);
@@ -2472,6 +2487,23 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     );
     assert.ok(nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
     assert.ok(!nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalIgnoredBazelOut}`));
+
+    // gradle/gradle-daemon-jvm.properties marks build cold and prevents warm daemon false positives
+    const daemonCriteriaDir = path.join(subAppDir, "gradle");
+    fs.mkdirSync(daemonCriteriaDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(daemonCriteriaDir, "gradle-daemon-jvm.properties"),
+      "toolchainVersion=21\ntoolchainVendor=temurin\n",
+    );
+    const daemonCriteriaReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
+    assert.equal(daemonCriteriaReqs.disablesDaemon, true);
+    const daemonCriteriaProbe = probeWarmBuildDaemons(daemonCriteriaReqs, {
+      env: { JAVA_HOME: canonicalMockJdkHome },
+      runner: () => ({
+        stdout: `5001 ${path.join(canonicalMockJdkHome, "bin", "java")} -Xmx4g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(daemonCriteriaProbe.warm, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
