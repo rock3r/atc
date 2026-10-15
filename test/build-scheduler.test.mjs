@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  canonicalizeBuildPath,
   classifyBuildCommand,
   resolveBuildResources,
   computeEffectiveMaxBuilds,
@@ -59,7 +60,7 @@ test("classifyBuildCommand & resolveBuildResources handle gradle, bazel, xcodebu
   assert.equal(pureGradle.tool, "gradle");
   assert.equal(pureGradle.requiresWorkspaceLock, true);
   assert.equal(pureGradle.requiresHeavySlot, true);
-  assert.deepEqual(pureGradle.resourceKeys, [`gradle:${fs.realpathSync(wsDir)}`]);
+  assert.deepEqual(pureGradle.resourceKeys, [`gradle:${canonicalizeBuildPath(wsDir)}`]);
 
   const wsOnlyGradle = resolveBuildResources("./gradlew", ["tasks", "--all"], wsDir);
   assert.equal(wsOnlyGradle.kind, "workspace_only");
@@ -172,11 +173,25 @@ test("evaluateCommandGuard respects coordinateBuilds toggle and always guards li
     anchorPid: 4242,
     activeLeases: [],
     coordinateBuilds: true,
+    platform: "darwin",
   });
   assert.equal(pureEnabled.allowed, true);
   assert.match(
     pureEnabled.rewrittenCommand,
     /^ATC_SESSION_ID=sess-a ATC_ANCHOR_PID=4242 atc exec --build -- build-brief \.\/gradlew assembleDebug$/,
+  );
+
+  const pureEnabledWin = evaluateCommandGuard("build-brief ./gradlew assembleDebug", {
+    sessionId: "sess-a",
+    anchorPid: 4242,
+    activeLeases: [],
+    coordinateBuilds: true,
+    platform: "win32",
+  });
+  assert.equal(pureEnabledWin.allowed, true);
+  assert.match(
+    pureEnabledWin.rewrittenCommand,
+    /^atc exec --session sess-a --anchor-pid 4242 --build -- build-brief \.\/gradlew assembleDebug$/,
   );
 
   const unleasedCoupled = evaluateCommandGuard("./gradlew connectedDebugAndroidTest", {
@@ -341,12 +356,26 @@ test("cmdExec --build coordinates pure builds and writes structured JSONL audit 
   fs.mkdirSync(wsDir, { recursive: true });
   fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
 
+  const fakeInventory = {
+    host: {
+      cpuCores: 8,
+      totalRamMb: 32768,
+      availableRamMb: 16384,
+      freeDiskMb: 50000,
+      sampledAtMs: Date.now(),
+    },
+    running: [],
+    offline: [],
+    creatable: [],
+  };
+
   const execRes = await cmdExec(
     stateDir,
     ["node", "-e", "process.exit(0)"],
     { build: true, session: "sess-1" },
     {
       cwd: wsDir,
+      inventory: fakeInventory,
       env: { ...process.env, ATC_SESSION_ID: "sess-1" },
     },
   );
@@ -360,6 +389,12 @@ test("cmdExec --build coordinates pure builds and writes structured JSONL audit 
   const eventNames = events.map((e) => e.event);
   assert.ok(eventNames.includes("build_admit"), `Expected build_admit in ${JSON.stringify(eventNames)}`);
   assert.ok(eventNames.includes("build_release"), `Expected build_release in ${JSON.stringify(eventNames)}`);
+
+  for (const ev of events) {
+    assert.equal(ev.schemaVersion, 1, "audit record must include schemaVersion: 1");
+    assert.equal(typeof ev.epochMs, "number", "audit record must include numeric epochMs");
+    assert.equal(ev.category, "build", "build_admit / build_release must have category 'build'");
+  }
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
@@ -401,6 +436,11 @@ test("cmdExec --claim performs atomic device + build co-allocation without holdi
   fs.writeFileSync(
     fakeGradlew,
     `#!/usr/bin/env node\nif (process.env.ANDROID_SERIAL !== "emulator-5554") process.exit(2);\nprocess.exit(0);\n`,
+    { mode: 0o755 },
+  );
+  fs.writeFileSync(
+    path.join(wsDir, "gradlew.cmd"),
+    `@node "%~dp0gradlew" %*\r\n`,
     { mode: 0o755 },
   );
 
@@ -540,6 +580,19 @@ test("cmdExec --build --wait 0 admits immediately when slot is free and exits wi
   fs.mkdirSync(wsDir, { recursive: true });
   fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
 
+  const fakeInventory = {
+    host: {
+      cpuCores: 8,
+      totalRamMb: 32768,
+      availableRamMb: 16384,
+      freeDiskMb: 50000,
+      sampledAtMs: Date.now(),
+    },
+    running: [],
+    offline: [],
+    creatable: [],
+  };
+
   // 1. Free slot -> --wait 0 succeeds immediately
   const freeRes = await cmdExec(
     stateDir,
@@ -547,6 +600,7 @@ test("cmdExec --build --wait 0 admits immediately when slot is free and exits wi
     { build: true, wait: "0", session: "sess-wait0-free" },
     {
       cwd: wsDir,
+      inventory: fakeInventory,
       env: { ...process.env, ATC_SESSION_ID: "sess-wait0-free" },
     },
   );
@@ -563,7 +617,7 @@ test("cmdExec --build --wait 0 admits immediately when slot is free and exits wi
 
   // 2. Busy workspace slot -> --wait 0 fails immediately with exitCode 2
   const state = readState(stateDir);
-  const resolvedWs = fs.realpathSync(wsDir);
+  const resolvedWs = canonicalizeBuildPath(wsDir);
   state.config.maxConcurrentBuilds = 1;
   state.buildLeases.build_busy = {
     buildId: "build_busy",
@@ -595,11 +649,109 @@ test("cmdExec --build --wait 0 admits immediately when slot is free and exits wi
     { build: true, wait: "0", session: "sess-wait0-busy" },
     {
       cwd: wsDir,
+      inventory: fakeInventory,
       env: { ...process.env, ATC_SESSION_ID: "sess-wait0-busy" },
     },
   );
   assert.equal(busyRes.exitCode, 2);
   assert.match(busyRes.error, /currently busy \(wait timeout reached\)/);
+
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
+
+test("starved pure builds can use burst slots, default burst capacity is 1, low-RAM fails fast with exitCode 5, and cmdGuard audits decisions", async () => {
+  const defaultState = createDefaultState();
+  assert.equal(defaultState.config.maxDeviceHolderBurstBuilds, 1, "Default maxDeviceHolderBurstBuilds must be 1");
+
+  const snap = computeBuildPoolSnapshot(defaultState, { cpuCores: 8, totalRamMb: 32768 });
+  assert.equal(snap.burstBuilds, 1);
+
+  // Starved pure-build ticket can use burst slot when base capacity is full
+  const now = 500_000;
+  const starvedQueue = [
+    {
+      ticketId: "bq_starved_pure",
+      seq: 1,
+      sessionId: "sess-pure",
+      waiterPid: process.pid,
+      resourceKeys: ["gradle:/ws-pure"],
+      requiresWorkspaceLock: true,
+      requiresHeavySlot: true,
+      pinnedDeviceLeaseId: null,
+      enqueuedAtMs: now - 130_000,
+      starvationDeadlineMs: now - 10_000, // starved!
+      lastHeartbeatAtMs: now,
+      waitExpiresAtMs: now + 60_000,
+    },
+  ];
+  const sel = pruneAndSelectNextBuildTicket(
+    starvedQueue,
+    {
+      activeWorkspaces: new Set(["gradle:/ws-other"]),
+      activeHeavyBuilds: 2,
+      maxHostBuilds: 2,
+      burstBuilds: 1,
+      leases: {},
+    },
+    now,
+  );
+  assert.equal(sel.chosenIdx, 0, "Starved pure build must be admitted into burst slot");
+
+  // Low-RAM host with 0 active heavy builds and 0 active device leases fails fast with exitCode 5 even when wait > 0
+  const stateDir = makeTempDir();
+  const wsDir = path.join(stateDir, "workspace");
+  fs.mkdirSync(wsDir, { recursive: true });
+  fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
+
+  const lowRamInventory = {
+    host: {
+      cpuCores: 8,
+      totalRamMb: 8192,
+      availableRamMb: 1024, // < 2048 floor + 3072 build RAM
+      freeDiskMb: 50000,
+      sampledAtMs: Date.now(),
+    },
+    running: [],
+    offline: [],
+    creatable: [],
+  };
+
+  const lowRamRes = await cmdExec(
+    stateDir,
+    ["node", "-e", "process.exit(0)"],
+    { build: true, wait: "600", session: "sess-low-ram" },
+    {
+      cwd: wsDir,
+      inventory: lowRamInventory,
+      env: { ...process.env, ATC_SESSION_ID: "sess-low-ram" },
+    },
+  );
+  assert.equal(lowRamRes.exitCode, 5, "Unrecoverable host RAM shortfall must fail fast with exitCode 5");
+  assert.match(lowRamRes.error, /Insufficient host RAM/);
+
+  // Standalone cmdGuard records guard_deny and guard_rewrite in audit log
+  cmdConfig(stateDir, "set", "coordinateBuilds", "true");
+  const denyRes = cmdGuard(
+    stateDir,
+    "adb shell input tap 1 1",
+    { session: "sess-guard" },
+    { runningCount: 2, platform: "darwin" },
+  );
+  assert.equal(denyRes.allowed, false);
+
+  const rewriteRes = cmdGuard(
+    stateDir,
+    "./gradlew assembleDebug",
+    { session: "sess-guard" },
+    { runningCount: 0, platform: "darwin" },
+  );
+  assert.equal(rewriteRes.allowed, true);
+  assert.ok(rewriteRes.rewrittenCommand);
+
+  const guardEvents = readRecentAuditEvents(stateDir, { category: "guard", limit: 10 });
+  const guardEventNames = guardEvents.map((e) => e.event);
+  assert.ok(guardEventNames.includes("guard_deny"), "cmdGuard must emit guard_deny audit event");
+  assert.ok(guardEventNames.includes("guard_rewrite"), "cmdGuard must emit guard_rewrite audit event");
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 });

@@ -5206,7 +5206,7 @@ function rewriteCompoundCommand(
       };
       const isCoordinatedBuildStage =
         Boolean(coordinateBuilds) &&
-        c.kind === "read_only" &&
+        (c.kind === "read_only" || c.kind === "ignore") &&
         (c.buildClass === "pure_build" || c.buildClass === "workspace_only");
       if (subRewrite.changed) {
         trimmed = subRewrite.rewrittenStage;

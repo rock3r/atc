@@ -6028,23 +6028,24 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           }
 
           // Cannot admit right now
+          const noRecoverableWorkload =
+            ramCheck &&
+            !ramCheck.allowed &&
+            pool.activeHeavyBuilds === 0 &&
+            Object.keys(state.leases || {}).length === 0;
+          if (noRecoverableWorkload) {
+            state.buildQueue = state.buildQueue.filter((t) => t.ticketId !== ticket.ticketId);
+            return {
+              mutated: wasAlreadyQueued,
+              value: {
+                status: "error",
+                exitCode: 5,
+                error: `Insufficient host RAM to admit build (${ramCheck.effectiveFreeMb} MB projected free < ${ramCheck.requiredFloorMb} MB required floor). Pass --force to override.`,
+              },
+            };
+          }
           if (waitSec <= 0 || now >= waitExpiresAtMs) {
             state.buildQueue = state.buildQueue.filter((t) => t.ticketId !== ticket.ticketId);
-            if (
-              ramCheck &&
-              !ramCheck.allowed &&
-              pool.activeHeavyBuilds === 0 &&
-              Object.keys(state.leases || {}).length === 0
-            ) {
-              return {
-                mutated: wasAlreadyQueued,
-                value: {
-                  status: "error",
-                  exitCode: 5,
-                  error: `Insufficient host RAM to admit build (${ramCheck.effectiveFreeMb} MB projected free < ${ramCheck.requiredFloorMb} MB required floor). Pass --force to override.`,
-                },
-              };
-            }
             return {
               mutated: wasAlreadyQueued,
               value: {
@@ -7072,7 +7073,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
     probedRunningCount = options.runningCount;
   }
 
-  const evalRes = withStateTransaction(stateDir, (state, { now }) => {
+  const evalRes = withStateTransaction(stateDir, (state, { now, auditEvents }) => {
     const identity = resolveSessionIdentity({
       flags,
       env: options.env || process.env,
@@ -7114,6 +7115,25 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
           ? Boolean(options.coordinateBuilds)
           : Boolean(state.config?.coordinateBuilds),
     });
+    if (!guard.allowed) {
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "guard_deny",
+          sessionId: identity.sessionId,
+          command: commandStr,
+          reason: guard.reason,
+        });
+      }
+    } else if (guard.rewrittenCommand) {
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "guard_rewrite",
+          sessionId: identity.sessionId,
+          command: commandStr,
+          rewrittenCommand: guard.rewrittenCommand,
+        });
+      }
+    }
     let mutated = false;
     if (guard.allowed && guard.renewLease && activeLeases.length > 0) {
       const ttlMs = (state.config?.defaultTtlSec ?? DEFAULT_CONFIG.defaultTtlSec ?? 600) * 1000;

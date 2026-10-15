@@ -272,7 +272,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   allowedPhysicalSerials: [],
   coordinateBuilds: false,
   maxConcurrentBuilds: "auto",
-  maxDeviceHolderBurstBuilds: 0,
+  maxDeviceHolderBurstBuilds: 1,
   buildRamEstimateMb: 3072,
   buildRamReservationWindowSec: 30,
   buildRamHysteresisMb: 256,

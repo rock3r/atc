@@ -839,7 +839,7 @@ export function computeBuildPoolSnapshot(state, host = null) {
   }
 
   const baseMaxBuilds = computeEffectiveMaxBuilds(cfg, host);
-  const burstBuilds = Math.max(0, Number(cfg.maxDeviceHolderBurstBuilds ?? 0));
+  const burstBuilds = Math.max(0, Number(cfg.maxDeviceHolderBurstBuilds ?? 1));
   return {
     activeWorkspaces,
     lockedWorkspaces: activeWorkspaces,
@@ -951,7 +951,10 @@ export function pruneAndSelectNextBuildTicket(
       if (activeWorkspaces.has(ws)) missing.add(`ws:${ws}`);
     }
     const hasDev = Boolean(ticket.pinnedDeviceLeaseId || ticket.requiresDeviceCoAlloc);
-    const effectiveCeiling = hasDev ? maxHostBuilds + burstBuilds : maxHostBuilds;
+    const isStarved =
+      typeof ticket.starvationDeadlineMs === "number" && now >= ticket.starvationDeadlineMs;
+    const effectiveCeiling =
+      hasDev || isStarved ? maxHostBuilds + burstBuilds : maxHostBuilds;
     if (ticket.requiresHeavySlot && activeHeavyBuilds >= effectiveCeiling) {
       missing.add("host:heavy_slot");
     }

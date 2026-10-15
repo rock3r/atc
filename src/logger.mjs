@@ -46,6 +46,15 @@ export function resolveAuditLogPath(
   return path.join(resolveAuditLogDir(stateDir, env, platform), "atc-audit.jsonl");
 }
 
+export function deriveAuditCategory(eventName) {
+  const name = String(eventName || "");
+  if (name.startsWith("guard_") || name.startsWith("guard.")) return "guard";
+  if (name.includes("queue")) return "queue";
+  if (name.startsWith("build_") || name.startsWith("build.")) return "build";
+  if (name.includes("gc_prune") || name.startsWith("gc_") || name.startsWith("gc.")) return "gc";
+  return "lease";
+}
+
 export function flushAuditEvents(
   events,
   {
@@ -92,11 +101,16 @@ export function flushAuditEvents(
         ...extraFields
       } = ev;
       const tsMs = typeof rawTsMs === "number" && Number.isFinite(rawTsMs) ? rawTsMs : nowMs;
+      const eventStr = String(rawEvent);
+      const category = extraFields.category || deriveAuditCategory(eventStr);
       const record = {
+        schemaVersion: 1,
         ts: new Date(tsMs).toISOString(),
+        epochMs: tsMs,
         tsMs,
         pid: rawPid ?? process.pid,
-        event: String(rawEvent),
+        category,
+        event: eventStr,
         sessionId: rawSessionId ?? null,
         ...extraFields,
         ...(rawDetails && typeof rawDetails === "object" ? { details: rawDetails } : {}),
