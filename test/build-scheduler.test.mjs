@@ -118,6 +118,15 @@ test("classifyBuildCommand & resolveBuildResources handle gradle, bazel, xcodebu
   assert.equal(xcodeMacBuild.requiresWorkspaceLock, true);
   assert.equal(xcodeMacBuild.requiresHeavySlot, true);
 
+  const shellMultiTool = resolveBuildResources(
+    "sh",
+    ["-c", "./gradlew assembleDebug; bazel build //app:main"],
+    wsDir,
+  );
+  assert.equal(shellMultiTool.kind, "pure_build");
+  assert.ok(shellMultiTool.resourceKeys.includes(`gradle:${canonicalizeBuildPath(wsDir)}`));
+  assert.ok(shellMultiTool.resourceKeys.includes(`bazel:ws:${canonicalizeBuildPath(wsDir)}`));
+
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -145,10 +154,18 @@ test("buildChildInvocation blocks daemon-killing commands and sanitizes ATC_BUIL
       buildId: "build_123",
       opId: "op_fresh",
       opNonce: "nonce_fresh",
+      reservedRamMb: 3072,
     },
   );
   assert.equal(inv.env.ATC_BUILD_OP_ID, "op_fresh");
   assert.equal(inv.env.ATC_BUILD_OP_NONCE, "nonce_fresh");
+  assert.ok(inv.args.some((a) => String(a).startsWith("-Dorg.gradle.workers.max=")));
+
+  const bazelInv = buildChildInvocation("bazel", ["build", "//app:main"], null, "sess-1", {}, {
+    reservedRamMb: 4096,
+  });
+  assert.ok(bazelInv.args.some((a) => String(a).startsWith("--jobs=")));
+  assert.ok(bazelInv.args.includes("--local_ram_resources=4096"));
   assert.equal(inv.env.ATC_BUILD_ID, "build_123");
 });
 
@@ -509,7 +526,7 @@ test("cmdExec --claim performs atomic device + build co-allocation without holdi
     "Pre-existing session lease must remain active after cmdExec --claim",
   );
 
-  // Also verify buildChildInvocation injects -destination id=<udid> for xcodebuild test under iOS lease
+  // Also verify buildChildInvocation injects -destination id=<udid> and -jobs for xcodebuild test under iOS lease
   const iosXb = buildChildInvocation(
     "xcodebuild",
     ["test", "-scheme", "App"],
@@ -522,10 +539,26 @@ test("cmdExec --claim performs atomic device + build co-allocation without holdi
     "sess-ios",
     {},
   );
-  assert.deepEqual(iosXb.args.slice(-2), [
-    "-destination",
-    "id=D9746857-ABCD-4321-9999-111122223333",
-  ]);
+  assert.ok(iosXb.args.includes("-destination"));
+  assert.ok(iosXb.args.includes("id=D9746857-ABCD-4321-9999-111122223333"));
+  assert.ok(iosXb.args.includes("-jobs"));
+
+  assert.throws(
+    () =>
+      buildChildInvocation(
+        "xcodebuild",
+        ["test", "-scheme", "App", "-destination", "platform=iOS Simulator,name=iPhone 16"],
+        {
+          leaseId: "lease_ios_1",
+          platform: "ios",
+          kind: "emulator",
+          serial: "D9746857-ABCD-4321-9999-111122223333",
+        },
+        "sess-ios",
+        {},
+      ),
+    /Conflicting device selector/,
+  );
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
@@ -766,6 +799,22 @@ test("starved pure builds can use burst slots, default burst capacity is 1, low-
   const wsDir = path.join(stateDir, "workspace");
   fs.mkdirSync(wsDir, { recursive: true });
   fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
+
+  const stLowRam = readState(stateDir);
+  stLowRam.leases["serial:usb-phone-1"] = {
+    leaseId: "lease_phys_1",
+    deviceKey: "serial:usb-phone-1",
+    platform: "android",
+    kind: "physical",
+    serial: "usb-phone-1",
+    sessionId: "sess-other-phys",
+    state: "active",
+    claimedAtMs: Date.now(),
+    renewedAtMs: Date.now(),
+    expiresAtMs: Date.now() + 600_000,
+    firstSeenOfflineAtMs: null,
+  };
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(stLowRam, null, 2));
 
   const lowRamInventory = {
     host: {

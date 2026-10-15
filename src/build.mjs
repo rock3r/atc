@@ -101,7 +101,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           .split(/(?:;|&&|\|\||\n)+/)
           .map((s) => s.trim())
           .filter(Boolean);
-        let matchedClauseTokens = null;
+        const matchedClauses = [];
         for (const clause of clauses) {
           const rawTokens = clause
             .replace(/\s+[0-9]*>>?\s*\S+/g, "")
@@ -112,21 +112,22 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           if (rawTokens.length === 0) continue;
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           if (normalizeBuildToolName(peeled.cmd)) {
-            matchedClauseTokens = [peeled.cmd, ...peeled.args];
-            break;
+            matchedClauses.push({ cmd: peeled.cmd, args: peeled.args });
           }
         }
-        if (matchedClauseTokens && matchedClauseTokens.length > 0) {
-          curCmd = matchedClauseTokens[0];
-          curArgs = matchedClauseTokens.slice(1);
-          continue;
+        if (matchedClauses.length > 0) {
+          return {
+            cmd: matchedClauses[0].cmd,
+            args: matchedClauses[0].args,
+            allBuildClauses: matchedClauses,
+          };
         }
       }
     }
     break;
   }
 
-  return { cmd: curCmd, args: curArgs };
+  return { cmd: curCmd, args: curArgs, allBuildClauses: null };
 }
 
 export function normalizeBuildToolName(cmd) {
@@ -247,7 +248,32 @@ const XCODEBUILD_VALUE_FLAGS = new Set([
 ]);
 
 export function classifyBuildCommand(rawCmd, rawArgs = []) {
-  const { cmd, args } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const { cmd, args, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  if (allBuildClauses && allBuildClauses.length > 1) {
+    const clauseResults = allBuildClauses.map((c) => classifyBuildCommand(c.cmd, c.args));
+    const deny = clauseResults.find((r) => r.kind === "deny_lifecycle");
+    if (deny) return deny;
+    const reject = clauseResults.find((r) => r.kind === "reject_long_running");
+    if (reject) return reject;
+    const requiresDevice = clauseResults.some((r) => r.requiresDevice);
+    const requiresHeavySlot = clauseResults.some((r) => r.requiresHeavySlot);
+    const requiresWorkspaceLock = clauseResults.some((r) => r.requiresWorkspaceLock);
+    const kind = requiresDevice
+      ? "device_coupled_build"
+      : requiresHeavySlot
+        ? "pure_build"
+        : requiresWorkspaceLock
+          ? "workspace_only"
+          : "not_build_tool";
+    return {
+      ...clauseResults[0],
+      kind,
+      targetPlatform: clauseResults.find((r) => r.targetPlatform)?.targetPlatform || null,
+      requiresDevice,
+      requiresHeavySlot,
+      requiresWorkspaceLock,
+    };
+  }
   const tool = normalizeBuildToolName(cmd);
   if (!tool) {
     return {
@@ -629,7 +655,36 @@ export function resolveBuildResources(
   cwd = process.cwd(),
   { forceBuild = false } = {},
 ) {
-  const { cmd, args } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const { cmd, args, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  if (allBuildClauses && allBuildClauses.length > 1) {
+    const clauseRes = allBuildClauses.map((c) =>
+      resolveBuildResources(c.cmd, c.args, cwd, { forceBuild: false }),
+    );
+    const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
+    if (deny) return deny;
+    const reject = clauseRes.find((r) => r.kind === "reject_long_running");
+    if (reject) return reject;
+    const requiresDevice = clauseRes.some((r) => r.requiresDevice);
+    const requiresHeavySlot = clauseRes.some((r) => r.requiresHeavySlot);
+    const requiresWorkspaceLock = clauseRes.some((r) => r.requiresWorkspaceLock);
+    const kind = requiresDevice
+      ? "device_coupled_build"
+      : requiresHeavySlot
+        ? "pure_build"
+        : requiresWorkspaceLock
+          ? "workspace_only"
+          : "not_build_tool";
+    return {
+      ...clauseRes[0],
+      kind,
+      targetPlatform: clauseRes.find((r) => r.targetPlatform)?.targetPlatform || null,
+      requiresDevice,
+      requiresHeavySlot,
+      requiresWorkspaceLock,
+      workspaceRoot: clauseRes.find((r) => r.workspaceRoot)?.workspaceRoot || null,
+      resourceKeys: Array.from(new Set(clauseRes.flatMap((r) => r.resourceKeys || []))),
+    };
+  }
   const classified = classifyBuildCommand(cmd, args);
   const baseCwd = path.resolve(cwd || process.cwd());
   if (classified.kind === "not_build_tool") {

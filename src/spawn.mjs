@@ -754,11 +754,11 @@ export function buildChildInvocation(
         .filter(Boolean)
         .map((s) => String(s).toUpperCase()),
     );
-    if (explicitDestination && allowedIds.size > 0) {
+    if (explicitDestination && allowedIds.size > 0 && (lease?.platform || "android") === "ios") {
       const idMatch = explicitDestination.match(/(?:^|,)\s*id=([^,\s]+)/i);
-      if (idMatch && idMatch[1] && !allowedIds.has(idMatch[1].toUpperCase())) {
+      if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
         throw new Error(
-          `Conflicting device selector "${idMatch[1]}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          `Conflicting device selector "${idMatch?.[1] || explicitDestination}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
         );
       }
     }
@@ -782,6 +782,76 @@ export function buildChildInvocation(
       (lease.platform || "android") === "ios"
     ) {
       nextArgs = [...nextArgs, "-destination", `id=${lease.serial}`];
+    }
+  }
+
+  const isShellWrapper = new Set([
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "cmd",
+    "powershell",
+    "pwsh",
+  ]).has(base);
+  if (buildClassified.requiresHeavySlot && !isShellWrapper) {
+    const hostCpus = Math.max(1, os.cpus()?.length || 4);
+    const maxConcurrent = Math.max(1, Number(buildLease?.maxConcurrentBuilds || 2));
+    const jobsLimit = Math.max(
+      2,
+      Number(buildLease?.jobsLimit || Math.floor(hostCpus / maxConcurrent)),
+    );
+    const ramLimitMb = Math.max(1024, Number(buildLease?.reservedRamMb || 3072));
+    if (buildClassified.tool === "gradle") {
+      const hasWorkersFlag = nextArgs.some((a) => {
+        const s = String(a);
+        return (
+          s === "--max-workers" ||
+          s.startsWith("--max-workers=") ||
+          s.startsWith("-Dorg.gradle.workers.max=")
+        );
+      });
+      if (!hasWorkersFlag) {
+        const dashDash = nextArgs.indexOf("--");
+        const flag = `-Dorg.gradle.workers.max=${jobsLimit}`;
+        if (dashDash !== -1) {
+          nextArgs = [...nextArgs.slice(0, dashDash), flag, ...nextArgs.slice(dashDash)];
+        } else {
+          nextArgs = [...nextArgs, flag];
+        }
+      }
+    } else if (buildClassified.tool === "bazel") {
+      const bazelBuildSubs = new Set(["build", "test", "run", "coverage"]);
+      const subIdx = nextArgs.findIndex((a) => bazelBuildSubs.has(String(a).toLowerCase()));
+      if (subIdx !== -1) {
+        const hasJobs = nextArgs.some((a) => {
+          const s = String(a);
+          return s === "--jobs" || s.startsWith("--jobs=");
+        });
+        const hasRam = nextArgs.some((a) => {
+          const s = String(a);
+          return s === "--local_ram_resources" || s.startsWith("--local_ram_resources=");
+        });
+        const injected = [];
+        if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
+        if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
+        if (injected.length > 0) {
+          nextArgs = [
+            ...nextArgs.slice(0, subIdx + 1),
+            ...injected,
+            ...nextArgs.slice(subIdx + 1),
+          ];
+        }
+      }
+    } else if (buildClassified.tool === "xcodebuild") {
+      const hasJobs = nextArgs.some((a) => {
+        const s = String(a);
+        return s === "-jobs" || s.startsWith("-jobs=");
+      });
+      if (!hasJobs) {
+        nextArgs = [...nextArgs, "-jobs", String(jobsLimit)];
+      }
     }
   }
 

@@ -6026,6 +6026,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               isBurstSlot: Boolean(
                 buildReqs.requiresHeavySlot && pool.activeHeavyBuilds >= pool.effectiveMaxBuilds,
               ),
+              maxConcurrentBuilds: pool.effectiveMaxBuilds,
               state: "active",
               preparingDevice: isColdPrep,
               pinnedDeviceLeaseId: lease?.leaseId || null,
@@ -6106,11 +6107,14 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           }
 
           // Cannot admit right now
+          const hasActiveVirtualDeviceLease = Object.values(state.leases || {}).some(
+            (l) => l && l.kind === "emulator",
+          );
           const noRecoverableWorkload =
             ramCheck &&
             !ramCheck.allowed &&
             pool.activeHeavyBuilds === 0 &&
-            Object.keys(state.leases || {}).length === 0;
+            !hasActiveVirtualDeviceLease;
           if (noRecoverableWorkload) {
             state.buildQueue = state.buildQueue.filter((t) => t.ticketId !== ticket.ticketId);
             return {
