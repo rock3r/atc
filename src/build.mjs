@@ -3313,12 +3313,25 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     const targetPlatform = requiresDevice ? (hasIosDeviceFlag ? "ios" : "android") : null;
 
     if (subcmd === "run" && !requiresDevice) {
-      const boundedBuildOnly =
-        bazelFlags.includes("--norun") || bazelFlags.some((a) => a.startsWith("--script_path"));
+      let noRunEnabled = false;
+      let hasScriptPath = false;
+      for (const a of bazelFlags) {
+        if (a === "--norun") noRunEnabled = true;
+        else if (a === "--run") noRunEnabled = false;
+        else if (a.startsWith("--norun=")) {
+          noRunEnabled = !isBazelBoolFalse(a.slice("--norun=".length));
+        } else if (a.startsWith("--run=")) {
+          noRunEnabled = isBazelBoolFalse(a.slice("--run=".length));
+        } else if (a.startsWith("--script_path")) {
+          hasScriptPath = true;
+        }
+      }
+      const boundedBuildOnly = noRunEnabled || hasScriptPath;
       if (!boundedBuildOnly) {
         return {
           kind: "reject_long_running",
           tool: "bazel",
+          subcommand: subcmd,
           targetPlatform: null,
           requiresDevice: false,
           requiresHeavySlot: true,
@@ -3674,7 +3687,7 @@ export function resolveBuildResources(
       clauseBuildReqs: clauseRes.filter((r) => r.requiresHeavySlot),
     };
   }
-  const classified = classifyBuildCommand(cmd, args);
+  let classified = classifyBuildCommand(cmd, args);
   const baseCwd = relCwd ? path.resolve(outerCwd, relCwd) : outerCwd;
   if (classified.kind === "not_build_tool") {
     if (forceBuild) {
@@ -4061,6 +4074,45 @@ export function resolveBuildResources(
       }
     };
 
+    const subcmdIdx = findBazelSubcommandIndex(strArgs, BAZEL_SUBCOMMANDS);
+    const subcmd = classified.subcommand
+      ? String(classified.subcommand).toLowerCase()
+      : subcmdIdx >= 0
+        ? strArgs[subcmdIdx].toLowerCase()
+        : null;
+    const cliRestArgs = subcmdIdx >= 0 ? strArgs.slice(subcmdIdx + 1) : strArgs;
+    let rcEntrySeq = 0;
+    const rcCommandEntries = [];
+    const rcConfigEntriesByName = new Map();
+    const getRcCommandRank = (rcCmd, targetSubcmd) => {
+      if (!targetSubcmd) return -1;
+      if (rcCmd === "always") return 0;
+      if (rcCmd === "common") return 1;
+      if (
+        rcCmd === "build" &&
+        [
+          "build",
+          "test",
+          "run",
+          "coverage",
+          "mobile-install",
+          "cquery",
+          "aquery",
+          "info",
+          "sync",
+          "fetch",
+          "clean",
+        ].includes(targetSubcmd)
+      ) {
+        return targetSubcmd === "build" ? 4 : 2;
+      }
+      if (rcCmd === "test" && (targetSubcmd === "test" || targetSubcmd === "coverage")) {
+        return targetSubcmd === "test" ? 4 : 3;
+      }
+      if (rcCmd === targetSubcmd) return 4;
+      return -1;
+    };
+
     if (!ignoreAllRc) {
       const visitedRc = new Set();
       const parseBazelrcFile = (rcPath, { required = false, depth = 0 } = {}) => {
@@ -4105,6 +4157,26 @@ export function resolveBuildResources(
             }
             const tokens = splitShellWords(startupMatch[2]);
             applyStartupOptionTokens(tokens, canonicalRoot);
+            continue;
+          }
+          const cmdMatch = line.match(/^([A-Za-z0-9_.-]+)(?::([A-Za-z0-9_.-]+))?\s+(.+)$/);
+          if (cmdMatch) {
+            const rcCmd = cmdMatch[1].toLowerCase();
+            const rcConfig = cmdMatch[2] || null;
+            const rank = getRcCommandRank(rcCmd, subcmd);
+            if (rank >= 0) {
+              const tokens = splitShellWords(cmdMatch[3]).map((t) =>
+                String(t).replace(/%workspace%/g, canonicalRoot),
+              );
+              const entry = { rank, seq: rcEntrySeq++, tokens };
+              if (!rcConfig) {
+                rcCommandEntries.push(entry);
+              } else {
+                const prev = rcConfigEntriesByName.get(rcConfig) || [];
+                prev.push(entry);
+                rcConfigEntriesByName.set(rcConfig, prev);
+              }
+            }
           }
         }
       };
@@ -4155,22 +4227,120 @@ export function resolveBuildResources(
             : baseEnv.BAZELRC
               ? String(baseEnv.BAZELRC)
               : null;
+      let hitNullRcSentinel = false;
       if (effectiveBazelrcEnv === "__UNRESOLVED_DYNAMIC_ENV__") {
         hasCustomStartupOption = true;
       } else if (effectiveBazelrcEnv) {
         for (const rawEnvRc of effectiveBazelrcEnv.split(",")) {
-          if (!rawEnvRc || rawEnvRc === "/dev/null" || rawEnvRc.toUpperCase() === "NUL") {
-            continue;
+          if (!rawEnvRc) continue;
+          if (rawEnvRc === "/dev/null" || rawEnvRc.toUpperCase() === "NUL") {
+            hitNullRcSentinel = true;
+            break;
           }
           const expandedRc = String(rawEnvRc).replace(/%workspace%/g, canonicalRoot);
           parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
         }
       }
-      for (const rawExplicitRc of explicitBazelrcPaths) {
-        if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") break;
-        const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
-        parseBazelrcFile(path.resolve(baseCwd, expandedRc), { required: true });
+      if (!hitNullRcSentinel) {
+        for (const rawExplicitRc of explicitBazelrcPaths) {
+          if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") break;
+          const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
+          parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
+        }
       }
+    }
+
+    if (subcmd && (rcCommandEntries.length > 0 || rcConfigEntriesByName.size > 0)) {
+      const flattenSortedEntries = (entries) =>
+        [...(entries || [])]
+          .sort((a, b) => a.rank - b.rank || a.seq - b.seq)
+          .flatMap((e) => e.tokens);
+      const rcCommandTokens = flattenSortedEntries(rcCommandEntries);
+      const rcConfigTokensByName = new Map();
+      for (const [k, entries] of rcConfigEntriesByName.entries()) {
+        rcConfigTokensByName.set(k, flattenSortedEntries(entries));
+      }
+      const expandConfigTokens = (tokens, depth = 0, activeStack = new Set()) => {
+        if (depth > 8) return [];
+        const out = [];
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = String(tokens[i] || "");
+          if (tok === "--") break;
+          let cfgName = null;
+          if (tok === "--config" && i + 1 < tokens.length) {
+            cfgName = String(tokens[++i] || "");
+          } else if (tok.startsWith("--config=")) {
+            cfgName = tok.slice("--config=".length);
+          }
+          if (cfgName !== null) {
+            out.push(`--config=${cfgName}`);
+            if (cfgName && !activeStack.has(cfgName) && rcConfigTokensByName.has(cfgName)) {
+              const nextStack = new Set(activeStack);
+              nextStack.add(cfgName);
+              out.push(
+                ...expandConfigTokens(
+                  rcConfigTokensByName.get(cfgName) || [],
+                  depth + 1,
+                  nextStack,
+                ),
+              );
+            }
+            continue;
+          }
+          out.push(tok);
+        }
+        return out;
+      };
+      const cliBeforeDashDash = (() => {
+        const idx = cliRestArgs.indexOf("--");
+        return idx >= 0 ? cliRestArgs.slice(0, idx) : cliRestArgs;
+      })();
+      const expandedFromRc = expandConfigTokens(rcCommandTokens);
+      const expandedFromCli = expandConfigTokens(cliBeforeDashDash);
+      const allEffectiveFlags = [...expandedFromRc, ...expandedFromCli];
+      const isFalseVal = (v) => /^(?:false|0|no|f|n)$/i.test(String(v || "").trim());
+      let platformConfigEnabled = false;
+      for (const tok of allEffectiveFlags) {
+        if (tok === "--enable_platform_specific_config") platformConfigEnabled = true;
+        else if (tok === "--noenable_platform_specific_config") platformConfigEnabled = false;
+        else if (tok.startsWith("--enable_platform_specific_config=")) {
+          platformConfigEnabled = !isFalseVal(
+            tok.slice("--enable_platform_specific_config=".length),
+          );
+        }
+      }
+      const effectivePlatform = platform || process.platform;
+      const osConfigName =
+        effectivePlatform === "darwin"
+          ? "macos"
+          : effectivePlatform === "win32"
+            ? "windows"
+            : effectivePlatform === "linux"
+              ? "linux"
+              : null;
+      const osConfigTokens =
+        platformConfigEnabled && osConfigName && rcConfigTokensByName.has(osConfigName)
+          ? expandConfigTokens(
+              rcConfigTokensByName.get(osConfigName) || [],
+              1,
+              new Set([osConfigName]),
+            )
+          : [];
+      const reclassified = classifyBuildCommand("bazel", [
+        subcmd,
+        ...expandedFromRc.filter((t) => t !== "--"),
+        ...osConfigTokens.filter((t) => t !== "--"),
+        ...expandedFromCli.filter((t) => t !== "--"),
+        ...(cliRestArgs.includes("--") ? cliRestArgs.slice(cliRestArgs.indexOf("--")) : []),
+      ]);
+      if (reclassified.kind === "deny_lifecycle" || reclassified.kind === "read_only") {
+        return {
+          ...reclassified,
+          workspaceRoot: null,
+          resourceKeys: [],
+        };
+      }
+      classified = reclassified;
     }
 
     applyStartupOptionTokens(strArgs, baseCwd);

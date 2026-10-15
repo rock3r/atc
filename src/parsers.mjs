@@ -116,6 +116,34 @@ export function parseJavaProperties(content) {
   return props;
 }
 
+function stripBazelrcLineComment(rawLine) {
+  let quote = null;
+  for (let i = 0; i < rawLine.length; i++) {
+    const ch = rawLine[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === "\\" && i + 1 < rawLine.length) i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < rawLine.length) {
+      i++;
+      continue;
+    }
+    if (ch === "#") {
+      return rawLine.slice(0, i);
+    }
+  }
+  return rawLine;
+}
+
 /**
  * Joins backslash-continued lines in configuration files like .bazelrc.
  */
@@ -125,7 +153,8 @@ export function joinBackslashContinuations(content) {
   const lines = [];
   let cur = "";
   for (const raw of rawLines) {
-    const trimmedRight = raw.replace(/\s+$/, "");
+    const uncommented = stripBazelrcLineComment(raw);
+    const trimmedRight = uncommented.replace(/\s+$/, "");
     let bs = 0;
     for (let i = trimmedRight.length - 1; i >= 0 && trimmedRight[i] === "\\"; i--) {
       bs++;
@@ -133,7 +162,7 @@ export function joinBackslashContinuations(content) {
     if (bs % 2 === 1) {
       cur += trimmedRight.slice(0, -1) + " ";
     } else {
-      cur += raw;
+      cur += uncommented;
       lines.push(cur);
       cur = "";
     }

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { classifyBuildCommand } from "./build.mjs";
+import { classifyBuildCommand, resolveBuildResources } from "./build.mjs";
 
 const FAST_PATH_REGEX =
   /(?:^|(?<![A-Za-z0-9]))(android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild|atc)(?=$|(?![A-Za-z0-9]))/i;
@@ -2800,7 +2800,22 @@ export function classifySegment(
     baseCmd === "bazelisk" ||
     baseCmd === "bazelw"
   ) {
-    const buildInfo = classifyBuildCommand(baseCmd, args);
+    let buildInfo = classifyBuildCommand(baseCmd, args);
+    if (
+      (baseCmd === "bazel" || baseCmd === "bazelisk" || baseCmd === "bazelw") &&
+      buildInfo.kind !== "deny_lifecycle" &&
+      buildInfo.kind !== "read_only"
+    ) {
+      const resolvedBazel = resolveBuildResources(
+        baseCmd,
+        args,
+        parsed.relCwd ? path.resolve(process.cwd(), parsed.relCwd) : process.cwd(),
+        { env: { ...process.env, ...(parsed.envVars || {}) } },
+      );
+      if (resolvedBazel && resolvedBazel.kind && resolvedBazel.kind !== "not_build_tool") {
+        buildInfo = resolvedBazel;
+      }
+    }
     if (buildInfo.kind === "deny_lifecycle") {
       return {
         kind: "deny_lifecycle",

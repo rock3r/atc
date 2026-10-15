@@ -11,6 +11,7 @@ import {
   injectBazelFlagsIntoShellClause,
   normalizeBuildToolName,
   peelBuildWrapperTokens,
+  resolveBuildResources,
   scanExecutableSubstitutions,
   splitShellClauseRedirAndGroup,
   splitShellScriptParts,
@@ -483,7 +484,19 @@ export function buildChildInvocation(
   cmd = effectiveCmd;
   args = effectiveArgs;
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
-  const buildClassified = classifyBuildCommand(cmd, args, { env: baseEnv || process.env });
+  let buildClassified = classifyBuildCommand(cmd, args, { env: baseEnv || process.env });
+  if (
+    buildClassified.tool === "bazel" &&
+    buildClassified.kind !== "deny_lifecycle" &&
+    buildClassified.kind !== "read_only"
+  ) {
+    const resolvedBazel = resolveBuildResources(cmd, args, process.cwd(), {
+      env: baseEnv || process.env,
+    });
+    if (resolvedBazel && resolvedBazel.kind && resolvedBazel.kind !== "not_build_tool") {
+      buildClassified = resolvedBazel;
+    }
+  }
   if (buildClassified.kind === "deny_lifecycle" && !buildClassified.unresolvedDynamicCwd) {
     throw new Error(buildClassified.reason);
   }

@@ -1990,6 +1990,81 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     );
     assert.equal(unsetBazelrcEnvReqs.requestedHeapMb, 0);
 
+    // BAZELRC=/dev/null sentinel stops processing subsequent comma-separated entries
+    const envRcIgnored = path.join(wsDir, "env-ignored.bazelrc");
+    const envOutIgnored = path.join(wsDir, "bazel-env-ignored-out");
+    fs.writeFileSync(envRcIgnored, `startup --output_base=${envOutIgnored}\n`);
+    const bazelrcNullSentinelReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "build", "//..."],
+      subAppDir,
+      { env: { ...process.env, BAZELRC: `${envRc1},/dev/null,${envRcIgnored}` } },
+    );
+    assert.ok(
+      bazelrcNullSentinelReqs.resourceKeys.some((k) => k.endsWith("bazel-env-out")),
+    );
+    assert.equal(
+      bazelrcNullSentinelReqs.resourceKeys.some((k) => k.endsWith("bazel-env-ignored-out")),
+      false,
+    );
+
+    // Command-specific .bazelrc options (clean --expunge, test --ios_simulator_device, run --norun) apply to classification
+    const cmdRcFile = path.join(wsDir, "cmd-options.bazelrc");
+    fs.writeFileSync(
+      cmdRcFile,
+      [
+        "clean --expunge",
+        "test --@rules_apple//apple/build_settings:ios_simulator_device=iPhone\\ 16",
+        "run --norun",
+      ].join("\n") + "\n",
+    );
+    const rcCleanExpungeReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "clean"],
+      subAppDir,
+    );
+    assert.equal(rcCleanExpungeReqs.kind, "deny_lifecycle");
+
+    const rcCleanNoExpungeOverrideReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "clean", "--noexpunge"],
+      subAppDir,
+    );
+    assert.equal(rcCleanNoExpungeOverrideReqs.kind, "workspace_only");
+
+    const rcIosTestReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "test", "//app:tests"],
+      subAppDir,
+    );
+    assert.equal(rcIosTestReqs.kind, "device_coupled_build");
+    assert.equal(rcIosTestReqs.requiresDevice, true);
+    assert.equal(rcIosTestReqs.targetPlatform, "ios");
+
+    const rcBoundedRunReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "run", "//app:bin"],
+      subAppDir,
+    );
+    assert.equal(rcBoundedRunReqs.kind, "pure_build");
+
+    const rcGuardClean = evaluateCommandGuard(
+      `bazel --nosystem_rc --nohome_rc --bazelrc=${cmdRcFile} clean`,
+      { sessionId: "sess-rc", activeLeases: [] },
+    );
+    assert.equal(rcGuardClean.allowed, false);
+
+    assert.throws(() =>
+      buildChildInvocation(
+        "bazel",
+        ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "clean"],
+        null,
+        "sess-rc",
+        process.env,
+        null,
+      ),
+    );
+
     // Trailing shell comments preserve comment text and insert injected flags before `#`
     const commentGradleInv = buildChildInvocation(
       "sh",
