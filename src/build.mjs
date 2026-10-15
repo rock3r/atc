@@ -74,6 +74,73 @@ export function tokenizeShellClause(clause) {
   return tokens;
 }
 
+export function splitShellScriptParts(script) {
+  const s = String(script || "");
+  const parts = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inSingle) {
+      cur += ch;
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      cur += ch;
+      if (ch === "\\" && i + 1 < s.length) {
+        cur += s[i + 1];
+        i++;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      cur += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      cur += ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) {
+      cur += ch + s[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === ";" || ch === "\n") {
+      parts.push(cur, ch);
+      cur = "";
+      continue;
+    }
+    if (ch === "&" && s[i + 1] === "&") {
+      parts.push(cur, "&&");
+      cur = "";
+      i++;
+      continue;
+    }
+    if (ch === "|") {
+      if (s[i + 1] === "|") {
+        parts.push(cur, "||");
+        cur = "";
+        i++;
+      } else {
+        parts.push(cur, "|");
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  parts.push(cur);
+  return parts;
+}
+
 export function peelBuildWrapperTokens(cmd, args = []) {
   let curCmd = String(cmd || "");
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
@@ -242,8 +309,8 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             ? curArgs.slice(cIdx + 1).join(" ")
             : String(curArgs[cIdx + 1] || "");
         const script = rawScriptArg.trim();
-        const clauses = script
-          .split(/(?:;|&&|\|\||\|(?!\|)|\n)+/)
+        const clauses = splitShellScriptParts(script)
+          .filter((_, idx) => idx % 2 === 0)
           .map((s) => s.trim())
           .filter(Boolean);
         const matchedClauses = [];
@@ -834,6 +901,27 @@ export function resolveBuildResources(
     if (deny) return deny;
     const reject = clauseRes.find((r) => r.kind === "reject_long_running");
     if (reject) return reject;
+    const devicePlatforms = Array.from(
+      new Set(
+        clauseRes
+          .filter((r) => r.requiresDevice && r.targetPlatform)
+          .map((r) => r.targetPlatform),
+      ),
+    );
+    if (devicePlatforms.length > 1) {
+      return {
+        kind: "deny_lifecycle",
+        tool: clauseRes[0]?.tool || "multi",
+        targetPlatform: null,
+        requiresDevice: true,
+        requiresHeavySlot: false,
+        requiresWorkspaceLock: false,
+        workspaceRoot: null,
+        resourceKeys: [],
+        reason:
+          "Mixed-platform device-coupled build clauses (Android + iOS) cannot share a single shell wrapper; run each platform's device build in its own atc exec invocation.",
+      };
+    }
     const requiresDevice = clauseRes.some((r) => r.requiresDevice);
     const requiresHeavySlot = clauseRes.some((r) => r.requiresHeavySlot);
     const requiresWorkspaceLock = clauseRes.some((r) => r.requiresWorkspaceLock);
@@ -854,6 +942,7 @@ export function resolveBuildResources(
       disablesDaemon: clauseRes.some((r) => r.disablesDaemon),
       workspaceRoot: clauseRes.find((r) => r.workspaceRoot)?.workspaceRoot || null,
       resourceKeys: Array.from(new Set(clauseRes.flatMap((r) => r.resourceKeys || []))),
+      clauseBuildReqs: clauseRes.filter((r) => r.requiresHeavySlot),
     };
   }
   const classified = classifyBuildCommand(cmd, args);
@@ -1548,6 +1637,15 @@ export function evaluateNestedBuildAdmission(
 }
 
 export function probeWarmBuildDaemons(buildReqs, options = {}) {
+  if (Array.isArray(buildReqs?.clauseBuildReqs) && buildReqs.clauseBuildReqs.length > 1) {
+    const subProbes = buildReqs.clauseBuildReqs.map((sub) =>
+      probeWarmBuildDaemons({ ...sub, clauseBuildReqs: null }, options),
+    );
+    return {
+      warm: subProbes.length > 0 && subProbes.every((p) => p.warm),
+      daemonPids: Array.from(new Set(subProbes.flatMap((p) => p.daemonPids || []))),
+    };
+  }
   if (
     !buildReqs ||
     (buildReqs.tool !== "gradle" && buildReqs.tool !== "bazel") ||

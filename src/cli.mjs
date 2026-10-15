@@ -5220,6 +5220,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
   // If --claim is requested without build coordination, claim the device first via cmdClaim
   let coAllocatedLeaseId = null;
+  let coAllocatedDeviceKey = null;
   if (isClaimFlag && !needsBuildCoordination) {
     const claimRes = cmdClaim(stateDir, claimFlags, options);
     if (claimRes.exitCode !== 0) {
@@ -5227,8 +5228,44 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }
     if (!claimRes.idempotent && claimRes.lease?.leaseId) {
       coAllocatedLeaseId = claimRes.lease.leaseId;
+      coAllocatedDeviceKey = claimRes.lease.deviceKey || null;
     }
   }
+  const cleanupCoAllocatedLeaseOnEarlyError = () => {
+    if (!coAllocatedLeaseId) return;
+    try {
+      withStateTransaction(
+        stateDir,
+        (state, { auditEvents }) => {
+          const { key, lease: cur } = findLeaseEntry(
+            state,
+            coAllocatedDeviceKey,
+            coAllocatedLeaseId,
+          );
+          if (!cur || cur.leaseId !== coAllocatedLeaseId) {
+            return { mutated: false };
+          }
+          delete state.leases[key];
+          if (Array.isArray(auditEvents)) {
+            auditEvents.push({
+              event: "device_free",
+              sessionId: cur.sessionId,
+              leaseId: cur.leaseId,
+              deviceKey: key,
+              platform: cur.platform,
+              kind: cur.kind,
+              serial: cur.serial,
+              reason: "exec_claim_abort",
+            });
+          }
+          return { mutated: true };
+        },
+        options,
+      );
+    } catch {
+      // Best-effort cleanup on pre-spawn error
+    }
+  };
 
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
@@ -5251,6 +5288,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     try {
       resolvedClaimPlatform = resolveTargetPlatform(claimFlags, cwd);
     } catch (err) {
+      cleanupCoAllocatedLeaseOnEarlyError();
       return { exitCode: 1, error: err.message };
     }
     if (
@@ -6184,6 +6222,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         options,
       );
     } catch (err) {
+      cleanupCoAllocatedLeaseOnEarlyError();
       return { exitCode: 1, error: err.message };
     }
 
@@ -6238,6 +6277,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       const coldCreatedNewLease = Boolean(!claimRes.idempotent);
       if (coldCreatedNewLease && claimedLease?.leaseId) {
         coAllocatedLeaseId = claimedLease.leaseId;
+        coAllocatedDeviceKey = claimedLease.deviceKey || null;
       }
       let postClaimValidationError = null;
       const leasePlat = claimedLease.platform || "android";
@@ -6394,6 +6434,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }
 
     if (txRes.status === "error") {
+      cleanupCoAllocatedLeaseOnEarlyError();
       return { exitCode: txRes.exitCode, error: txRes.error };
     }
 

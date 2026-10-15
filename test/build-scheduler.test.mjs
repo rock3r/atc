@@ -1240,7 +1240,97 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       testWithoutBuildingInv.args[1],
       "xcodebuild test-without-building -scheme App -destination id=SIM-UDID-999",
     );
+
+    // Quoted shell separators inside arguments are preserved intact
+    const quotedSepInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build -Pfilter='a|b;c&&d'"],
+      null,
+      "sess-round9",
+      process.env,
+      buildLease,
+    );
+    assert.equal(
+      quotedSepInv.args[1],
+      "./gradlew build -Pfilter='a|b;c&&d' -Dorg.gradle.workers.max=4",
+    );
+
+    // Mixed-platform device-coupled shell clauses are denied
+    const mixedDeviceReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew connectedCheck && xcodebuild test -scheme App"],
+      spacedAppDir,
+    );
+    assert.equal(mixedDeviceReqs.kind, "deny_lifecycle");
+    assert.match(mixedDeviceReqs.reason, /Mixed-platform device-coupled build clauses/);
+
+    // Multi-tool warm daemon probe checks every heavy tool in the shell wrapper
+    const multiToolReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew assembleDebug && bazel build //app"],
+      spacedAppDir,
+    );
+    const onlyGradleWarm = probeWarmBuildDaemons(multiToolReqs, {
+      inventory: {
+        warmBuildDaemons: [{ tool: "gradle", workspaceRoot: canonicalSpacedApp, pid: 1111 }],
+      },
+    });
+    assert.equal(onlyGradleWarm.warm, false);
+    const bothWarm = probeWarmBuildDaemons(multiToolReqs, {
+      inventory: {
+        warmBuildDaemons: [
+          { tool: "gradle", workspaceRoot: canonicalSpacedApp, pid: 1111 },
+          { tool: "bazel", workspaceRoot: canonicalSpacedApp, pid: 2222 },
+        ],
+      },
+    });
+    assert.equal(bothWarm.warm, true);
+    assert.deepEqual(bothWarm.daemonPids, [1111, 2222]);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("cmdExec --claim releases newly claimed device when pre-spawn validation fails", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-claim-abort-"));
+  const fakeInventory = {
+    hostResources: {
+      totalMemMb: 32768,
+      freeMemMb: 16384,
+      availableMemMb: 16384,
+      cpus: 8,
+      sampledAtMs: Date.now(),
+    },
+    running: [
+      {
+        deviceKey: "Pixel_7_API_35",
+        serial: "emulator-5554",
+        avd: "Pixel_7_API_35",
+        platform: "android",
+        kind: "emulator",
+        profile: { deviceType: "phone", apiLevel: 35, playStore: true },
+        state: "online",
+      },
+    ],
+    offline: [],
+    creatable: [],
+  };
+  try {
+    const res = await cmdExec(
+      stateDir,
+      ["adb", "-s", "emulator-5556", "shell", "echo", "hi"],
+      { claim: true, session: "agent-claim-validation-fail" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "agent-claim-validation-fail" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.equal(res.exitCode, 3);
+    assert.match(res.error, /Conflicting device selector "emulator-5556"/);
+    const stateAfter = readState(stateDir);
+    assert.equal(Object.keys(stateAfter.leases || {}).length, 0);
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });

@@ -2,7 +2,12 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyBuildCommand, peelBuildWrapperTokens, tokenizeShellClause } from "./build.mjs";
+import {
+  classifyBuildCommand,
+  peelBuildWrapperTokens,
+  splitShellScriptParts,
+  tokenizeShellClause,
+} from "./build.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -819,7 +824,7 @@ export function buildChildInvocation(
         const rawScript = isMultiTokenWinShell
           ? nextArgs.slice(cIdx + 1).join(" ")
           : String(nextArgs[cIdx + 1] || "");
-        const parts = rawScript.split(/([;\n]|&&|\|\||\|)/);
+        const parts = splitShellScriptParts(rawScript);
         const rewrittenParts = parts.map((part, idx) => {
           if (idx % 2 === 1) return part;
           const trimmed = part.trim();
