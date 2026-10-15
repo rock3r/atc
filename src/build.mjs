@@ -1345,6 +1345,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           envVars.JAVA_TOOL_OPTIONS = null;
           envVars.USE_BAZEL_VERSION = null;
           envVars.HOME = null;
+          envVars.USERPROFILE = null;
+          envVars.TEST_TMPDIR = null;
+          envVars.XDG_CACHE_HOME = null;
+          envVars.USER = null;
+          envVars.LOGNAME = null;
+          envVars.USERNAME = null;
         } else if (act.type === "chdir") {
           const rawNextDir = act.rawDir;
           const exp = inShell
@@ -4142,11 +4148,28 @@ export function resolveBuildResources(
       const wsMd5 = crypto.createHash("md5").update(canonicalRoot).digest("hex");
       resourceKeys.push(`bazel:out:${path.join(canonicalUserRoot, wsMd5)}`);
     }
+    const bazelEnvMeta = {
+      baseCwd,
+      platform: platform || process.platform,
+      envBazelTestTmpdir: effectiveEnvVars.TEST_TMPDIR,
+      envBazelUser: effectiveEnvVars.USER,
+      envBazelLogname: effectiveEnvVars.LOGNAME,
+      envBazelUsername: effectiveEnvVars.USERNAME,
+      envBazelHome: effectiveEnvVars.HOME,
+      envBazelUserProfile: effectiveEnvVars.USERPROFILE,
+      envBazelXdgCacheHome: effectiveEnvVars.XDG_CACHE_HOME,
+    };
     return applyExplicitWorkspaceKeys({
       ...classified,
+      ...bazelEnvMeta,
       disablesDaemon,
       requestedHeapMb,
       bazelOutputUserRoot: canonicalUserRoot,
+      defaultBazelOutputBases: computeDefaultBazelOutputBases(canonicalRoot, {
+        buildReqs: bazelEnvMeta,
+        env: baseEnv,
+        platform: platform || process.platform,
+      }),
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
     });
@@ -4823,6 +4846,105 @@ export function evaluateNestedBuildAdmission(
   };
 }
 
+export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
+  if (!wsRoot) return [];
+  const wsMd5 = crypto.createHash("md5").update(String(wsRoot)).digest("hex");
+  const buildReqs = options.buildReqs || null;
+  const env = options.env || process.env;
+  const platform = options.platform || buildReqs?.platform || process.platform;
+  const baseCwd = buildReqs?.baseCwd || process.cwd();
+
+  const resolveEnvVar = (key, wrapperVal) => {
+    if (wrapperVal === null || wrapperVal === "") return null;
+    if (wrapperVal !== undefined) return String(wrapperVal);
+    const fromEnv = env?.[key];
+    return fromEnv === undefined || fromEnv === "" ? null : String(fromEnv);
+  };
+
+  const rawTestTmpdir = resolveEnvVar("TEST_TMPDIR", buildReqs?.envBazelTestTmpdir);
+  const rawUser =
+    resolveEnvVar("USER", buildReqs?.envBazelUser) ||
+    resolveEnvVar("LOGNAME", buildReqs?.envBazelLogname) ||
+    resolveEnvVar("USERNAME", buildReqs?.envBazelUsername);
+  const rawHome =
+    resolveEnvVar("HOME", buildReqs?.envBazelHome) ||
+    resolveEnvVar("USERPROFILE", buildReqs?.envBazelUserProfile);
+  const rawXdgCache = resolveEnvVar("XDG_CACHE_HOME", buildReqs?.envBazelXdgCacheHome);
+
+  if (
+    rawTestTmpdir === "__UNRESOLVED_DYNAMIC_ENV__" ||
+    rawUser === "__UNRESOLVED_DYNAMIC_ENV__" ||
+    rawHome === "__UNRESOLVED_DYNAMIC_ENV__" ||
+    rawXdgCache === "__UNRESOLVED_DYNAMIC_ENV__"
+  ) {
+    return [];
+  }
+
+  const user =
+    rawUser ||
+    (() => {
+      try {
+        return os.userInfo().username;
+      } catch {
+        return "default";
+      }
+    })() ||
+    "default";
+
+  const candidateRoots = [];
+  if (rawTestTmpdir) {
+    const resolvedTmp = path.resolve(baseCwd, rawTestTmpdir);
+    candidateRoots.push(path.join(resolvedTmp, `_bazel_${user}`));
+    candidateRoots.push(
+      path.join(canonicalizeBuildPath(resolvedTmp, { platform }), `_bazel_${user}`),
+    );
+  } else if (platform === "darwin") {
+    candidateRoots.push(`/var/tmp/_bazel_${user}`);
+    candidateRoots.push(`/private/var/tmp/_bazel_${user}`);
+  } else if (platform === "win32") {
+    const homeDir =
+      rawHome || (buildReqs?.envBazelHome === null ? null : os.homedir());
+    if (homeDir) {
+      const resolvedHome =
+        /^[a-zA-Z]:[\\/]/.test(homeDir) || homeDir.startsWith("\\\\")
+          ? path.win32.resolve(homeDir)
+          : path.resolve(baseCwd, homeDir);
+      candidateRoots.push(path.win32.join(resolvedHome, `_bazel_${user}`));
+      candidateRoots.push(
+        path.win32.join(
+          canonicalizeBuildPath(resolvedHome, { platform: "win32" }),
+          `_bazel_${user}`,
+        ),
+      );
+    }
+  } else {
+    const homeDir =
+      rawHome || (buildReqs?.envBazelHome === null ? null : os.homedir());
+    const xdgCache = rawXdgCache
+      ? path.resolve(baseCwd, rawXdgCache)
+      : homeDir
+        ? path.join(path.resolve(baseCwd, homeDir), ".cache")
+        : null;
+    if (xdgCache) {
+      candidateRoots.push(path.join(xdgCache, "bazel", `_bazel_${user}`));
+      candidateRoots.push(
+        path.join(canonicalizeBuildPath(xdgCache, { platform }), "bazel", `_bazel_${user}`),
+      );
+    } else {
+      candidateRoots.push(`/var/tmp/_bazel_${user}`);
+    }
+  }
+
+  const joinFn = platform === "win32" ? path.win32.join : path.join;
+  const bases = [];
+  for (const root of candidateRoots) {
+    if (!root) continue;
+    bases.push(joinFn(root, wsMd5));
+    bases.push(canonicalizeBuildPath(joinFn(root, wsMd5), { platform }));
+  }
+  return Array.from(new Set(bases));
+}
+
 export function probeWarmBuildDaemons(buildReqs, options = {}) {
   if (Array.isArray(buildReqs?.clauseBuildReqs) && buildReqs.clauseBuildReqs.length > 0) {
     const subProbes = buildReqs.clauseBuildReqs.map((sub) =>
@@ -4883,9 +5005,6 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     if (!stdout) return { warm: false, daemonPids: [] };
     const daemonPids = [];
     const wsRoot = String(buildReqs.workspaceRoot || "");
-    const defaultBazelOutMd5 = wsRoot
-      ? crypto.createHash("md5").update(wsRoot).digest("hex")
-      : null;
     let expectedGradleVersion = null;
     let expectedGradleJavaHome = buildReqs.envJavaHomeUnset
       ? null
@@ -5175,26 +5294,17 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           /\bbazel\([^)]+\)/.test(cmdLine) ||
           /com\.google\.devtools\.build\.lib\.bazel\.BazelMain\b/.test(cmdLine);
         if (isBazelServer) {
-          const matchesOut = outKeys.some(
+          const targetOutPaths =
+            outKeys.length > 0
+              ? outKeys
+              : computeDefaultBazelOutputBases(wsRoot, {
+                  buildReqs,
+                  env: options.env,
+                  platform,
+                });
+          const matchesWorkspace = targetOutPaths.some(
             (outPath) => outPath && matchesCmdPathBoundary(cmdLine, outPath),
           );
-          const matchesDefaultMd5 =
-            defaultBazelOutMd5 &&
-            new RegExp(`(?:^|[\\\\/=])${defaultBazelOutMd5}(?:$|[\\\\/\\s"'])`, "i").test(cmdLine);
-          const matchesUserRootAndWs = Boolean(
-            buildReqs.bazelOutputUserRoot &&
-              matchesCmdPathBoundary(cmdLine, buildReqs.bazelOutputUserRoot, {
-                allowSubpath: true,
-              }) &&
-              wsRoot &&
-              (matchesCmdPathBoundary(cmdLine, wsRoot) || matchesDefaultMd5),
-          );
-          const matchesWorkspace =
-            outKeys.length > 0
-              ? matchesOut || matchesUserRootAndWs
-              : Boolean(
-                  wsRoot && (matchesCmdPathBoundary(cmdLine, wsRoot) || matchesDefaultMd5),
-                );
           if (matchesWorkspace) {
             daemonPids.push(pid);
           }

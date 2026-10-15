@@ -15,6 +15,7 @@ import {
   checkUnifiedRamAdmission,
   reconcileBuildLease,
   evaluateNestedBuildAdmission,
+  computeDefaultBazelOutputBases,
   probeWarmBuildDaemons,
 } from "../src/build.mjs";
 import {
@@ -1858,9 +1859,18 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.equal(otherBasenameProbe.warm, false);
 
+    // Custom --output_base server for same workspace must NOT match a default Bazel invocation
+    const customOutputBaseSameWsProbe = probeWarmBuildDaemons(bazelAppReqs, {
+      runner: () => ({
+        stdout: `9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=/tmp/custom-bazel-out --workspace_directory=${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(customOutputBaseSameWsProbe.warm, false);
+
+    const defaultSubAppBazelOut = computeDefaultBazelOutputBases(canonicalSubApp)[0];
     const exactWorkspaceProbe = probeWarmBuildDaemons(bazelAppReqs, {
       runner: () => ({
-        stdout: `9002 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n`,
+        stdout: `9002 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=${defaultSubAppBazelOut} --workspace_directory=${canonicalSubApp}\n`,
       }),
     });
     assert.equal(exactWorkspaceProbe.warm, true);
@@ -1991,9 +2001,10 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       }),
     });
     assert.equal(warmGradleOnlyProbe.warm, false);
+    const defaultRootBazelOut = computeDefaultBazelOutputBases(canonicalWs)[0];
     const warmBazelProbe = probeWarmBuildDaemons(mixedWrapperReqs, {
       runner: () => ({
-        stdout: `9102 bazel(root) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalWs}\n`,
+        stdout: `9102 bazel(root) -XX:+HeapDumpOnOutOfMemoryError --output_base=${defaultRootBazelOut} --workspace_directory=${canonicalWs}\n`,
       }),
     });
     assert.equal(warmBazelProbe.warm, true);
