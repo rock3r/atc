@@ -16,6 +16,7 @@ import {
   splitShellScriptParts,
   tokenizeShellClause,
 } from "./build.mjs";
+import { detectUnparseableShellConstructs } from "./parsers.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -833,6 +834,16 @@ export function buildChildInvocation(
           ? nextArgs.slice(cIdx + 1).join(" ")
           : String(nextArgs[cIdx + 1] || "");
         const shellType = base === "cmd" ? "cmd" : "posix";
+        const unparseableGate = detectUnparseableShellConstructs(rawScript, shellType);
+        if (
+          unparseableGate.unparseable &&
+          (buildLease ||
+            /(?:^|[^A-Za-z0-9_])(?:gradlew|gradle|bazel|bazelisk|bazelw|xcodebuild)(?![A-Za-z0-9_])/i.test(
+              rawScript,
+            ))
+        ) {
+          throw new Error(unparseableGate.reason);
+        }
         const isAmpersandBackground = base !== "cmd";
         const stripSentinels = (v) => String(v || "").replaceAll("\uE000", "");
         const rewriteShellScriptInternal = (
@@ -1565,6 +1576,9 @@ export function buildChildInvocation(
               taintedVars: taintedEnvVars,
               shellType,
             });
+            if (peeled.denySubkind === "unparseable_shell" && peeled.denyReason) {
+              throw new Error(peeled.denyReason);
+            }
             const expanded = expandShellBuildClausePaths(
               peeled.cmd,
               peeled.args,
@@ -1888,6 +1902,20 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
+    if (child.stdout) {
+      if (options.redirectStdoutToStderr) {
+        child.stdout.pipe(process.stderr);
+      } else {
+        child.stdout.resume();
+      }
+    }
+    if (child.stderr) {
+      if (options.redirectStdoutToStderr) {
+        child.stderr.pipe(process.stderr);
+      } else {
+        child.stderr.resume();
+      }
+    }
     const childPid = child.pid || null;
     const effectivePlatform = options.platform || process.platform;
     let childStartToken = null;

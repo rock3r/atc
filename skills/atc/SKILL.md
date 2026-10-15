@@ -29,7 +29,7 @@ The `atc` CLI coordinates Android emulators, iOS Simulators, and physical test d
    atc claim --ios --type phone --os ">=18.0" --wait 300
    ```
    Never start, boot, stop, or wipe an emulator/simulator or kill shared build daemons directly (`emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`, `xcrun simctl boot`, `xcrun simctl shutdown`, `xcrun simctl erase`, `./gradlew --stop`, `bazel shutdown`). Default claims target virtual devices (`--kind emulator`) so you never hijack a developer's personal USB phone unless explicitly asked.
-4. Run every device, instrumentation, or heavy build command through `atc exec`:
+4. Run every device, instrumentation, or heavy build command through `atc exec` (or `atc batch` for multi-step build-then-test DAGs):
    ```bash
    atc exec -- adb shell getprop ro.product.model
    atc exec -- android layout --pretty
@@ -37,8 +37,10 @@ The `atc` CLI coordinates Android emulators, iOS Simulators, and physical test d
    atc exec -- xcrun simctl launch booted com.example.app
    atc exec --build -- ./gradlew assembleDebug
    atc exec --claim "--type phone --api >=35" -- ./gradlew connectedDebugAndroidTest
+   atc exec --phase pure-build --workspace . --ram-mb 4096 -- ./gradlew assembleDebug assembleDebugAndroidTest
+   atc batch --file pipeline.json --json
    ```
-   `atc exec` injects `ANDROID_SERIAL=<serial>` and `--device=<serial>` on Android, or `ATC_IOS_UDID=<udid>`, rewrites `booted` -> `<udid>` on `simctl`, and injects `--device <udid>` on `devicectl` for iOS. For Gradle, Bazel, and `xcodebuild`, `atc exec` also coordinates 3-tier build slots, per-workspace locks, and CPU/RAM flags. In a KMP session holding 1 Android + 1 iOS lease, `atc exec` auto-selects the matching platform lease.
+   `atc exec` injects `ANDROID_SERIAL=<serial>` and `--device=<serial>` on Android, or `ATC_IOS_UDID=<udid>`, rewrites `booted` -> `<udid>` on `simctl`, and injects `--device <udid>` on `devicectl` for iOS. For Gradle, Bazel, and `xcodebuild`, `atc exec` also coordinates 3-tier build slots, per-workspace locks, and CPU/RAM flags (`--workspace <dir>`, `--phase <pure-build|device-build|device-test|read-only>`, `--ram-mb <mb>`). For multi-step pipelines, split pure compilation from device testing (`assembleDebugAndroidTest` -> `connectedDebugAndroidTest`, `build-for-testing` -> `test-without-building`, `bazel build` -> `bazel test`) or declare a DAG with `atc batch` so you never hold a scarce emulator while compiling. In a KMP session holding 1 Android + 1 iOS lease, `atc exec` auto-selects the matching platform lease.
 5. Free the lease as soon as your task finishes:
    ```bash
    atc free

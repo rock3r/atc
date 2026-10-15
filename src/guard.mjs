@@ -2367,7 +2367,10 @@ export function classifySegment(
             a === "--abi" ||
             a === "--services" ||
             a === "--reorder-window" ||
-            a === "--reorder-window-sec") &&
+            a === "--reorder-window-sec" ||
+            a === "--workspace" ||
+            a === "--phase" ||
+            a === "--ram-mb") &&
           i + 1 < scanEnd
         ) {
           if (a === "--udid") {

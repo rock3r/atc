@@ -34,6 +34,7 @@ import {
   withStateTransaction,
 } from "../src/state.mjs";
 import {
+  cmdBatch,
   cmdClaim,
   cmdExec,
   cmdFree,
@@ -42,12 +43,23 @@ import {
   cmdConfig,
   parseCliArgs,
 } from "../src/cli.mjs";
+import {
+  detectUnparseableShellConstructs,
+  joinBackslashContinuations,
+  parseEnvWrapperArgs,
+  parseJavaProperties,
+  parseShellQuote,
+  splitShellWords,
+} from "../src/parsers.mjs";
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "atc-build-test-"));
 }
 
 delete process.env.GRADLE_OPTS;
+delete process.env._JAVA_OPTIONS;
+delete process.env.JAVA_TOOL_OPTIONS;
+delete process.env.GRADLE_HOME;
 delete process.env.JAVA_OPTS;
 delete process.env.GRADLE_USER_HOME;
 
@@ -1351,7 +1363,7 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     // Multi-tool warm daemon probe checks every heavy tool in the shell wrapper
     const multiToolReqs = resolveBuildResources(
       "sh",
-      ["-c", "./gradlew assembleDebug && bazel build //app"],
+      ["-c", "./gradlew assembleDebug && bazel --nosystem_rc build //app"],
       spacedAppDir,
     );
     const onlyGradleWarm = probeWarmBuildDaemons(multiToolReqs, {
@@ -1838,7 +1850,7 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
 
     // Bazel warm daemon probe requires full workspace identity or output base (not basename-only bazel(app))
     fs.writeFileSync(path.join(subAppDir, "MODULE.bazel"), 'module(name = "app")\n');
-    const bazelAppReqs = resolveBuildResources("bazel", ["build", "//..."], subAppDir);
+    const bazelAppReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir);
     const otherBasenameProbe = probeWarmBuildDaemons(bazelAppReqs, {
       runner: () => ({
         stdout: "9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=/other/work/app\n",
@@ -1968,7 +1980,7 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     fs.writeFileSync(path.join(wsDir, "MODULE.bazel"), 'module(name = "root")\n');
     const mixedWrapperReqs = resolveBuildResources(
       "sh",
-      ["-c", "./gradlew tasks && bazel build //..."],
+      ["-c", "./gradlew tasks && bazel --nosystem_rc build //..."],
       wsDir,
     );
     assert.equal(mixedWrapperReqs.clauseBuildReqs.length, 1);
@@ -2506,5 +2518,347 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     assert.equal(daemonCriteriaProbe.warm, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit flags (--workspace, --phase, --ram-mb), cmdBatch DAG, and parser fuzzing", async () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-battle-plan-v3-"));
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-battle-state-v3-"));
+  try {
+    const dirA = path.join(wsDir, "a");
+    const dirB = path.join(wsDir, "b");
+    fs.mkdirSync(dirA, { recursive: true });
+    fs.mkdirSync(dirB, { recursive: true });
+    fs.writeFileSync(path.join(dirA, "settings.gradle"), "rootProject.name = 'a'\n");
+    fs.writeFileSync(path.join(dirB, "settings.gradle"), "rootProject.name = 'b'\n");
+    const canonicalDirB = (fs.realpathSync.native || fs.realpathSync)(dirB);
+
+    // 1. Repeated `env -C a -C b` resolves each `-C` relative to original entry cwd (not stacked)
+    const repeatedEnvC = resolveBuildResources(
+      "env",
+      ["-C", "a", "-C", "b", "./gradlew", "assembleDebug"],
+      wsDir,
+      { env: { HOME: wsDir } },
+    );
+    assert.equal(repeatedEnvC.kind, "pure_build");
+    assert.equal(repeatedEnvC.workspaceRoot, canonicalDirB);
+    assert.ok(repeatedEnvC.resourceKeys.includes(`gradle:${canonicalDirB}`));
+
+    // 2. Default Gradle JVM arguments (-Xmx512m -XX:MaxMetaspaceSize=384m) match warm daemon when org.gradle.jvmargs is unset
+    const mockJdk = path.join(wsDir, "jdk-def");
+    fs.mkdirSync(path.join(mockJdk, "bin"), { recursive: true });
+    fs.writeFileSync(
+      path.join(mockJdk, "bin", process.platform === "win32" ? "java.exe" : "java"),
+      "",
+    );
+    const canonicalMockJdk = (fs.realpathSync.native || fs.realpathSync)(mockJdk);
+    const defaultJvmWarmProbe = probeWarmBuildDaemons(repeatedEnvC, {
+      env: { JAVA_HOME: canonicalMockJdk, HOME: wsDir },
+      runner: () => ({
+        stdout: `7001 ${path.join(canonicalMockJdk, "bin", "java")} -Xmx512m -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(defaultJvmWarmProbe.warm, true);
+    assert.deepEqual(defaultJvmWarmProbe.daemonPids, [7001]);
+
+    // Non-default heap when org.gradle.jvmargs is unset must NOT match as warm
+    const nonDefaultJvmWarmProbe = probeWarmBuildDaemons(repeatedEnvC, {
+      env: { JAVA_HOME: canonicalMockJdk, HOME: wsDir },
+      runner: () => ({
+        stdout: `7002 ${path.join(canonicalMockJdk, "bin", "java")} -Xmx2g -XX:MaxMetaspaceSize=384m org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(nonDefaultJvmWarmProbe.warm, false);
+
+    // 3. Installation-level $GRADLE_HOME/gradle.properties is loaded with lowest precedence
+    const fakeGradleHome = path.join(wsDir, "gradle-dist");
+    const fakeUserHome = path.join(wsDir, "gradle-user");
+    fs.mkdirSync(fakeGradleHome, { recursive: true });
+    fs.mkdirSync(fakeUserHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeGradleHome, "gradle.properties"),
+      "org.gradle.jvmargs=-Xmx3g\norg.gradle.daemon=false\n",
+    );
+    const gradleHomeOnlyReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { GRADLE_HOME: fakeGradleHome, GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(gradleHomeOnlyReqs.requestedHeapMb, 3072);
+    assert.equal(gradleHomeOnlyReqs.disablesDaemon, true);
+
+    // Project gradle.properties overrides $GRADLE_HOME/gradle.properties
+    fs.writeFileSync(
+      path.join(dirB, "gradle.properties"),
+      "org.gradle.jvmargs=-Xmx4g\norg.gradle.daemon=true\n",
+    );
+    const projectOverridesDistReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { GRADLE_HOME: fakeGradleHome, GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(projectOverridesDistReqs.requestedHeapMb, 4096);
+    assert.equal(projectOverridesDistReqs.disablesDaemon, false);
+
+    // _JAVA_OPTIONS overrides smaller CLI -Dorg.gradle.jvmargs heap (HotSpot precedence)
+    const underscoreJavaHigherHeap = resolveBuildResources(
+      "./gradlew",
+      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
+      dirB,
+      { env: { _JAVA_OPTIONS: "-Xmx16g", GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(underscoreJavaHigherHeap.requestedHeapMb, 16384);
+
+    // Literal single-quoted redirection target >'$(output)' is allowed (not treated as dynamic expansion)
+    const literalRedirReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew assembleDebug >'$(output)'"],
+      dirB,
+      { env: { GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(literalRedirReqs.kind, "pure_build");
+
+    // 4. Windows %ProgramData%\bazel.bazelrc system rc loading
+    const fakeProgData = path.join(wsDir, "ProgramData");
+    const winSysBazelOut = path.join(wsDir, "win-sys-bazel-out");
+    fs.mkdirSync(fakeProgData, { recursive: true });
+    fs.mkdirSync(winSysBazelOut, { recursive: true });
+    const canonicalWinSysBazelOut = (fs.realpathSync.native || fs.realpathSync)(winSysBazelOut);
+    fs.writeFileSync(
+      path.join(fakeProgData, "bazel.bazelrc"),
+      `startup --output_base=${canonicalWinSysBazelOut}\n`,
+    );
+    fs.writeFileSync(path.join(dirA, "MODULE.bazel"), 'module(name = "a")\n');
+    const winSysRcReqs = resolveBuildResources("bazel", ["build", "//..."], dirA, {
+      platform: "win32",
+      env: { ProgramData: fakeProgData },
+    });
+    assert.ok(winSysRcReqs.resourceKeys.includes(`bazel:out:${canonicalWinSysBazelOut}`));
+
+    // 5. Fail-closed unparseable shell gate in both resolveBuildResources and buildChildInvocation
+    for (const trickyScript of [
+      'eval "./gradlew connectedCheck"',
+      "./gradlew build <(echo flags)",
+      "./gradlew build >$(echo out.log)",
+      './gradlew build "unclosed quote',
+      "./gradlew build \\",
+    ]) {
+      const gateReqs = resolveBuildResources("sh", ["-c", trickyScript], dirA);
+      assert.equal(gateReqs.kind, "deny_lifecycle", `Expected deny_lifecycle for: ${trickyScript}`);
+      assert.equal(gateReqs.denySubkind, "unparseable_shell");
+      assert.throws(
+        () =>
+          buildChildInvocation("sh", ["-c", trickyScript], null, "sess-gate", process.env, {
+            jobsLimit: 4,
+            reservedRamMb: 3072,
+          }),
+        /cannot be safely analyzed under ATC|Unclosed quote or substitution|Trailing backslash/,
+      );
+    }
+
+    // 6. Explicit --workspace, --phase, and --ram-mb flags on cmdExec
+    const subNested = path.join(dirA, "sub", "nested");
+    fs.mkdirSync(subNested, { recursive: true });
+    const canonicalDirA = (fs.realpathSync.native || fs.realpathSync)(dirA);
+    const explicitWsReqs = resolveBuildResources(
+      process.execPath,
+      ["-e", "process.exit(0)"],
+      wsDir,
+      { forceBuild: true, workspace: subNested },
+    );
+    assert.ok(explicitWsReqs.resourceKeys.includes(`workspace:${canonicalDirA}`));
+
+    // --phase monotonic lattice checks
+    const phaseReadOnlyOnBuild = await cmdExec(
+      stateDir,
+      ["./gradlew", "tasks"],
+      { phase: "read-only", session: "sess-phase" },
+      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
+    );
+    assert.equal(phaseReadOnlyOnBuild.exitCode, 3);
+    assert.match(phaseReadOnlyOnBuild.error, /violates --phase=read-only/);
+
+    const phasePureOnDevice = await cmdExec(
+      stateDir,
+      ["./gradlew", "connectedDebugAndroidTest"],
+      { phase: "pure-build", session: "sess-phase" },
+      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
+    );
+    assert.equal(phasePureOnDevice.exitCode, 3);
+    assert.match(phasePureOnDevice.error, /violates --phase=pure-build/);
+
+    const phasePureWithClaim = await cmdExec(
+      stateDir,
+      ["./gradlew", "assembleDebug"],
+      { phase: "pure-build", claim: true, session: "sess-phase" },
+      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
+    );
+    assert.equal(phasePureWithClaim.exitCode, 3);
+    assert.match(phasePureWithClaim.error, /cannot be combined with --claim/);
+
+    const phaseDeviceTestOnPureBuild = await cmdExec(
+      stateDir,
+      ["./gradlew", "assembleDebug"],
+      { phase: "device-test", session: "sess-phase" },
+      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
+    );
+    assert.equal(phaseDeviceTestOnPureBuild.exitCode, 3);
+    assert.match(phaseDeviceTestOnPureBuild.error, /violates --phase=device-test/);
+
+    const nulEnvBatch = await cmdBatch(
+      stateDir,
+      {
+        steps: [
+          {
+            id: "s1",
+            command: process.execPath,
+            args: ["-e", "process.exit(0)"],
+            env: { BAD_VAL: "abc\0def" },
+          },
+        ],
+      },
+      { session: "sess-batch" },
+      { cwd: dirA },
+    );
+    assert.equal(nulEnvBatch.exitCode, 1);
+    assert.match(nulEnvBatch.error, /NUL bytes/);
+
+    const invalidRam = await cmdExec(
+      stateDir,
+      [process.execPath, "-e", "process.exit(0)"],
+      { phase: "pure-build", ramMb: -5, session: "sess-phase" },
+      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
+    );
+    assert.equal(invalidRam.exitCode, 1);
+    assert.match(invalidRam.error, /Invalid --ram-mb/);
+
+    // 7. cmdBatch multi-step DAG runner: cycle detection, pre-flight validation, topological execution
+    const cycleRes = await cmdBatch(
+      stateDir,
+      {
+        steps: [
+          { id: "a", command: process.execPath, args: ["-e", "process.exit(0)"], dependsOn: ["b"] },
+          { id: "b", command: process.execPath, args: ["-e", "process.exit(0)"], dependsOn: ["a"] },
+        ],
+      },
+      { session: "sess-batch" },
+      { cwd: dirA },
+    );
+    assert.equal(cycleRes.exitCode, 1);
+    assert.match(cycleRes.error, /Dependency cycle detected/);
+
+    const markerFile = path.join(wsDir, "step1-ran.txt");
+    const preflightFailRes = await cmdBatch(
+      stateDir,
+      {
+        steps: [
+          {
+            id: "step1",
+            phase: "pure-build",
+            command: process.execPath,
+            args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(markerFile)}, 'ran')`],
+          },
+          {
+            id: "step2",
+            dependsOn: ["step1"],
+            phase: "pure-build",
+            command: "./gradlew",
+            args: ["connectedDebugAndroidTest"],
+          },
+        ],
+      },
+      { session: "sess-batch" },
+      { cwd: dirA },
+    );
+    assert.equal(preflightFailRes.exitCode, 3);
+    assert.match(preflightFailRes.error, /Batch pre-flight failed on step "step2"/);
+    assert.equal(fs.existsSync(markerFile), false, "Step 1 must not run if Step 2 fails pre-flight");
+
+    const orderLog = path.join(wsDir, "dag-order.txt");
+    const dagRes = await cmdBatch(
+      stateDir,
+      {
+        steps: [
+          {
+            id: "test-ready",
+            dependsOn: ["compile-lib", "compile-app"],
+            phase: "read-only",
+            command: process.execPath,
+            args: [
+              "-e",
+              `require('node:fs').appendFileSync(${JSON.stringify(orderLog)}, '3\\n')`,
+            ],
+          },
+          {
+            id: "compile-lib",
+            phase: "pure-build",
+            workspace: dirA,
+            ramMb: 1024,
+            command: process.execPath,
+            args: [
+              "-e",
+              `require('node:fs').appendFileSync(${JSON.stringify(orderLog)}, '1\\n')`,
+            ],
+          },
+          {
+            id: "compile-app",
+            dependsOn: ["compile-lib"],
+            phase: "pure-build",
+            workspace: dirA,
+            command: process.execPath,
+            args: [
+              "-e",
+              `require('node:fs').appendFileSync(${JSON.stringify(orderLog)}, '2\\n')`,
+            ],
+          },
+        ],
+      },
+      { session: "sess-batch", json: true },
+      { cwd: dirA },
+    );
+    assert.equal(dagRes.exitCode, 0);
+    assert.equal(dagRes.status, "completed");
+    assert.deepEqual(
+      dagRes.steps.map((s) => s.id),
+      ["compile-lib", "compile-app", "test-ready"],
+    );
+    assert.equal(fs.readFileSync(orderLog, "utf8"), "1\n2\n3\n");
+
+    // 8. Differential / property-based fuzzing of vendored parsers (seeded PRNG)
+    let seed = 0x1337beef;
+    const nextRand = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 0x100000000;
+    };
+    const pick = (arr) => arr[Math.floor(nextRand() * arr.length)];
+    for (let i = 0; i < 200; i++) {
+      const k = `org.gradle.${pick(["jvmargs", "java.home", "daemon", "caching", "workers.max"])}`;
+      const v = pick(["-Xmx4g", "C:\\Java\\jdk-21", "/opt/jdk:21", "true", "false", "line1\\\n  line2"]);
+      const sep = pick(["=", ":", " = ", " : ", " "]);
+      const propText = `# comment\n${k}${sep}${v}\n`;
+      const parsedProps = parseJavaProperties(propText);
+      assert.equal(typeof parsedProps.get(k), "string");
+
+      const rcPhase = pick(["startup", "build", "test", "common", "build:ci"]);
+      const rcFlag = pick(["--output_base=/tmp/out", "--jobs=4", "--javabase=/jdk"]);
+      const rcText = `# bazelrc comment\n${rcPhase} \\\n  ${rcFlag}\n`;
+      const rcLines = joinBackslashContinuations(rcText).filter(
+        (l) => l.trim() && !l.trim().startsWith("#"),
+      );
+      assert.equal(rcLines.length, 1);
+      const rcWords = splitShellWords(rcLines[0]);
+      assert.equal(rcWords[0], rcPhase);
+      assert.equal(rcWords[1], rcFlag);
+
+      const safeToks = [
+        pick(["./gradlew", "bazel", "xcodebuild"]),
+        pick(["assembleDebug", "build", "-scheme"]),
+        pick(["'quoted arg'", '"double quoted"', "--flag=val"]),
+      ];
+      const safeCmd = safeToks.join(" ");
+      const sq = parseShellQuote(safeCmd);
+      assert.equal(sq.unclosedQuote, false);
+      const gate = detectUnparseableShellConstructs(safeCmd);
+      assert.equal(gate.unparseable, false);
+    }
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });

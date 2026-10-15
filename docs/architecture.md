@@ -95,11 +95,11 @@ To keep `atc.lock` hold times under `20 ms`, audit logging is decoupled into two
 
 | Module | Path | Responsibility |
 |---|---|---|
-| CLI entrypoint | `bin/atc.mjs`, `src/cli.mjs` | Flag parsing and command handlers (`guide`, `claim`, `free`, `renew`, `snapshot`, `exec`, `status`, `config`, `gc`, `guard`, `hook`, `mcp`). |
+| CLI entrypoint | `bin/atc.mjs`, `src/cli.mjs` | Flag parsing and command handlers (`guide`, `claim`, `free`, `renew`, `snapshot`, `exec`, `batch`/`plan`, `status`, `config`, `gc`, `guard`, `hook`, `mcp`). |
 | Built-in guides | `src/guide.mjs`, `src/guides/*.md` | Markdown topics (`workflow`, `profiles`, `snapshots`, `multi-agent`, `traps`) served by `atc guide` and `atc_guide`. |
 | Atomic lock | `src/lock.mjs` | Directory mutex (`mkdir <stateDir>/atc.lock`), `owner.json` nonce check, stale-lock breaking, and atomic `state.json` write + `fsync` + `rename`. |
 | State & scheduler | `src/state.mjs` | Schema validation, corruption quarantine, dead-PID GC, 6-step session identity ladder, `watch`/`wear` profile matching, and warm-affinity queue selection. |
-| Build co-scheduler | `src/build.mjs` | Gradle/Bazel/`xcodebuild` classifier, workspace key extraction, 3-tier priority scheduler, `"draining"` daemon reconciliation, re-entrant sub-build admission, and CPU/RAM flag shaping. |
+| Build co-scheduler | `src/build.mjs`, `src/parsers.mjs` | Gradle/Bazel/`xcodebuild` classifier, vendored `shell-quote` fail-closed unparseable-shell gate (`detectUnparseableShellConstructs`), workspace key extraction, 3-tier priority scheduler, `"draining"` daemon reconciliation, re-entrant sub-build admission, and CPU/RAM flag shaping. |
 | System audit logger | `src/logger.mjs` | OS-native log directory resolution, lock-free JSONL event staging (`recordAuditEvent`), post-lock disk flushing (`flushAuditEvents`), and size-bounded rotation. |
 | Android probes | `src/android.mjs` | Android 3-tier discovery, `.avd/config.ini` + dead-PID `.lock` cleanup, RAM/disk admission, and QEMU boot/stop/snapshot helpers. |
 | iOS probes | `src/ios.mjs` | iOS/watchOS/tvOS/visionOS discovery (`simctl` + `devicectl`), simulator boot/shutdown/erase/create, privacy/container app reset, and APFS `cp -cR` snapshots. |

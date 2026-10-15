@@ -208,6 +208,10 @@ atc claim --type phone --api ">=35"
 atc exec -- ./gradlew installDebug
 atc exec -- adb shell am start -n com.example/.MainActivity
 atc free
+
+# 4. Explicit build intent flags & multi-step DAG pipelines (atc batch)
+atc exec --phase pure-build --workspace . --ram-mb 4096 -- ./gradlew assembleDebug assembleDebugAndroidTest
+atc batch --file pipeline.json --json
 ```
 
 ## One KMP session holds an Android lease and an iOS lease at once

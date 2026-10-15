@@ -4,10 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  detectUnparseableShellConstructs,
   joinBackslashContinuations,
   parseEnvWrapperArgs,
   parseJavaProperties,
   splitShellWords,
+  stripOpaqueHeredocsForCheck,
 } from "./parsers.mjs";
 
 export function canonicalizeBuildPath(targetPath) {
@@ -1321,6 +1323,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         unresolvedDynamicCwd = true;
         break;
       }
+      const envEntryCwd = relCwd;
+      const envEntryUnresolved = unresolvedDynamicCwd;
       for (const act of parsedEnv.actions) {
         if (act.type === "ignore_env") {
           for (const k of Object.keys(envVars)) {
@@ -1330,8 +1334,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           envVars.JAVA_HOME = null;
           envVars.PATH = null;
           envVars.GRADLE_USER_HOME = null;
+          envVars.GRADLE_HOME = null;
           envVars.GRADLE_OPTS = null;
           envVars.JAVA_OPTS = null;
+          envVars._JAVA_OPTIONS = null;
+          envVars.JAVA_TOOL_OPTIONS = null;
+          envVars.USE_BAZEL_VERSION = null;
           envVars.HOME = null;
         } else if (act.type === "chdir") {
           const rawNextDir = act.rawDir;
@@ -1349,7 +1357,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               relCwd = nextDir;
               unresolvedDynamicCwd = false;
             } else {
-              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+              relCwd = envEntryCwd ? path.join(envEntryCwd, nextDir) : nextDir;
+              unresolvedDynamicCwd = envEntryUnresolved;
             }
           }
         } else if (act.type === "unset") {
@@ -2740,6 +2749,28 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
 
         runShellScript(script);
 
+        const unparseableCheck = detectUnparseableShellConstructs(script, shellType);
+        const scriptWithoutHeredoc = stripOpaqueHeredocsForCheck(script);
+        const mentionsBuildToolMatch = scriptWithoutHeredoc.match(
+          /(?:^|[\s"'/;(&|`])(gradlew|gradle|bazelisk|bazelw|bazel|xcodebuild)(?:\.(?:bat|cmd|exe|sh))?(?=$|[\s"'/);&|`])/i,
+        );
+        if (
+          unparseableCheck.unparseable &&
+          (matchedClauses.length > 0 || Boolean(mentionsBuildToolMatch) || hasUnresolvedCmd)
+        ) {
+          return {
+            cmd: matchedClauses[0]?.cmd || mentionsBuildToolMatch?.[1] || "gradle",
+            args: matchedClauses[0]?.args || [],
+            relCwd: matchedClauses[0]?.relCwd || null,
+            envVars: matchedClauses[0]?.envVars || { ...curShellEnvVars },
+            backgrounded: false,
+            unresolvedDynamicCwd: true,
+            unparseableShellReason: unparseableCheck.reason,
+            hasUnresolvedCmd: true,
+            allBuildClauses: matchedClauses.length > 0 ? matchedClauses : null,
+          };
+        }
+
         if (matchedClauses.length > 0) {
           return {
             cmd: matchedClauses[0].cmd,
@@ -2958,8 +2989,14 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = [], op
 }
 
 export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
-  const { cmd, args, backgrounded, unresolvedDynamicCwd, allBuildClauses } =
-    peelBuildWrapperTokens(rawCmd, rawArgs, options);
+  const {
+    cmd,
+    args,
+    backgrounded,
+    unresolvedDynamicCwd,
+    unparseableShellReason,
+    allBuildClauses,
+  } = peelBuildWrapperTokens(rawCmd, rawArgs, options);
   if (backgrounded) {
     return {
       kind: "reject_long_running",
@@ -2982,6 +3019,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     if (unresolvedDynamicCwd) {
       return {
         kind: "deny_lifecycle",
+        denySubkind: unparseableShellReason ? "unparseable_shell" : "unresolved_cwd",
         tool: normalizeBuildToolName(cmd) || "multi",
         targetPlatform: null,
         requiresDevice: false,
@@ -2989,6 +3027,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         requiresWorkspaceLock: false,
         unresolvedDynamicCwd: true,
         reason:
+          unparseableShellReason ||
           "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
       };
     }
@@ -3016,6 +3055,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
   if (unresolvedDynamicCwd) {
     return {
       kind: "deny_lifecycle",
+      denySubkind: unparseableShellReason ? "unparseable_shell" : "unresolved_cwd",
       tool: normalizeBuildToolName(cmd) || "multi",
       targetPlatform: null,
       requiresDevice: false,
@@ -3023,6 +3063,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       requiresWorkspaceLock: false,
       unresolvedDynamicCwd: true,
       reason:
+        unparseableShellReason ||
         "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
     };
   }
@@ -3397,9 +3438,103 @@ export function resolveBuildResources(
   rawCmd,
   rawArgs = [],
   cwd = process.cwd(),
-  { forceBuild = false, inheritedEnvVars = null, env = process.env } = {},
+  {
+    forceBuild = false,
+    inheritedEnvVars = null,
+    env = process.env,
+    workspace = null,
+    systemBazelrcPath = undefined,
+    platform = undefined,
+  } = {},
 ) {
   const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
+  const outerCwd = path.resolve(cwd || process.cwd());
+  const applyExplicitWorkspaceKeys = (res) => {
+    if (
+      !workspace ||
+      !res ||
+      res.kind === "deny_lifecycle" ||
+      res.kind === "reject_long_running" ||
+      res.kind === "read_only"
+    ) {
+      return res;
+    }
+    const canonicalExplicitWs = canonicalizeBuildPath(path.resolve(outerCwd, String(workspace)));
+    const extraKeys = [`workspace:${canonicalExplicitWs}`];
+    if (res.tool === "gradle") {
+      const discovered = canonicalizeBuildPath(
+        findNearestMarkerAncestor(canonicalExplicitWs, [
+          "settings.gradle.kts",
+          "settings.gradle",
+          "gradlew",
+          "gradlew.bat",
+        ]) ||
+          findNearestMarkerAncestor(canonicalExplicitWs, ["build.gradle.kts", "build.gradle"]) ||
+          canonicalExplicitWs,
+      );
+      extraKeys.push(
+        `gradle:${discovered}`,
+        `gradle:${canonicalExplicitWs}`,
+        `workspace:${discovered}`,
+      );
+    } else if (res.tool === "bazel") {
+      const discovered = canonicalizeBuildPath(
+        findNearestMarkerAncestor(canonicalExplicitWs, [
+          "MODULE.bazel",
+          "REPO.bazel",
+          "WORKSPACE.bazel",
+          "WORKSPACE",
+        ]) || canonicalExplicitWs,
+      );
+      extraKeys.push(
+        `bazel:ws:${discovered}`,
+        `bazel:ws:${canonicalExplicitWs}`,
+        `workspace:${discovered}`,
+      );
+    } else if (res.tool === "xcodebuild") {
+      let xcodeDiscovered = canonicalExplicitWs;
+      let cur = canonicalExplicitWs;
+      for (let depth = 0; depth < 16; depth++) {
+        try {
+          const entries = fs.readdirSync(cur);
+          if (entries.some((e) => e.endsWith(".xcworkspace") || e.endsWith(".xcodeproj"))) {
+            xcodeDiscovered = canonicalizeBuildPath(cur);
+            break;
+          }
+        } catch {
+          break;
+        }
+        const parent = path.dirname(cur);
+        if (!parent || parent === cur) break;
+        cur = parent;
+      }
+      extraKeys.push(
+        `xcode:${xcodeDiscovered}`,
+        `xcode:${canonicalExplicitWs}`,
+        `workspace:${xcodeDiscovered}`,
+      );
+    } else {
+      const discovered = canonicalizeBuildPath(
+        findNearestMarkerAncestor(canonicalExplicitWs, [
+          "settings.gradle.kts",
+          "settings.gradle",
+          "gradlew",
+          "MODULE.bazel",
+          "REPO.bazel",
+          "WORKSPACE.bazel",
+          "WORKSPACE",
+          "build.gradle.kts",
+          "build.gradle",
+        ]) || canonicalExplicitWs,
+      );
+      extraKeys.push(`workspace:${discovered}`);
+    }
+    return {
+      ...res,
+      workspaceRoot: res.workspaceRoot || canonicalExplicitWs,
+      resourceKeys: Array.from(new Set([...(res.resourceKeys || []), ...extraKeys])),
+    };
+  };
   const {
     cmd,
     args,
@@ -3407,6 +3542,7 @@ export function resolveBuildResources(
     envVars,
     backgrounded,
     unresolvedDynamicCwd,
+    unparseableShellReason,
     hasUnresolvedCmd,
     allBuildClauses,
   } = peelBuildWrapperTokens(rawCmd, rawArgs, { env: baseEnv, cwd });
@@ -3428,6 +3564,7 @@ export function resolveBuildResources(
   if (unresolvedDynamicCwd || (forceBuild && hasUnresolvedCmd)) {
     return {
       kind: "deny_lifecycle",
+      denySubkind: unparseableShellReason ? "unparseable_shell" : "unresolved_cwd",
       tool: normalizeBuildToolName(cmd) || "multi",
       targetPlatform: null,
       requiresDevice: false,
@@ -3437,11 +3574,11 @@ export function resolveBuildResources(
       workspaceRoot: null,
       resourceKeys: [],
       reason:
+        unparseableShellReason ||
         "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
     };
   }
   const effectiveEnvVars = { ...(inheritedEnvVars || {}), ...(envVars || {}) };
-  const outerCwd = path.resolve(cwd || process.cwd());
   if (allBuildClauses && allBuildClauses.length > 1) {
     const clauseRes = allBuildClauses.map((c) => {
       const clauseCwd = c.relCwd ? path.resolve(outerCwd, c.relCwd) : outerCwd;
@@ -3449,6 +3586,9 @@ export function resolveBuildResources(
         forceBuild: false,
         inheritedEnvVars: c.envVars || effectiveEnvVars,
         env,
+        workspace,
+        systemBazelrcPath,
+        platform,
       });
     });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
@@ -3504,8 +3644,10 @@ export function resolveBuildResources(
   const baseCwd = relCwd ? path.resolve(outerCwd, relCwd) : outerCwd;
   if (classified.kind === "not_build_tool") {
     if (forceBuild) {
-      const canonicalRoot = canonicalizeBuildPath(baseCwd);
-      return {
+      const canonicalRoot = canonicalizeBuildPath(
+        workspace ? path.resolve(outerCwd, String(workspace)) : baseCwd,
+      );
+      return applyExplicitWorkspaceKeys({
         kind: "pure_build",
         tool: "custom",
         targetPlatform: null,
@@ -3514,7 +3656,7 @@ export function resolveBuildResources(
         requiresWorkspaceLock: true,
         workspaceRoot: canonicalRoot,
         resourceKeys: [`workspace:${canonicalRoot}`],
-      };
+      });
     }
     return {
       ...classified,
@@ -3578,6 +3720,8 @@ export function resolveBuildResources(
       effectiveEnvVars.PATH === null || effectiveEnvVars.PATH === "";
     const envGradleUserHomeUnset =
       effectiveEnvVars.GRADLE_USER_HOME === null || effectiveEnvVars.GRADLE_USER_HOME === "";
+    const envGradleHomeUnset =
+      effectiveEnvVars.GRADLE_HOME === null || effectiveEnvVars.GRADLE_HOME === "";
     let cliGradleUserHome = null;
     let cliHeapMb = 0;
     for (let i = 0; i < strArgs.length; i++) {
@@ -3593,6 +3737,13 @@ export function resolveBuildResources(
         cliHeapMb = Math.max(cliHeapMb, parseJvmHeapMb(a.slice("-Dorg.gradle.jvmargs=".length)));
       }
     }
+    const effectiveGradleHomeEnv = envGradleHomeUnset
+      ? null
+      : effectiveEnvVars.GRADLE_HOME || baseEnv.GRADLE_HOME || null;
+    const resolvedGradleHome =
+      effectiveGradleHomeEnv && effectiveGradleHomeEnv !== "__UNRESOLVED_DYNAMIC_ENV__"
+        ? path.resolve(baseCwd, effectiveGradleHomeEnv)
+        : null;
     const effectiveGradleUserHomeEnv = envGradleUserHomeUnset
       ? null
       : effectiveEnvVars.GRADLE_USER_HOME || baseEnv.GRADLE_USER_HOME || null;
@@ -3627,9 +3778,11 @@ export function resolveBuildResources(
       // Ignore daemon JVM criteria read errors
     }
     const gradlePropsFiles = [
+      ...(resolvedGradleHome ? [path.join(resolvedGradleHome, "gradle.properties")] : []),
       path.join(canonicalRoot, "gradle.properties"),
       ...(resolvedGradleUserHome ? [path.join(resolvedGradleUserHome, "gradle.properties")] : []),
     ];
+    let propsReadError = false;
     for (const gradlePropsPath of gradlePropsFiles) {
       try {
         if (fs.existsSync(gradlePropsPath)) {
@@ -3643,7 +3796,7 @@ export function resolveBuildResources(
           }
         }
       } catch {
-        // Ignore property read errors
+        propsReadError = true;
       }
     }
     const envGradleOpts =
@@ -3654,14 +3807,31 @@ export function resolveBuildResources(
       effectiveEnvVars.JAVA_OPTS === null || effectiveEnvVars.JAVA_OPTS === ""
         ? null
         : effectiveEnvVars.JAVA_OPTS || baseEnv.JAVA_OPTS || null;
+    const envUnderscoreJavaOptions =
+      effectiveEnvVars._JAVA_OPTIONS === null || effectiveEnvVars._JAVA_OPTIONS === ""
+        ? null
+        : effectiveEnvVars._JAVA_OPTIONS || baseEnv._JAVA_OPTIONS || null;
+    const envJavaToolOptions =
+      effectiveEnvVars.JAVA_TOOL_OPTIONS === null || effectiveEnvVars.JAVA_TOOL_OPTIONS === ""
+        ? null
+        : effectiveEnvVars.JAVA_TOOL_OPTIONS || baseEnv.JAVA_TOOL_OPTIONS || null;
+    const underscoreJavaHeapMb = parseJvmHeapMb(envUnderscoreJavaOptions);
     const optsHeapMb = Math.max(
       parseJvmHeapMb(envGradleOpts),
       parseJvmHeapMb(envJavaOpts),
+      underscoreJavaHeapMb,
+      parseJvmHeapMb(envJavaToolOptions),
     );
-    const requestedHeapMb = cliHeapMb > 0 ? cliHeapMb : Math.max(propsHeapMb, optsHeapMb);
+    const requestedHeapMb =
+      cliHeapMb > 0
+        ? Math.max(cliHeapMb, underscoreJavaHeapMb)
+        : Math.max(propsHeapMb, optsHeapMb);
     const disablesDaemon =
       propsDaemonDisabled ||
-      Boolean(envGradleOpts || envJavaOpts) ||
+      propsReadError ||
+      Boolean(
+        envGradleOpts || envJavaOpts || envUnderscoreJavaOptions || envJavaToolOptions,
+      ) ||
       strArgs.some(
         (a) =>
           a === "--no-daemon" ||
@@ -3675,10 +3845,12 @@ export function resolveBuildResources(
           a.startsWith("--gradle-user-home=") ||
           a.startsWith("-Dgradle.user.home="),
       );
-    return {
+    return applyExplicitWorkspaceKeys({
       ...classified,
       disablesDaemon,
       requestedHeapMb,
+      gradleHomeDir: resolvedGradleHome,
+      envGradleHomeUnset,
       gradleUserHomeDir: resolvedGradleUserHome,
       envJavaHome: envJavaHomeUnset ? "" : effectiveEnvVars.JAVA_HOME || null,
       envJavaHomeUnset,
@@ -3688,7 +3860,7 @@ export function resolveBuildResources(
       envGradleUserHomeUnset,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
-    };
+    });
   }
 
   if (classified.tool === "bazel") {
@@ -3888,7 +4060,26 @@ export function resolveBuildResources(
       };
 
       if (!noSystemRc) {
-        parseBazelrcFile("/etc/bazel.bazelrc", { required: false });
+        const effectivePlatform = platform || process.platform;
+        const resolvedSystemRc =
+          systemBazelrcPath !== undefined
+            ? systemBazelrcPath
+            : effectivePlatform === "win32"
+              ? (() => {
+                  const progData =
+                    effectiveEnvVars.ProgramData ||
+                    effectiveEnvVars.PROGRAMDATA ||
+                    baseEnv.ProgramData ||
+                    baseEnv.PROGRAMDATA ||
+                    "C:\\ProgramData";
+                  return progData.includes("\\") || /^[A-Za-z]:/.test(progData)
+                    ? path.win32.join(progData, "bazel.bazelrc")
+                    : path.join(progData, "bazel.bazelrc");
+                })()
+              : "/etc/bazel.bazelrc";
+        if (resolvedSystemRc) {
+          parseBazelrcFile(resolvedSystemRc, { required: false });
+        }
       }
       if (!noWorkspaceRc) {
         parseBazelrcFile(path.join(canonicalRoot, ".bazelrc"), { required: false });
@@ -3914,7 +4105,12 @@ export function resolveBuildResources(
     }
 
     applyStartupOptionTokens(strArgs, baseCwd);
-    const disablesDaemon = batchMode || hasCustomStartupOption;
+    const hasUseBazelVersion = Boolean(
+      effectiveEnvVars.USE_BAZEL_VERSION === null || effectiveEnvVars.USE_BAZEL_VERSION === ""
+        ? null
+        : effectiveEnvVars.USE_BAZEL_VERSION || baseEnv.USE_BAZEL_VERSION || null,
+    );
+    const disablesDaemon = batchMode || hasCustomStartupOption || hasUseBazelVersion;
 
     const canonicalUserRoot = outputUserRoot ? canonicalizeBuildPath(outputUserRoot) : null;
     const resourceKeys = [`bazel:ws:${canonicalRoot}`];
@@ -3924,14 +4120,14 @@ export function resolveBuildResources(
       const wsMd5 = crypto.createHash("md5").update(canonicalRoot).digest("hex");
       resourceKeys.push(`bazel:out:${path.join(canonicalUserRoot, wsMd5)}`);
     }
-    return {
+    return applyExplicitWorkspaceKeys({
       ...classified,
       disablesDaemon,
       requestedHeapMb,
       bazelOutputUserRoot: canonicalUserRoot,
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
-    };
+    });
   }
 
   if (classified.tool === "xcodebuild") {
@@ -3975,18 +4171,18 @@ export function resolveBuildResources(
     if (derivedDataPath) {
       resourceKeys.push(`xcode:dd:${canonicalizeBuildPath(derivedDataPath)}`);
     }
-    return {
+    return applyExplicitWorkspaceKeys({
       ...classified,
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
-    };
+    });
   }
 
-  return {
+  return applyExplicitWorkspaceKeys({
     ...classified,
     workspaceRoot: null,
     resourceKeys: [],
-  };
+  });
 }
 
 function parseJvmHeapMb(str) {
@@ -4761,6 +4957,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
       );
     };
     let expectedGradleJvmArgs = [];
+    let hasExplicitGradleJvmArgs = false;
     if (buildReqs.tool === "gradle" && wsRoot) {
       try {
         const daemonJvmCriteriaPath = path.join(wsRoot, "gradle", "gradle-daemon-jvm.properties");
@@ -4778,12 +4975,19 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
             expectedGradleVersion = verMatch[1];
           }
         }
+        const gradleHomePropsDir = buildReqs.envGradleHomeUnset
+          ? null
+          : buildReqs.gradleHomeDir ||
+            options.env?.GRADLE_HOME ||
+            (!options.env ? process.env.GRADLE_HOME : null) ||
+            null;
         const userHomePropsDir = buildReqs.envGradleUserHomeUnset
           ? null
           : expectedGradleUserHome ||
             buildReqs.gradleUserHomeDir ||
             path.join(options.env?.HOME || os.homedir(), ".gradle");
         const gradlePropsFiles = [
+          ...(gradleHomePropsDir ? [path.join(gradleHomePropsDir, "gradle.properties")] : []),
           path.join(wsRoot, "gradle.properties"),
           ...(userHomePropsDir ? [path.join(userHomePropsDir, "gradle.properties")] : []),
         ];
@@ -4799,6 +5003,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
               expectedGradleJavaHome = String(propsMap.get("org.gradle.java.home")).trim();
             }
             if (propsMap.has("org.gradle.jvmargs")) {
+              hasExplicitGradleJvmArgs = true;
               expectedGradleJvmArgs = splitShellWords(propsMap.get("org.gradle.jvmargs"));
             }
           }
@@ -4807,7 +5012,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           return { warm: false, daemonPids: [] };
         }
       } catch {
-        // Ignore wrapper property read errors
+        return { warm: false, daemonPids: [] };
       }
     }
     if (
@@ -4908,10 +5113,22 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const preMainTokens = splitShellWords(preMainCmd);
           const daemonCompatJvmArgs = preMainTokens
             .slice(1)
-            .filter((tok) => isGradleCompatibilityJvmArg(tok) || expectedCompatJvmArgs.includes(tok));
-          const jvmArgsMatch =
-            expectedCompatJvmArgs.every((arg) => daemonCompatJvmArgs.includes(arg)) &&
-            daemonCompatJvmArgs.every((arg) => expectedCompatJvmArgs.includes(arg));
+            .filter(
+              (tok) =>
+                (isGradleCompatibilityJvmArg(tok) &&
+                  (tok !== "-XX:+HeapDumpOnOutOfMemoryError" ||
+                    expectedCompatJvmArgs.includes("-XX:+HeapDumpOnOutOfMemoryError"))) ||
+                expectedCompatJvmArgs.includes(tok),
+            );
+          const jvmArgsMatch = hasExplicitGradleJvmArgs
+            ? expectedCompatJvmArgs.every((arg) => daemonCompatJvmArgs.includes(arg)) &&
+              daemonCompatJvmArgs.every((arg) => expectedCompatJvmArgs.includes(arg))
+            : daemonCompatJvmArgs.length === 0 ||
+              (daemonCompatJvmArgs.includes("-Xmx512m") &&
+                daemonCompatJvmArgs.includes("-XX:MaxMetaspaceSize=384m") &&
+                daemonCompatJvmArgs.every(
+                  (arg) => arg === "-Xmx512m" || arg === "-XX:MaxMetaspaceSize=384m",
+                ));
           if (!jvmArgsMatch) {
             continue;
           }

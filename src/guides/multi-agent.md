@@ -38,6 +38,15 @@ When all matching devices or platform slots (`maxRunningEmulators` on Android, `
 | `Tier 1` | Holds an active device lease or runs `atc exec --claim "<flags>" -- <cmd>` | Base + Burst (`"auto"` `[1..4]` + `1` burst) | Jumps ahead of `< 120 s` pure builds and uses the burst slot so leased devices never sit idle waiting to compile. Cold-boot `--claim` runs reserve a `"preparing_device"` build slot before booting. |
 | `Tier 2` | Pure CPU build (`atc exec --build -- ./gradlew assembleDebug`) | Base (`maxConcurrentBuilds = "auto"`, `[1..4]`) | Serializes colliding `workspaceKeys` (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) and enters a `5 s` `"draining"` cooldown if aborted or while client-group processes unwind. Nested sub-builds inherit `ATC_BUILD_OP_ID` without deadlocking. |
 
+### Explicit intent flags (`--workspace`, `--phase`, `--ram-mb`) & Phase Sharding Playbook (`atc batch`)
+
+Instead of relying solely on shell string parsing or holding a device lease during long compilations:
+- Pass `--workspace <dir>`, `--phase <pure-build|device-build|device-test|read-only>`, and `--ram-mb <mb>` on `atc exec` to declare build intent explicitly (enforced via a strict monotonic safety lattice).
+- Split compile and device-test steps (or run `atc batch --file plan.json`) so pure compilation runs in Step 1 (`phase: "pure-build"`, `0` devices held) and device testing runs in Step 2 (`phase: "device-build"`, `claim: "--type phone --api >=35"`):
+  - **Gradle:** `./gradlew assembleDebug assembleDebugAndroidTest` -> `./gradlew connectedDebugAndroidTest`
+  - **Xcode:** `xcodebuild build-for-testing ...` -> `xcodebuild test-without-building ...`
+  - **Bazel:** `bazel build //app:instrumented_tests` -> `bazel test //app:instrumented_tests`
+
 ## 4. Guardrails, KMP dual-lease routing, and agent hooks
 
 `atc guard <command>` and `atc hook pre-tool-use` inspect shell commands before execution:

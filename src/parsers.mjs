@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 
-const LITERAL_SENTINEL = "\uE000";
+export const LITERAL_SENTINEL = "\uE000";
 
 function stripSentinels(value) {
   return String(value || "").replaceAll(LITERAL_SENTINEL, "");
@@ -324,3 +324,336 @@ export function parseEnvWrapperArgs(curArgs = []) {
 
   return { actions, cmdIndex, unknownOption };
 }
+
+export function stripOpaqueHeredocsForCheck(script) {
+  if (!script || !script.includes("<<")) return script;
+  const lines = String(script).split(/\r?\n/);
+  const out = [];
+  let activeDelim = null;
+  let stripTabs = false;
+  for (const line of lines) {
+    if (activeDelim !== null) {
+      const candidate = stripTabs ? line.replace(/^\t+/, "") : line;
+      if (candidate === activeDelim) {
+        activeDelim = null;
+        stripTabs = false;
+      }
+      continue;
+    }
+    out.push(line);
+    let q = null;
+    for (let i = 0; i < line.length - 1; i++) {
+      const ch = line[i];
+      if (q === "'") {
+        if (ch === "'") q = null;
+        continue;
+      }
+      if (q === '"') {
+        if (ch === "\\" && i + 1 < line.length) {
+          i++;
+          continue;
+        }
+        if (ch === '"') q = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        q = ch;
+        continue;
+      }
+      if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) break;
+      if (ch === "<" && line[i + 1] === "<" && line[i + 2] !== "<") {
+        const rest = line.slice(i + 2);
+        const m = rest.match(/^(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z0-9_.-]+))/);
+        if (m) {
+          stripTabs = m[1] === "-";
+          activeDelim = m[2] || m[3] || m[4] || null;
+          break;
+        }
+      }
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * Vendored shell-quote style tokenizer producing operator, word, and comment tokens,
+ * plus quote/escape integrity status.
+ */
+export function parseShellQuote(rawScript, { shellType = "posix" } = {}) {
+  const s = stripOpaqueHeredocsForCheck(String(rawScript || ""));
+  const tokens = [];
+  let i = 0;
+  let unclosedQuote = false;
+  let trailingEscape = false;
+
+  while (i < s.length) {
+    while (i < s.length && /[ \t\f\r]/.test(s[i])) i++;
+    if (i >= s.length) break;
+
+    if (s[i] === "\n") {
+      tokens.push({ type: "op", op: ";" });
+      i++;
+      continue;
+    }
+
+    if (s[i] === "#" && (i === 0 || /\s/.test(s[i - 1]))) {
+      let end = s.indexOf("\n", i);
+      if (end === -1) end = s.length;
+      tokens.push({ type: "comment", value: s.slice(i + 1, end) });
+      i = end;
+      continue;
+    }
+
+    if (
+      shellType === "posix" &&
+      (s[i] === "<" || s[i] === ">") &&
+      s[i + 1] === "("
+    ) {
+      tokens.push({ type: "op", op: `${s[i]}(` });
+      i += 2;
+      continue;
+    }
+
+    const twoCharOp = s.slice(i, i + 2);
+    if (
+      twoCharOp === "&&" ||
+      twoCharOp === "||" ||
+      twoCharOp === ";;" ||
+      twoCharOp === "|&" ||
+      twoCharOp === ">>" ||
+      twoCharOp === ">&" ||
+      twoCharOp === ">|" ||
+      twoCharOp === "<<" ||
+      twoCharOp === "<&" ||
+      twoCharOp === "<>"
+    ) {
+      tokens.push({ type: "op", op: twoCharOp });
+      i += 2;
+      continue;
+    }
+
+    if (
+      s[i] === ";" ||
+      s[i] === "|" ||
+      s[i] === "&" ||
+      s[i] === "(" ||
+      s[i] === ")" ||
+      s[i] === ">" ||
+      s[i] === "<"
+    ) {
+      tokens.push({ type: "op", op: s[i] });
+      i++;
+      continue;
+    }
+
+    let word = "";
+    let hasExpansion = false;
+    let quoted = false;
+    while (i < s.length) {
+      const ch = s[i];
+      if (/[ \t\f\r\n]/.test(ch)) break;
+      if (
+        ch === ";" ||
+        ch === "|" ||
+        ch === "&" ||
+        ch === "(" ||
+        ch === ")" ||
+        ch === ">" ||
+        ch === "<"
+      ) {
+        break;
+      }
+      if (ch === "'") {
+        quoted = true;
+        i++;
+        while (i < s.length && s[i] !== "'") {
+          word += s[i++];
+        }
+        if (i >= s.length) {
+          unclosedQuote = true;
+          break;
+        }
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        quoted = true;
+        i++;
+        while (i < s.length && s[i] !== '"') {
+          if (s[i] === "\\" && i + 1 < s.length) {
+            const nxt = s[i + 1];
+            if (nxt === '"' || nxt === "\\" || nxt === "$" || nxt === "`") {
+              word += nxt;
+              i += 2;
+              continue;
+            }
+          }
+          if (s[i] === "$" || s[i] === "`") {
+            hasExpansion = true;
+          }
+          word += s[i++];
+        }
+        if (i >= s.length) {
+          unclosedQuote = true;
+          break;
+        }
+        i++;
+        continue;
+      }
+      if (shellType === "posix" && ch === "\\") {
+        if (i + 1 >= s.length) {
+          trailingEscape = true;
+          i++;
+          break;
+        }
+        if (s[i + 1] === "\n") {
+          i += 2;
+          continue;
+        }
+        word += s[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === "$" && s[i + 1] === "(") {
+        hasExpansion = true;
+        let depth = 1;
+        word += "$(";
+        i += 2;
+        while (i < s.length && depth > 0) {
+          if (s[i] === "(") depth++;
+          else if (s[i] === ")") depth--;
+          word += s[i++];
+        }
+        if (depth > 0) {
+          unclosedQuote = true;
+        }
+        continue;
+      }
+      if (ch === "`") {
+        hasExpansion = true;
+        word += ch;
+        i++;
+        while (i < s.length && s[i] !== "`") {
+          if (s[i] === "\\" && i + 1 < s.length) {
+            word += s[i] + s[i + 1];
+            i += 2;
+            continue;
+          }
+          word += s[i++];
+        }
+        if (i >= s.length) {
+          unclosedQuote = true;
+          break;
+        }
+        word += s[i++];
+        continue;
+      }
+      if (ch === "$") {
+        hasExpansion = true;
+      }
+      word += s[i++];
+    }
+    tokens.push({ type: "word", value: word, hasExpansion, quoted });
+  }
+
+  return { tokens, unclosedQuote, trailingEscape };
+}
+
+/**
+ * Shared fail-closed gate used by both classifier (`peelBuildCommandWrappers`)
+ * and rewriter (`buildChildInvocation`).
+ * Rejects unclosed quotes/subshells, `eval`/`coproc`/`select` in command position,
+ * process substitutions `<(...)` / `>(...)`, and dynamic redirection targets `>$(...)`.
+ */
+export function detectUnparseableShellConstructs(script, shellType = "posix") {
+  if (!script || typeof script !== "string") {
+    return { unparseable: false, reason: null };
+  }
+  const cleanScript = stripSentinels(script);
+  const parsed = parseShellQuote(cleanScript, { shellType });
+  if (parsed.unclosedQuote) {
+    return {
+      unparseable: true,
+      reason:
+        "Unclosed quote or command substitution in shell command cannot be safely analyzed under ATC.",
+    };
+  }
+  if (shellType === "posix" && parsed.trailingEscape) {
+    return {
+      unparseable: true,
+      reason:
+        "Trailing unescaped backslash in shell command cannot be safely analyzed under ATC.",
+    };
+  }
+
+  const REDIR_OPS = new Set([">", ">>", ">&", ">|", "<", "<&", "<>"]);
+  const CMD_BOUNDARY_OPS = new Set([";", ";;", "&", "&&", "||", "|", "|&", "("]);
+  const CMD_BOUNDARY_WORDS = new Set(["{", "!", "then", "else", "elif", "do"]);
+
+  let atCommandHead = true;
+  let afterCommandOrBuiltin = false;
+
+  for (let idx = 0; idx < parsed.tokens.length; idx++) {
+    const tok = parsed.tokens[idx];
+    if (tok.type === "comment") continue;
+    if (tok.type === "op") {
+      if (tok.op === "<(" || tok.op === ">(") {
+        return {
+          unparseable: true,
+          reason:
+            "Process substitution <(...) / >(...) in shell command cannot be safely analyzed under ATC.",
+        };
+      }
+      if (REDIR_OPS.has(tok.op)) {
+        const nextTok = parsed.tokens[idx + 1];
+        if (nextTok && nextTok.type === "word" && nextTok.hasExpansion) {
+          return {
+            unparseable: true,
+            reason:
+              "Dynamic redirection target in shell command cannot be safely analyzed under ATC.",
+          };
+        }
+        continue;
+      }
+      if (CMD_BOUNDARY_OPS.has(tok.op)) {
+        atCommandHead = true;
+        afterCommandOrBuiltin = false;
+      }
+      continue;
+    }
+
+    if (tok.type === "word") {
+      const val = tok.value;
+      if (atCommandHead) {
+        if (CMD_BOUNDARY_WORDS.has(val)) {
+          continue;
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(val) || /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(val)) {
+          continue;
+        }
+        if (val === "command" || val === "builtin") {
+          afterCommandOrBuiltin = true;
+          continue;
+        }
+        if (afterCommandOrBuiltin && val.startsWith("-")) {
+          if (/[vV]/.test(val)) {
+            atCommandHead = false;
+            afterCommandOrBuiltin = false;
+          }
+          continue;
+        }
+        if (val === "eval" || val === "coproc" || val === "select") {
+          return {
+            unparseable: true,
+            reason: `Shell "${val}" construct cannot be safely analyzed under ATC; run direct commands via "atc exec" or "atc batch".`,
+          };
+        }
+        atCommandHead = false;
+        afterCommandOrBuiltin = false;
+      }
+    }
+  }
+
+  return { unparseable: false, reason: null };
+}
+

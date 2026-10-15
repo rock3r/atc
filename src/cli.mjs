@@ -268,7 +268,22 @@ const EXEC_ALLOWED_FLAGS = new Set([
   ...CLAIM_ALLOWED_FLAGS,
   "build",
   "claim",
+  "workspace",
+  "phase",
+  "ramMb",
+  "ram-mb",
 ]);
+
+const BATCH_ALLOWED_FLAGS = new Set([
+  ...COMMON_ALLOWED_FLAGS,
+  "file",
+  "spec",
+  "workspace",
+  "wait",
+  "waitSec",
+]);
+
+const VALID_EXEC_PHASES = new Set(["pure-build", "device-build", "device-test", "read-only"]);
 
 const STATUS_ALLOWED_FLAGS = new Set([
   ...COMMON_ALLOWED_FLAGS,
@@ -307,6 +322,10 @@ function validateCommandFlags(flags, allowedSet, subcommand) {
     "snapshotLoad",
     "snapshotSaveOnFree",
     "resetApp",
+    "workspace",
+    "phase",
+    "ramMb",
+    "ram-mb",
   ]);
   for (const [key, val] of Object.entries(flags)) {
     if (val === undefined) continue;
@@ -5185,18 +5204,72 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const [cmd, ...args] = commandArgs;
   const cwd = options.cwd || process.cwd();
   const callerEnv = options.env || process.env;
-  const isBuildFlag = parseBoolFlag(flags.build);
+  let explicitWorkspace = null;
+  if (flags.workspace !== undefined && flags.workspace !== null) {
+    if (typeof flags.workspace === "boolean" || !String(flags.workspace).trim()) {
+      return { exitCode: 1, error: 'Option "--workspace" requires a directory path.' };
+    }
+    const candidateWs = path.resolve(cwd, String(flags.workspace).trim());
+    try {
+      if (!fs.existsSync(candidateWs) || !fs.statSync(candidateWs).isDirectory()) {
+        return { exitCode: 1, error: `Workspace directory does not exist: ${candidateWs}` };
+      }
+      explicitWorkspace = fs.realpathSync(candidateWs);
+    } catch {
+      return { exitCode: 1, error: `Workspace directory is not accessible: ${candidateWs}` };
+    }
+  }
+
+  const rawRamMb = flags.ramMb ?? flags["ram-mb"];
+  let explicitRamMb = 0;
+  if (rawRamMb !== undefined && rawRamMb !== null) {
+    const parsedRam =
+      typeof rawRamMb === "boolean" || (typeof rawRamMb === "string" && !rawRamMb.trim())
+        ? Number.NaN
+        : Number(rawRamMb);
+    if (!Number.isInteger(parsedRam) || parsedRam < 1 || parsedRam > 1_048_576) {
+      return {
+        exitCode: 1,
+        error: `Invalid --ram-mb "${rawRamMb}". Expected an integer between 1 and 1048576.`,
+      };
+    }
+    explicitRamMb = parsedRam;
+  }
+
+  let explicitPhase = null;
+  if (flags.phase !== undefined && flags.phase !== null) {
+    const p = typeof flags.phase === "boolean" ? "" : String(flags.phase).trim().toLowerCase();
+    if (!VALID_EXEC_PHASES.has(p)) {
+      return {
+        exitCode: 1,
+        error: `Invalid --phase "${flags.phase}". Expected one of: pure-build, device-build, device-test, read-only.`,
+      };
+    }
+    explicitPhase = p;
+  }
+
+  const isBuildFlag =
+    parseBoolFlag(flags.build) ||
+    explicitPhase === "pure-build" ||
+    explicitPhase === "device-build";
   const isClaimFlag = parseBoolFlag(flags.claim);
   const selectorSerial = flags.serial || flags.udid || null;
 
   const buildReqs = resolveBuildResources(cmd, args, cwd, {
     forceBuild: isBuildFlag,
     env: callerEnv,
+    workspace: explicitWorkspace,
   });
+  if (explicitRamMb > 0) {
+    buildReqs.requestedHeapMb = Math.max(buildReqs.requestedHeapMb || 0, explicitRamMb);
+  }
   if (buildReqs.kind === "deny_lifecycle") {
     return { exitCode: 3, error: buildReqs.reason };
   }
-  if (buildReqs.kind === "reject_long_running" && (isBuildFlag || isClaimFlag || buildReqs.backgrounded)) {
+  if (
+    buildReqs.kind === "reject_long_running" &&
+    (isBuildFlag || isClaimFlag || Boolean(explicitPhase) || buildReqs.backgrounded)
+  ) {
     return { exitCode: 3, error: buildReqs.reason };
   }
 
@@ -5206,6 +5279,59 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const cmdDeviceClass = classifySegment(rawCmdStrForDeviceCheck);
   if (cmdDeviceClass.kind === "deny_lifecycle") {
     return { exitCode: 3, error: cmdDeviceClass.reason };
+  }
+
+  if (explicitPhase) {
+    if (
+      (explicitPhase === "pure-build" || explicitPhase === "read-only") &&
+      (isClaimFlag || Boolean(selectorSerial))
+    ) {
+      return {
+        exitCode: 3,
+        error: `Conflicting flags: --phase=${explicitPhase} cannot be combined with --claim or --serial/--udid.`,
+      };
+    }
+    if (explicitPhase === "read-only") {
+      if (
+        buildReqs.requiresHeavySlot ||
+        buildReqs.requiresWorkspaceLock ||
+        buildReqs.requiresDevice ||
+        cmdDeviceClass.kind === "device_action"
+      ) {
+        return {
+          exitCode: 3,
+          error: `Phase conflict: command requires build/workspace/device locks (${buildReqs.kind}), which violates --phase=read-only.`,
+        };
+      }
+      buildReqs.kind = "read_only";
+      buildReqs.requiresWorkspaceLock = false;
+      buildReqs.requiresHeavySlot = false;
+      buildReqs.requiresDevice = false;
+    } else if (explicitPhase === "pure-build") {
+      if (buildReqs.requiresDevice || cmdDeviceClass.kind === "device_action") {
+        return {
+          exitCode: 3,
+          error: `Phase conflict: command interacts with a device (${buildReqs.kind}), which violates --phase=pure-build. Use --phase=device-build or split build and test phases.`,
+        };
+      }
+      buildReqs.kind = "pure_build";
+      buildReqs.requiresWorkspaceLock = true;
+      buildReqs.requiresHeavySlot = true;
+      buildReqs.requiresDevice = false;
+    } else if (explicitPhase === "device-build") {
+      buildReqs.kind = "device_coupled_build";
+      buildReqs.requiresWorkspaceLock = true;
+      buildReqs.requiresHeavySlot = true;
+      buildReqs.requiresDevice = true;
+    } else if (explicitPhase === "device-test") {
+      if (buildReqs.requiresHeavySlot && !buildReqs.requiresDevice) {
+        return {
+          exitCode: 3,
+          error: `Phase conflict: command is a pure compilation (${buildReqs.kind}) that does not target a device, which violates --phase=device-test. Use --phase=pure-build or --phase=device-build.`,
+        };
+      }
+      buildReqs.requiresDevice = true;
+    }
   }
 
   const requiredDevicePlatform =
@@ -5224,11 +5350,13 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
   const needsBuildCoordination = Boolean(buildReqs.requiresWorkspaceLock);
   const needsDeviceLease =
-    isClaimFlag ||
-    Boolean(selectorSerial) ||
-    Boolean(buildReqs.requiresDevice) ||
-    cmdDeviceClass.kind === "device_action" ||
-    !isBuildFlag;
+    explicitPhase === "pure-build" || explicitPhase === "read-only"
+      ? false
+      : isClaimFlag ||
+        Boolean(selectorSerial) ||
+        Boolean(buildReqs.requiresDevice) ||
+        cmdDeviceClass.kind === "device_action" ||
+        !isBuildFlag;
 
   const rawWait = flags.wait ?? flags.waitSec;
   if (rawWait !== undefined && rawWait !== null) {
@@ -5245,7 +5373,15 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   }
 
   const claimFlags = Object.fromEntries(
-    Object.entries(flags).filter(([k]) => k !== "build" && k !== "claim"),
+    Object.entries(flags).filter(
+      ([k]) =>
+        k !== "build" &&
+        k !== "claim" &&
+        k !== "workspace" &&
+        k !== "phase" &&
+        k !== "ramMb" &&
+        k !== "ram-mb",
+    ),
   );
   if (!claimFlags.platform && !claimFlags.ios && !claimFlags.android && requiredDevicePlatform) {
     claimFlags.platform = requiredDevicePlatform;
@@ -6057,8 +6193,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           const coldEstimateMb = Math.max(
             state.config?.buildRamEstimateMb ?? 3072,
             buildReqs.requestedHeapMb || 0,
+            explicitRamMb || 0,
           );
-          const estimateMb = warmDaemonProbe.warm ? 0 : coldEstimateMb;
+          const estimateMb = warmDaemonProbe.warm
+            ? Math.max(0, explicitRamMb || 0)
+            : coldEstimateMb;
           if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
             ramCheck = checkUnifiedRamAdmission(state, host, estimateMb, now, {
               hysteresisMb: wasAlreadyQueued ? 0 : undefined,
@@ -7445,6 +7584,623 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
   };
 }
 
+export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {}) {
+  const unknownFlagErr = validateCommandFlags(flags, BATCH_ALLOWED_FLAGS, "batch");
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
+
+  let defaultBatchWorkspace = null;
+  if (flags.workspace !== undefined && flags.workspace !== null) {
+    if (typeof flags.workspace === "boolean" || !String(flags.workspace).trim()) {
+      return { exitCode: 1, error: 'Option "--workspace" requires a directory path.' };
+    }
+    const candWs = path.resolve(options.cwd || process.cwd(), String(flags.workspace).trim());
+    try {
+      if (!fs.existsSync(candWs) || !fs.statSync(candWs).isDirectory()) {
+        return { exitCode: 1, error: `Workspace directory does not exist: ${candWs}` };
+      }
+      defaultBatchWorkspace = fs.realpathSync(candWs);
+    } catch {
+      return { exitCode: 1, error: `Workspace directory is not accessible: ${candWs}` };
+    }
+  }
+  const rawBatchWait = flags.wait ?? flags.waitSec;
+  let defaultBatchWait = undefined;
+  if (rawBatchWait !== undefined && rawBatchWait !== null) {
+    const parsedWait =
+      typeof rawBatchWait === "boolean" || (typeof rawBatchWait === "string" && !rawBatchWait.trim())
+        ? Number.NaN
+        : Number(rawBatchWait);
+    if (!Number.isFinite(parsedWait) || parsedWait < 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --wait duration "${rawBatchWait}". Expected a non-negative number of seconds.`,
+      };
+    }
+    defaultBatchWait = parsedWait;
+  }
+
+  let spec = null;
+  const effectiveSpecInput =
+    rawSpecInput || (typeof flags.spec === "string" ? flags.spec : null);
+  if (
+    effectiveSpecInput &&
+    typeof effectiveSpecInput === "object" &&
+    !Array.isArray(effectiveSpecInput)
+  ) {
+    spec = effectiveSpecInput;
+  } else {
+    const rawStr = typeof effectiveSpecInput === "string" ? effectiveSpecInput.trim() : "";
+    if (!rawStr) {
+      return {
+        exitCode: 1,
+        error: 'Usage: atc batch [--file <path.json>|--spec <json>] [--json] (or pass JSON spec via stdin)',
+      };
+    }
+    try {
+      spec = JSON.parse(rawStr);
+    } catch (err) {
+      return {
+        exitCode: 1,
+        error: `Invalid JSON batch specification: ${err.message}`,
+      };
+    }
+  }
+
+  if (!spec || typeof spec !== "object" || !Array.isArray(spec.steps) || spec.steps.length === 0) {
+    return {
+      exitCode: 1,
+      error: 'Batch specification must contain a non-empty "steps" array.',
+    };
+  }
+
+  const baseCwd = options.cwd || process.cwd();
+  const baseEnv = options.env || process.env;
+  const stepsById = new Map();
+  const preparedSteps = [];
+
+  for (let i = 0; i < spec.steps.length; i++) {
+    const rawStep = spec.steps[i];
+    if (!rawStep || typeof rawStep !== "object" || Array.isArray(rawStep)) {
+      return { exitCode: 1, error: `Batch step at index ${i} must be an object.` };
+    }
+    const id = typeof rawStep.id === "string" ? rawStep.id.trim() : "";
+    if (!id) {
+      return {
+        exitCode: 1,
+        error: `Batch step at index ${i} is missing a non-empty string "id".`,
+      };
+    }
+    if (stepsById.has(id)) {
+      return {
+        exitCode: 1,
+        error: `Duplicate step id "${id}" in batch specification.`,
+      };
+    }
+    const command = typeof rawStep.command === "string" ? rawStep.command.trim() : "";
+    if (!command || command.includes("\0")) {
+      return {
+        exitCode: 1,
+        error: `Batch step "${id}" has an empty or invalid "command".`,
+      };
+    }
+    let stepArgs = [];
+    if (rawStep.args !== undefined && rawStep.args !== null) {
+      if (!Array.isArray(rawStep.args)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "args" must be an array of strings.`,
+        };
+      }
+      stepArgs = rawStep.args.map((a) => String(a));
+      if (stepArgs.some((a) => a.includes("\0"))) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "args" entries must not contain NUL bytes.`,
+        };
+      }
+    }
+
+    let dependsOn = [];
+    if (rawStep.dependsOn !== undefined && rawStep.dependsOn !== null) {
+      if (!Array.isArray(rawStep.dependsOn)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "dependsOn" must be an array of step IDs.`,
+        };
+      }
+      for (const dep of rawStep.dependsOn) {
+        const depId = typeof dep === "string" ? dep.trim() : "";
+        if (!depId) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": "dependsOn" entries must be non-empty strings.`,
+          };
+        }
+        if (depId === id) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}" cannot depend on itself.`,
+          };
+        }
+        if (!dependsOn.includes(depId)) {
+          dependsOn.push(depId);
+        }
+      }
+    }
+
+    let stepCwd = baseCwd;
+    if (rawStep.cwd !== undefined && rawStep.cwd !== null) {
+      if (typeof rawStep.cwd !== "string" || !rawStep.cwd.trim()) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "cwd" must be a non-empty directory path.`,
+        };
+      }
+      const candCwd = path.resolve(baseCwd, rawStep.cwd.trim());
+      try {
+        if (!fs.existsSync(candCwd) || !fs.statSync(candCwd).isDirectory()) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": cwd directory does not exist: ${candCwd}`,
+          };
+        }
+        stepCwd = fs.realpathSync(candCwd);
+      } catch {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": cwd directory is not accessible: ${candCwd}`,
+        };
+      }
+    }
+
+    let stepWorkspace = defaultBatchWorkspace;
+    if (rawStep.workspace !== undefined && rawStep.workspace !== null) {
+      if (typeof rawStep.workspace !== "string" || !rawStep.workspace.trim()) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "workspace" must be a non-empty directory path.`,
+        };
+      }
+      const candWs = path.resolve(stepCwd, rawStep.workspace.trim());
+      try {
+        if (!fs.existsSync(candWs) || !fs.statSync(candWs).isDirectory()) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": workspace directory does not exist: ${candWs}`,
+          };
+        }
+        stepWorkspace = fs.realpathSync(candWs);
+      } catch {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": workspace directory is not accessible: ${candWs}`,
+        };
+      }
+    }
+
+    let stepPhase = null;
+    if (rawStep.phase !== undefined && rawStep.phase !== null) {
+      const p = typeof rawStep.phase === "string" ? rawStep.phase.trim().toLowerCase() : "";
+      if (!VALID_EXEC_PHASES.has(p)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": invalid phase "${rawStep.phase}". Expected one of: pure-build, device-build, device-test, read-only.`,
+        };
+      }
+      stepPhase = p;
+    }
+
+    const rawStepRam = rawStep.ramMb ?? rawStep["ram-mb"];
+    let stepRamMb = undefined;
+    if (rawStepRam !== undefined && rawStepRam !== null) {
+      const parsedRam =
+        typeof rawStepRam === "boolean" || (typeof rawStepRam === "string" && !rawStepRam.trim())
+          ? Number.NaN
+          : Number(rawStepRam);
+      if (!Number.isInteger(parsedRam) || parsedRam < 1 || parsedRam > 1_048_576) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": invalid ramMb "${rawStepRam}". Expected an integer between 1 and 1048576.`,
+        };
+      }
+      stepRamMb = parsedRam;
+    }
+
+    const rawStepWait = rawStep.wait ?? rawStep.waitSec;
+    let stepWait = defaultBatchWait;
+    if (rawStepWait !== undefined && rawStepWait !== null) {
+      const parsedWait =
+        typeof rawStepWait === "boolean" || (typeof rawStepWait === "string" && !rawStepWait.trim())
+          ? Number.NaN
+          : Number(rawStepWait);
+      if (!Number.isFinite(parsedWait) || parsedWait < 0) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": invalid wait "${rawStepWait}". Expected a non-negative number of seconds.`,
+        };
+      }
+      stepWait = parsedWait;
+    }
+
+    let stepEnv = { ...baseEnv };
+    if (rawStep.env !== undefined && rawStep.env !== null) {
+      if (typeof rawStep.env !== "object" || Array.isArray(rawStep.env)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "env" must be an object of key-value pairs.`,
+        };
+      }
+      for (const [k, v] of Object.entries(rawStep.env)) {
+        if (!k || k.includes("\0") || k.includes("=")) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": invalid environment variable name ${JSON.stringify(k)}.`,
+          };
+        }
+        if (v === undefined || v === null) {
+          delete stepEnv[k];
+        } else {
+          const strVal = String(v);
+          if (strVal.includes("\0")) {
+            return {
+              exitCode: 1,
+              error: `Batch step "${id}": environment variable "${k}" must not contain NUL bytes.`,
+            };
+          }
+          stepEnv[k] = strVal;
+        }
+      }
+    }
+
+    const stepFlags = {};
+    if (flags.session !== undefined) stepFlags.session = flags.session;
+    if (flags.role !== undefined) stepFlags.role = flags.role;
+    if (flags.anchorPid !== undefined) stepFlags.anchorPid = flags.anchorPid;
+    if (stepPhase) stepFlags.phase = stepPhase;
+    if (stepWorkspace) stepFlags.workspace = stepWorkspace;
+    if (stepRamMb !== undefined) stepFlags.ramMb = stepRamMb;
+    if (stepWait !== undefined) stepFlags.wait = stepWait;
+    if (rawStep.build !== undefined) stepFlags.build = parseBoolFlag(rawStep.build);
+    if (rawStep.serial !== undefined) stepFlags.serial = String(rawStep.serial);
+    if (rawStep.udid !== undefined) stepFlags.udid = String(rawStep.udid);
+
+    if (rawStep.claim !== undefined && rawStep.claim !== null && rawStep.claim !== false) {
+      if (rawStep.claim === true) {
+        stepFlags.claim = true;
+      } else if (typeof rawStep.claim === "string") {
+        const parsedSel = parseCliArgs(["exec", ...tokenizeClaimSelectorString(rawStep.claim)]);
+        if (parsedSel.positionals.length > 0) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": unexpected argument "${parsedSel.positionals[0]}" in claim selector.`,
+          };
+        }
+        Object.assign(stepFlags, parsedSel.flags);
+        stepFlags.claim = true;
+      } else if (typeof rawStep.claim === "object" && !Array.isArray(rawStep.claim)) {
+        const claimErr = validateCommandFlags(rawStep.claim, CLAIM_ALLOWED_FLAGS, "claim");
+        if (claimErr) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": ${claimErr}`,
+          };
+        }
+        Object.assign(stepFlags, rawStep.claim);
+        stepFlags.claim = true;
+      } else {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "claim" must be a boolean, selector string, or claim options object.`,
+        };
+      }
+    }
+
+    const execFlagErr = validateCommandFlags(stepFlags, EXEC_ALLOWED_FLAGS, "exec");
+    if (execFlagErr) {
+      return { exitCode: 1, error: `Batch step "${id}": ${execFlagErr}` };
+    }
+
+    try {
+      resolveExplicitPlatformFilter(stepFlags);
+      if (parseBoolFlag(stepFlags.claim)) {
+        resolveTargetPlatform(stepFlags, stepCwd);
+      }
+    } catch (err) {
+      return { exitCode: 1, error: `Batch step "${id}": ${err.message}` };
+    }
+
+    const isStepBuild =
+      parseBoolFlag(stepFlags.build) ||
+      stepPhase === "pure-build" ||
+      stepPhase === "device-build";
+    const isStepClaim = parseBoolFlag(stepFlags.claim);
+    const stepSelectorSerial = stepFlags.serial || stepFlags.udid || null;
+
+    const preflightBuildReqs = resolveBuildResources(command, stepArgs, stepCwd, {
+      forceBuild: isStepBuild,
+      env: stepEnv,
+      workspace: stepWorkspace,
+    });
+    if (preflightBuildReqs.kind === "deny_lifecycle") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightBuildReqs.reason}`,
+      };
+    }
+    if (
+      preflightBuildReqs.kind === "reject_long_running" &&
+      (isStepBuild || isStepClaim || Boolean(stepPhase) || preflightBuildReqs.backgrounded)
+    ) {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightBuildReqs.reason}`,
+      };
+    }
+    const rawStepCmdStr = [command, ...stepArgs]
+      .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+      .join(" ");
+    const preflightDevClass = classifySegment(rawStepCmdStr);
+    if (preflightDevClass.kind === "deny_lifecycle") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightDevClass.reason}`,
+      };
+    }
+    if (stepPhase) {
+      if (
+        (stepPhase === "pure-build" || stepPhase === "read-only") &&
+        (isStepClaim || Boolean(stepSelectorSerial))
+      ) {
+        return {
+          exitCode: 3,
+          error: `Batch pre-flight failed on step "${id}": Conflicting flags: --phase=${stepPhase} cannot be combined with --claim or --serial/--udid.`,
+        };
+      }
+      if (stepPhase === "read-only") {
+        if (
+          preflightBuildReqs.requiresHeavySlot ||
+          preflightBuildReqs.requiresWorkspaceLock ||
+          preflightBuildReqs.requiresDevice ||
+          preflightDevClass.kind === "device_action"
+        ) {
+          return {
+            exitCode: 3,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command requires build/workspace/device locks (${preflightBuildReqs.kind}), which violates --phase=read-only.`,
+          };
+        }
+      } else if (stepPhase === "pure-build") {
+        if (preflightBuildReqs.requiresDevice || preflightDevClass.kind === "device_action") {
+          return {
+            exitCode: 3,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command interacts with a device (${preflightBuildReqs.kind}), which violates --phase=pure-build.`,
+          };
+        }
+      } else if (stepPhase === "device-test") {
+        if (preflightBuildReqs.requiresHeavySlot && !preflightBuildReqs.requiresDevice) {
+          return {
+            exitCode: 3,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command is a pure compilation (${preflightBuildReqs.kind}) that does not target a device, which violates --phase=device-test.`,
+          };
+        }
+      }
+    }
+
+    const stepObj = {
+      id,
+      index: i,
+      command,
+      args: stepArgs,
+      dependsOn,
+      phase: stepPhase,
+      cwd: stepCwd,
+      workspace: stepWorkspace,
+      env: stepEnv,
+      flags: stepFlags,
+    };
+    stepsById.set(id, stepObj);
+    preparedSteps.push(stepObj);
+  }
+
+  // Validate dependency references and perform Kahn's topological sort
+  const inDegree = new Map();
+  const dependents = new Map();
+  for (const s of preparedSteps) {
+    inDegree.set(s.id, 0);
+    dependents.set(s.id, []);
+  }
+  for (const s of preparedSteps) {
+    for (const depId of s.dependsOn) {
+      if (!stepsById.has(depId)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${s.id}" depends on unknown step "${depId}".`,
+        };
+      }
+      inDegree.set(s.id, (inDegree.get(s.id) || 0) + 1);
+      dependents.get(depId).push(s.id);
+    }
+  }
+
+  const readyQueue = preparedSteps.filter((s) => inDegree.get(s.id) === 0).map((s) => s.id);
+  const topoOrder = [];
+  while (readyQueue.length > 0) {
+    const curId = readyQueue.shift();
+    topoOrder.push(stepsById.get(curId));
+    for (const nextId of dependents.get(curId) || []) {
+      const nextDeg = (inDegree.get(nextId) || 0) - 1;
+      inDegree.set(nextId, nextDeg);
+      if (nextDeg === 0) {
+        readyQueue.push(nextId);
+      }
+    }
+  }
+
+  if (topoOrder.length !== preparedSteps.length) {
+    const cycleIds = preparedSteps
+      .filter((s) => (inDegree.get(s.id) || 0) > 0)
+      .map((s) => s.id);
+    return {
+      exitCode: 1,
+      error: `Dependency cycle detected in batch specification involving step(s): ${cycleIds.join(", ")}.`,
+    };
+  }
+
+  const batchId = `batch_${randomNonce().slice(0, 12)}`;
+  const batchStartMs = Date.now();
+  let sessionId = null;
+  withStateTransaction(
+    stateDir,
+    (state, { auditEvents }) => {
+      const identity = resolveSessionIdentity({
+        flags,
+        env: baseEnv,
+        state,
+        cwd: baseCwd,
+        ppid: options.ppid ?? process.ppid,
+        ancestorPids: options.ancestorPids,
+        processChain: options.processChain,
+      });
+      sessionId = identity.sessionId;
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "batch_start",
+          sessionId: identity.sessionId,
+          batchId,
+          stepCount: topoOrder.length,
+          stepOrder: topoOrder.map((s) => s.id),
+        });
+      }
+      return { mutated: false };
+    },
+    options,
+  );
+
+  const stepResults = [];
+  const jsonOutputMode = parseBoolFlag(flags.json);
+
+  for (const step of topoOrder) {
+    const stepStartMs = Date.now();
+    let execRes;
+    try {
+      execRes = await cmdExec(
+        stateDir,
+        [step.command, ...step.args],
+        step.flags,
+        {
+          ...options,
+          cwd: step.cwd,
+          env: step.env,
+          ...(jsonOutputMode && !options.stdio
+            ? {
+                stdio: ["ignore", "pipe", "pipe"],
+                redirectStdoutToStderr: true,
+              }
+            : {}),
+        },
+      );
+    } catch (err) {
+      execRes = {
+        exitCode: 1,
+        error: err && err.message ? err.message : String(err),
+      };
+    }
+    const durationMs = Math.max(0, Date.now() - stepStartMs);
+    const exitCode = typeof execRes?.exitCode === "number" ? execRes.exitCode : 1;
+    const stepRecord = {
+      id: step.id,
+      phase: step.phase,
+      exitCode,
+      durationMs,
+      ...(execRes?.error ? { error: execRes.error } : {}),
+    };
+    stepResults.push(stepRecord);
+
+    withStateTransaction(
+      stateDir,
+      (state, { auditEvents }) => {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: exitCode === 0 ? "batch_step_done" : "batch_step_failed",
+            sessionId,
+            batchId,
+            stepId: step.id,
+            phase: step.phase,
+            exitCode,
+            durationMs,
+            ...(execRes?.error ? { error: execRes.error } : {}),
+          });
+        }
+        return { mutated: false };
+      },
+      options,
+    );
+
+    if (exitCode !== 0) {
+      const totalDurationMs = Math.max(0, Date.now() - batchStartMs);
+      withStateTransaction(
+        stateDir,
+        (state, { auditEvents }) => {
+          if (Array.isArray(auditEvents)) {
+            auditEvents.push({
+              event: "batch_complete",
+              sessionId,
+              batchId,
+              status: "failed",
+              failedStepId: step.id,
+              exitCode,
+              completedSteps: stepResults.length,
+              totalSteps: topoOrder.length,
+              durationMs: totalDurationMs,
+            });
+          }
+          return { mutated: false };
+        },
+        options,
+      );
+      return {
+        exitCode,
+        batchId,
+        status: "failed",
+        failedStepId: step.id,
+        steps: stepResults,
+        durationMs: totalDurationMs,
+        error: execRes?.error || `Batch step "${step.id}" failed with exit code ${exitCode}.`,
+      };
+    }
+  }
+
+  const totalDurationMs = Math.max(0, Date.now() - batchStartMs);
+  withStateTransaction(
+    stateDir,
+    (state, { auditEvents }) => {
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "batch_complete",
+          sessionId,
+          batchId,
+          status: "completed",
+          exitCode: 0,
+          completedSteps: stepResults.length,
+          totalSteps: topoOrder.length,
+          durationMs: totalDurationMs,
+        });
+      }
+      return { mutated: false };
+    },
+    options,
+  );
+
+  return {
+    exitCode: 0,
+    batchId,
+    status: "completed",
+    steps: stepResults,
+    durationMs: totalDurationMs,
+  };
+}
+
 export async function runCli(argv = process.argv.slice(2), env = process.env, options = {}) {
   const parsed = parseCliArgs(argv);
   const stateDir = resolveStateDir(env.ATC_STATE_DIR);
@@ -7481,7 +8237,8 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
         `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
         `  atc renew [<target>] [--ttl <sec>]\n` +
         `  atc snapshot <list|save|load|delete> [<name>]\n` +
-        `  atc exec [--build] [--claim] -- <command> [args...]\n` +
+        `  atc exec [--build] [--claim] [--workspace <dir>] [--phase <phase>] [--ram-mb <mb>] -- <command> [args...]\n` +
+        `  atc batch [--file <path.json>] [--json]\n` +
         `  atc status [--ios|--android] [--type <type>] [--api|--os <spec>] [--json]\n` +
         `  atc config <get|set> [key] [val]\n` +
         `  atc gc\n` +
@@ -7633,6 +8390,48 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
       const res = await cmdExec(stateDir, cmdTokens, parsed.flags, { env });
       if (res.error) {
         process.stderr.write(`[atc] ${res.error}\n`);
+      }
+      return res.exitCode;
+    }
+
+    case "batch":
+    case "plan": {
+      if (
+        parsed.positionals.length > 1 ||
+        (parsed.positionals.length > 0 && parsed.flags.file !== undefined)
+      ) {
+        const extra =
+          parsed.positionals.length > 1 ? parsed.positionals[1] : parsed.positionals[0];
+        process.stderr.write(
+          `[atc] Unexpected argument "${extra}" for "atc ${parsed.subcommand}".\n`,
+        );
+        return 1;
+      }
+      const fileArg =
+        parsed.positionals[0] ||
+        (typeof parsed.flags.file === "string" ? parsed.flags.file : null);
+      let rawSpec = "";
+      if (typeof parsed.flags.spec === "string") {
+        rawSpec = parsed.flags.spec;
+      } else if (fileArg && fileArg !== "-") {
+        try {
+          rawSpec = fs.readFileSync(path.resolve(options.cwd || process.cwd(), fileArg), "utf8");
+        } catch (err) {
+          process.stderr.write(`[atc] Failed to read batch file "${fileArg}": ${err.message}\n`);
+          return 1;
+        }
+      } else {
+        rawSpec = readStdinSync();
+      }
+      const res = await cmdBatch(stateDir, rawSpec, parsed.flags, { env, ...options });
+      if (parsed.flags.json) {
+        process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+      } else if (res.error) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+      } else {
+        process.stdout.write(
+          `✓ Completed batch ${res.batchId} (${res.steps.length} step${res.steps.length === 1 ? "" : "s"} in ${res.durationMs}ms)\n`,
+        );
       }
       return res.exitCode;
     }
