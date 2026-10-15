@@ -182,7 +182,7 @@ export function splitShellWords(rawStr) {
       hasToken = true;
       continue;
     }
-    if (ch === "\\" && i + 1 < s.length) {
+    if (ch === "\\" && i + 1 < s.length && /[\s"']/.test(s[i + 1])) {
       cur += s[++i];
       hasToken = true;
       continue;

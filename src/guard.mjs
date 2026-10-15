@@ -2182,6 +2182,18 @@ export function extractTargetSerial(parsed) {
         const val = String(args[i + 1]).trim();
         if (val) selectors.push(val);
         i += 1;
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_version=/.test(a)
+      ) {
+        const val = a.slice(a.indexOf("=") + 1).trim();
+        if (val) selectors.push(`ios_simulator_version=${val}`);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_version$/.test(a) &&
+        i + 1 < args.length
+      ) {
+        const val = String(args[i + 1]).trim();
+        if (val) selectors.push(`ios_simulator_version=${val}`);
+        i += 1;
       }
     }
     if (selectors.length > 0) {

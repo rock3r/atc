@@ -1330,6 +1330,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           envVars.JAVA_HOME = null;
           envVars.PATH = null;
           envVars.GRADLE_USER_HOME = null;
+          envVars.GRADLE_OPTS = null;
+          envVars.JAVA_OPTS = null;
           envVars.HOME = null;
         } else if (act.type === "chdir") {
           const rawNextDir = act.rawDir;
@@ -3629,9 +3631,22 @@ export function resolveBuildResources(
         // Ignore property read errors
       }
     }
-    const requestedHeapMb = cliHeapMb > 0 ? cliHeapMb : propsHeapMb;
+    const envGradleOpts =
+      effectiveEnvVars.GRADLE_OPTS === null || effectiveEnvVars.GRADLE_OPTS === ""
+        ? null
+        : effectiveEnvVars.GRADLE_OPTS || baseEnv.GRADLE_OPTS || null;
+    const envJavaOpts =
+      effectiveEnvVars.JAVA_OPTS === null || effectiveEnvVars.JAVA_OPTS === ""
+        ? null
+        : effectiveEnvVars.JAVA_OPTS || baseEnv.JAVA_OPTS || null;
+    const optsHeapMb = Math.max(
+      parseJvmHeapMb(envGradleOpts),
+      parseJvmHeapMb(envJavaOpts),
+    );
+    const requestedHeapMb = cliHeapMb > 0 ? cliHeapMb : Math.max(propsHeapMb, optsHeapMb);
     const disablesDaemon =
       propsDaemonDisabled ||
+      Boolean(envGradleOpts || envJavaOpts) ||
       strArgs.some(
         (a) =>
           a === "--no-daemon" ||
@@ -3677,6 +3692,7 @@ export function resolveBuildResources(
     let hasCustomStartupOption = false;
     let requestedHeapMb = 0;
     let ignoreAllRc = false;
+    let noSystemRc = false;
     let noWorkspaceRc = false;
     let noHomeRc = false;
     const explicitBazelrcPaths = [];
@@ -3689,6 +3705,14 @@ export function resolveBuildResources(
       }
       if (a === "--noignore_all_rc_files") {
         ignoreAllRc = false;
+        continue;
+      }
+      if (a === "--nosystem_rc") {
+        noSystemRc = true;
+        continue;
+      }
+      if (a === "--system_rc") {
+        noSystemRc = false;
         continue;
       }
       if (a === "--noworkspace_rc") {
@@ -3777,6 +3801,8 @@ export function resolveBuildResources(
           a.startsWith("--bazelrc=") ||
           a === "--ignore_all_rc_files" ||
           a === "--noignore_all_rc_files" ||
+          a === "--nosystem_rc" ||
+          a === "--system_rc" ||
           a === "--noworkspace_rc" ||
           a === "--workspace_rc" ||
           a === "--nohome_rc" ||
@@ -3846,6 +3872,9 @@ export function resolveBuildResources(
         }
       };
 
+      if (!noSystemRc) {
+        parseBazelrcFile("/etc/bazel.bazelrc", { required: false });
+      }
       if (!noWorkspaceRc) {
         parseBazelrcFile(path.join(canonicalRoot, ".bazelrc"), { required: false });
       }
@@ -3863,7 +3892,7 @@ export function resolveBuildResources(
         });
       }
       for (const rawExplicitRc of explicitBazelrcPaths) {
-        if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") continue;
+        if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") break;
         const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
         parseBazelrcFile(path.resolve(baseCwd, expandedRc), { required: true });
       }

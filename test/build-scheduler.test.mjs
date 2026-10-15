@@ -2421,6 +2421,57 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     );
     const contPropsReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
     assert.equal(contPropsReqs.requestedHeapMb, 4096);
+
+    // GRADLE_OPTS supplies JVM heap settings and marks invocation cold
+    const gradleOptsReqs = resolveBuildResources(
+      "env",
+      ["GRADLE_OPTS=-Dorg.gradle.jvmargs=-Xmx8g", "./gradlew", "build"],
+      subAppDir,
+    );
+    assert.equal(gradleOptsReqs.disablesDaemon, true);
+    assert.equal(gradleOptsReqs.requestedHeapMb, 8192);
+
+    // rules_apple ios_simulator_version without bound UDID is rejected by guard
+    const rulesAppleVerGuard = evaluateCommandGuard(
+      "bazel test //app:tests --@rules_apple//apple/build_settings:ios_simulator_version=18.0",
+      {
+        sessionId: "sess-ios",
+        activeLeases: [
+          {
+            leaseId: "lease_ios_sim",
+            sessionId: "sess-ios",
+            platform: "ios",
+            serial: "11111111-2222-3333-4444-555555555555",
+            udid: "11111111-2222-3333-4444-555555555555",
+            state: "active",
+          },
+        ],
+      },
+    );
+    assert.equal(rulesAppleVerGuard.allowed, false);
+
+    // --bazelrc=/dev/null stops processing subsequent --bazelrc flags
+    const rcX = path.join(wsDir, "x.rc");
+    const rcZ = path.join(wsDir, "z.rc");
+    const ignoredBazelOut = path.join(wsDir, "ignored-bazel-out");
+    fs.mkdirSync(ignoredBazelOut, { recursive: true });
+    const canonicalIgnoredBazelOut = (fs.realpathSync.native || fs.realpathSync)(ignoredBazelOut);
+    fs.writeFileSync(rcX, `startup --output_base=${canonicalSharedBazelOut}\n`);
+    fs.writeFileSync(rcZ, `startup --output_base=${canonicalIgnoredBazelOut}\n`);
+    const nullSentinelBazelrcReqs = resolveBuildResources(
+      "bazel",
+      [
+        "--noworkspace_rc",
+        `--bazelrc=${rcX}`,
+        "--bazelrc=/dev/null",
+        `--bazelrc=${rcZ}`,
+        "build",
+        "//...",
+      ],
+      subAppDir,
+    );
+    assert.ok(nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
+    assert.ok(!nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalIgnoredBazelOut}`));
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
