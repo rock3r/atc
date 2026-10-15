@@ -167,7 +167,7 @@ sequenceDiagram
     AgentA->>ATC: atc exec -- ./gradlew installDebug (Tier 1: Device Holder)
     ATC-->>AgentA: Tier 1 jumps ahead of Tier 2 (or uses +1 burst slot) so leased device never sits idle!
     AgentA->>Build: Spawns ./gradlew (ATC_BUILD_OP_ID exported for zero-deadlock nested builds)
-    Build-->>AgentA: Build exits -> 2.5s "draining" cooldown waits for daemon lock release
+    Build-->>AgentA: Clean exit releases slot immediately (abort/timeout holds 5s "draining" cooldown)
 ```
 
 ### Three-tier build priority and workspace mutual exclusion
@@ -182,8 +182,8 @@ Even when global build slots are free, two builds targeting the **same workspace
 
 | Build tool | Extracted `workspaceKeys` | Daemon & re-entrancy protections |
 |---|---|---|
-| `gradle` / `./gradlew` | `gradle:<canonicalProjectRoot>` + `gradle:dir:<--project-dir>` | Blocks `--stop` (`exit 2`); injects `-Dorg.gradle.workers.max=<N>`; holds `"draining"` state for up to `2500 ms` after CLI exit until the Gradle daemon releases its workspace lock. |
-| `bazel` / `bazelisk` / `./bazelw` | `bazel:ws:<workspaceRoot>` + `bazel:out:<--output_base>` | Blocks `shutdown` and `clean --expunge` (`exit 2`); injects `--jobs=<N>` and `--local_ram_resources=<MB>`; holds `"draining"` state while the Bazel server PID is active. |
+| `gradle` / `./gradlew` | `gradle:<canonicalProjectRoot>` + `gradle:dir:<--project-dir>` | Blocks `--stop` (`exit 2`); injects `-Dorg.gradle.workers.max=<N>`; enters `"draining"` (`5 s` abort cooldown / `30 s` max horizon) if aborted or while client-group processes remain alive. |
+| `bazel` / `bazelisk` / `./bazelw` | `bazel:ws:<workspaceRoot>` + `bazel:out:<--output_base>` | Blocks `shutdown` and `clean --expunge` (`exit 2`); injects `--jobs=<N>` and `--local_ram_resources=<MB>`; enters `"draining"` if aborted or while client-group processes remain alive. |
 | `xcodebuild` | `xcode:<projectOrWorkspaceDir>` + `xcode:dd:<derivedDataPath>` | Injects `-jobs <N>` unless already passed; coordinates `-derivedDataPath` access across concurrent iOS/macOS sessions. |
 
 ### Re-entrant sub-builds (zero nested deadlocks)

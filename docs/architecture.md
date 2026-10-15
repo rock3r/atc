@@ -76,7 +76,7 @@ flowchart TD
     Mode -- "Pure build or existing lease" --> Queue["Under atc.lock:\ncomputeBuildTier() -> Tier 0 (starved >=120s) | Tier 1 (device-holder) | Tier 2 (pure)"]
     Queue --> Admit["canAdmitBuildCandidate():\n1. Workspace mutex (active + draining)\n2. Slot ceiling (Base vs Base + Burst)\n3. Unified RAM check (cold daemon + preparingDevice + unaccounted <10s builds)"]
     Admit --> Spawn["Outside atc.lock:\nExport ATC_BUILD_OP_ID + inject worker/RAM flags\n(--jobs / -Dorg.gradle.workers.max / -jobs)"]
-    Spawn --> Drain["On exit -> transition to 'draining' (2500ms cooldown)\nWait for Gradle/Bazel daemon lock release, then delete"]
+    Spawn --> Drain["On exit -> release immediately if clean;\nenter 'draining' (5s cooldown / 30s cap) on abort or lingering PGID"]
 ```
 
 ### Unified RAM accounting across emulators and builds

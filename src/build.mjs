@@ -12,6 +12,67 @@ export function canonicalizeBuildPath(targetPath) {
   }
 }
 
+export function tokenizeShellClause(clause) {
+  const s = String(clause || "");
+  const tokens = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  let hasToken = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') {
+        inDouble = false;
+      } else if (ch === "\\" && i + 1 < s.length && (s[i + 1] === '"' || s[i + 1] === "\\")) {
+        cur += s[i + 1];
+        i++;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      hasToken = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      hasToken = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length && /\s|['"\\]/.test(s[i + 1])) {
+      cur += s[i + 1];
+      hasToken = true;
+      i++;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken || cur.length > 0) {
+        tokens.push(cur);
+        cur = "";
+        hasToken = false;
+      }
+      continue;
+    }
+    cur += ch;
+    hasToken = true;
+  }
+  if (hasToken || cur.length > 0) {
+    tokens.push(cur);
+  }
+  return tokens;
+}
+
 export function peelBuildWrapperTokens(cmd, args = []) {
   let curCmd = String(cmd || "");
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
@@ -134,12 +195,11 @@ export function peelBuildWrapperTokens(cmd, args = []) {
         const matchedClauses = [];
         let curShellRelCwd = relCwd;
         for (const clause of clauses) {
-          const rawTokens = clause
+          const strippedClause = clause
             .replace(/\s+[0-9]*>>?\s*\S+/g, "")
             .replace(/\s+2>&1\b/g, "")
-            .trim()
-            .split(/\s+/)
-            .filter(Boolean);
+            .trim();
+          const rawTokens = tokenizeShellClause(strippedClause);
           if (rawTokens.length === 0) continue;
           const headTok = rawTokens[0];
           if ((headTok === "cd" || headTok === "pushd") && rawTokens.length >= 2) {
@@ -148,7 +208,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
               dirIdx++;
             }
             if (dirIdx < rawTokens.length) {
-              const targetDir = rawTokens[dirIdx].replace(/^['"]|['"]$/g, "");
+              const targetDir = rawTokens[dirIdx];
               if (targetDir && targetDir !== "-") {
                 curShellRelCwd = curShellRelCwd ? path.join(curShellRelCwd, targetDir) : targetDir;
               }

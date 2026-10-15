@@ -36,7 +36,7 @@ When all matching devices or platform slots (`maxRunningEmulators` on Android, `
 |---|---|---|---|
 | `Tier 0` | Starved build ticket waiting `>= 120 s` (`buildReorderWindowSec`) | Base + Burst (`2 + 1 = 3`) | Bounds maximum queue wait so pure builds never starve indefinitely. |
 | `Tier 1` | Holds an active device lease or runs `atc exec --claim "<flags>" -- <cmd>` | Base + Burst (`2 + 1 = 3`) | Jumps ahead of `< 120 s` pure builds and uses the burst slot so leased devices never sit idle waiting to compile. Cold-boot `--claim` runs reserve a `"preparing_device"` build slot before booting. |
-| `Tier 2` | Pure CPU build (`atc exec --build -- ./gradlew assembleDebug`) | Base (`maxConcurrentBuilds = 2`) | Serializes colliding `workspaceKeys` (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) and holds a `2.5 s` `"draining"` cooldown after exit while daemons release workspace locks. Nested sub-builds inherit `ATC_BUILD_OP_ID` without deadlocking. |
+| `Tier 2` | Pure CPU build (`atc exec --build -- ./gradlew assembleDebug`) | Base (`maxConcurrentBuilds = 2`) | Serializes colliding `workspaceKeys` (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) and enters a `5 s` `"draining"` cooldown if aborted or while client-group processes unwind. Nested sub-builds inherit `ATC_BUILD_OP_ID` without deadlocking. |
 
 ## 4. Guardrails, KMP dual-lease routing, and agent hooks
 

@@ -694,8 +694,9 @@ stateDiagram-v2
     [*] --> Active: Immediate admission (Tier 0/1/2 or re-entrant reuse)
     Queued --> Active: Slot + workspaceKeys + RAM available
     PreparingDevice --> Active: Device boot completes -> transition to active
-    Active --> Draining: Wrapper PID exits (2500ms daemon lock release cooldown)
-    Draining --> [*]: Daemon idle / 2500ms elapsed -> delete buildLease
+    Active --> [*]: Clean exit & no surviving client PGID -> delete buildLease
+    Active --> Draining: Aborted/signal exit (5s cooldown) or surviving client PGID (<=30s)
+    Draining --> [*]: Client PGID exits & cooldown elapsed -> delete buildLease
 ```
 
 ### 10.2 Per-Workspace Mutual Exclusion, Daemon Safety & Re-Entrant Sub-Builds
@@ -703,9 +704,9 @@ stateDiagram-v2
    - **Gradle (`gradle` / `./gradlew`):** Locks both the root workspace (`gradle:<rootDir>`, walking up to the highest `settings.gradle[.kts]` or `gradlew`) and the subproject (`gradle:dir:<projectDir>`).
    - **Bazel (`bazel` / `bazelisk` / `./bazelw`):** Locks both the workspace root (`bazel:ws:<rootDir>`, via `MODULE.bazel` / `WORKSPACE`) and any explicit `--output_base` (`bazel:out:<outputBase>`).
    - **Xcode (`xcodebuild`):** Locks the project/workspace directory (`xcode:<dir>`) and any explicit `-derivedDataPath` (`xcode:dd:<path>`).
-2. **Daemon Kill Blocking & `"draining"` Cooldown (`buildDaemonDrainMs = 2500`):**
+2. **Daemon Kill Blocking & `"draining"` Cooldown (`buildAbortCooldownSec = 5`, `maxBuildDrainingSec = 30`):**
    - `atc guard` blocks global daemon termination commands (`./gradlew --stop`, `bazel shutdown`, `bazel clean --expunge`) with exit code `2` so one agent cannot crash another agent's compilation.
-   - Because Gradle and Bazel client wrappers can exit milliseconds before their background daemon releases its workspace lock, `cmdExec` transitions finished build leases to `state: "draining"` (`drainingUntilMs = now + 2500`). `reconcileDrainingBuildLeases()` keeps the workspace keys locked against other sessions until the daemon exits or `drainingUntilMs` elapses.
+   - Clean build exits with no remaining processes in the client process group release their `buildLease` immediately. When a build is aborted/killed by signal (`exitCode` `130`/`137`/`143` or signal) or leaves surviving child processes in its process group, `cmdExec` transitions the lease to `state: "draining"` (`drainingCooldownUntilMs = now + 5000` on abort, bounded by `drainingDeadlineMs = now + 30000`) so workspace keys stay locked until the daemon/client tree finishes unwinding.
 3. **Re-Entrant Nested Build Admission (`ATC_BUILD_OP_ID` & `ATC_BUILD_OP_NONCE`):**
    - `atc exec` exports `ATC_BUILD_OP_ID=<opId>` and `ATC_BUILD_OP_NONCE=<nonce>` into the child environment.
    - When a nested build (e.g., an `xcodebuild` Run Script phase invoking `./gradlew` in a KMP project) runs inside the parent's live process group, `evaluateNestedBuildAdmission()` validates the parent lease's `opId`, `nonce`, and worker PGID liveness, reusing the parent's concurrency slot (`reentrantReuse`) and acquiring only delta `workspaceKeys` not already held by the parent.

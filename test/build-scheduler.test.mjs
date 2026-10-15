@@ -1023,3 +1023,76 @@ test("computeUnaccountedBuildRamMb keeps preparingDevice build RAM reserved even
     0,
   );
 });
+
+test("resolveBuildResources and buildChildInvocation handle quoted shell paths, shell xcodebuild destinations, and Bazel startup flags with subcommand names", () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "atc-round5-"));
+  try {
+    const spacedAppDir = path.join(tmpRoot, "my app");
+    fs.mkdirSync(spacedAppDir, { recursive: true });
+    fs.writeFileSync(path.join(spacedAppDir, "settings.gradle.kts"), "");
+
+    const resQuotedCd = resolveBuildResources(
+      "sh",
+      ["-c", 'cd "my app" && ./gradlew test'],
+      tmpRoot,
+      process.env,
+    );
+    const canonicalSpacedApp = canonicalizeBuildPath(spacedAppDir);
+    assert.ok(
+      resQuotedCd.resourceKeys.includes(`gradle:${canonicalSpacedApp}`),
+      `Expected gradle:${canonicalSpacedApp} in ${JSON.stringify(resQuotedCd.resourceKeys)}`,
+    );
+
+    const iosLease = {
+      leaseId: "lease-ios-shell",
+      platform: "ios",
+      kind: "emulator",
+      serial: "SIM-UDID-999",
+      udid: "SIM-UDID-999",
+    };
+    const buildLease = {
+      buildId: "bld-shell-1",
+      jobsLimit: 4,
+      reservedRamMb: 3072,
+    };
+
+    const xcShellInv = buildChildInvocation(
+      "sh",
+      ["-c", "xcodebuild test -scheme App"],
+      iosLease,
+      "sess-round5",
+      process.env,
+      buildLease,
+    );
+    assert.match(xcShellInv.args[1], /-jobs 4/);
+    assert.match(xcShellInv.args[1], /-destination id=SIM-UDID-999/);
+
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "sh",
+          ["-c", 'xcodebuild test -scheme App -destination "platform=iOS Simulator,name=iPhone 16"'],
+          iosLease,
+          "sess-round5",
+          process.env,
+          buildLease,
+        ),
+      /Conflicting device selector/,
+    );
+
+    const bazelShellInv = buildChildInvocation(
+      "sh",
+      ["-c", "bazel --output_base=/tmp/build build //app:bin"],
+      null,
+      "sess-round5",
+      process.env,
+      buildLease,
+    );
+    assert.equal(
+      bazelShellInv.args[1],
+      "bazel --output_base=/tmp/build build --jobs=4 --local_ram_resources=3072 //app:bin",
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

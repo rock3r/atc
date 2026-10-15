@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyBuildCommand, peelBuildWrapperTokens } from "./build.mjs";
+import { classifyBuildCommand, peelBuildWrapperTokens, tokenizeShellClause } from "./build.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -817,7 +817,7 @@ export function buildChildInvocation(
           const redirMatch = part.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1)(?:\s+(?:[0-9]*>>?\s*\S+|2>&1))*)\s*$/);
           const redirSuffix = redirMatch ? redirMatch[1] : "";
           const corePart = redirMatch ? part.slice(0, part.length - redirMatch[0].length) : part;
-          const rawTokens = corePart.trim().split(/\s+/).filter(Boolean);
+          const rawTokens = tokenizeShellClause(corePart.trim());
           if (rawTokens.length === 0) return part;
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           const cClass = classifyBuildCommand(peeled.cmd, peeled.args);
@@ -836,14 +836,52 @@ export function buildChildInvocation(
             if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
             if (injected.length > 0) {
               const rewrittenCore = corePart.replace(
-                /\b(build|test|run|coverage)\b/,
-                (m) => `${m} ${injected.join(" ")}`,
+                /(\bbazel(?:isk|w)?(?:\.(?:exe|cmd|bat))?(?:\s+(?:"[^"]*"|'[^']*'|[^\s"'])+)*?\s+)(build|test|run|coverage)(?=\s|$)/i,
+                (_, prefix, sub) => `${prefix}${sub} ${injected.join(" ")}`,
               );
               return `${rewrittenCore}${redirSuffix}`;
             }
           }
-          if (cClass.tool === "xcodebuild" && !/(?:^|\s)-jobs(?:=|\s|$)/.test(corePart)) {
-            return `${corePart.trimEnd()} -jobs ${jobsLimit}${redirSuffix}`;
+          if (cClass.tool === "xcodebuild") {
+            let explicitDestination = null;
+            for (let i = 0; i < peeled.args.length; i++) {
+              const a = String(peeled.args[i]);
+              if (a.startsWith("-destination=")) {
+                explicitDestination = a.slice("-destination=".length);
+                break;
+              }
+              if (a === "-destination" && i + 1 < peeled.args.length) {
+                explicitDestination = String(peeled.args[i + 1]);
+                break;
+              }
+            }
+            const allowedIds = new Set(
+              [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
+                .filter(Boolean)
+                .map((s) => String(s).toUpperCase()),
+            );
+            if (explicitDestination && allowedIds.size > 0 && (lease?.platform || "android") === "ios") {
+              const idMatch = explicitDestination.match(/(?:^|,)\s*id=([^,\s]+)/i);
+              if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
+                throw new Error(
+                  `Conflicting device selector "${idMatch?.[1] || explicitDestination}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+                );
+              }
+            }
+            const xcodeInjected = [];
+            if (!/(?:^|\s)-jobs(?:=|\s|$)/.test(corePart)) {
+              xcodeInjected.push(`-jobs ${jobsLimit}`);
+            }
+            if (
+              !explicitDestination &&
+              lease?.serial &&
+              (lease.platform || "android") === "ios"
+            ) {
+              xcodeInjected.push(`-destination id=${lease.serial}`);
+            }
+            if (xcodeInjected.length > 0) {
+              return `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}`;
+            }
           }
           return part;
         });
