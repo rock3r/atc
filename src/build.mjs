@@ -3201,10 +3201,24 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     const dashDashIdx = restArgs.indexOf("--");
     const bazelFlags = dashDashIdx >= 0 ? restArgs.slice(0, dashDashIdx) : restArgs;
 
+    const isBazelBoolFalse = (v) => /^(?:false|0|no|f|n)$/i.test(String(v || "").trim());
+    let expungeEnabled = false;
+    let expungeAsyncEnabled = false;
+    for (const a of bazelFlags) {
+      if (a === "--expunge") expungeEnabled = true;
+      else if (a === "--noexpunge") expungeEnabled = false;
+      else if (a.startsWith("--expunge=")) {
+        expungeEnabled = !isBazelBoolFalse(a.slice("--expunge=".length));
+      } else if (a === "--expunge_async") expungeAsyncEnabled = true;
+      else if (a === "--noexpunge_async") expungeAsyncEnabled = false;
+      else if (a.startsWith("--expunge_async=")) {
+        expungeAsyncEnabled = !isBazelBoolFalse(a.slice("--expunge_async=".length));
+      }
+    }
+
     if (
       subcmd === "shutdown" ||
-      (subcmd === "clean" &&
-        bazelFlags.some((a) => a === "--expunge" || a === "--expunge_async"))
+      (subcmd === "clean" && (expungeEnabled || expungeAsyncEnabled))
     ) {
       const label = subcmd === "clean" ? "bazel clean --expunge" : "bazel shutdown";
       return {

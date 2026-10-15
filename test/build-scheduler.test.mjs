@@ -1942,6 +1942,24 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.ok(sanitizedUserBases.some((p) => p.includes("/_bazel_CORP_team_alice/")));
 
+    // Boolean-valued Bazel clean --expunge=<value> / --expunge_async=<value>
+    for (const flag of [
+      "--expunge=true",
+      "--expunge=yes",
+      "--expunge=1",
+      "--expunge_async=true",
+      "--expunge_async=1",
+    ]) {
+      const boolExpungeReqs = resolveBuildResources("bazel", ["clean", flag], subAppDir);
+      assert.equal(boolExpungeReqs.kind, "deny_lifecycle");
+    }
+    const disabledExpungeReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "clean", "--expunge=false", "--expunge_async=0"],
+      subAppDir,
+    );
+    assert.equal(disabledExpungeReqs.kind, "workspace_only");
+
     // Trailing shell comments preserve comment text and insert injected flags before `#`
     const commentGradleInv = buildChildInvocation(
       "sh",
