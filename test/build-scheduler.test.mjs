@@ -1286,6 +1286,51 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     });
     assert.equal(bothWarm.warm, true);
     assert.deepEqual(bothWarm.daemonPids, [1111, 2222]);
+
+    // Grouped shell commands place injected flags inside the closing parenthesis and preserve cd scope
+    const groupedReqs = resolveBuildResources(
+      "sh",
+      ["-c", '(cd "my app" && ./gradlew connectedCheck)'],
+      tmpRoot,
+    );
+    assert.equal(groupedReqs.kind, "device_coupled_build");
+    assert.ok(groupedReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
+    const groupedInv = buildChildInvocation(
+      "sh",
+      ["-c", '(cd "my app" && ./gradlew build)'],
+      null,
+      "sess-round10",
+      process.env,
+      buildLease,
+    );
+    assert.equal(
+      groupedInv.args[1],
+      '(cd "my app" && ./gradlew build -Dorg.gradle.workers.max=4)',
+    );
+
+    // Invocation JAVA_HOME is honored when matching warm Gradle daemons
+    const javaHomeReqs = resolveBuildResources(
+      "env",
+      ["JAVA_HOME=/opt/jdk-21", "./gradlew", "assembleDebug"],
+      spacedAppDir,
+    );
+    assert.equal(javaHomeReqs.envJavaHome, "/opt/jdk-21");
+    const wrongJavaProbe = probeWarmBuildDaemons(javaHomeReqs, {
+      platform: "darwin",
+      runner: () => ({
+        status: 0,
+        stdout: "54321 /opt/jdk-17/bin/java -Xmx4g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
+      }),
+    });
+    assert.equal(wrongJavaProbe.warm, false);
+    const matchingJavaProbe = probeWarmBuildDaemons(javaHomeReqs, {
+      platform: "darwin",
+      runner: () => ({
+        status: 0,
+        stdout: "54321 /opt/jdk-21/bin/java -Xmx4g -XX:MaxMetaspaceSize=512m org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
+      }),
+    });
+    assert.equal(matchingJavaProbe.warm, true);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

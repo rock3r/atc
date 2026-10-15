@@ -145,10 +145,13 @@ export function peelBuildWrapperTokens(cmd, args = []) {
   let curCmd = String(cmd || "");
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
   let relCwd = null;
+  const envVars = {};
 
   for (let depth = 0; depth < 16; depth++) {
     const cleaned = curCmd.trim().replace(/^@+/, "");
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cleaned)) {
+      const eqIdx = cleaned.indexOf("=");
+      envVars[cleaned.slice(0, eqIdx)] = cleaned.slice(eqIdx + 1);
       if (curArgs.length === 0) break;
       curCmd = curArgs[0];
       curArgs = curArgs.slice(1);
@@ -245,6 +248,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           continue;
         }
         if ((a === "-u" || a === "--unset") && i + 1 < curArgs.length) {
+          delete envVars[curArgs[i + 1]];
           i += 2;
           continue;
         }
@@ -253,6 +257,8 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           continue;
         }
         if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) {
+          const eqIdx = a.indexOf("=");
+          envVars[a.slice(0, eqIdx)] = a.slice(eqIdx + 1);
           i++;
           continue;
         }
@@ -315,13 +321,37 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           .filter(Boolean);
         const matchedClauses = [];
         let curShellRelCwd = relCwd;
+        const cwdStack = [];
         for (const clause of clauses) {
-          const strippedClause = clause
+          let strippedClause = clause
             .replace(/\s+[0-9]*>>?\s*\S+/g, "")
             .replace(/\s+2>&1\b/g, "")
             .trim();
+          while (/^[({]/.test(strippedClause)) {
+            if (strippedClause.startsWith("(")) {
+              cwdStack.push(curShellRelCwd);
+            }
+            strippedClause = strippedClause.slice(1).trim();
+          }
+          let closedSubshells = 0;
+          while (/[)}]$/.test(strippedClause)) {
+            if (strippedClause.endsWith(")")) {
+              closedSubshells++;
+            }
+            strippedClause = strippedClause.slice(0, -1).trim();
+          }
+          const popSubshells = () => {
+            for (let s = 0; s < closedSubshells; s++) {
+              if (cwdStack.length > 0) {
+                curShellRelCwd = cwdStack.pop();
+              }
+            }
+          };
           const rawTokens = tokenizeShellClause(strippedClause);
-          if (rawTokens.length === 0) continue;
+          if (rawTokens.length === 0) {
+            popSubshells();
+            continue;
+          }
           const headTok = rawTokens[0];
           if ((headTok === "cd" || headTok === "pushd") && rawTokens.length >= 2) {
             let dirIdx = 1;
@@ -334,6 +364,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
                 curShellRelCwd = curShellRelCwd ? path.join(curShellRelCwd, targetDir) : targetDir;
               }
             }
+            popSubshells();
             continue;
           }
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
@@ -346,14 +377,17 @@ export function peelBuildWrapperTokens(cmd, args = []) {
               cmd: peeled.cmd,
               args: peeled.args,
               relCwd: effectiveRelCwd,
+              envVars: { ...envVars, ...(peeled.envVars || {}) },
             });
           }
+          popSubshells();
         }
         if (matchedClauses.length > 0) {
           return {
             cmd: matchedClauses[0].cmd,
             args: matchedClauses[0].args,
             relCwd: matchedClauses[0].relCwd || null,
+            envVars: matchedClauses[0].envVars || { ...envVars },
             allBuildClauses: matchedClauses,
           };
         }
@@ -362,7 +396,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
     break;
   }
 
-  return { cmd: curCmd, args: curArgs, relCwd, allBuildClauses: null };
+  return { cmd: curCmd, args: curArgs, relCwd, envVars, allBuildClauses: null };
 }
 
 export function normalizeBuildToolName(cmd) {
@@ -888,14 +922,18 @@ export function resolveBuildResources(
   rawCmd,
   rawArgs = [],
   cwd = process.cwd(),
-  { forceBuild = false } = {},
+  { forceBuild = false, inheritedEnvVars = null } = {},
 ) {
-  const { cmd, args, relCwd, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const { cmd, args, relCwd, envVars, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const effectiveEnvVars = { ...(inheritedEnvVars || {}), ...(envVars || {}) };
   const outerCwd = path.resolve(cwd || process.cwd());
   if (allBuildClauses && allBuildClauses.length > 1) {
     const clauseRes = allBuildClauses.map((c) => {
       const clauseCwd = c.relCwd ? path.resolve(outerCwd, c.relCwd) : outerCwd;
-      return resolveBuildResources(c.cmd, c.args, clauseCwd, { forceBuild: false });
+      return resolveBuildResources(c.cmd, c.args, clauseCwd, {
+        forceBuild: false,
+        inheritedEnvVars: c.envVars || effectiveEnvVars,
+      });
     });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
     if (deny) return deny;
@@ -1023,6 +1061,8 @@ export function resolveBuildResources(
         a === "-Dorg.gradle.daemon=false" ||
         a.startsWith("-Dorg.gradle.jvmargs=") ||
         a.startsWith("-Dorg.gradle.java.home=") ||
+        a === "--java-home" ||
+        a.startsWith("--java-home=") ||
         a === "-g" ||
         a === "--gradle-user-home" ||
         a.startsWith("--gradle-user-home="),
@@ -1030,6 +1070,7 @@ export function resolveBuildResources(
     return {
       ...classified,
       disablesDaemon,
+      envJavaHome: effectiveEnvVars.JAVA_HOME || null,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
     };
@@ -1698,7 +1739,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     const wsRoot = String(buildReqs.workspaceRoot || "");
     const wsBase = wsRoot ? path.basename(wsRoot) : "";
     let expectedGradleVersion = null;
-    let expectedGradleJavaHome = null;
+    let expectedGradleJavaHome = buildReqs.envJavaHome || options.env?.JAVA_HOME || null;
     let expectedGradleJvmArgs = [];
     if (buildReqs.tool === "gradle" && wsRoot) {
       try {

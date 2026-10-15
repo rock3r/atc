@@ -831,10 +831,27 @@ export function buildChildInvocation(
           if (!trimmed) return part;
           const trailingWs = part.match(/(\s*)$/)?.[1] || "";
           const partNoTrail = part.slice(0, part.length - trailingWs.length);
-          const redirMatch = partNoTrail.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1)(?:\s+(?:[0-9]*>>?\s*\S+|2>&1))*)$/);
-          const redirSuffix = redirMatch ? redirMatch[1] : "";
-          const corePart = redirMatch ? partNoTrail.slice(0, partNoTrail.length - redirMatch[0].length) : partNoTrail;
-          const rawTokens = tokenizeShellClause(corePart.trim());
+          let coreEnd = partNoTrail;
+          let groupAndRedirSuffix = "";
+          while (true) {
+            const rMatch = coreEnd.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1))$/);
+            if (rMatch) {
+              groupAndRedirSuffix = rMatch[1] + groupAndRedirSuffix;
+              coreEnd = coreEnd.slice(0, coreEnd.length - rMatch[1].length);
+              continue;
+            }
+            const gMatch = coreEnd.match(/(\s*[)}]+)$/);
+            if (gMatch) {
+              groupAndRedirSuffix = gMatch[1] + groupAndRedirSuffix;
+              coreEnd = coreEnd.slice(0, coreEnd.length - gMatch[1].length);
+              continue;
+            }
+            break;
+          }
+          const redirSuffix = groupAndRedirSuffix;
+          const corePart = coreEnd;
+          const leadingGroupStrip = corePart.trim().replace(/^[({]+\s*/, "");
+          const rawTokens = tokenizeShellClause(leadingGroupStrip);
           if (rawTokens.length === 0) return part;
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           const cClass = classifyBuildCommand(peeled.cmd, peeled.args);
@@ -1119,17 +1136,21 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     }
 
     if (childPid && effectivePlatform === "win32") {
-      earlyWinDiscoveryTimer = setTimeout(() => {
-        earlyWinDiscoveryTimer = null;
-        try {
-          captureStartTokenWhileHandleOpen();
-          if (hasAliveProcessInGroup(childPid)) {
-            onHeartbeat();
+      earlyWinDiscoveryTimer = setTimeout(
+        () => {
+          earlyWinDiscoveryTimer = null;
+          if (child.exitCode !== null || child.signalCode !== null) return;
+          try {
+            captureStartTokenWhileHandleOpen();
+            if (hasAliveProcessInGroup(childPid)) {
+              onHeartbeat();
+            }
+          } catch {
+            // Best-effort early descendant discovery
           }
-        } catch {
-          // Best-effort early descendant discovery
-        }
-      }, 80);
+        },
+        options.buildMode && !lease ? 500 : 80,
+      );
       if (typeof earlyWinDiscoveryTimer.unref === "function") {
         earlyWinDiscoveryTimer.unref();
       }
@@ -1215,13 +1236,22 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
             // Best-effort exit callback
           }
         }
-        try {
-          onHeartbeat();
-        } catch {
-          // Ignore final heartbeat error
+        if (!options.buildMode || lease) {
+          try {
+            onHeartbeat();
+          } catch {
+            // Ignore final heartbeat error
+          }
         }
         resolve(resolvedExitCode);
       };
+
+      if (options.buildMode && !effectiveSignal) {
+        // Do not block or kill detached shared build daemons (GradleDaemon, kotlin-daemon, Bazel server)
+        // when the build client wrapper exits normally.
+        finishClose();
+        return;
+      }
 
       if (childPid && isProcessGroupAlive(childPid)) {
         if (effectiveSignal) {
@@ -1237,12 +1267,6 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
               sleepSync(25);
             }
           }
-          finishClose();
-          return;
-        }
-        if (options.buildMode) {
-          // Do not block or kill detached shared build daemons (GradleDaemon, kotlin-daemon, Bazel server)
-          // when the build client wrapper exits normally.
           finishClose();
           return;
         }

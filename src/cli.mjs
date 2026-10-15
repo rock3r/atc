@@ -6602,6 +6602,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         try {
           keepSpawnedChildGroup = hasAliveProcessInGroup(spawnedChildPid, {
             allowSubprocess: true,
+            triState: true,
             spawnSyncFn: options.spawnSyncFn,
             platform: options.platform,
             expectedStartToken: spawnedChildStartToken,
