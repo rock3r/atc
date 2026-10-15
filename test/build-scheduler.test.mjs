@@ -3291,6 +3291,86 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     );
     assert.equal(fgGradleExec.exitCode, 3);
     assert.match(fgGradleExec.error, /gradle --foreground/);
+
+    // 10. Round 45: Bazel child validation from execution cwd, client/env heap max with CLI jvmargs, and full default Gradle daemon compatibility set
+    const bazelStepDir = path.join(wsDir, "bazel-step");
+    fs.mkdirSync(bazelStepDir, { recursive: true });
+    fs.writeFileSync(path.join(bazelStepDir, "MODULE.bazel"), "");
+    fs.writeFileSync(
+      path.join(bazelStepDir, ".bazelrc"),
+      "test --test_arg=--device=emulator-9999\n",
+    );
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "bazel",
+          ["test", "//app:test"],
+          { leaseId: "lease_cwd_bazel", serial: "emulator-5554", platform: "android" },
+          "sess-bazel-cwd",
+          {},
+          null,
+          { cwd: bazelStepDir },
+        ),
+      /Conflicting device selector "emulator-9999"/,
+    );
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "sh",
+          ["-c", "bazel test //app:test"],
+          { leaseId: "lease_cwd_bazel", serial: "emulator-5554", platform: "android" },
+          "sess-bazel-cwd",
+          {},
+          null,
+          { cwd: bazelStepDir },
+        ),
+      /Conflicting device selector "emulator-9999"/,
+    );
+
+    const javaOptsHigherThanCli = resolveBuildResources(
+      "./gradlew",
+      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
+      dirB,
+      { env: { JAVA_OPTS: "-Xmx8g", GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(javaOptsHigherThanCli.requestedHeapMb, 8192);
+
+    const gradleOptsHigherThanCli = resolveBuildResources(
+      "./gradlew",
+      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
+      dirB,
+      { env: { GRADLE_OPTS: "-Xmx6g", GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(gradleOptsHigherThanCli.requestedHeapMb, 6144);
+
+    const javaToolOptsHigherThanCli = resolveBuildResources(
+      "./gradlew",
+      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
+      dirB,
+      { env: { JAVA_TOOL_OPTIONS: "-Xmx12g", GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(javaToolOptsHigherThanCli.requestedHeapMb, 12288);
+
+    fs.rmSync(path.join(dirB, "gradle.properties"), { force: true });
+    const defaultGradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+    });
+    const fullDefaultDaemonProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(fullDefaultDaemonProbe.warm, true);
+    assert.deepEqual(fullDefaultDaemonProbe.daemonPids, [7020]);
+
+    const mismatchedDefaultLocaleProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "en_US.UTF-8" },
+      runner: () => ({
+        stdout: `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(mismatchedDefaultLocaleProbe.warm, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

@@ -4060,6 +4060,7 @@ export function resolveBuildResources(
     const envGradleHomeUnset =
       effectiveEnvVars.GRADLE_HOME === null || effectiveEnvVars.GRADLE_HOME === "";
     let cliGradleUserHome = null;
+    let hasCliGradleJvmArgs = false;
     let cliHeapMb = 0;
     for (let i = 0; i < strArgs.length; i++) {
       const a = strArgs[i];
@@ -4071,7 +4072,8 @@ export function resolveBuildResources(
       } else if (a.startsWith("-Dgradle.user.home=")) {
         cliGradleUserHome = path.resolve(baseCwd, a.slice("-Dgradle.user.home=".length));
       } else if (a.startsWith("-Dorg.gradle.jvmargs=")) {
-        cliHeapMb = Math.max(cliHeapMb, parseJvmHeapMb(a.slice("-Dorg.gradle.jvmargs=".length)));
+        hasCliGradleJvmArgs = true;
+        cliHeapMb = parseJvmHeapMb(a.slice("-Dorg.gradle.jvmargs=".length));
       }
     }
     const effectiveGradleHomeEnv = envGradleHomeUnset
@@ -4159,10 +4161,10 @@ export function resolveBuildResources(
       underscoreJavaHeapMb,
       parseJvmHeapMb(envJavaToolOptions),
     );
-    const requestedHeapMb =
-      cliHeapMb > 0
-        ? Math.max(cliHeapMb, underscoreJavaHeapMb)
-        : Math.max(propsHeapMb, optsHeapMb);
+    const requestedHeapMb = Math.max(
+      hasCliGradleJvmArgs ? cliHeapMb : propsHeapMb,
+      optsHeapMb,
+    );
     const disablesDaemon =
       propsDaemonDisabled ||
       propsReadError ||
@@ -4826,7 +4828,10 @@ function normalizeGradleCompatJvmArgs(args) {
     } else if (tok.startsWith("-D")) {
       const eqIdx = tok.indexOf("=");
       const propKey = eqIdx >= 0 ? tok.slice(2, eqIdx) : tok.slice(2);
-      const propVal = eqIdx >= 0 ? tok.slice(eqIdx + 1) : "true";
+      let propVal = eqIdx >= 0 ? tok.slice(eqIdx + 1) : "";
+      if (propKey === "file.encoding" && /^utf-?8$/i.test(propVal)) {
+        propVal = "UTF-8";
+      }
       keyed.set(`prop:${propKey}`, propVal);
     } else if (tok === "-ea" || tok === "-enableassertions") {
       keyed.set("assert:user", "true");
@@ -4849,9 +4854,137 @@ function normalizeGradleCompatJvmArgs(args) {
   return { keyed, positional };
 }
 
-function gradleCompatJvmArgsEqual(expectedArgs, daemonArgs) {
-  const exp = normalizeGradleCompatJvmArgs(expectedArgs);
-  const dmn = normalizeGradleCompatJvmArgs(daemonArgs);
+function resolveDefaultGradleLocaleProps(env = null) {
+  const effectiveEnv = env || process.env || {};
+  const explicitLocaleRaw =
+    effectiveEnv.LC_ALL || effectiveEnv.LC_MESSAGES || effectiveEnv.LANG || "";
+  const hostLocaleRaw =
+    process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || "";
+  const parsePosixLocale = (raw) => {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return null;
+    if (/^(?:C|POSIX)(?:\.(.+))?$/i.test(trimmed)) {
+      const enc = trimmed.includes(".") ? trimmed.slice(trimmed.indexOf(".") + 1) : "UTF-8";
+      return { language: "en", country: "", variant: "", encoding: enc };
+    }
+    const m = trimmed.match(
+      /^([a-zA-Z]{2,3})(?:[_-]([a-zA-Z]{2}|\d{3}))?(?:\.([^@]+))?(?:@(.+))?$/,
+    );
+    if (!m) return null;
+    return {
+      language: m[1].toLowerCase(),
+      country: (m[2] || "").toUpperCase(),
+      encoding: m[3] || "UTF-8",
+      variant: m[4] || "",
+    };
+  };
+  const explicitParsed = parsePosixLocale(explicitLocaleRaw);
+  const hostParsed = parsePosixLocale(hostLocaleRaw);
+  let intlLanguage = null;
+  let intlCountry = null;
+  try {
+    const intlLoc = Intl.DateTimeFormat().resolvedOptions().locale || "";
+    const im = intlLoc.match(/^([a-zA-Z]{2,3})(?:[-_]([a-zA-Z]{2}|\d{3}))?/);
+    if (im) {
+      intlLanguage = im[1].toLowerCase();
+      if (im[2]) intlCountry = im[2].toUpperCase();
+    }
+  } catch {
+    // Ignore Intl errors
+  }
+  const languages = new Set(["en"]);
+  const countries = new Set(["US", ""]);
+  const variants = new Set([""]);
+  const encodings = new Set(["UTF-8"]);
+  if (explicitParsed && explicitLocaleRaw !== hostLocaleRaw) {
+    languages.clear();
+    countries.clear();
+    variants.clear();
+    languages.add(explicitParsed.language);
+    countries.add(explicitParsed.country);
+    if (!explicitParsed.country) countries.add("US");
+    variants.add(explicitParsed.variant);
+    if (explicitParsed.encoding) {
+      encodings.add(
+        /^utf-?8$/i.test(explicitParsed.encoding)
+          ? "UTF-8"
+          : explicitParsed.encoding.toUpperCase(),
+      );
+    }
+  } else {
+    for (const p of [explicitParsed, hostParsed]) {
+      if (p?.language) languages.add(p.language);
+      if (p?.country) countries.add(p.country);
+      if (p?.variant) variants.add(p.variant);
+    }
+    if (intlLanguage) languages.add(intlLanguage);
+    if (intlCountry) countries.add(intlCountry);
+  }
+  return { languages, countries, variants, encodings };
+}
+
+function stripDefaultGradleDaemonJvmArgs(daemonNorm, expectedNorm, env = null) {
+  const keyed = new Map(daemonNorm.keyed);
+  const defaultLocale = resolveDefaultGradleLocaleProps(env);
+  if (
+    !expectedNorm.keyed.has("xx:HeapDumpOnOutOfMemoryError") &&
+    keyed.get("xx:HeapDumpOnOutOfMemoryError") === "true"
+  ) {
+    keyed.delete("xx:HeapDumpOnOutOfMemoryError");
+  }
+  if (
+    !expectedNorm.keyed.has("max_heap") &&
+    !expectedNorm.keyed.has("min_heap") &&
+    !expectedNorm.keyed.has("xx:MaxMetaspaceSize") &&
+    keyed.get("max_heap") === "bytes:536870912" &&
+    keyed.get("xx:MaxMetaspaceSize") === "bytes:402653184" &&
+    (!keyed.has("min_heap") || keyed.get("min_heap") === "bytes:268435456")
+  ) {
+    keyed.delete("max_heap");
+    keyed.delete("xx:MaxMetaspaceSize");
+    keyed.delete("min_heap");
+  }
+  if (
+    !expectedNorm.keyed.has("prop:file.encoding") &&
+    keyed.has("prop:file.encoding") &&
+    defaultLocale.encodings.has(String(keyed.get("prop:file.encoding") || "").toUpperCase())
+  ) {
+    keyed.delete("prop:file.encoding");
+  }
+  if (
+    !expectedNorm.keyed.has("prop:user.country") &&
+    keyed.has("prop:user.country") &&
+    defaultLocale.countries.has(String(keyed.get("prop:user.country") || "").toUpperCase())
+  ) {
+    keyed.delete("prop:user.country");
+  }
+  if (
+    !expectedNorm.keyed.has("prop:user.language") &&
+    keyed.has("prop:user.language") &&
+    defaultLocale.languages.has(String(keyed.get("prop:user.language") || "").toLowerCase())
+  ) {
+    keyed.delete("prop:user.language");
+  }
+  if (
+    !expectedNorm.keyed.has("prop:user.variant") &&
+    keyed.has("prop:user.variant") &&
+    defaultLocale.variants.has(String(keyed.get("prop:user.variant") || ""))
+  ) {
+    keyed.delete("prop:user.variant");
+  }
+  for (const sysProp of [
+    "prop:java.io.tmpdir",
+    "prop:sun.io.unicode.encoding",
+    "prop:sun.jnu.encoding",
+  ]) {
+    if (!expectedNorm.keyed.has(sysProp) && keyed.has(sysProp)) {
+      keyed.delete(sysProp);
+    }
+  }
+  return { keyed, positional: [...daemonNorm.positional] };
+}
+
+function gradleCompatNormEqual(exp, dmn) {
   if (exp.keyed.size !== dmn.keyed.size) return false;
   for (const [k, v] of exp.keyed.entries()) {
     if (!dmn.keyed.has(k) || dmn.keyed.get(k) !== v) return false;
@@ -5998,7 +6131,11 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const expectedCompatJvmArgs = expectedGradleJvmArgs.filter(
             (arg) => !arg.startsWith("-Dgradle.user.home=") && !arg.startsWith("-Duser.dir="),
           );
-          const expectedCompatNorm = normalizeGradleCompatJvmArgs(expectedCompatJvmArgs);
+          const expectedCompatNorm = stripDefaultGradleDaemonJvmArgs(
+            normalizeGradleCompatJvmArgs(expectedCompatJvmArgs),
+            { keyed: new Map(), positional: [] },
+            options.env,
+          );
           const daemonMainIdx = cmdLine.search(
             /\b(?:org\.gradle\.launcher\.daemon\.bootstrap\.)?GradleDaemon\b/,
           );
@@ -6007,19 +6144,17 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const daemonCompatJvmArgs = preMainTokens
             .slice(1)
             .filter(
-              (tok) =>
-                (isGradleCompatibilityJvmArg(tok) &&
-                  (tok !== "-XX:+HeapDumpOnOutOfMemoryError" ||
-                    expectedCompatNorm.keyed.has("xx:HeapDumpOnOutOfMemoryError"))) ||
-                expectedCompatJvmArgs.includes(tok),
+              (tok) => isGradleCompatibilityJvmArg(tok) || expectedCompatJvmArgs.includes(tok),
             );
-          const jvmArgsMatch = hasExplicitGradleJvmArgs
-            ? gradleCompatJvmArgsEqual(expectedCompatJvmArgs, daemonCompatJvmArgs)
-            : daemonCompatJvmArgs.length === 0 ||
-              gradleCompatJvmArgsEqual(
-                ["-Xmx512m", "-XX:MaxMetaspaceSize=384m"],
-                daemonCompatJvmArgs,
-              );
+          const daemonCompatNorm = stripDefaultGradleDaemonJvmArgs(
+            normalizeGradleCompatJvmArgs(daemonCompatJvmArgs),
+            normalizeGradleCompatJvmArgs(expectedCompatJvmArgs),
+            options.env,
+          );
+          const rawExpectedCompatNorm = normalizeGradleCompatJvmArgs(expectedCompatJvmArgs);
+          const jvmArgsMatch =
+            gradleCompatNormEqual(rawExpectedCompatNorm, daemonCompatNorm) ||
+            gradleCompatNormEqual(expectedCompatNorm, daemonCompatNorm);
           if (!jvmArgsMatch) {
             continue;
           }

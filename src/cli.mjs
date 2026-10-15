@@ -5932,6 +5932,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 effectiveDeviceForCheck,
                 identity.sessionId,
                 callerEnv,
+                null,
+                { cwd },
               );
             } catch (err) {
               return {
@@ -5967,7 +5969,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             }
           } else if (!needsDeviceLease) {
             try {
-              buildChildInvocation(cmd, args, null, identity.sessionId, callerEnv);
+              buildChildInvocation(cmd, args, null, identity.sessionId, callerEnv, null, {
+                cwd,
+              });
             } catch (err) {
               return {
                 mutated: false,
@@ -6529,17 +6533,19 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       if (wrappedClass.kind === "deny_lifecycle") {
         postClaimValidationError = wrappedClass.reason;
       } else {
+        const effectiveTargetSerial =
+          wrappedClass.targetSerial || buildReqs.targetSerial || null;
         const isRewritableBooted =
           leasePlat === "ios" &&
           claimedLease.kind === "emulator" &&
-          String(wrappedClass.targetSerial || "").toLowerCase() === "booted";
+          String(effectiveTargetSerial || "").toLowerCase() === "booted";
         if (
-          wrappedClass.targetSerial &&
+          effectiveTargetSerial &&
           !isRewritableBooted &&
           devSerial &&
-          wrappedClass.targetSerial !== devSerial
+          effectiveTargetSerial !== devSerial
         ) {
-          postClaimValidationError = `Conflicting device selector "${wrappedClass.targetSerial}" in atc exec; lease ${claimedLease.leaseId || claimedLease.deviceKey} is bound to "${devSerial}".`;
+          postClaimValidationError = `Conflicting device selector "${effectiveTargetSerial}" in atc exec; lease ${claimedLease.leaseId || claimedLease.deviceKey} is bound to "${devSerial}".`;
         } else {
           try {
             buildChildInvocation(
@@ -6548,6 +6554,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               claimedLease,
               txRes.sessionId,
               callerEnv,
+              txRes.buildLease || null,
+              { cwd },
             );
           } catch (err) {
             postClaimValidationError = err.message;

@@ -445,7 +445,12 @@ export function buildChildInvocation(
   sessionId,
   baseEnv = process.env,
   buildLease = null,
+  options = {},
 ) {
+  const effectiveCwd =
+    options?.cwd ||
+    (buildLease && typeof buildLease === "object" ? buildLease.cwd : null) ||
+    process.cwd();
   let effectiveCmd = cmd;
   let effectiveArgs = [...args];
   let useDefaultStandardPath = false;
@@ -486,11 +491,14 @@ export function buildChildInvocation(
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
   let buildClassified = classifyBuildCommand(cmd, args, { env: baseEnv || process.env });
   if (
-    buildClassified.tool === "bazel" &&
+    (buildClassified.tool === "bazel" ||
+      (buildClassified.tool === "shell" &&
+        Array.isArray(buildClassified.tools) &&
+        buildClassified.tools.includes("bazel"))) &&
     buildClassified.kind !== "deny_lifecycle" &&
     buildClassified.kind !== "read_only"
   ) {
-    const resolvedBazel = resolveBuildResources(cmd, args, process.cwd(), {
+    const resolvedBazel = resolveBuildResources(cmd, args, effectiveCwd, {
       env: baseEnv || process.env,
     });
     if (resolvedBazel && resolvedBazel.kind && resolvedBazel.kind !== "not_build_tool") {
@@ -500,14 +508,22 @@ export function buildChildInvocation(
   if (buildClassified.kind === "deny_lifecycle" && !buildClassified.unresolvedDynamicCwd) {
     throw new Error(buildClassified.reason);
   }
-  if (buildClassified.tool === "bazel" && buildClassified.targetSerial && lease) {
+  const bazelTargetSerials =
+    buildClassified.tool === "bazel"
+      ? [buildClassified.targetSerial].filter(Boolean)
+      : Array.isArray(buildClassified.clauseBuildReqs)
+        ? buildClassified.clauseBuildReqs
+            .filter((c) => c?.tool === "bazel" && c.targetSerial)
+            .map((c) => c.targetSerial)
+        : [];
+  if (bazelTargetSerials.length > 0 && lease) {
     const allowedIds = new Set(
       [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
         .filter(Boolean)
         .map((s) => String(s).toUpperCase()),
     );
-    const selParts = String(buildClassified.targetSerial)
-      .split(",")
+    const selParts = bazelTargetSerials
+      .flatMap((ts) => String(ts).split(","))
       .map((s) => s.trim())
       .filter(Boolean);
     for (const sel of selParts) {
@@ -2055,6 +2071,7 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     sessionId,
     options.env,
     options.buildLease || null,
+    { cwd: options.cwd },
   );
   const detachChild = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
