@@ -3237,9 +3237,9 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       };
     }
 
-    const hasIosDeviceFlag = restArgs.some(
-      (a) => a === "--ios_simulator_device" || a.startsWith("--ios_simulator_device="),
-    );
+    const IOS_SIM_FLAG_RE =
+      /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_(?:device|version)(?:=|$)/;
+    const hasIosDeviceFlag = restArgs.some((a) => IOS_SIM_FLAG_RE.test(String(a)));
     const hasAndroidDeviceFlag = restArgs.some(
       (a, idx) =>
         a === "--device" ||
@@ -3589,54 +3589,92 @@ export function resolveBuildResources(
       searchStart;
 
     const canonicalRoot = canonicalizeBuildPath(rootDir);
-    let requestedHeapMb = 0;
-    for (const a of strArgs) {
-      if (a.startsWith("-Dorg.gradle.jvmargs=")) {
-        requestedHeapMb = Math.max(
-          requestedHeapMb,
-          parseJvmHeapMb(a.slice("-Dorg.gradle.jvmargs=".length)),
-        );
-      }
-    }
-    try {
-      const gradlePropsPath = path.join(canonicalRoot, "gradle.properties");
-      if (fs.existsSync(gradlePropsPath)) {
-        const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
-        for (const rawPropLine of propsContent.split(/\r?\n/)) {
-          const propLine = rawPropLine.trim();
-          if (!propLine || propLine.startsWith("#")) continue;
-          const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
-          if (jvmMatch?.[1]) {
-            requestedHeapMb = Math.max(requestedHeapMb, parseJvmHeapMb(jvmMatch[1]));
-          }
-        }
-      }
-    } catch {
-      // Ignore property read errors
-    }
-    const disablesDaemon = strArgs.some(
-      (a) =>
-        a === "--no-daemon" ||
-        a === "-Dorg.gradle.daemon=false" ||
-        a.startsWith("-Dorg.gradle.jvmargs=") ||
-        a.startsWith("-Dorg.gradle.java.home=") ||
-        a === "--java-home" ||
-        a.startsWith("--java-home=") ||
-        a === "-g" ||
-        a === "--gradle-user-home" ||
-        a.startsWith("--gradle-user-home=") ||
-        a.startsWith("-Dgradle.user.home="),
-    );
     const envJavaHomeUnset =
       effectiveEnvVars.JAVA_HOME === null || effectiveEnvVars.JAVA_HOME === "";
     const envPathUnset =
       effectiveEnvVars.PATH === null || effectiveEnvVars.PATH === "";
     const envGradleUserHomeUnset =
       effectiveEnvVars.GRADLE_USER_HOME === null || effectiveEnvVars.GRADLE_USER_HOME === "";
+    let cliGradleUserHome = null;
+    let cliHeapMb = 0;
+    for (let i = 0; i < strArgs.length; i++) {
+      const a = strArgs[i];
+      if (a === "--") break;
+      if ((a === "-g" || a === "--gradle-user-home") && i + 1 < strArgs.length) {
+        cliGradleUserHome = path.resolve(baseCwd, strArgs[++i]);
+      } else if (a.startsWith("--gradle-user-home=")) {
+        cliGradleUserHome = path.resolve(baseCwd, a.slice("--gradle-user-home=".length));
+      } else if (a.startsWith("-Dgradle.user.home=")) {
+        cliGradleUserHome = path.resolve(baseCwd, a.slice("-Dgradle.user.home=".length));
+      } else if (a.startsWith("-Dorg.gradle.jvmargs=")) {
+        cliHeapMb = Math.max(cliHeapMb, parseJvmHeapMb(a.slice("-Dorg.gradle.jvmargs=".length)));
+      }
+    }
+    const effectiveGradleUserHomeEnv = envGradleUserHomeUnset
+      ? null
+      : effectiveEnvVars.GRADLE_USER_HOME || baseEnv.GRADLE_USER_HOME || null;
+    const effectiveHomeEnv =
+      effectiveEnvVars.HOME === null || effectiveEnvVars.HOME === ""
+        ? null
+        : effectiveEnvVars.HOME || baseEnv.HOME || null;
+    const resolvedGradleUserHome =
+      cliGradleUserHome ||
+      (effectiveGradleUserHomeEnv && effectiveGradleUserHomeEnv !== "__UNRESOLVED_DYNAMIC_ENV__"
+        ? path.resolve(baseCwd, effectiveGradleUserHomeEnv)
+        : !envGradleUserHomeUnset &&
+            effectiveHomeEnv &&
+            effectiveHomeEnv !== "__UNRESOLVED_DYNAMIC_ENV__" &&
+            effectiveHomeEnv !== os.homedir()
+          ? path.join(path.resolve(baseCwd, effectiveHomeEnv), ".gradle")
+          : null);
+    let propsDaemonDisabled = false;
+    let propsHeapMb = 0;
+    const gradlePropsFiles = [
+      path.join(canonicalRoot, "gradle.properties"),
+      ...(resolvedGradleUserHome ? [path.join(resolvedGradleUserHome, "gradle.properties")] : []),
+    ];
+    for (const gradlePropsPath of gradlePropsFiles) {
+      try {
+        if (fs.existsSync(gradlePropsPath)) {
+          const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
+          for (const rawPropLine of propsContent.split(/\r?\n/)) {
+            const propLine = rawPropLine.trim();
+            if (!propLine || propLine.startsWith("#")) continue;
+            const daemonMatch = propLine.match(/^org\.gradle\.daemon\s*=\s*(.+)$/);
+            if (daemonMatch?.[1]) {
+              propsDaemonDisabled = daemonMatch[1].trim().toLowerCase() === "false";
+            }
+            const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
+            if (jvmMatch?.[1]) {
+              propsHeapMb = parseJvmHeapMb(jvmMatch[1]);
+            }
+          }
+        }
+      } catch {
+        // Ignore property read errors
+      }
+    }
+    const requestedHeapMb = cliHeapMb > 0 ? cliHeapMb : propsHeapMb;
+    const disablesDaemon =
+      propsDaemonDisabled ||
+      strArgs.some(
+        (a) =>
+          a === "--no-daemon" ||
+          a === "-Dorg.gradle.daemon=false" ||
+          a.startsWith("-Dorg.gradle.jvmargs=") ||
+          a.startsWith("-Dorg.gradle.java.home=") ||
+          a === "--java-home" ||
+          a.startsWith("--java-home=") ||
+          a === "-g" ||
+          a === "--gradle-user-home" ||
+          a.startsWith("--gradle-user-home=") ||
+          a.startsWith("-Dgradle.user.home="),
+      );
     return {
       ...classified,
       disablesDaemon,
       requestedHeapMb,
+      gradleUserHomeDir: resolvedGradleUserHome,
       envJavaHome: envJavaHomeUnset ? "" : effectiveEnvVars.JAVA_HOME || null,
       envJavaHomeUnset,
       envPath: envPathUnset ? "" : effectiveEnvVars.PATH || null,
@@ -3649,64 +3687,6 @@ export function resolveBuildResources(
   }
 
   if (classified.tool === "bazel") {
-    let outputBase = null;
-    let outputUserRoot = null;
-    let batchMode = false;
-    let hasCustomStartupOption = false;
-    let requestedHeapMb = 0;
-    for (let i = 0; i < strArgs.length; i++) {
-      const a = strArgs[i];
-      if (a === "--batch") {
-        batchMode = true;
-        continue;
-      }
-      if (a === "--nobatch") {
-        batchMode = false;
-        continue;
-      }
-      if (a === "--output_base" && i + 1 < strArgs.length) {
-        outputBase = path.resolve(baseCwd, strArgs[++i]);
-        continue;
-      }
-      if (a.startsWith("--output_base=")) {
-        outputBase = path.resolve(baseCwd, a.slice("--output_base=".length));
-        continue;
-      }
-      if (a === "--output_user_root" && i + 1 < strArgs.length) {
-        outputUserRoot = path.resolve(baseCwd, strArgs[++i]);
-        continue;
-      }
-      if (a.startsWith("--output_user_root=")) {
-        outputUserRoot = path.resolve(baseCwd, a.slice("--output_user_root=".length));
-        continue;
-      }
-      if (a === "--host_jvm_args" && i + 1 < strArgs.length) {
-        hasCustomStartupOption = true;
-        requestedHeapMb = Math.max(requestedHeapMb, parseJvmHeapMb(strArgs[++i]));
-        continue;
-      }
-      if (a.startsWith("--host_jvm_args=")) {
-        hasCustomStartupOption = true;
-        requestedHeapMb = Math.max(
-          requestedHeapMb,
-          parseJvmHeapMb(a.slice("--host_jvm_args=".length)),
-        );
-        continue;
-      }
-      if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
-        hasCustomStartupOption = true;
-        i++;
-        continue;
-      }
-      if (!a.startsWith("-") && BAZEL_SUBCOMMANDS.has(a)) {
-        break;
-      }
-      if (a.startsWith("-")) {
-        hasCustomStartupOption = true;
-      }
-    }
-    const disablesDaemon = batchMode || hasCustomStartupOption;
-
     const rootDir =
       findNearestMarkerAncestor(baseCwd, [
         "MODULE.bazel",
@@ -3714,8 +3694,210 @@ export function resolveBuildResources(
         "WORKSPACE.bazel",
         "WORKSPACE",
       ]) || baseCwd;
-
     const canonicalRoot = canonicalizeBuildPath(rootDir);
+
+    let outputBase = null;
+    let outputUserRoot = null;
+    let batchMode = false;
+    let hasCustomStartupOption = false;
+    let requestedHeapMb = 0;
+    let ignoreAllRc = false;
+    let noWorkspaceRc = false;
+    let noHomeRc = false;
+    const explicitBazelrcPaths = [];
+
+    for (let i = 0; i < strArgs.length; i++) {
+      const a = strArgs[i];
+      if (a === "--ignore_all_rc_files") {
+        ignoreAllRc = true;
+        continue;
+      }
+      if (a === "--noignore_all_rc_files") {
+        ignoreAllRc = false;
+        continue;
+      }
+      if (a === "--noworkspace_rc") {
+        noWorkspaceRc = true;
+        continue;
+      }
+      if (a === "--workspace_rc") {
+        noWorkspaceRc = false;
+        continue;
+      }
+      if (a === "--nohome_rc") {
+        noHomeRc = true;
+        continue;
+      }
+      if (a === "--home_rc") {
+        noHomeRc = false;
+        continue;
+      }
+      if (a === "--bazelrc" && i + 1 < strArgs.length) {
+        explicitBazelrcPaths.push(strArgs[++i]);
+        continue;
+      }
+      if (a.startsWith("--bazelrc=")) {
+        explicitBazelrcPaths.push(a.slice("--bazelrc=".length));
+        continue;
+      }
+      if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
+        i++;
+        continue;
+      }
+      if (!a.startsWith("-") && BAZEL_SUBCOMMANDS.has(a)) {
+        break;
+      }
+    }
+
+    const applyStartupOptionTokens = (tokens, resolveBaseDir) => {
+      const expandWs = (val) =>
+        String(val || "").replace(/%workspace%/g, canonicalRoot);
+      for (let i = 0; i < tokens.length; i++) {
+        const a = tokens[i];
+        if (a === "--batch") {
+          batchMode = true;
+          continue;
+        }
+        if (a === "--nobatch") {
+          batchMode = false;
+          continue;
+        }
+        if (a === "--output_base" && i + 1 < tokens.length) {
+          outputBase = path.resolve(resolveBaseDir, expandWs(tokens[++i]));
+          continue;
+        }
+        if (a.startsWith("--output_base=")) {
+          outputBase = path.resolve(resolveBaseDir, expandWs(a.slice("--output_base=".length)));
+          continue;
+        }
+        if (a === "--output_user_root" && i + 1 < tokens.length) {
+          outputUserRoot = path.resolve(resolveBaseDir, expandWs(tokens[++i]));
+          continue;
+        }
+        if (a.startsWith("--output_user_root=")) {
+          outputUserRoot = path.resolve(
+            resolveBaseDir,
+            expandWs(a.slice("--output_user_root=".length)),
+          );
+          continue;
+        }
+        if (a === "--host_jvm_args" && i + 1 < tokens.length) {
+          hasCustomStartupOption = true;
+          requestedHeapMb = Math.max(requestedHeapMb, parseJvmHeapMb(tokens[++i]));
+          continue;
+        }
+        if (a.startsWith("--host_jvm_args=")) {
+          hasCustomStartupOption = true;
+          requestedHeapMb = Math.max(
+            requestedHeapMb,
+            parseJvmHeapMb(a.slice("--host_jvm_args=".length)),
+          );
+          continue;
+        }
+        if (a === "--bazelrc" && i + 1 < tokens.length) {
+          i++;
+          continue;
+        }
+        if (
+          a.startsWith("--bazelrc=") ||
+          a === "--ignore_all_rc_files" ||
+          a === "--noignore_all_rc_files" ||
+          a === "--noworkspace_rc" ||
+          a === "--workspace_rc" ||
+          a === "--nohome_rc" ||
+          a === "--home_rc"
+        ) {
+          continue;
+        }
+        if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
+          hasCustomStartupOption = true;
+          i++;
+          continue;
+        }
+        if (!a.startsWith("-") && BAZEL_SUBCOMMANDS.has(a)) {
+          break;
+        }
+        if (a.startsWith("-")) {
+          hasCustomStartupOption = true;
+        }
+      }
+    };
+
+    if (!ignoreAllRc) {
+      const visitedRc = new Set();
+      const parseBazelrcFile = (rcPath, { required = false, depth = 0 } = {}) => {
+        if (!rcPath || rcPath === "/dev/null" || rcPath.toUpperCase() === "NUL") return;
+        if (depth > 8) {
+          hasCustomStartupOption = true;
+          return;
+        }
+        const resolvedRc = canonicalizeBuildPath(rcPath);
+        if (visitedRc.has(resolvedRc)) return;
+        visitedRc.add(resolvedRc);
+        let content;
+        try {
+          if (!fs.existsSync(resolvedRc)) {
+            if (required) hasCustomStartupOption = true;
+            return;
+          }
+          content = fs.readFileSync(resolvedRc, "utf8");
+        } catch {
+          if (required) hasCustomStartupOption = true;
+          return;
+        }
+        const rcDir = path.dirname(resolvedRc);
+        for (const rawLine of content.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line || line.startsWith("#")) continue;
+          const importMatch = line.match(/^(import|try-import)\s+(.+)$/);
+          if (importMatch) {
+            const isRequiredImport = importMatch[1] === "import";
+            const rawTarget = importMatch[2]
+              .trim()
+              .replace(/^['"]|['"]$/g, "")
+              .replace(/%workspace%/g, canonicalRoot);
+            const targetPath = path.resolve(rcDir, rawTarget);
+            parseBazelrcFile(targetPath, { required: isRequiredImport, depth: depth + 1 });
+            continue;
+          }
+          const startupMatch = line.match(/^startup(?::([A-Za-z0-9_.-]+))?\s+(.+)$/);
+          if (startupMatch) {
+            if (startupMatch[1]) {
+              hasCustomStartupOption = true;
+            }
+            const tokens = splitJvmArgTokens(startupMatch[2]);
+            applyStartupOptionTokens(tokens, canonicalRoot);
+          }
+        }
+      };
+
+      if (!noWorkspaceRc) {
+        parseBazelrcFile(path.join(canonicalRoot, ".bazelrc"), { required: false });
+      }
+      const effectiveHomeForBazel =
+        effectiveEnvVars.HOME === null || effectiveEnvVars.HOME === ""
+          ? null
+          : effectiveEnvVars.HOME || baseEnv.HOME || null;
+      if (
+        !noHomeRc &&
+        effectiveHomeForBazel &&
+        effectiveHomeForBazel !== "__UNRESOLVED_DYNAMIC_ENV__" &&
+        effectiveHomeForBazel !== os.homedir()
+      ) {
+        parseBazelrcFile(path.join(path.resolve(baseCwd, effectiveHomeForBazel), ".bazelrc"), {
+          required: false,
+        });
+      }
+      for (const rawExplicitRc of explicitBazelrcPaths) {
+        if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") continue;
+        const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
+        parseBazelrcFile(path.resolve(baseCwd, expandedRc), { required: true });
+      }
+    }
+
+    applyStartupOptionTokens(strArgs, baseCwd);
+    const disablesDaemon = batchMode || hasCustomStartupOption;
+
     const canonicalUserRoot = outputUserRoot ? canonicalizeBuildPath(outputUserRoot) : null;
     const resourceKeys = [`bazel:ws:${canonicalRoot}`];
     if (outputBase) {
@@ -4534,25 +4716,40 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
             expectedGradleVersion = verMatch[1];
           }
         }
-        const gradlePropsPath = path.join(wsRoot, "gradle.properties");
-        if (fs.existsSync(gradlePropsPath)) {
-          const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
-          for (const rawPropLine of propsContent.split(/\r?\n/)) {
-            const propLine = rawPropLine.trim();
-            if (!propLine || propLine.startsWith("#")) continue;
-            const daemonMatch = propLine.match(/^org\.gradle\.daemon\s*=\s*(.+)$/);
-            if (daemonMatch?.[1] && daemonMatch[1].trim().toLowerCase() === "false") {
-              return { warm: false, daemonPids: [] };
-            }
-            const jhMatch = propLine.match(/^org\.gradle\.java\.home\s*=\s*(.+)$/);
-            if (jhMatch?.[1]) {
-              expectedGradleJavaHome = jhMatch[1].trim().replace(/\\:/g, ":");
-            }
-            const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
-            if (jvmMatch?.[1]) {
-              expectedGradleJvmArgs = splitJvmArgTokens(jvmMatch[1]);
+        const userHomePropsDir =
+          expectedGradleUserHome ||
+          buildReqs.gradleUserHomeDir ||
+          (options.env?.HOME && options.env.HOME !== os.homedir()
+            ? path.join(options.env.HOME, ".gradle")
+            : null);
+        const gradlePropsFiles = [
+          path.join(wsRoot, "gradle.properties"),
+          ...(userHomePropsDir ? [path.join(userHomePropsDir, "gradle.properties")] : []),
+        ];
+        let daemonDisabledInProps = false;
+        for (const gradlePropsPath of gradlePropsFiles) {
+          if (fs.existsSync(gradlePropsPath)) {
+            const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
+            for (const rawPropLine of propsContent.split(/\r?\n/)) {
+              const propLine = rawPropLine.trim();
+              if (!propLine || propLine.startsWith("#")) continue;
+              const daemonMatch = propLine.match(/^org\.gradle\.daemon\s*=\s*(.+)$/);
+              if (daemonMatch?.[1]) {
+                daemonDisabledInProps = daemonMatch[1].trim().toLowerCase() === "false";
+              }
+              const jhMatch = propLine.match(/^org\.gradle\.java\.home\s*=\s*(.+)$/);
+              if (jhMatch?.[1]) {
+                expectedGradleJavaHome = jhMatch[1].trim().replace(/\\:/g, ":");
+              }
+              const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
+              if (jvmMatch?.[1]) {
+                expectedGradleJvmArgs = splitJvmArgTokens(jvmMatch[1]);
+              }
             }
           }
+        }
+        if (daemonDisabledInProps) {
+          return { warm: false, daemonPids: [] };
         }
       } catch {
         // Ignore wrapper property read errors

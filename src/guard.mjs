@@ -2170,12 +2170,17 @@ export function extractTargetSerial(parsed) {
             i += 2;
           }
         }
-      } else if (a.startsWith("--ios_simulator_device=")) {
-        const val = a.slice("--ios_simulator_device=".length);
-        if (UUID_RE.test(val)) selectors.push(val);
-      } else if (a === "--ios_simulator_device" && i + 1 < args.length) {
-        const val = String(args[i + 1]);
-        if (UUID_RE.test(val)) selectors.push(val);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_device=/.test(a)
+      ) {
+        const val = a.slice(a.indexOf("=") + 1).trim();
+        if (val) selectors.push(val);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_device$/.test(a) &&
+        i + 1 < args.length
+      ) {
+        const val = String(args[i + 1]).trim();
+        if (val) selectors.push(val);
         i += 1;
       }
     }

@@ -2324,6 +2324,65 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       }),
     });
     assert.equal(bazelHostJvmProbe.warm, false);
+
+    // Namespaced @rules_apple//apple/build_settings:ios_simulator_device requires iOS lease and binds UDID
+    const rulesAppleSimReqs = resolveBuildResources(
+      "bazel",
+      ["test", "//app:tests", "--@rules_apple//apple/build_settings:ios_simulator_device=iPhone 16"],
+      subAppDir,
+    );
+    assert.equal(rulesAppleSimReqs.kind, "device_coupled_build");
+    assert.equal(rulesAppleSimReqs.targetPlatform, "ios");
+    assert.equal(rulesAppleSimReqs.requiresDevice, true);
+
+    const rulesAppleUnboundGuard = evaluateCommandGuard(
+      "bazel test //app:tests --@rules_apple//apple/build_settings:ios_simulator_device='iPhone 16'",
+      {
+        sessionId: "sess-ios",
+        activeLeases: [
+          {
+            leaseId: "lease_ios_sim",
+            sessionId: "sess-ios",
+            platform: "ios",
+            serial: "11111111-2222-3333-4444-555555555555",
+            udid: "11111111-2222-3333-4444-555555555555",
+            state: "active",
+          },
+        ],
+      },
+    );
+    assert.equal(rulesAppleUnboundGuard.allowed, false);
+
+    // $GRADLE_USER_HOME/gradle.properties overrides project properties for heap and warm daemon probe
+    fs.mkdirSync(isolatedGradleHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(isolatedGradleHome, "gradle.properties"),
+      "org.gradle.jvmargs=-Xmx8g -Dfile.encoding=UTF-8\n",
+    );
+    const userHomeOverrideReqs = resolveBuildResources("./gradlew", ["build"], subAppDir, {
+      env: { ...process.env, GRADLE_USER_HOME: isolatedGradleHome },
+    });
+    assert.equal(userHomeOverrideReqs.requestedHeapMb, 8192);
+    const staleProjectHeapProbe = probeWarmBuildDaemons(userHomeOverrideReqs, {
+      env: { JAVA_HOME: canonicalMockJdkHome, GRADLE_USER_HOME: isolatedGradleHome },
+      runner: () => ({
+        stdout: `5002 ${path.join(canonicalMockJdkHome, "bin", "java")} -Dgradle.user.home=${isolatedGradleHome} -Xmx2g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(staleProjectHeapProbe.warm, false);
+
+    // .bazelrc startup options (--output_base and --host_jvm_args) are loaded into resourceKeys and requestedHeapMb
+    const sharedBazelOut = path.join(wsDir, "shared-bazel-out");
+    fs.mkdirSync(sharedBazelOut, { recursive: true });
+    const canonicalSharedBazelOut = (fs.realpathSync.native || fs.realpathSync)(sharedBazelOut);
+    fs.writeFileSync(
+      path.join(subAppDir, ".bazelrc"),
+      `startup --output_base=${canonicalSharedBazelOut}\nstartup --host_jvm_args=-Xmx6g\n`,
+    );
+    const bazelrcReqs = resolveBuildResources("bazel", ["build", "//..."], subAppDir);
+    assert.ok(bazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
+    assert.equal(bazelrcReqs.disablesDaemon, true);
+    assert.equal(bazelrcReqs.requestedHeapMb, 6144);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
