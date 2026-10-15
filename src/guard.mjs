@@ -1,5 +1,6 @@
 import path from "node:path";
 import { classifyBuildCommand, resolveBuildResources } from "./build.mjs";
+import { matchesLeaseTarget } from "./state.mjs";
 
 const FAST_PATH_REGEX =
   /(?:^|(?<![A-Za-z0-9]))(android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild|atc)(?=$|(?![A-Za-z0-9]))/i;
@@ -6015,25 +6016,6 @@ function rewriteCompoundCommand(
       return trimmed;
     })
     .join("");
-}
-
-function matchesLeaseSerial(leaseSerial, targetSerial) {
-  if (!leaseSerial || !targetSerial) return false;
-  if (leaseSerial === targetSerial) return true;
-  if (UUID_RE.test(targetSerial) && UUID_RE.test(leaseSerial)) {
-    return leaseSerial.toLowerCase() === targetSerial.toLowerCase();
-  }
-  return false;
-}
-
-function matchesLeaseTarget(lease, targetSerial) {
-  if (!lease || !targetSerial) return false;
-  return (
-    matchesLeaseSerial(lease.serial, targetSerial) ||
-    matchesLeaseSerial(lease.udid, targetSerial) ||
-    matchesLeaseSerial(lease.coreDeviceId, targetSerial) ||
-    matchesLeaseSerial(lease.profile?.coreDeviceId, targetSerial)
-  );
 }
 
 export function evaluateCommandGuard(

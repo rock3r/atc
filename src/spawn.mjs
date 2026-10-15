@@ -18,6 +18,7 @@ import {
   tokenizeShellClause,
 } from "./build.mjs";
 import { detectUnparseableShellConstructs, parseScriptHeredocs } from "./parsers.mjs";
+import { findConflictingLeaseSelector } from "./state.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -517,20 +518,17 @@ export function buildChildInvocation(
             .map((c) => c.targetSerial)
         : [];
   if (bazelTargetSerials.length > 0 && lease) {
-    const allowedIds = new Set(
-      [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
-        .filter(Boolean)
-        .map((s) => String(s).toUpperCase()),
+    const hasDeviceIds = Boolean(
+      lease?.serial || lease?.udid || lease?.coreDeviceId || lease?.profile?.coreDeviceId,
     );
-    const selParts = bazelTargetSerials
-      .flatMap((ts) => String(ts).split(","))
-      .map((s) => s.trim())
-      .filter(Boolean);
-    for (const sel of selParts) {
-      if (allowedIds.size > 0 && !allowedIds.has(sel.toUpperCase())) {
-        throw new Error(
-          `Conflicting device selector "${sel}" in atc exec; lease ${lease.leaseId || lease.deviceKey || lease.serial} is bound to "${lease.serial || lease.udid}".`,
-        );
+    if (hasDeviceIds) {
+      for (const ts of bazelTargetSerials) {
+        const conflictSel = findConflictingLeaseSelector(lease, ts);
+        if (conflictSel) {
+          throw new Error(
+            `Conflicting device selector "${conflictSel}" in atc exec; lease ${lease.leaseId || lease.deviceKey || lease.serial} is bound to "${lease.serial || lease.udid}".`,
+          );
+        }
       }
     }
   }

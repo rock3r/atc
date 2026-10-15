@@ -3371,6 +3371,84 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       }),
     });
     assert.equal(mismatchedDefaultLocaleProbe.warm, false);
+
+    // 11. Round 46: rules_apple ios_simulator_device/version match lease profile metadata, and non-English host locale rejects English daemon
+    const frHostRejectsEnDaemon = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" },
+      runner: () => ({
+        stdout: `7022 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(frHostRejectsEnDaemon.warm, false);
+
+    const frHostAcceptsFrDaemon = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" },
+      runner: () => ({
+        stdout: `7023 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(frHostAcceptsFrDaemon.warm, true);
+
+    const iosMatchingLease = {
+      leaseId: "lease_ios_16",
+      sessionId: "sess-ios-match",
+      platform: "ios",
+      kind: "emulator",
+      avd: "iPhone 16",
+      serial: "11111111-2222-3333-4444-555555555555",
+      udid: "11111111-2222-3333-4444-555555555555",
+      state: "active",
+      profile: {
+        platform: "ios",
+        deviceType: "phone",
+        deviceName: "iPhone 16",
+        osVersion: "iOS-18.0",
+        apiLevel: "iOS-18.0",
+      },
+    };
+    const rulesAppleMatchingGuard = evaluateCommandGuard(
+      "bazel test //app:tests --@rules_apple//apple/build_settings:ios_simulator_device='iPhone 16' --@rules_apple//apple/build_settings:ios_simulator_version=18.0",
+      {
+        sessionId: "sess-ios-match",
+        activeLeases: [iosMatchingLease],
+      },
+    );
+    assert.equal(rulesAppleMatchingGuard.allowed, true);
+
+    const rulesAppleChildInv = buildChildInvocation(
+      "bazel",
+      [
+        "test",
+        "//app:tests",
+        "--@rules_apple//apple/build_settings:ios_simulator_device=iPhone 16",
+        "--@rules_apple//apple/build_settings:ios_simulator_version=18.0",
+      ],
+      iosMatchingLease,
+      "sess-ios-match",
+      {},
+      null,
+      { cwd: dirA },
+    );
+    assert.equal(rulesAppleChildInv.cmd, "bazel");
+
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "bazel",
+          [
+            "test",
+            "//app:tests",
+            "--@rules_apple//apple/build_settings:ios_simulator_device=iPhone 15",
+            "--@rules_apple//apple/build_settings:ios_simulator_version=18.0",
+          ],
+          iosMatchingLease,
+          "sess-ios-match",
+          {},
+          null,
+          { cwd: dirA },
+        ),
+      /Conflicting device selector "iPhone 15"/,
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

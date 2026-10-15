@@ -2003,6 +2003,87 @@ export function matchesOsSpec(deviceOsVersion, osSpec) {
   return false;
 }
 
+const UUID_SELECTOR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function matchesSingleLeaseSelector(lease, sel) {
+  if (!lease || !sel) return false;
+  const trimmed = String(sel).trim();
+  if (!trimmed) return true;
+  if (trimmed.startsWith("ios_simulator_version=")) {
+    if ((lease.platform || "android") !== "ios") return false;
+    const verSpec = trimmed.slice("ios_simulator_version=".length).trim();
+    const leaseOs = lease.profile?.osVersion || lease.profile?.apiLevel || null;
+    if (!leaseOs) return false;
+    return matchesOsSpec(leaseOs, verSpec);
+  }
+  if (trimmed.startsWith("ios_simulator_device=") || (lease.platform || "android") === "ios") {
+    if ((lease.platform || "android") !== "ios") return false;
+    const rawDevSpec = trimmed.startsWith("ios_simulator_device=")
+      ? trimmed.slice("ios_simulator_device=".length).trim()
+      : trimmed;
+    const devSpec = rawDevSpec.toLowerCase();
+    if (!devSpec) return false;
+    const candidates = [
+      lease.serial,
+      lease.udid,
+      lease.coreDeviceId,
+      lease.profile?.coreDeviceId,
+      lease.profile?.deviceName,
+      lease.avd,
+      lease.profile?.deviceTypeId,
+      lease.profile?.deviceTypeIdentifier,
+    ]
+      .filter(Boolean)
+      .map((s) => String(s).trim().toLowerCase());
+    return candidates.includes(devSpec);
+  }
+  const exactIds = [
+    lease.serial,
+    lease.udid,
+    lease.coreDeviceId,
+    lease.profile?.coreDeviceId,
+  ].filter(Boolean);
+  for (const id of exactIds) {
+    if (String(id) === trimmed) return true;
+    if (UUID_SELECTOR_RE.test(trimmed) && UUID_SELECTOR_RE.test(String(id))) {
+      if (String(id).toLowerCase() === trimmed.toLowerCase()) return true;
+    }
+  }
+  return false;
+}
+
+export function findConflictingLeaseSelector(
+  lease,
+  targetSerial,
+  { allowRewritableBooted = false } = {},
+) {
+  if (!targetSerial || !lease) return null;
+  const parts = String(targetSerial)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const leasePlat = lease.platform || "android";
+  for (const part of parts) {
+    if (
+      allowRewritableBooted &&
+      leasePlat === "ios" &&
+      lease.kind === "emulator" &&
+      part.toLowerCase() === "booted"
+    ) {
+      continue;
+    }
+    if (!matchesSingleLeaseSelector(lease, part)) {
+      return part;
+    }
+  }
+  return null;
+}
+
+export function matchesLeaseTarget(lease, targetSerial, options = {}) {
+  if (!lease || !targetSerial) return false;
+  return findConflictingLeaseSelector(lease, targetSerial, options) === null;
+}
+
 export function matchesProfile(device, req = {}) {
   const devPlatform = device.platform || "android";
   if (req.platform && req.platform !== "any" && devPlatform !== req.platform) {
@@ -2026,9 +2107,19 @@ export function matchesProfile(device, req = {}) {
     if (devPlatform === "ios") {
       const wantAvd = String(req.avd).trim().toLowerCase();
       const devAvd = String(device.avd || "").trim().toLowerCase();
+      const devName = String(device.profile?.deviceName || "").trim().toLowerCase();
       const devUdid = String(device.udid || device.serial || "").trim().toLowerCase();
-      const devTypeId = String(device.profile?.deviceTypeIdentifier || "").trim().toLowerCase();
-      if (devAvd !== wantAvd && devUdid !== wantAvd && devTypeId !== wantAvd) {
+      const devTypeId = String(
+        device.profile?.deviceTypeId || device.profile?.deviceTypeIdentifier || "",
+      )
+        .trim()
+        .toLowerCase();
+      if (
+        devAvd !== wantAvd &&
+        devName !== wantAvd &&
+        devUdid !== wantAvd &&
+        devTypeId !== wantAvd
+      ) {
         return false;
       }
     } else if (device.avd !== req.avd) {

@@ -68,6 +68,7 @@ import {
   computeEffectiveMaxSimulators,
   computeUsedEmulatorSlots,
   computeUsedSimulatorSlots,
+  findConflictingLeaseSelector,
   getAncestorPids,
   getAncestorProcessChain,
   getKnownPosixPgidStartToken,
@@ -5383,6 +5384,27 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   if (!claimFlags.platform && !claimFlags.ios && !claimFlags.android && requiredDevicePlatform) {
     claimFlags.platform = requiredDevicePlatform;
   }
+  if (buildReqs.targetSerial && requiredDevicePlatform === "ios") {
+    for (const part of String(buildReqs.targetSerial)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)) {
+      if (part.startsWith("ios_simulator_version=")) {
+        if (!claimFlags.os && !claimFlags.api) {
+          claimFlags.os = part.slice("ios_simulator_version=".length).trim();
+        }
+      } else if (
+        !claimFlags.avd &&
+        !claimFlags.udid &&
+        !claimFlags.serial &&
+        part.toLowerCase() !== "booted"
+      ) {
+        claimFlags.avd = part.startsWith("ios_simulator_device=")
+          ? part.slice("ios_simulator_device=".length).trim()
+          : part;
+      }
+    }
+  }
 
   // If --claim is requested without build coordination, claim the device first via cmdClaim
   let coAllocatedLeaseId = null;
@@ -5904,26 +5926,26 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 },
               };
             }
-            const effectiveTargetSerial =
-              wrappedClass.targetSerial || buildReqs.targetSerial || null;
-            const isRewritableBooted =
-              leasePlat === "ios" &&
-              effectiveDeviceForCheck.kind === "emulator" &&
-              String(effectiveTargetSerial || "").toLowerCase() === "booted";
-            if (
-              effectiveTargetSerial &&
-              !isRewritableBooted &&
-              devSerial &&
-              effectiveTargetSerial !== devSerial
-            ) {
-              return {
-                mutated: false,
-                value: {
-                  status: "error",
-                  exitCode: 3,
-                  error: `Conflicting device selector "${effectiveTargetSerial}" in atc exec; lease ${effectiveDeviceForCheck.leaseId || effectiveDeviceForCheck.deviceKey} is bound to "${devSerial}".`,
-                },
-              };
+            const candidateTargetSerials = [
+              wrappedClass.targetSerial,
+              buildReqs.targetSerial,
+            ].filter(Boolean);
+            for (const ts of candidateTargetSerials) {
+              const conflictSel = devSerial
+                ? findConflictingLeaseSelector(effectiveDeviceForCheck, ts, {
+                    allowRewritableBooted: true,
+                  })
+                : null;
+              if (conflictSel) {
+                return {
+                  mutated: false,
+                  value: {
+                    status: "error",
+                    exitCode: 3,
+                    error: `Conflicting device selector "${conflictSel}" in atc exec; lease ${effectiveDeviceForCheck.leaseId || effectiveDeviceForCheck.deviceKey} is bound to "${devSerial}".`,
+                  },
+                };
+              }
             }
             try {
               buildChildInvocation(
@@ -6533,19 +6555,21 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       if (wrappedClass.kind === "deny_lifecycle") {
         postClaimValidationError = wrappedClass.reason;
       } else {
-        const effectiveTargetSerial =
-          wrappedClass.targetSerial || buildReqs.targetSerial || null;
-        const isRewritableBooted =
-          leasePlat === "ios" &&
-          claimedLease.kind === "emulator" &&
-          String(effectiveTargetSerial || "").toLowerCase() === "booted";
-        if (
-          effectiveTargetSerial &&
-          !isRewritableBooted &&
-          devSerial &&
-          effectiveTargetSerial !== devSerial
-        ) {
-          postClaimValidationError = `Conflicting device selector "${effectiveTargetSerial}" in atc exec; lease ${claimedLease.leaseId || claimedLease.deviceKey} is bound to "${devSerial}".`;
+        const candidateTargetSerials = [
+          wrappedClass.targetSerial,
+          buildReqs.targetSerial,
+        ].filter(Boolean);
+        let conflictSel = null;
+        if (devSerial) {
+          for (const ts of candidateTargetSerials) {
+            conflictSel = findConflictingLeaseSelector(claimedLease, ts, {
+              allowRewritableBooted: true,
+            });
+            if (conflictSel) break;
+          }
+        }
+        if (conflictSel) {
+          postClaimValidationError = `Conflicting device selector "${conflictSel}" in atc exec; lease ${claimedLease.leaseId || claimedLease.deviceKey} is bound to "${devSerial}".`;
         } else {
           try {
             buildChildInvocation(

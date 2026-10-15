@@ -4856,71 +4856,54 @@ function normalizeGradleCompatJvmArgs(args) {
 
 function resolveDefaultGradleLocaleProps(env = null) {
   const effectiveEnv = env || process.env || {};
-  const explicitLocaleRaw =
-    effectiveEnv.LC_ALL || effectiveEnv.LC_MESSAGES || effectiveEnv.LANG || "";
-  const hostLocaleRaw =
-    process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || "";
+  const rawLocale =
+    effectiveEnv.LC_ALL ||
+    effectiveEnv.LC_MESSAGES ||
+    effectiveEnv.LANG ||
+    process.env.LC_ALL ||
+    process.env.LC_MESSAGES ||
+    process.env.LANG ||
+    "";
   const parsePosixLocale = (raw) => {
     const trimmed = String(raw || "").trim();
     if (!trimmed) return null;
     if (/^(?:C|POSIX)(?:\.(.+))?$/i.test(trimmed)) {
-      const enc = trimmed.includes(".") ? trimmed.slice(trimmed.indexOf(".") + 1) : "UTF-8";
-      return { language: "en", country: "", variant: "", encoding: enc };
+      const encRaw = trimmed.includes(".") ? trimmed.slice(trimmed.indexOf(".") + 1) : "UTF-8";
+      const encoding = /^utf-?8$/i.test(encRaw) ? "UTF-8" : encRaw.toUpperCase();
+      return { language: "en", country: "US", variant: "", encoding };
     }
     const m = trimmed.match(
       /^([a-zA-Z]{2,3})(?:[_-]([a-zA-Z]{2}|\d{3}))?(?:\.([^@]+))?(?:@(.+))?$/,
     );
     if (!m) return null;
+    const encRaw = m[3] || "UTF-8";
+    const encoding = /^utf-?8$/i.test(encRaw) ? "UTF-8" : encRaw.toUpperCase();
     return {
       language: m[1].toLowerCase(),
       country: (m[2] || "").toUpperCase(),
-      encoding: m[3] || "UTF-8",
       variant: m[4] || "",
+      encoding,
     };
   };
-  const explicitParsed = parsePosixLocale(explicitLocaleRaw);
-  const hostParsed = parsePosixLocale(hostLocaleRaw);
-  let intlLanguage = null;
-  let intlCountry = null;
+  const parsed = parsePosixLocale(rawLocale);
+  if (parsed) {
+    return parsed;
+  }
   try {
     const intlLoc = Intl.DateTimeFormat().resolvedOptions().locale || "";
     const im = intlLoc.match(/^([a-zA-Z]{2,3})(?:[-_]([a-zA-Z]{2}|\d{3}))?/);
     if (im) {
-      intlLanguage = im[1].toLowerCase();
-      if (im[2]) intlCountry = im[2].toUpperCase();
+      return {
+        language: im[1].toLowerCase(),
+        country: (im[2] || "US").toUpperCase(),
+        variant: "",
+        encoding: "UTF-8",
+      };
     }
   } catch {
     // Ignore Intl errors
   }
-  const languages = new Set(["en"]);
-  const countries = new Set(["US", ""]);
-  const variants = new Set([""]);
-  const encodings = new Set(["UTF-8"]);
-  if (explicitParsed && explicitLocaleRaw !== hostLocaleRaw) {
-    languages.clear();
-    countries.clear();
-    variants.clear();
-    languages.add(explicitParsed.language);
-    countries.add(explicitParsed.country);
-    if (!explicitParsed.country) countries.add("US");
-    variants.add(explicitParsed.variant);
-    if (explicitParsed.encoding) {
-      encodings.add(
-        /^utf-?8$/i.test(explicitParsed.encoding)
-          ? "UTF-8"
-          : explicitParsed.encoding.toUpperCase(),
-      );
-    }
-  } else {
-    for (const p of [explicitParsed, hostParsed]) {
-      if (p?.language) languages.add(p.language);
-      if (p?.country) countries.add(p.country);
-      if (p?.variant) variants.add(p.variant);
-    }
-    if (intlLanguage) languages.add(intlLanguage);
-    if (intlCountry) countries.add(intlCountry);
-  }
-  return { languages, countries, variants, encodings };
+  return { language: "en", country: "US", variant: "", encoding: "UTF-8" };
 }
 
 function stripDefaultGradleDaemonJvmArgs(daemonNorm, expectedNorm, env = null) {
@@ -4947,28 +4930,28 @@ function stripDefaultGradleDaemonJvmArgs(daemonNorm, expectedNorm, env = null) {
   if (
     !expectedNorm.keyed.has("prop:file.encoding") &&
     keyed.has("prop:file.encoding") &&
-    defaultLocale.encodings.has(String(keyed.get("prop:file.encoding") || "").toUpperCase())
+    String(keyed.get("prop:file.encoding") || "").toUpperCase() === defaultLocale.encoding
   ) {
     keyed.delete("prop:file.encoding");
   }
   if (
     !expectedNorm.keyed.has("prop:user.country") &&
     keyed.has("prop:user.country") &&
-    defaultLocale.countries.has(String(keyed.get("prop:user.country") || "").toUpperCase())
+    String(keyed.get("prop:user.country") || "").toUpperCase() === defaultLocale.country
   ) {
     keyed.delete("prop:user.country");
   }
   if (
     !expectedNorm.keyed.has("prop:user.language") &&
     keyed.has("prop:user.language") &&
-    defaultLocale.languages.has(String(keyed.get("prop:user.language") || "").toLowerCase())
+    String(keyed.get("prop:user.language") || "").toLowerCase() === defaultLocale.language
   ) {
     keyed.delete("prop:user.language");
   }
   if (
     !expectedNorm.keyed.has("prop:user.variant") &&
     keyed.has("prop:user.variant") &&
-    defaultLocale.variants.has(String(keyed.get("prop:user.variant") || ""))
+    String(keyed.get("prop:user.variant") || "") === defaultLocale.variant
   ) {
     keyed.delete("prop:user.variant");
   }
