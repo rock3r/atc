@@ -833,7 +833,17 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
     const cleaned = stripLiteralSentinels(curCmd).trim().replace(/^@+/, "");
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cleaned)) {
       const eqIdx = cleaned.indexOf("=");
-      envVars[cleaned.slice(0, eqIdx)] = cleaned.slice(eqIdx + 1);
+      const rawKey = cleaned.slice(0, eqIdx);
+      const rawVal = curCmd.slice(curCmd.indexOf("=") + 1);
+      if (inShell) {
+        const expVal = expandOrValidateShellPath(rawVal, baseEnv, {
+          taintedVars: incomingTaintedVars,
+          shellType: incomingShellType,
+        });
+        envVars[rawKey] = expVal.unresolved ? "__UNRESOLVED_DYNAMIC_ENV__" : expVal.resolved;
+      } else {
+        envVars[rawKey] = stripLiteralSentinels(rawVal);
+      }
       if (curArgs.length === 0) break;
       curCmd = curArgs[0];
       curArgs = curArgs.slice(1);
@@ -981,17 +991,17 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             delete envVars[k];
           }
           envVars.JAVA_HOME = null;
+          envVars.PATH = null;
           i++;
           continue;
         }
         if ((a === "-C" || a === "--chdir") && i + 1 < curArgs.length) {
           const rawNextDir = curArgs[i + 1];
           const exp = inShell
-            ? expandOrValidateShellPath(
-                rawNextDir,
-                { ...baseEnv, ...envVars },
-                { taintedVars: incomingTaintedVars, shellType: incomingShellType },
-              )
+            ? expandOrValidateShellPath(rawNextDir, baseEnv, {
+                taintedVars: incomingTaintedVars,
+                shellType: incomingShellType,
+              })
             : { resolved: stripLiteralSentinels(rawNextDir), unresolved: false };
           if (exp.unresolved) {
             unresolvedDynamicCwd = true;
@@ -1024,7 +1034,17 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(stripLiteralSentinels(a))) {
           const cleanAssign = stripLiteralSentinels(a);
           const eqIdx = cleanAssign.indexOf("=");
-          envVars[cleanAssign.slice(0, eqIdx)] = cleanAssign.slice(eqIdx + 1);
+          const rawKey = cleanAssign.slice(0, eqIdx);
+          const rawVal = a.slice(a.indexOf("=") + 1);
+          if (inShell) {
+            const expVal = expandOrValidateShellPath(rawVal, baseEnv, {
+              taintedVars: incomingTaintedVars,
+              shellType: incomingShellType,
+            });
+            envVars[rawKey] = expVal.unresolved ? "__UNRESOLVED_DYNAMIC_ENV__" : expVal.resolved;
+          } else {
+            envVars[rawKey] = stripLiteralSentinels(rawVal);
+          }
           i++;
           continue;
         }
@@ -1106,6 +1126,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         );
         const script = rawScriptArg.trim();
         const rawParts = splitShellScriptParts(script);
+        const isAmpersandBackground = base !== "cmd";
         const clauses = [];
         let pendingSepBefore = null;
         for (let pIdx = 0; pIdx < rawParts.length; pIdx += 2) {
@@ -1116,7 +1137,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               text,
               sepBefore: pendingSepBefore,
               sepAfter,
-              backgrounded: sepAfter === "&",
+              backgrounded: isAmpersandBackground && sepAfter === "&",
             });
             pendingSepBefore = sepAfter;
           } else if (sepAfter) {
@@ -1124,6 +1145,18 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               pendingSepBefore = ";;";
             } else {
               pendingSepBefore = sepAfter;
+            }
+          }
+        }
+        if (isAmpersandBackground) {
+          for (let ci = clauses.length - 1; ci > 0; ci--) {
+            if (
+              clauses[ci].backgrounded &&
+              (clauses[ci].sepBefore === "&&" ||
+                clauses[ci].sepBefore === "||" ||
+                clauses[ci].sepBefore === "|")
+            ) {
+              clauses[ci - 1].backgrounded = true;
             }
           }
         }
@@ -1143,6 +1176,16 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let chainAnyCwdMutation = false;
         let chainMutatedEnv = new Set();
         let chainAnyEnvMutation = new Set();
+        let currentClauseBackgrounded = false;
+        const captureChainEntryState = () => ({
+          cwd: curShellRelCwd,
+          unresolvedCwd: curShellUnresolvedCwd,
+          pushdStack: [...pushdStack],
+          shellEnv: { ...shellEnv },
+          envVars: { ...curShellEnvVars },
+          taintedEnvVars: new Set(taintedEnvVars),
+        });
+        let chainEntryState = captureChainEntryState();
 
         const findTopControlFrame = (types = null) => {
           for (let i = controlStack.length - 1; i >= 0; i--) {
@@ -1171,14 +1214,16 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           ) {
             curShellUnresolvedCwd = true;
           }
-          for (const frame of controlStack) {
-            if (frame.subshellDepth === cwdStack.length) {
-              frame.mutatedCwd = true;
-              if (frame.phase === "cond") {
-                frame.condMutatedCwd = true;
-              }
-              if (frame.type === "loop" && !isAbsoluteTarget) {
-                curShellUnresolvedCwd = true;
+          if (!currentClauseBackgrounded) {
+            for (const frame of controlStack) {
+              if (frame.subshellDepth === cwdStack.length) {
+                frame.mutatedCwd = true;
+                if (frame.phase === "cond") {
+                  frame.condMutatedCwd = true;
+                }
+                if (frame.type === "loop" && !isAbsoluteTarget) {
+                  curShellUnresolvedCwd = true;
+                }
               }
             }
           }
@@ -1210,37 +1255,53 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             } else if (!chainHasCondition) {
               taintedEnvVars.delete(k);
             }
-            for (const frame of controlStack) {
-              if (frame.subshellDepth === cwdStack.length) {
-                frame.mutatedEnv.add(k);
-                if (frame.phase === "cond") {
-                  frame.condMutatedEnv.add(k);
+            if (!currentClauseBackgrounded) {
+              for (const frame of controlStack) {
+                if (frame.subshellDepth === cwdStack.length) {
+                  frame.mutatedEnv.add(k);
+                  if (frame.phase === "cond") {
+                    frame.condMutatedEnv.add(k);
+                  }
                 }
               }
             }
           }
         };
 
+        const resetChainState = () => {
+          chainHasCondition = false;
+          chainSawOrOrPipe = false;
+          chainMutatedCwd = false;
+          chainAnyCwdMutation = false;
+          chainMutatedEnv = new Set();
+          chainAnyEnvMutation = new Set();
+          chainEntryState = captureChainEntryState();
+        };
+
         for (const clauseObj of clauses) {
           const { sepBefore, sepAfter } = clauseObj;
+          currentClauseBackgrounded = Boolean(clauseObj.backgrounded);
           if (
             sepBefore === ";" ||
             sepBefore === ";;" ||
             sepBefore === "\n" ||
             sepBefore === "&"
           ) {
-            if (chainMutatedCwd) {
-              curShellUnresolvedCwd = true;
+            if (sepBefore === "&" && isAmpersandBackground) {
+              curShellRelCwd = chainEntryState.cwd;
+              curShellUnresolvedCwd = chainEntryState.unresolvedCwd;
+              pushdStack = [...chainEntryState.pushdStack];
+              shellEnv = { ...chainEntryState.shellEnv };
+              curShellEnvVars = { ...chainEntryState.envVars };
+              taintedEnvVars = new Set(chainEntryState.taintedEnvVars);
+            } else {
+              if (chainMutatedCwd) {
+                curShellUnresolvedCwd = true;
+              }
+              for (const k of chainMutatedEnv) {
+                taintedEnvVars.add(k);
+              }
             }
-            for (const k of chainMutatedEnv) {
-              taintedEnvVars.add(k);
-            }
-            chainHasCondition = false;
-            chainSawOrOrPipe = false;
-            chainMutatedCwd = false;
-            chainAnyCwdMutation = false;
-            chainMutatedEnv = new Set();
-            chainAnyEnvMutation = new Set();
             if (sepBefore === ";;") {
               const topCase = findTopControlFrame(["case"])?.frame;
               if (topCase) {
@@ -1252,6 +1313,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 taintedEnvVars = new Set(topCase.entryTaintedEnv);
               }
             }
+            resetChainState();
           } else if (sepBefore === "||" || sepBefore === "|") {
             chainHasCondition = true;
             chainSawOrOrPipe = true;
@@ -1286,13 +1348,16 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               chainAnyCwdMutation,
               chainMutatedEnv: new Set(chainMutatedEnv),
               chainAnyEnvMutation: new Set(chainAnyEnvMutation),
+              chainEntryState: {
+                cwd: chainEntryState.cwd,
+                unresolvedCwd: chainEntryState.unresolvedCwd,
+                pushdStack: [...chainEntryState.pushdStack],
+                shellEnv: { ...chainEntryState.shellEnv },
+                envVars: { ...chainEntryState.envVars },
+                taintedEnvVars: new Set(chainEntryState.taintedEnvVars),
+              },
             });
-            chainHasCondition = false;
-            chainSawOrOrPipe = false;
-            chainMutatedCwd = false;
-            chainAnyCwdMutation = false;
-            chainMutatedEnv = new Set();
-            chainAnyEnvMutation = new Set();
+            resetChainState();
           }
           const popSubshells = () => {
             for (let s = 0; s < closedSubshells; s++) {
@@ -1310,6 +1375,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 chainAnyCwdMutation = frame.chainAnyCwdMutation;
                 chainMutatedEnv = frame.chainMutatedEnv;
                 chainAnyEnvMutation = frame.chainAnyEnvMutation;
+                chainEntryState = frame.chainEntryState;
                 while (
                   controlStack.length > 0 &&
                   controlStack[controlStack.length - 1].subshellDepth > cwdStack.length
@@ -1318,15 +1384,6 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 }
               }
             }
-          };
-
-          const resetChainState = () => {
-            chainHasCondition = false;
-            chainSawOrOrPipe = false;
-            chainMutatedCwd = false;
-            chainAnyCwdMutation = false;
-            chainMutatedEnv = new Set();
-            chainAnyEnvMutation = new Set();
           };
 
           for (const kw of leadingKeywords || []) {
@@ -1480,6 +1537,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               curShellEnvVars = { ...topCase.entryEnvVars };
               taintedEnvVars = new Set(topCase.entryTaintedEnv);
             }
+            resetChainState();
           }
 
           const rawTokens = tokenizeShellClause(strippedClause, { markLiterals: true });
@@ -1727,11 +1785,36 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             taintedVars: taintedEnvVars,
             shellType,
           });
-          const clauseEnv = { ...shellEnv, ...(peeled.envVars || {}) };
+          if (Array.isArray(peeled.allBuildClauses) && peeled.allBuildClauses.length > 0) {
+            for (const subC of peeled.allBuildClauses) {
+              const subUnresolvedCwd = Boolean(
+                subC.unresolvedDynamicCwd ||
+                  peeled.unresolvedDynamicCwd ||
+                  (curShellUnresolvedCwd && !(subC.relCwd && path.isAbsolute(subC.relCwd))),
+              );
+              const subEffectiveRelCwd = subC.relCwd
+                ? path.isAbsolute(subC.relCwd)
+                  ? subC.relCwd
+                  : curShellRelCwd
+                    ? path.join(curShellRelCwd, subC.relCwd)
+                    : subC.relCwd
+                : curShellRelCwd || null;
+              matchedClauses.push({
+                cmd: subC.cmd,
+                args: subC.args,
+                relCwd: subEffectiveRelCwd,
+                envVars: { ...curShellEnvVars, ...(peeled.envVars || {}), ...(subC.envVars || {}) },
+                backgrounded: Boolean(clauseObj.backgrounded || peeled.backgrounded || subC.backgrounded),
+                unresolvedDynamicCwd: subUnresolvedCwd,
+              });
+            }
+            popSubshells();
+            continue;
+          }
           const expandedClause = expandShellBuildClausePaths(
             peeled.cmd,
             peeled.args,
-            clauseEnv,
+            shellEnv,
             { taintedVars: taintedEnvVars, shellType },
           );
           if (normalizeBuildToolName(expandedClause.cmd)) {
@@ -2553,11 +2636,15 @@ export function resolveBuildResources(
     );
     const envJavaHomeUnset =
       effectiveEnvVars.JAVA_HOME === null || effectiveEnvVars.JAVA_HOME === "";
+    const envPathUnset =
+      effectiveEnvVars.PATH === null || effectiveEnvVars.PATH === "";
     return {
       ...classified,
       disablesDaemon,
       envJavaHome: envJavaHomeUnset ? "" : effectiveEnvVars.JAVA_HOME || null,
       envJavaHomeUnset,
+      envPath: envPathUnset ? "" : effectiveEnvVars.PATH || null,
+      envPathUnset,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
     };
@@ -3263,6 +3350,50 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
         }
       } catch {
         // Ignore wrapper property read errors
+      }
+    }
+    if (buildReqs.tool === "gradle" && !expectedGradleJavaHome) {
+      const rawPathVal = buildReqs.envPathUnset
+        ? ""
+        : buildReqs.envPath ||
+          options.env?.PATH ||
+          options.env?.Path ||
+          (!options.env ? process.env.PATH || process.env.Path : "") ||
+          "";
+      if (rawPathVal && rawPathVal !== "__UNRESOLVED_DYNAMIC_ENV__") {
+        const pathSep = platform === "win32" ? ";" : ":";
+        const javaExeNames = platform === "win32" ? ["java.exe", "java.cmd", "java"] : ["java"];
+        for (const rawDir of String(rawPathVal).split(pathSep)) {
+          const dir = rawDir.trim();
+          if (!dir) continue;
+          let foundHome = null;
+          for (const exeName of javaExeNames) {
+            const candidate = path.join(dir, exeName);
+            try {
+              if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+                const realJava = canonicalizeBuildPath(candidate);
+                if (realJava === "/usr/bin/java") {
+                  break;
+                }
+                const parentDir = path.dirname(realJava);
+                foundHome =
+                  path.basename(parentDir).toLowerCase() === "bin"
+                    ? path.dirname(parentDir)
+                    : parentDir;
+                break;
+              }
+            } catch {
+              // Ignore inaccessible PATH entry
+            }
+          }
+          if (foundHome) {
+            expectedGradleJavaHome = foundHome;
+            break;
+          }
+        }
+      }
+      if (!expectedGradleJavaHome && buildReqs.envJavaHomeUnset) {
+        return { warm: false, daemonPids: [] };
       }
     }
     const outKeys = (buildReqs.resourceKeys || [])

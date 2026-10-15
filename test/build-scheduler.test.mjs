@@ -1634,13 +1634,35 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       wsDir,
     );
     assert.equal(unsetJavaHomeReqs.envJavaHomeUnset, true);
-    const warmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
-      env: { JAVA_HOME: "/nonexistent/parent/java" },
+    const mockJdkHome = path.join(wsDir, "jdk21");
+    const mockJdkBin = path.join(mockJdkHome, "bin");
+    fs.mkdirSync(mockJdkBin, { recursive: true });
+    fs.writeFileSync(
+      path.join(mockJdkBin, process.platform === "win32" ? "java.exe" : "java"),
+      "",
+    );
+    const canonicalMockJdkHome = (fs.realpathSync.native || fs.realpathSync)(mockJdkHome);
+    const mismatchedJdkWarmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
+      env: { JAVA_HOME: "/nonexistent/parent/java", PATH: mockJdkBin },
       runner: () => ({
-        stdout: `4242 /Library/Java/Standard/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
+        stdout: `4241 /Library/Java/JDK17/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
+      }),
+    });
+    assert.equal(mismatchedJdkWarmProbe.warm, false);
+    const warmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
+      env: { JAVA_HOME: "/nonexistent/parent/java", PATH: mockJdkBin },
+      runner: () => ({
+        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
       }),
     });
     assert.equal(warmProbe.warm, true);
+    const unresolvablePathWarmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
+      env: { JAVA_HOME: "/nonexistent/parent/java", PATH: path.join(wsDir, "no-such-bin") },
+      runner: () => ({
+        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
+      }),
+    });
+    assert.equal(unresolvablePathWarmProbe.warm, false);
 
     const subAppDir = path.join(wsDir, "app");
     fs.mkdirSync(subAppDir, { recursive: true });
@@ -1799,7 +1821,7 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     const literalDollarDir = path.join(wsDir, "$PROJECT_DIR");
     fs.mkdirSync(literalDollarDir, { recursive: true });
     fs.writeFileSync(path.join(literalDollarDir, "settings.gradle"), 'rootProject.name = "literal"\n');
-    const canonicalLiteralDollar = fs.realpathSync(literalDollarDir);
+    const canonicalLiteralDollar = (fs.realpathSync.native || fs.realpathSync)(literalDollarDir);
     const singleQuotedFlagReqs = resolveBuildResources(
       "sh",
       ["-c", "./gradlew -p '$PROJECT_DIR' build"],
@@ -1841,6 +1863,47 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.equal(warmBazelProbe.warm, true);
     assert.deepEqual(warmBazelProbe.daemonPids, [9102]);
+
+    // Command-local prefix assignments do not alter parameter expansion of that same command's arguments
+    const prefixAssignReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'PROJECT_DIR=/wrong ./gradlew -p "$PROJECT_DIR" build'],
+      wsDir,
+      { env: { ...process.env, PROJECT_DIR: subAppDir } },
+    );
+    assert.equal(prefixAssignReqs.kind, "pure_build");
+    assert.deepEqual(prefixAssignReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    // POSIX `&` runs the backgrounded clause in a subshell (restoring cwd), whereas Windows `cmd` `&` is sequential
+    const posixBgCdReqs = resolveBuildResources(
+      "sh",
+      ["-c", "cd app & ./gradlew build"],
+      wsDir,
+    );
+    assert.equal(posixBgCdReqs.kind, "pure_build");
+    assert.deepEqual(posixBgCdReqs.resourceKeys, [`gradle:${canonicalWs}`]);
+
+    const cmdAmpSeqReqs = resolveBuildResources(
+      "cmd",
+      ["/c", "cd app & gradlew.bat build & echo done"],
+      wsDir,
+    );
+    assert.equal(cmdAmpSeqReqs.kind, "pure_build");
+    assert.deepEqual(cmdAmpSeqReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    // Worker limit injection checks standalone tokens, not substrings inside `-Pnote=...`
+    const propSubstringInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build -Pnote='-Dorg.gradle.workers.max=99'"],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      propSubstringInv.args[1],
+      "./gradlew build -Pnote='-Dorg.gradle.workers.max=99' -Dorg.gradle.workers.max=4",
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

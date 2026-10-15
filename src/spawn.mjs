@@ -870,7 +870,11 @@ export function buildChildInvocation(
               }
             }
             const xcodeInjected = [];
-            if (cClass.requiresHeavySlot && !/(?:^|\s)-jobs(?:=|\s|$)/.test(corePart)) {
+            const hasXcodeJobs = peeled.args.some((a) => {
+              const s = String(a);
+              return s === "-jobs" || s.startsWith("-jobs=");
+            });
+            if (cClass.requiresHeavySlot && !hasXcodeJobs) {
               xcodeInjected.push(`-jobs ${jobsLimit}`);
             }
             if (
@@ -886,15 +890,29 @@ export function buildChildInvocation(
             return part;
           }
           if (!cClass.requiresHeavySlot) return part;
-          if (
-            cClass.tool === "gradle" &&
-            !/(-Dorg\.gradle\.workers\.max=|--max-workers\b)/.test(corePart)
-          ) {
-            return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
+          if (cClass.tool === "gradle") {
+            const hasWorkersFlag = peeled.args.some((a) => {
+              const s = String(a);
+              return (
+                s === "--max-workers" ||
+                s.startsWith("--max-workers=") ||
+                s.startsWith("-Dorg.gradle.workers.max=")
+              );
+            });
+            if (!hasWorkersFlag) {
+              return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
+            }
+            return part;
           }
           if (cClass.tool === "bazel") {
-            const hasJobs = /(?:^|\s)--jobs(?:=|\s|$)/.test(corePart);
-            const hasRam = /(?:^|\s)--local_ram_resources(?:=|\s|$)/.test(corePart);
+            const hasJobs = peeled.args.some((a) => {
+              const s = String(a);
+              return s === "--jobs" || s.startsWith("--jobs=");
+            });
+            const hasRam = peeled.args.some((a) => {
+              const s = String(a);
+              return s === "--local_ram_resources" || s.startsWith("--local_ram_resources=");
+            });
             const injected = [];
             if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
             if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
