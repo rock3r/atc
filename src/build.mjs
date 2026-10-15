@@ -19,16 +19,86 @@ export function tokenizeShellClauseWithSpans(clause) {
   let cur = "";
   let inSingle = false;
   let inDouble = false;
+  let inBacktick = false;
+  const substStack = [];
   let hasToken = false;
   let tokStart = -1;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
+    if (substStack.length > 0) {
+      const top = substStack[substStack.length - 1];
+      cur += ch;
+      if (top.inSingle) {
+        if (ch === "'") top.inSingle = false;
+        continue;
+      }
+      if (ch === "\\" && i + 1 < s.length) {
+        cur += s[++i];
+        continue;
+      }
+      if (top.inDouble) {
+        if (ch === '"') top.inDouble = false;
+        continue;
+      }
+      if (ch === "'") {
+        top.inSingle = true;
+        continue;
+      }
+      if (ch === '"') {
+        top.inDouble = true;
+        continue;
+      }
+      if (top.type === "paren") {
+        if (ch === "(") substStack.push({ type: "paren", inSingle: false, inDouble: false });
+        else if (ch === ")") substStack.pop();
+      } else if (top.type === "brace") {
+        if (ch === "{") substStack.push({ type: "brace", inSingle: false, inDouble: false });
+        else if (ch === "}") substStack.pop();
+      }
+      continue;
+    }
     if (inSingle) {
       if (ch === "'") {
         inSingle = false;
       } else {
         cur += ch;
       }
+      continue;
+    }
+    if (inBacktick) {
+      cur += ch;
+      if (ch === "\\" && i + 1 < s.length) {
+        cur += s[++i];
+      } else if (ch === "`") {
+        inBacktick = false;
+      }
+      continue;
+    }
+    if (ch === "$" && i + 1 < s.length && (s[i + 1] === "(" || s[i + 1] === "{")) {
+      if (!hasToken) tokStart = i;
+      hasToken = true;
+      cur += ch + s[i + 1];
+      substStack.push({
+        type: s[i + 1] === "(" ? "paren" : "brace",
+        inSingle: false,
+        inDouble: false,
+      });
+      i++;
+      continue;
+    }
+    if (!inDouble && (ch === "<" || ch === ">") && i + 1 < s.length && s[i + 1] === "(") {
+      if (!hasToken) tokStart = i;
+      hasToken = true;
+      cur += ch + s[i + 1];
+      substStack.push({ type: "paren", inSingle: false, inDouble: false });
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      if (!hasToken) tokStart = i;
+      hasToken = true;
+      inBacktick = true;
+      cur += ch;
       continue;
     }
     if (inDouble) {
@@ -88,37 +158,92 @@ function computeQuotedMask(s) {
   const mask = new Uint8Array(s.length);
   let inSingle = false;
   let inDouble = false;
+  let inBacktick = false;
+  const substStack = [];
+
+  const curCtx = () => (substStack.length > 0 ? substStack[substStack.length - 1] : null);
+  const isSingle = () => (curCtx() ? curCtx().inSingle : inSingle);
+  const isDouble = () => (curCtx() ? curCtx().inDouble : inDouble);
+  const setSingle = (v) => {
+    if (curCtx()) curCtx().inSingle = v;
+    else inSingle = v;
+  };
+  const setDouble = (v) => {
+    if (curCtx()) curCtx().inDouble = v;
+    else inDouble = v;
+  };
+
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (inSingle) {
+    if (isSingle()) {
       mask[i] = 1;
-      if (ch === "'") inSingle = false;
+      if (ch === "'") setSingle(false);
       continue;
     }
-    if (inDouble) {
+    if (inBacktick) {
       mask[i] = 1;
       if (ch === "\\" && i + 1 < s.length) {
         mask[i + 1] = 1;
         i++;
         continue;
       }
-      if (ch === '"') inDouble = false;
-      continue;
-    }
-    if (ch === "'") {
-      inSingle = true;
-      mask[i] = 1;
-      continue;
-    }
-    if (ch === '"') {
-      inDouble = true;
-      mask[i] = 1;
+      if (ch === "`") inBacktick = false;
       continue;
     }
     if (ch === "\\" && i + 1 < s.length) {
       mask[i] = 1;
       mask[i + 1] = 1;
       i++;
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      mask[i] = 1;
+      continue;
+    }
+    if (ch === "$" && i + 1 < s.length && (s[i + 1] === "(" || s[i + 1] === "{")) {
+      mask[i] = 1;
+      mask[i + 1] = 1;
+      substStack.push({
+        type: s[i + 1] === "(" ? "paren" : "brace",
+        inSingle: false,
+        inDouble: false,
+      });
+      i++;
+      continue;
+    }
+    if (!isDouble() && (ch === "<" || ch === ">") && i + 1 < s.length && s[i + 1] === "(") {
+      mask[i] = 1;
+      mask[i + 1] = 1;
+      substStack.push({ type: "paren", inSingle: false, inDouble: false });
+      i++;
+      continue;
+    }
+    if (isDouble()) {
+      mask[i] = 1;
+      if (ch === '"') setDouble(false);
+      continue;
+    }
+    if (ch === "'") {
+      setSingle(true);
+      mask[i] = 1;
+      continue;
+    }
+    if (ch === '"') {
+      setDouble(true);
+      mask[i] = 1;
+      continue;
+    }
+    if (substStack.length > 0) {
+      mask[i] = 1;
+      const top = curCtx();
+      if (top.type === "paren") {
+        if (ch === "(") substStack.push({ type: "paren", inSingle: false, inDouble: false });
+        else if (ch === ")") substStack.pop();
+      } else if (top.type === "brace") {
+        if (ch === "{") substStack.push({ type: "brace", inSingle: false, inDouble: false });
+        else if (ch === "}") substStack.pop();
+      }
       continue;
     }
   }
@@ -148,22 +273,29 @@ export function splitShellClauseRedirAndGroup(part) {
     }
     const gMatch = coreEnd.match(/(\s*[)}]+)$/);
     if (gMatch) {
-      const matchStart = coreEnd.length - gMatch[1].length;
-      let allUnquoted = true;
+      let stripPos = coreEnd.length;
       let parens = 0;
-      for (let i = matchStart; i < coreEnd.length; i++) {
-        if (coreEnd[i] === ")" || coreEnd[i] === "}") {
-          if (mask[i] === 1) {
-            allUnquoted = false;
-            break;
-          }
-          if (coreEnd[i] === ")") parens++;
+      let braces = 0;
+      while (stripPos > 0) {
+        let p = stripPos - 1;
+        while (p >= 0 && /\s/.test(coreEnd[p]) && mask[p] === 0) {
+          p--;
         }
+        if (p >= 0 && (coreEnd[p] === ")" || coreEnd[p] === "}") && mask[p] === 0) {
+          if (coreEnd[p] === ")") parens++;
+          else braces++;
+          stripPos = p;
+          while (stripPos > 0 && /\s/.test(coreEnd[stripPos - 1]) && mask[stripPos - 1] === 0) {
+            stripPos--;
+          }
+          continue;
+        }
+        break;
       }
-      if (allUnquoted) {
+      if (parens + braces > 0) {
         closedSubshells += parens;
-        suffix = gMatch[1] + suffix;
-        coreEnd = coreEnd.slice(0, matchStart);
+        suffix = coreEnd.slice(stripPos) + suffix;
+        coreEnd = coreEnd.slice(0, stripPos);
         continue;
       }
     }
@@ -202,41 +334,14 @@ export function splitShellClauseRedirAndGroup(part) {
 
 export function splitShellScriptParts(script) {
   const s = String(script || "");
+  const mask = computeQuotedMask(s);
   const parts = [];
   let cur = "";
-  let inSingle = false;
-  let inDouble = false;
 
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (inSingle) {
+    if (mask[i] === 1) {
       cur += ch;
-      if (ch === "'") inSingle = false;
-      continue;
-    }
-    if (inDouble) {
-      cur += ch;
-      if (ch === "\\" && i + 1 < s.length) {
-        cur += s[i + 1];
-        i++;
-        continue;
-      }
-      if (ch === '"') inDouble = false;
-      continue;
-    }
-    if (ch === "'") {
-      inSingle = true;
-      cur += ch;
-      continue;
-    }
-    if (ch === '"') {
-      inDouble = true;
-      cur += ch;
-      continue;
-    }
-    if (ch === "\\" && i + 1 < s.length) {
-      cur += ch + s[i + 1];
-      i++;
       continue;
     }
     if (ch === ";" || ch === "\n") {
@@ -245,7 +350,7 @@ export function splitShellScriptParts(script) {
       continue;
     }
     if (ch === "&") {
-      if (s[i + 1] === "&") {
+      if (s[i + 1] === "&" && mask[i + 1] === 0) {
         parts.push(cur, "&&");
         cur = "";
         i++;
@@ -258,7 +363,7 @@ export function splitShellScriptParts(script) {
       }
     }
     if (ch === "|") {
-      if (s[i + 1] === "|") {
+      if (s[i + 1] === "|" && mask[i + 1] === 0) {
         parts.push(cur, "||");
         cur = "";
         i++;

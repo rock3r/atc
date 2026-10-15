@@ -378,9 +378,9 @@ Android emulators boot full QEMU virtual machines with dedicated guest RAM, whil
 
 | Pool | Config key & default | Admission check before boot / start |
 |---|---|---|
-| Android QEMU emulators | `maxRunningEmulators = 2` | Available host RAM must cover `ramSizeMb + 1024 MB overhead + minFreeRamMb (2048 MB)` plus unaccounted `<10 s` starting builds, and `2048 MB` free disk. |
+| Android QEMU emulators | `maxRunningEmulators = 2` | Available host RAM must cover `ramSizeMb + 1024 MB overhead + minFreeRamMb (2048 MB)` plus unaccounted `<30 s` starting builds, and `2048 MB` free disk. |
 | iOS Simulators (macOS) | `maxRunningSimulators = 4` | Target volume must have at least `minFreeDiskMb (2048 MB)` free disk space. |
-| Heavy builds (`gradle` / `bazel` / `xcodebuild`) | `maxConcurrentBuilds = 2` (`+1` burst for device holders) | Per-workspace key lock + RAM check (`buildRamEstimateMb = 4096 MB` for cold daemons + `preparingDevice` reservations + `minFreeRamMb`). |
+| Heavy builds (`gradle` / `bazel` / `xcodebuild`) | `maxConcurrentBuilds = "auto"` (1-4 by CPU/RAM, `+1` burst for device holders) | Per-workspace key lock + RAM check (`buildRamEstimateMb = 3072 MB` for cold daemons + `preparingDevice` reservations + `minFreeRamMb`). |
 | Physical devices | Unlimited (`0` virtual slots) | Must be online in `adb devices` or `xcrun devicectl list devices`. |
 
 ## Commands and exit codes map every failure to one action

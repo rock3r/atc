@@ -1591,6 +1591,19 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       "if test -f settings.gradle; then ./gradlew build -Dorg.gradle.workers.max=4; else bazel build --jobs=4 --local_ram_resources=3072 //app; fi",
     );
 
+    const substInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build -Pversion=$(git describe; echo suffix)"],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      substInv.args[1],
+      "./gradlew build -Pversion=$(git describe; echo suffix) -Dorg.gradle.workers.max=4",
+    );
+
     const expandedVarReqs = resolveBuildResources(
       "sh",
       ["-c", 'cd "$PROJECT_DIR" && ./gradlew build'],
@@ -1599,9 +1612,10 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     );
     assert.equal(expandedVarReqs.kind, "pure_build");
     assert.equal(expandedVarReqs.tool, "gradle");
+    const canonicalWs = (fs.realpathSync.native || fs.realpathSync)(wsDir);
     assert.ok(
       expandedVarReqs.resourceKeys.some((k) =>
-        k.endsWith(fs.realpathSync(wsDir)),
+        k.endsWith(canonicalWs),
       ),
     );
 
