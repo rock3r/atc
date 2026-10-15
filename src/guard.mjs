@@ -2144,6 +2144,32 @@ export function extractTargetSerial(parsed) {
       } else if (a === "--device" && i + 1 < args.length) {
         selectors.push(String(args[i + 1]));
         i += 1;
+      } else if (a.startsWith("--test_arg=--device=")) {
+        selectors.push(a.slice("--test_arg=--device=".length));
+      } else if (a === "--test_arg=--device" && i + 1 < args.length) {
+        const nextArg = String(args[i + 1]);
+        if (nextArg.startsWith("--test_arg=")) {
+          selectors.push(nextArg.slice("--test_arg=".length));
+          i += 1;
+        } else if (nextArg === "--test_arg" && i + 2 < args.length) {
+          selectors.push(String(args[i + 2]));
+          i += 2;
+        }
+      } else if (a === "--test_arg" && i + 1 < args.length) {
+        const testArgVal = String(args[i + 1]);
+        if (testArgVal.startsWith("--device=")) {
+          selectors.push(testArgVal.slice("--device=".length));
+          i += 1;
+        } else if (testArgVal === "--device" && i + 2 < args.length) {
+          const nextPair = String(args[i + 2]);
+          if (nextPair === "--test_arg" && i + 3 < args.length) {
+            selectors.push(String(args[i + 3]));
+            i += 3;
+          } else if (nextPair.startsWith("--test_arg=")) {
+            selectors.push(nextPair.slice("--test_arg=".length));
+            i += 2;
+          }
+        }
       } else if (a.startsWith("--ios_simulator_device=")) {
         const val = a.slice("--ios_simulator_device=".length);
         if (UUID_RE.test(val)) selectors.push(val);

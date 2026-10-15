@@ -1614,6 +1614,19 @@ test("cmdExec --claim releases newly claimed device when pre-spawn validation fa
     assert.match(res.error, /Conflicting device selector "emulator-5556"/);
     const stateAfter = readState(stateDir);
     assert.equal(Object.keys(stateAfter.leases || {}).length, 0);
+
+    const bazelTestArgConflict = await cmdExec(
+      stateDir,
+      ["bazel", "test", "--test_arg=--device=emulator-5556", "//app:test"],
+      { claim: true, session: "agent-claim-validation-fail" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "agent-claim-validation-fail" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.equal(bazelTestArgConflict.exitCode, 3);
+    assert.match(bazelTestArgConflict.error, /Conflicting device selector "emulator-5556"/);
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }

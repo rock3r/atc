@@ -3188,10 +3188,15 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       (a) => a === "--ios_simulator_device" || a.startsWith("--ios_simulator_device="),
     );
     const hasAndroidDeviceFlag = bazelFlags.some(
-      (a) =>
+      (a, idx) =>
         a === "--device" ||
         a.startsWith("--device=") ||
-        a.startsWith("--test_arg=--device="),
+        a === "--test_arg=--device" ||
+        a.startsWith("--test_arg=--device=") ||
+        (a === "--test_arg" &&
+          idx + 1 < bazelFlags.length &&
+          (bazelFlags[idx + 1] === "--device" ||
+            String(bazelFlags[idx + 1]).startsWith("--device="))),
     );
     const hasDeviceFlag = hasIosDeviceFlag || hasAndroidDeviceFlag;
     const requiresDevice =
