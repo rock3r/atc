@@ -4,10 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import {
   classifyBuildCommand,
+  expandOrValidateShellPath,
+  expandShellBuildClausePaths,
   findBazelSubcommandIndex,
   injectBazelFlagsIntoShellClause,
   normalizeBuildToolName,
   peelBuildWrapperTokens,
+  scanExecutableSubstitutions,
   splitShellClauseRedirAndGroup,
   splitShellScriptParts,
   tokenizeShellClause,
@@ -828,106 +831,208 @@ export function buildChildInvocation(
         const rawScript = isMultiTokenWinShell
           ? nextArgs.slice(cIdx + 1).join(" ")
           : String(nextArgs[cIdx + 1] || "");
-        const parts = splitShellScriptParts(rawScript);
-        const rewrittenParts = parts.map((part, idx) => {
-          if (idx % 2 === 1) return part;
-          const trimmed = part.trim();
-          if (!trimmed) return part;
-          const { corePart, strippedClause, redirSuffix, trailingWs } =
-            splitShellClauseRedirAndGroup(part);
-          const rawTokens = tokenizeShellClause(strippedClause);
-          if (rawTokens.length === 0) return part;
-          const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
-          const cClass = classifyBuildCommand(peeled.cmd, peeled.args);
-          if (cClass.tool === "xcodebuild" && (cClass.requiresHeavySlot || cClass.requiresDevice)) {
-            const explicitDestinations = [];
-            for (let i = 0; i < peeled.args.length; i++) {
-              const a = String(peeled.args[i]);
-              if (a.startsWith("-destination=")) {
-                explicitDestinations.push(a.slice("-destination=".length));
-              } else if (a === "-destination" && i + 1 < peeled.args.length) {
-                explicitDestinations.push(String(peeled.args[i + 1]));
-                i++;
-              }
-            }
-            const allowedIds = new Set(
-              [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
-                .filter(Boolean)
-                .map((s) => String(s).toUpperCase()),
-            );
-            if (
-              explicitDestinations.length > 0 &&
-              allowedIds.size > 0 &&
-              (lease?.platform || "android") === "ios"
-            ) {
-              for (const dest of explicitDestinations) {
-                const idMatch = dest.match(/(?:^|,)\s*id=([^,\s]+)/i);
-                if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
-                  throw new Error(
-                    `Conflicting device selector "${idMatch?.[1] || dest}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-                  );
+        const shellType = base === "cmd" ? "cmd" : "posix";
+        const stripSentinels = (v) => String(v || "").replaceAll("\uE000", "");
+        const rewriteShellScript = (scriptText, initialEnv) => {
+          const curShellEnv = { ...(initialEnv || {}) };
+          const parts = splitShellScriptParts(scriptText);
+          const rewrittenParts = parts.map((rawPart, idx) => {
+            if (idx % 2 === 1) return rawPart;
+            let part = rawPart;
+            const subs = scanExecutableSubstitutions(part);
+            if (subs.length > 0) {
+              for (let si = subs.length - 1; si >= 0; si--) {
+                const sub = subs[si];
+                const rewrittenBody = rewriteShellScript(sub.body, curShellEnv);
+                if (rewrittenBody !== sub.body) {
+                  part = `${part.slice(0, sub.bodyStart)}${rewrittenBody}${part.slice(sub.bodyEnd)}`;
                 }
               }
             }
-            const xcodeInjected = [];
-            const hasXcodeJobs = peeled.args.some((a) => {
-              const s = String(a);
-              return s === "-jobs" || s.startsWith("-jobs=");
-            });
-            if (cClass.requiresHeavySlot && !hasXcodeJobs) {
-              xcodeInjected.push(`-jobs ${jobsLimit}`);
+            const trimmed = part.trim();
+            if (!trimmed) return part;
+            const { corePart, strippedClause, redirSuffix, trailingWs } =
+              splitShellClauseRedirAndGroup(part);
+            const rawTokens = tokenizeShellClause(strippedClause, { markLiterals: true });
+            if (rawTokens.length === 0) return part;
+            const headTok = stripSentinels(rawTokens[0]);
+            const headLower = headTok.toLowerCase();
+            if (
+              headLower === "export" ||
+              headLower === "local" ||
+              headLower === "declare" ||
+              headLower === "typeset" ||
+              headLower === "readonly" ||
+              (base === "cmd" && headLower === "set" && rawTokens.length > 1) ||
+              rawTokens.every((t) =>
+                /^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(stripSentinels(t)),
+              )
+            ) {
+              const assignTokens =
+                headLower === "export" ||
+                headLower === "local" ||
+                headLower === "declare" ||
+                headLower === "typeset" ||
+                headLower === "readonly" ||
+                (base === "cmd" && headLower === "set")
+                  ? rawTokens.slice(1)
+                  : rawTokens;
+              for (const tok of assignTokens) {
+                const cleanTok = stripSentinels(tok);
+                if (/^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(cleanTok)) {
+                  const eqIdx = tok.indexOf("=");
+                  const rawBeforeEq = stripSentinels(tok.slice(0, eqIdx));
+                  const isAppend = rawBeforeEq.endsWith("+");
+                  const rawKey = isAppend ? rawBeforeEq.slice(0, -1) : rawBeforeEq;
+                  const k = rawKey.replace(/^\$env:/i, "");
+                  const rawVal = tok.slice(eqIdx + 1);
+                  const expVal = expandOrValidateShellPath(rawVal, curShellEnv, { shellType });
+                  const prevVal = isAppend ? String(curShellEnv[k] ?? "") : "";
+                  const finalVal = expVal.unresolved
+                    ? stripSentinels(rawVal)
+                    : isAppend
+                      ? prevVal + expVal.resolved
+                      : expVal.resolved;
+                  curShellEnv[k] = finalVal;
+                }
+              }
+              return part;
             }
             if (
-              explicitDestinations.length === 0 &&
-              lease?.serial &&
-              (lease.platform || "android") === "ios"
+              (base === "powershell" || base === "pwsh") &&
+              /^\$env:[A-Za-z_][A-Za-z0-9_]*$/i.test(headTok) &&
+              (stripSentinels(rawTokens[1] || "") === "=" ||
+                stripSentinels(rawTokens[1] || "") === "+=") &&
+              rawTokens.length >= 3
             ) {
-              xcodeInjected.push(`-destination id=${lease.serial}`);
+              const k = headTok.replace(/^\$env:/i, "");
+              const isAppend = stripSentinels(rawTokens[1] || "") === "+=";
+              const rawVal = rawTokens.slice(2).join(" ");
+              const expVal = expandOrValidateShellPath(rawVal, curShellEnv, { shellType });
+              const prevVal = isAppend ? String(curShellEnv[k] ?? "") : "";
+              curShellEnv[k] = expVal.unresolved
+                ? stripSentinels(rawVal)
+                : isAppend
+                  ? prevVal + expVal.resolved
+                  : expVal.resolved;
+              return part;
             }
-            if (xcodeInjected.length > 0) {
-              return `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}${trailingWs}`;
+            if (headLower === "unset") {
+              for (const tok of rawTokens.slice(1)) {
+                const cleanTok = stripSentinels(tok);
+                if (!cleanTok.startsWith("-")) {
+                  delete curShellEnv[cleanTok];
+                }
+              }
+              return part;
             }
-            return part;
-          }
-          if (!cClass.requiresHeavySlot) return part;
-          if (cClass.tool === "gradle") {
-            const hasWorkersFlag = peeled.args.some((a) => {
-              const s = String(a);
-              return (
-                s === "--max-workers" ||
-                s.startsWith("--max-workers=") ||
-                s.startsWith("-Dorg.gradle.workers.max=")
+            const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
+              env: curShellEnv,
+              inShell: true,
+              shellType,
+            });
+            const expanded = expandShellBuildClausePaths(
+              peeled.cmd,
+              peeled.args,
+              curShellEnv,
+              { shellType },
+            );
+            const cArgs = expanded.args;
+            const cClass = classifyBuildCommand(expanded.cmd, cArgs);
+            if (cClass.tool === "xcodebuild" && (cClass.requiresHeavySlot || cClass.requiresDevice)) {
+              const explicitDestinations = [];
+              for (let i = 0; i < cArgs.length; i++) {
+                const a = String(cArgs[i]);
+                if (a.startsWith("-destination=")) {
+                  explicitDestinations.push(a.slice("-destination=".length));
+                } else if (a === "-destination" && i + 1 < cArgs.length) {
+                  explicitDestinations.push(String(cArgs[i + 1]));
+                  i++;
+                }
+              }
+              const allowedIds = new Set(
+                [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
+                  .filter(Boolean)
+                  .map((s) => String(s).toUpperCase()),
               );
-            });
-            if (!hasWorkersFlag) {
-              return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
+              if (
+                explicitDestinations.length > 0 &&
+                allowedIds.size > 0 &&
+                (lease?.platform || "android") === "ios"
+              ) {
+                for (const dest of explicitDestinations) {
+                  const idMatch = dest.match(/(?:^|,)\s*id=([^,\s]+)/i);
+                  if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
+                    throw new Error(
+                      `Conflicting device selector "${idMatch?.[1] || dest}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+                    );
+                  }
+                }
+              }
+              const xcodeInjected = [];
+              const hasXcodeJobs = cArgs.some((a) => {
+                const s = String(a);
+                return s === "-jobs" || s.startsWith("-jobs=");
+              });
+              if (cClass.requiresHeavySlot && !hasXcodeJobs) {
+                xcodeInjected.push(`-jobs ${jobsLimit}`);
+              }
+              if (
+                explicitDestinations.length === 0 &&
+                lease?.serial &&
+                (lease.platform || "android") === "ios"
+              ) {
+                xcodeInjected.push(`-destination id=${lease.serial}`);
+              }
+              if (xcodeInjected.length > 0) {
+                return `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}${trailingWs}`;
+              }
+              return part;
+            }
+            if (!cClass.requiresHeavySlot) return part;
+            if (cClass.tool === "gradle") {
+              const hasWorkersFlag = cArgs.some((a) => {
+                const s = String(a);
+                return (
+                  s === "--max-workers" ||
+                  s.startsWith("--max-workers=") ||
+                  s.startsWith("-Dorg.gradle.workers.max=")
+                );
+              });
+              if (!hasWorkersFlag) {
+                return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
+              }
+              return part;
+            }
+            if (cClass.tool === "bazel") {
+              const hasJobs = cArgs.some((a) => {
+                const s = String(a);
+                return s === "--jobs" || s.startsWith("--jobs=");
+              });
+              const hasRam = cArgs.some((a) => {
+                const s = String(a);
+                return s === "--local_ram_resources" || s.startsWith("--local_ram_resources=");
+              });
+              const injected = [];
+              if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
+              if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
+              if (injected.length > 0) {
+                const rewrittenCore = injectBazelFlagsIntoShellClause(corePart, injected, {
+                  env: curShellEnv,
+                });
+                return `${rewrittenCore}${redirSuffix}${trailingWs}`;
+              }
             }
             return part;
-          }
-          if (cClass.tool === "bazel") {
-            const hasJobs = peeled.args.some((a) => {
-              const s = String(a);
-              return s === "--jobs" || s.startsWith("--jobs=");
-            });
-            const hasRam = peeled.args.some((a) => {
-              const s = String(a);
-              return s === "--local_ram_resources" || s.startsWith("--local_ram_resources=");
-            });
-            const injected = [];
-            if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
-            if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
-            if (injected.length > 0) {
-              const rewrittenCore = injectBazelFlagsIntoShellClause(corePart, injected);
-              return `${rewrittenCore}${redirSuffix}${trailingWs}`;
-            }
-          }
-          return part;
-        });
+          });
+          return rewrittenParts.join("");
+        };
+        const rewrittenScript = rewriteShellScript(rawScript, baseEnv || process.env);
         if (isMultiTokenWinShell) {
-          nextArgs = [...nextArgs.slice(0, cIdx + 1), rewrittenParts.join("")];
+          nextArgs = [...nextArgs.slice(0, cIdx + 1), rewrittenScript];
         } else {
           nextArgs = [...nextArgs];
-          nextArgs[cIdx + 1] = rewrittenParts.join("");
+          nextArgs[cIdx + 1] = rewrittenScript;
         }
       }
     } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "gradle") {

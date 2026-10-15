@@ -1934,6 +1934,50 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     );
     assert.equal(appendAssignReqs.kind, "pure_build");
     assert.deepEqual(appendAssignReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    // Command substitutions `$(...)` containing build invocations are classified and rewritten
+    const cmdSubReqs = resolveBuildResources(
+      "sh",
+      ["-c", "echo $(./gradlew build)"],
+      wsDir,
+    );
+    assert.equal(cmdSubReqs.kind, "pure_build");
+    assert.deepEqual(cmdSubReqs.resourceKeys, [`gradle:${canonicalWs}`]);
+
+    const cmdSubInv = buildChildInvocation(
+      "sh",
+      ["-c", "echo $(./gradlew build)"],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      cmdSubInv.args[1],
+      "echo $(./gradlew build -Dorg.gradle.workers.max=4)",
+    );
+
+    // Assignment-only clauses storing build executables are preserved while subsequent expanded invocations receive injected flags
+    const toolVarReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'TOOL=./gradlew; "$TOOL" build'],
+      wsDir,
+    );
+    assert.equal(toolVarReqs.kind, "pure_build");
+    assert.deepEqual(toolVarReqs.resourceKeys, [`gradle:${canonicalWs}`]);
+
+    const toolVarInv = buildChildInvocation(
+      "sh",
+      ["-c", 'TOOL=./gradlew; "$TOOL" build'],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      toolVarInv.args[1],
+      'TOOL=./gradlew; "$TOOL" build -Dorg.gradle.workers.max=4',
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

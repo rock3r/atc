@@ -178,6 +178,159 @@ export function tokenizeShellClause(clause, options = {}) {
   return tokenizeShellClauseWithSpans(clause, options).map((t) => t.value);
 }
 
+export function scanExecutableSubstitutions(text) {
+  const s = String(text || "");
+  const results = [];
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  let topSub = null;
+  const stack = [];
+
+  const curCtx = () => (stack.length > 0 ? stack[stack.length - 1] : null);
+  const isSingle = () => (curCtx() ? curCtx().inSingle : inSingle);
+  const isDouble = () => (curCtx() ? curCtx().inDouble : inDouble);
+  const setSingle = (v) => {
+    if (curCtx()) curCtx().inSingle = v;
+    else inSingle = v;
+  };
+  const setDouble = (v) => {
+    if (curCtx()) curCtx().inDouble = v;
+    else inDouble = v;
+  };
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (isSingle()) {
+      if (ch === "'") setSingle(false);
+      continue;
+    }
+    if (inBacktick) {
+      if (ch === "\\" && i + 1 < s.length) {
+        i++;
+        continue;
+      }
+      if (ch === "`") {
+        inBacktick = false;
+        if (topSub && topSub.kind === "backtick" && stack.length === 0) {
+          results.push({
+            openStart: topSub.openStart,
+            bodyStart: topSub.bodyStart,
+            bodyEnd: i,
+            closeEnd: i + 1,
+            body: s.slice(topSub.bodyStart, i),
+            kind: "backtick",
+          });
+          topSub = null;
+        }
+      }
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      if (!topSub && stack.length === 0) {
+        topSub = {
+          openStart: i,
+          bodyStart: i + 1,
+          kind: "backtick",
+        };
+      }
+      continue;
+    }
+    if (ch === "$" && i + 1 < s.length && (s[i + 1] === "(" || s[i + 1] === "{")) {
+      if (s[i + 1] === "(" && s[i + 2] === "(") {
+        stack.push({ type: "arith", inSingle: false, inDouble: false });
+        stack.push({ type: "paren", inSingle: false, inDouble: false });
+        i += 2;
+        continue;
+      }
+      const isCmdSub = s[i + 1] === "(";
+      if (isCmdSub && !topSub) {
+        topSub = {
+          openStart: i,
+          bodyStart: i + 2,
+          kind: "paren",
+          stackDepth: stack.length + 1,
+        };
+      }
+      stack.push({
+        type: isCmdSub ? "paren" : "brace",
+        inSingle: false,
+        inDouble: false,
+      });
+      i++;
+      continue;
+    }
+    if (!isDouble() && (ch === "<" || ch === ">") && i + 1 < s.length && s[i + 1] === "(") {
+      if (!topSub) {
+        topSub = {
+          openStart: i,
+          bodyStart: i + 2,
+          kind: "paren",
+          stackDepth: stack.length + 1,
+        };
+      }
+      stack.push({ type: "paren", inSingle: false, inDouble: false });
+      i++;
+      continue;
+    }
+    if (isDouble()) {
+      if (ch === '"') setDouble(false);
+      continue;
+    }
+    if (ch === "'") {
+      setSingle(true);
+      continue;
+    }
+    if (ch === '"') {
+      setDouble(true);
+      continue;
+    }
+    if (stack.length > 0) {
+      const top = curCtx();
+      if (top.type === "paren" || top.type === "arith") {
+        if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+          while (i + 1 < s.length && s[i + 1] !== "\n") {
+            i++;
+          }
+          continue;
+        }
+        if (ch === "(") {
+          stack.push({ type: "paren", inSingle: false, inDouble: false });
+        } else if (ch === ")") {
+          stack.pop();
+          if (topSub && topSub.kind === "paren" && stack.length < topSub.stackDepth) {
+            results.push({
+              openStart: topSub.openStart,
+              bodyStart: topSub.bodyStart,
+              bodyEnd: i,
+              closeEnd: i + 1,
+              body: s.slice(topSub.bodyStart, i),
+              kind: "paren",
+            });
+            topSub = null;
+          }
+        }
+      } else if (top.type === "brace") {
+        if (ch === "{") stack.push({ type: "brace", inSingle: false, inDouble: false });
+        else if (ch === "}") stack.pop();
+      }
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+      while (i + 1 < s.length && s[i + 1] !== "\n") {
+        i++;
+      }
+      continue;
+    }
+  }
+  return results;
+}
+
 function computeQuotedMask(s) {
   const mask = new Uint8Array(s.length);
   let inSingle = false;
@@ -666,7 +819,7 @@ export function expandOrValidateShellPath(rawPath, envMap = process.env, options
   return { resolved: stripLiteralSentinels(p), unresolved: false };
 }
 
-function expandShellBuildClausePaths(cmd, args = [], envMap = process.env, options = {}) {
+export function expandShellBuildClausePaths(cmd, args = [], envMap = process.env, options = {}) {
   let nextCmd = String(cmd || "");
   if (
     nextCmd.includes("/") ||
@@ -865,7 +1018,10 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           ? prevVal + stripLiteralSentinels(rawVal)
           : stripLiteralSentinels(rawVal);
       }
-      if (curArgs.length === 0) break;
+      if (curArgs.length === 0) {
+        curCmd = "";
+        break;
+      }
       curCmd = curArgs[0];
       curArgs = curArgs.slice(1);
       continue;
@@ -884,7 +1040,10 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       base === "until" ||
       cleaned === "!"
     ) {
-      if (curArgs.length === 0) break;
+      if (curArgs.length === 0) {
+        curCmd = "";
+        break;
+      }
       curCmd = curArgs[0];
       curArgs = curArgs.slice(1);
       continue;
@@ -1570,6 +1729,53 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             popSubshells();
             continue;
           }
+          const subExecs = scanExecutableSubstitutions(strippedClause);
+          if (subExecs.length > 0) {
+            const subBaseCwd = curShellRelCwd
+              ? path.isAbsolute(curShellRelCwd)
+                ? curShellRelCwd
+                : path.resolve(baseCwd, curShellRelCwd)
+              : baseCwd;
+            for (const subExec of subExecs) {
+              const subPeeled = peelBuildWrapperTokens(base, ["-c", subExec.body], {
+                env: shellEnv,
+                cwd: subBaseCwd,
+                inShell: true,
+                taintedVars: taintedEnvVars,
+                shellType,
+              });
+              if (Array.isArray(subPeeled.allBuildClauses) && subPeeled.allBuildClauses.length > 0) {
+                for (const subC of subPeeled.allBuildClauses) {
+                  const subUnresolvedCwd = Boolean(
+                    subC.unresolvedDynamicCwd ||
+                      subPeeled.unresolvedDynamicCwd ||
+                      (curShellUnresolvedCwd && !(subC.relCwd && path.isAbsolute(subC.relCwd))),
+                  );
+                  const subEffectiveRelCwd = subC.relCwd
+                    ? path.isAbsolute(subC.relCwd)
+                      ? subC.relCwd
+                      : curShellRelCwd
+                        ? path.join(curShellRelCwd, subC.relCwd)
+                        : subC.relCwd
+                    : curShellRelCwd || null;
+                  matchedClauses.push({
+                    cmd: subC.cmd,
+                    args: subC.args,
+                    relCwd: subEffectiveRelCwd,
+                    envVars: {
+                      ...curShellEnvVars,
+                      ...(subPeeled.envVars || {}),
+                      ...(subC.envVars || {}),
+                    },
+                    backgrounded: Boolean(
+                      clauseObj.backgrounded || subPeeled.backgrounded || subC.backgrounded,
+                    ),
+                    unresolvedDynamicCwd: subUnresolvedCwd,
+                  });
+                }
+              }
+            }
+          }
           const headTok = stripLiteralSentinels(rawTokens[0]);
           const headLower = headTok.toLowerCase();
           if (headLower === "source" || headTok === "." || headLower === "eval") {
@@ -1952,7 +2158,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
 
 export function normalizeBuildToolName(cmd) {
   if (!cmd || typeof cmd !== "string") return null;
-  const cleaned = cmd.trim().replace(/^@+/, "");
+  const cleaned = stripLiteralSentinels(cmd).trim().replace(/^@+/, "");
+  if (/^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(cleaned)) return null;
   const base = (cleaned.split(/[\\/]/).pop() || "")
     .toLowerCase()
     .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
@@ -2082,7 +2289,7 @@ export function findBazelSubcommandIndex(args = [], allowedSubcommands = BAZEL_S
   return -1;
 }
 
-export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = []) {
+export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = [], options = {}) {
   if (!injectedFlags || injectedFlags.length === 0) return corePart;
   const s = String(corePart || "");
   let leadingOffset = 0;
@@ -2101,7 +2308,11 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = []) {
     break;
   }
   const spans = tokenizeShellClauseWithSpans(s.slice(leadingOffset));
-  const bazelIdx = spans.findIndex((t) => normalizeBuildToolName(t.value) === "bazel");
+  const bazelIdx = spans.findIndex((t) => {
+    const exp = options?.env ? expandOrValidateShellPath(t.value, options.env) : null;
+    const candidate = exp && !exp.unresolved && exp.resolved ? exp.resolved : t.value;
+    return normalizeBuildToolName(candidate) === "bazel";
+  });
   if (bazelIdx === -1) return corePart;
   const afterBazel = spans.slice(bazelIdx + 1).map((t) => t.value);
   const subRelIdx = findBazelSubcommandIndex(
