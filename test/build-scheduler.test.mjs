@@ -2605,6 +2605,38 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     );
     assert.equal(underscoreJavaHigherHeap.requestedHeapMb, 16384);
 
+    // -Xms initial heap settings also reserve RAM alongside -Xmx
+    const xmsGradleHeap = resolveBuildResources(
+      "./gradlew",
+      ["-Dorg.gradle.jvmargs=-Xms8g", "assembleDebug"],
+      dirB,
+      { env: { GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(xmsGradleHeap.requestedHeapMb, 8192);
+
+    const xmsBazelHeap = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--host_jvm_args=-Xms6g", "build", "//..."],
+      dirA,
+    );
+    assert.equal(xmsBazelHeap.requestedHeapMb, 6144);
+
+    // Nonexistent Windows shared output_base normalizes case-insensitively
+    const winOutUpper = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--output_base=C:\\Shared\\Out", "build", "//..."],
+      dirA,
+      { platform: "win32" },
+    );
+    const winOutLower = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--output_base=c:\\shared\\out", "build", "//..."],
+      dirB,
+      { platform: "win32" },
+    );
+    assert.ok(winOutUpper.resourceKeys.includes("bazel:out:c:\\shared\\out"));
+    assert.ok(winOutLower.resourceKeys.includes("bazel:out:c:\\shared\\out"));
+
     // Literal single-quoted redirection target >'$(output)' is allowed (not treated as dynamic expansion)
     const literalRedirReqs = resolveBuildResources(
       "sh",

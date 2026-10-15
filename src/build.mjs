@@ -12,13 +12,17 @@ import {
   stripOpaqueHeredocsForCheck,
 } from "./parsers.mjs";
 
-export function canonicalizeBuildPath(targetPath) {
-  const resolved = path.resolve(String(targetPath || "."));
+export function canonicalizeBuildPath(targetPath, options = {}) {
+  const rawStr = String(targetPath || ".");
+  const isWinPath = /^[a-zA-Z]:[\\/]/.test(rawStr) || rawStr.startsWith("\\\\");
+  const isWin = (options?.platform || process.platform) === "win32" || isWinPath;
+  const resolved =
+    isWinPath && process.platform !== "win32" ? path.win32.resolve(rawStr) : path.resolve(rawStr);
   try {
     const realpathFn = fs.realpathSync.native || fs.realpathSync;
     return realpathFn(resolved);
   } catch {
-    return resolved;
+    return isWin ? resolved.toLowerCase() : resolved;
   }
 }
 
@@ -3935,6 +3939,19 @@ export function resolveBuildResources(
       }
     }
 
+    const resolveBazelPath = (resolveBaseDir, val) => {
+      const s = String(val || "");
+      const b = String(resolveBaseDir || "");
+      if (
+        /^[a-zA-Z]:[\\/]/.test(s) ||
+        s.startsWith("\\\\") ||
+        /^[a-zA-Z]:[\\/]/.test(b) ||
+        b.startsWith("\\\\")
+      ) {
+        return path.win32.resolve(b || ".", s);
+      }
+      return path.resolve(resolveBaseDir, s);
+    };
     const applyStartupOptionTokens = (tokens, resolveBaseDir) => {
       const expandWs = (val) =>
         String(val || "").replace(/%workspace%/g, canonicalRoot);
@@ -3949,19 +3966,22 @@ export function resolveBuildResources(
           continue;
         }
         if (a === "--output_base" && i + 1 < tokens.length) {
-          outputBase = path.resolve(resolveBaseDir, expandWs(tokens[++i]));
+          outputBase = resolveBazelPath(resolveBaseDir, expandWs(tokens[++i]));
           continue;
         }
         if (a.startsWith("--output_base=")) {
-          outputBase = path.resolve(resolveBaseDir, expandWs(a.slice("--output_base=".length)));
+          outputBase = resolveBazelPath(
+            resolveBaseDir,
+            expandWs(a.slice("--output_base=".length)),
+          );
           continue;
         }
         if (a === "--output_user_root" && i + 1 < tokens.length) {
-          outputUserRoot = path.resolve(resolveBaseDir, expandWs(tokens[++i]));
+          outputUserRoot = resolveBazelPath(resolveBaseDir, expandWs(tokens[++i]));
           continue;
         }
         if (a.startsWith("--output_user_root=")) {
-          outputUserRoot = path.resolve(
+          outputUserRoot = resolveBazelPath(
             resolveBaseDir,
             expandWs(a.slice("--output_user_root=".length)),
           );
@@ -4112,10 +4132,12 @@ export function resolveBuildResources(
     );
     const disablesDaemon = batchMode || hasCustomStartupOption || hasUseBazelVersion;
 
-    const canonicalUserRoot = outputUserRoot ? canonicalizeBuildPath(outputUserRoot) : null;
+    const canonicalUserRoot = outputUserRoot
+      ? canonicalizeBuildPath(outputUserRoot, { platform })
+      : null;
     const resourceKeys = [`bazel:ws:${canonicalRoot}`];
     if (outputBase) {
-      resourceKeys.push(`bazel:out:${canonicalizeBuildPath(outputBase)}`);
+      resourceKeys.push(`bazel:out:${canonicalizeBuildPath(outputBase, { platform })}`);
     } else if (canonicalUserRoot) {
       const wsMd5 = crypto.createHash("md5").update(canonicalRoot).digest("hex");
       resourceKeys.push(`bazel:out:${path.join(canonicalUserRoot, wsMd5)}`);
@@ -4188,7 +4210,7 @@ export function resolveBuildResources(
 function parseJvmHeapMb(str) {
   if (!str) return 0;
   let maxMb = 0;
-  const re = /-Xmx(\d+(?:\.\d+)?)([kKmMgGtT])?\b/g;
+  const re = /-(?:Xmx|Xms|XX:(?:Max|Initial|Min)HeapSize=)(\d+(?:\.\d+)?)([kKmMgGtT])?\b/g;
   let m;
   while ((m = re.exec(String(str))) !== null) {
     const num = Number(m[1]);
@@ -4342,13 +4364,22 @@ export function doBuildResourceKeysConflict(keyA, keyB) {
   const a = extractBuildResourceKeyInfo(keyA);
   const b = extractBuildResourceKeyInfo(keyB);
   if (!a.path || !b.path) return false;
+  const isWinPath =
+    process.platform === "win32" ||
+    /^[a-zA-Z]:[\\/]/.test(a.path) ||
+    /^[a-zA-Z]:[\\/]/.test(b.path) ||
+    a.path.startsWith("\\\\") ||
+    b.path.startsWith("\\\\");
+  const normA = isWinPath ? a.path.replace(/\//g, "\\").toLowerCase() : a.path;
+  const normB = isWinPath ? b.path.replace(/\//g, "\\").toLowerCase() : b.path;
+  if (a.prefix === b.prefix && normA === normB) return true;
   if (a.prefix === "workspace" || b.prefix === "workspace") {
     return (
-      a.path === b.path ||
-      a.path.startsWith(`${b.path}/`) ||
-      a.path.startsWith(`${b.path}\\`) ||
-      b.path.startsWith(`${a.path}/`) ||
-      b.path.startsWith(`${a.path}\\`)
+      normA === normB ||
+      normA.startsWith(`${normB}/`) ||
+      normA.startsWith(`${normB}\\`) ||
+      normB.startsWith(`${normA}/`) ||
+      normB.startsWith(`${normA}\\`)
     );
   }
   return false;
