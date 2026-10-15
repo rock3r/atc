@@ -2383,6 +2383,44 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     assert.ok(bazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
     assert.equal(bazelrcReqs.disablesDaemon, true);
     assert.equal(bazelrcReqs.requestedHeapMb, 6144);
+
+    // env --chdir=DIR, -CDIR, -iCDIR (via util.parseArgs) resolve workspace, and unknown env flags fail closed
+    const envAttachedChdirReqs = resolveBuildResources(
+      "env",
+      ["--chdir=app", "./gradlew", "build"],
+      wsDir,
+    );
+    assert.ok(envAttachedChdirReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
+
+    const envShortAttachedChdirReqs = resolveBuildResources(
+      "env",
+      ["-Capp", "./gradlew", "build"],
+      wsDir,
+    );
+    assert.ok(envShortAttachedChdirReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
+
+    const envBundledChdirReqs = resolveBuildResources(
+      "env",
+      ["-iCapp", `PATH=${mockJdkBin}`, "./gradlew", "build"],
+      wsDir,
+    );
+    assert.ok(envBundledChdirReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
+    assert.equal(envBundledChdirReqs.envGradleUserHomeUnset, true);
+
+    const envUnknownFlagReqs = resolveBuildResources(
+      "env",
+      ["--split-string=./gradlew build"],
+      wsDir,
+    );
+    assert.equal(envUnknownFlagReqs.kind, "deny_lifecycle");
+
+    // Java .properties parser supports ':' separator and backslash line continuation in gradle.properties
+    fs.writeFileSync(
+      path.join(subAppDir, "gradle.properties"),
+      "! comment line\norg.gradle.jvmargs : -Xmx4g \\\n  -Dfile.encoding=UTF-8\n",
+    );
+    const contPropsReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
+    assert.equal(contPropsReqs.requestedHeapMb, 4096);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

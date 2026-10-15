@@ -3,6 +3,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  joinBackslashContinuations,
+  parseEnvWrapperArgs,
+  parseJavaProperties,
+  splitShellWords,
+} from "./parsers.mjs";
 
 export function canonicalizeBuildPath(targetPath) {
   const resolved = path.resolve(String(targetPath || "."));
@@ -1310,14 +1316,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       continue;
     }
     if (base === "env") {
-      let i = 0;
-      while (i < curArgs.length) {
-        const a = curArgs[i];
-        if (a === "--") {
-          i++;
-          break;
-        }
-        if (a === "-" || a === "-i" || a === "--ignore-environment") {
+      const parsedEnv = parseEnvWrapperArgs(curArgs);
+      if (parsedEnv.unknownOption) {
+        unresolvedDynamicCwd = true;
+        break;
+      }
+      for (const act of parsedEnv.actions) {
+        if (act.type === "ignore_env") {
           for (const k of Object.keys(envVars)) {
             delete envVars[k];
           }
@@ -1325,11 +1330,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           envVars.JAVA_HOME = null;
           envVars.PATH = null;
           envVars.GRADLE_USER_HOME = null;
-          i++;
-          continue;
-        }
-        if ((a === "-C" || a === "--chdir") && i + 1 < curArgs.length) {
-          const rawNextDir = curArgs[i + 1];
+          envVars.HOME = null;
+        } else if (act.type === "chdir") {
+          const rawNextDir = act.rawDir;
           const exp = inShell
             ? expandOrValidateShellPath(rawNextDir, baseEnv, {
                 taintedVars: incomingTaintedVars,
@@ -1347,45 +1350,23 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
             }
           }
-          i += 2;
-          continue;
-        }
-        if ((a === "-u" || a === "--unset") && i + 1 < curArgs.length) {
-          envVars[stripLiteralSentinels(curArgs[i + 1])] = null;
-          i += 2;
-          continue;
-        }
-        if (a.startsWith("--unset=") && a.length > "--unset=".length) {
-          envVars[stripLiteralSentinels(a.slice("--unset=".length))] = null;
-          i++;
-          continue;
-        }
-        if (a.startsWith("-")) {
-          i++;
-          continue;
-        }
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(stripLiteralSentinels(a))) {
-          const cleanAssign = stripLiteralSentinels(a);
-          const eqIdx = cleanAssign.indexOf("=");
-          const rawKey = cleanAssign.slice(0, eqIdx);
-          const rawVal = a.slice(a.indexOf("=") + 1);
+        } else if (act.type === "unset") {
+          envVars[act.key] = null;
+        } else if (act.type === "assign") {
           if (inShell) {
-            const expVal = expandOrValidateShellPath(rawVal, baseEnv, {
+            const expVal = expandOrValidateShellPath(act.rawVal, baseEnv, {
               taintedVars: incomingTaintedVars,
               shellType: incomingShellType,
             });
-            envVars[rawKey] = expVal.unresolved ? "__UNRESOLVED_DYNAMIC_ENV__" : expVal.resolved;
+            envVars[act.key] = expVal.unresolved ? "__UNRESOLVED_DYNAMIC_ENV__" : expVal.resolved;
           } else {
-            envVars[rawKey] = stripLiteralSentinels(rawVal);
+            envVars[act.key] = stripLiteralSentinels(act.rawVal);
           }
-          i++;
-          continue;
         }
-        break;
       }
-      if (i >= curArgs.length) break;
-      curCmd = curArgs[i];
-      curArgs = curArgs.slice(i + 1);
+      if (parsedEnv.cmdIndex >= curArgs.length) break;
+      curCmd = curArgs[parsedEnv.cmdIndex];
+      curArgs = curArgs.slice(parsedEnv.cmdIndex + 1);
       continue;
     }
     if (base === "builtin") {
@@ -3616,15 +3597,14 @@ export function resolveBuildResources(
     const effectiveHomeEnv =
       effectiveEnvVars.HOME === null || effectiveEnvVars.HOME === ""
         ? null
-        : effectiveEnvVars.HOME || baseEnv.HOME || null;
+        : effectiveEnvVars.HOME || baseEnv.HOME || os.homedir() || null;
     const resolvedGradleUserHome =
       cliGradleUserHome ||
       (effectiveGradleUserHomeEnv && effectiveGradleUserHomeEnv !== "__UNRESOLVED_DYNAMIC_ENV__"
         ? path.resolve(baseCwd, effectiveGradleUserHomeEnv)
         : !envGradleUserHomeUnset &&
             effectiveHomeEnv &&
-            effectiveHomeEnv !== "__UNRESOLVED_DYNAMIC_ENV__" &&
-            effectiveHomeEnv !== os.homedir()
+            effectiveHomeEnv !== "__UNRESOLVED_DYNAMIC_ENV__"
           ? path.join(path.resolve(baseCwd, effectiveHomeEnv), ".gradle")
           : null);
     let propsDaemonDisabled = false;
@@ -3636,18 +3616,13 @@ export function resolveBuildResources(
     for (const gradlePropsPath of gradlePropsFiles) {
       try {
         if (fs.existsSync(gradlePropsPath)) {
-          const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
-          for (const rawPropLine of propsContent.split(/\r?\n/)) {
-            const propLine = rawPropLine.trim();
-            if (!propLine || propLine.startsWith("#")) continue;
-            const daemonMatch = propLine.match(/^org\.gradle\.daemon\s*=\s*(.+)$/);
-            if (daemonMatch?.[1]) {
-              propsDaemonDisabled = daemonMatch[1].trim().toLowerCase() === "false";
-            }
-            const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
-            if (jvmMatch?.[1]) {
-              propsHeapMb = parseJvmHeapMb(jvmMatch[1]);
-            }
+          const propsMap = parseJavaProperties(fs.readFileSync(gradlePropsPath, "utf8"));
+          if (propsMap.has("org.gradle.daemon")) {
+            propsDaemonDisabled =
+              String(propsMap.get("org.gradle.daemon")).trim().toLowerCase() === "false";
+          }
+          if (propsMap.has("org.gradle.jvmargs")) {
+            propsHeapMb = parseJvmHeapMb(propsMap.get("org.gradle.jvmargs"));
           }
         }
       } catch {
@@ -3846,7 +3821,7 @@ export function resolveBuildResources(
           return;
         }
         const rcDir = path.dirname(resolvedRc);
-        for (const rawLine of content.split(/\r?\n/)) {
+        for (const rawLine of joinBackslashContinuations(content)) {
           const line = rawLine.trim();
           if (!line || line.startsWith("#")) continue;
           const importMatch = line.match(/^(import|try-import)\s+(.+)$/);
@@ -3865,7 +3840,7 @@ export function resolveBuildResources(
             if (startupMatch[1]) {
               hasCustomStartupOption = true;
             }
-            const tokens = splitJvmArgTokens(startupMatch[2]);
+            const tokens = splitShellWords(startupMatch[2]);
             applyStartupOptionTokens(tokens, canonicalRoot);
           }
         }
@@ -3877,12 +3852,11 @@ export function resolveBuildResources(
       const effectiveHomeForBazel =
         effectiveEnvVars.HOME === null || effectiveEnvVars.HOME === ""
           ? null
-          : effectiveEnvVars.HOME || baseEnv.HOME || null;
+          : effectiveEnvVars.HOME || baseEnv.HOME || os.homedir() || null;
       if (
         !noHomeRc &&
         effectiveHomeForBazel &&
-        effectiveHomeForBazel !== "__UNRESOLVED_DYNAMIC_ENV__" &&
-        effectiveHomeForBazel !== os.homedir()
+        effectiveHomeForBazel !== "__UNRESOLVED_DYNAMIC_ENV__"
       ) {
         parseBazelrcFile(path.join(path.resolve(baseCwd, effectiveHomeForBazel), ".bazelrc"), {
           required: false,
@@ -4716,12 +4690,11 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
             expectedGradleVersion = verMatch[1];
           }
         }
-        const userHomePropsDir =
-          expectedGradleUserHome ||
-          buildReqs.gradleUserHomeDir ||
-          (options.env?.HOME && options.env.HOME !== os.homedir()
-            ? path.join(options.env.HOME, ".gradle")
-            : null);
+        const userHomePropsDir = buildReqs.envGradleUserHomeUnset
+          ? null
+          : expectedGradleUserHome ||
+            buildReqs.gradleUserHomeDir ||
+            path.join(options.env?.HOME || os.homedir(), ".gradle");
         const gradlePropsFiles = [
           path.join(wsRoot, "gradle.properties"),
           ...(userHomePropsDir ? [path.join(userHomePropsDir, "gradle.properties")] : []),
@@ -4729,22 +4702,16 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
         let daemonDisabledInProps = false;
         for (const gradlePropsPath of gradlePropsFiles) {
           if (fs.existsSync(gradlePropsPath)) {
-            const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
-            for (const rawPropLine of propsContent.split(/\r?\n/)) {
-              const propLine = rawPropLine.trim();
-              if (!propLine || propLine.startsWith("#")) continue;
-              const daemonMatch = propLine.match(/^org\.gradle\.daemon\s*=\s*(.+)$/);
-              if (daemonMatch?.[1]) {
-                daemonDisabledInProps = daemonMatch[1].trim().toLowerCase() === "false";
-              }
-              const jhMatch = propLine.match(/^org\.gradle\.java\.home\s*=\s*(.+)$/);
-              if (jhMatch?.[1]) {
-                expectedGradleJavaHome = jhMatch[1].trim().replace(/\\:/g, ":");
-              }
-              const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
-              if (jvmMatch?.[1]) {
-                expectedGradleJvmArgs = splitJvmArgTokens(jvmMatch[1]);
-              }
+            const propsMap = parseJavaProperties(fs.readFileSync(gradlePropsPath, "utf8"));
+            if (propsMap.has("org.gradle.daemon")) {
+              daemonDisabledInProps =
+                String(propsMap.get("org.gradle.daemon")).trim().toLowerCase() === "false";
+            }
+            if (propsMap.has("org.gradle.java.home")) {
+              expectedGradleJavaHome = String(propsMap.get("org.gradle.java.home")).trim();
+            }
+            if (propsMap.has("org.gradle.jvmargs")) {
+              expectedGradleJvmArgs = splitShellWords(propsMap.get("org.gradle.jvmargs"));
             }
           }
         }
