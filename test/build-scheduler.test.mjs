@@ -1708,6 +1708,48 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.equal(exactWorkspaceProbe.warm, true);
     assert.deepEqual(exactWorkspaceProbe.daemonPids, [9002]);
+
+    // Trailing shell comments preserve comment text and insert injected flags before `#`
+    const commentGradleInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build # note; not a command"],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      commentGradleInv.args[1],
+      "./gradlew build -Dorg.gradle.workers.max=4 # note; not a command",
+    );
+
+    const commentXcodeInv = buildChildInvocation(
+      "sh",
+      ["-c", "xcodebuild test -scheme App # note"],
+      { serial: "SIM-UDID-123", leaseId: "lease_ios_1", platform: "ios", kind: "emulator" },
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      commentXcodeInv.args[1],
+      "xcodebuild test -scheme App -jobs 4 -destination id=SIM-UDID-123 # note",
+    );
+
+    // Heredoc bodies mentioning build commands are opaque and neither require a lease nor get rewritten
+    const heredocScript = "cat <<EOF\n./gradlew connectedCheck\nEOF";
+    const heredocReqs = resolveBuildResources("sh", ["-c", heredocScript], wsDir);
+    assert.equal(heredocReqs.kind, "not_build_tool");
+    assert.equal(heredocReqs.requiresDevice, false);
+    const heredocInv = buildChildInvocation(
+      "sh",
+      ["-c", heredocScript],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(heredocInv.args[1], heredocScript);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

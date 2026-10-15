@@ -6396,26 +6396,29 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         (state, { now, auditEvents }) => {
           const livenessCheck = options.livenessCheck || isPidAlive;
           const curBuild = state.buildLeases?.[txRes.buildLease.buildId];
-          if (!curBuild || curBuild.state !== "active") {
-            if (curBuild) {
-              delete state.buildLeases[txRes.buildLease.buildId];
-            }
-            return {
-              mutated: Boolean(curBuild),
-              value: { ok: false },
-            };
-          }
           const { lease: curDev } = findLeaseEntry(
             state,
             claimedLease.deviceKey,
             claimedLease.leaseId,
           );
-          if (curDev) {
-            addLeaseWorker(curDev, process.pid, livenessCheck);
-            curDev.loadedSnapshot = null;
-            curDev.renewedAtMs = now;
-            curDev.expiresAtMs = Math.max(curDev.expiresAtMs || 0, now + txRes.ttlMs);
+          const deviceGone = Boolean(
+            !curDev ||
+              curDev.state !== "active" ||
+              curDev.sessionId !== txRes.sessionId,
+          );
+          if (!curBuild || curBuild.state !== "active" || deviceGone) {
+            if (curBuild) {
+              delete state.buildLeases[txRes.buildLease.buildId];
+            }
+            return {
+              mutated: Boolean(curBuild),
+              value: { ok: false, deviceGone },
+            };
           }
+          addLeaseWorker(curDev, process.pid, livenessCheck);
+          curDev.loadedSnapshot = null;
+          curDev.renewedAtMs = now;
+          curDev.expiresAtMs = Math.max(curDev.expiresAtMs || 0, now + txRes.ttlMs);
           const reserveWindowMs = (state.config?.buildRamReservationWindowSec ?? 30) * 1000;
           curBuild.preparingDevice = false;
           curBuild.pinnedDeviceLeaseId = claimedLease.leaseId;
@@ -6449,7 +6452,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         options,
       );
       if (!postClaimTx?.ok) {
-        // Build reservation expired during cold device prep; re-enter admission loop now holding the claimed device lease
+        if (postClaimTx?.deviceGone) {
+          coAllocatedDeviceLease = null;
+          coAllocatedDeviceCreated = false;
+        }
+        // Build reservation or device lease was lost during cold device prep; re-enter admission loop
         continue;
       }
       check = {

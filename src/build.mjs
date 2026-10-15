@@ -141,6 +141,12 @@ export function tokenizeShellClauseWithSpans(clause) {
       }
       continue;
     }
+    if (!hasToken && ch === "#") {
+      while (i < s.length && s[i] !== "\n") {
+        i++;
+      }
+      continue;
+    }
     if (!hasToken) tokStart = i;
     cur += ch;
     hasToken = true;
@@ -161,6 +167,7 @@ function computeQuotedMask(s) {
   let inDouble = false;
   let inBacktick = false;
   const substStack = [];
+  const pendingHeredocs = [];
 
   const curCtx = () => (substStack.length > 0 ? substStack[substStack.length - 1] : null);
   const isSingle = () => (curCtx() ? curCtx().inSingle : inSingle);
@@ -239,6 +246,13 @@ function computeQuotedMask(s) {
       mask[i] = 1;
       const top = curCtx();
       if (top.type === "paren") {
+        if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+          while (i + 1 < s.length && s[i + 1] !== "\n") {
+            i++;
+            mask[i] = 1;
+          }
+          continue;
+        }
         if (ch === "(") substStack.push({ type: "paren", inSingle: false, inDouble: false });
         else if (ch === ")") substStack.pop();
       } else if (top.type === "brace") {
@@ -247,26 +261,163 @@ function computeQuotedMask(s) {
       }
       continue;
     }
+    if (ch === "\n" && pendingHeredocs.length > 0) {
+      mask[i] = 3;
+      let cursor = i + 1;
+      while (pendingHeredocs.length > 0 && cursor <= s.length) {
+        const { delim, stripTabs } = pendingHeredocs.shift();
+        while (cursor <= s.length) {
+          const nextNl = s.indexOf("\n", cursor);
+          const lineEnd = nextNl === -1 ? s.length : nextNl;
+          let lineText = s.slice(cursor, lineEnd);
+          if (lineText.endsWith("\r")) lineText = lineText.slice(0, -1);
+          const cmpText = stripTabs ? lineText.replace(/^\t+/, "") : lineText;
+          for (let k = cursor; k < lineEnd; k++) {
+            mask[k] = 3;
+          }
+          if (cmpText === delim) {
+            if (nextNl !== -1 && pendingHeredocs.length > 0) {
+              mask[nextNl] = 3;
+              cursor = nextNl + 1;
+            } else {
+              cursor = lineEnd;
+            }
+            break;
+          }
+          if (nextNl === -1) {
+            cursor = s.length;
+            break;
+          }
+          mask[nextNl] = 3;
+          cursor = nextNl + 1;
+        }
+      }
+      i = cursor - 1;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+      mask[i] = 2;
+      while (i + 1 < s.length && s[i + 1] !== "\n") {
+        i++;
+        mask[i] = 2;
+      }
+      continue;
+    }
+    if (ch === "<" && s[i + 1] === "<" && s[i + 2] !== "<") {
+      let k = i + 2;
+      const stripTabs = s[k] === "-";
+      if (stripTabs) k++;
+      while (k < s.length && (s[k] === " " || s[k] === "\t")) {
+        k++;
+      }
+      let delim = "";
+      const delimStart = k;
+      let dSingle = false;
+      let dDouble = false;
+      while (k < s.length) {
+        const c = s[k];
+        if (dSingle) {
+          mask[k] = 1;
+          if (c === "'") dSingle = false;
+          else delim += c;
+          k++;
+          continue;
+        }
+        if (dDouble) {
+          mask[k] = 1;
+          if (c === '"') {
+            dDouble = false;
+          } else if (
+            c === "\\" &&
+            k + 1 < s.length &&
+            (s[k + 1] === '"' || s[k + 1] === "\\" || s[k + 1] === "$" || s[k + 1] === "`")
+          ) {
+            mask[k + 1] = 1;
+            delim += s[k + 1];
+            k += 2;
+            continue;
+          } else {
+            delim += c;
+          }
+          k++;
+          continue;
+        }
+        if (c === "'") {
+          mask[k] = 1;
+          dSingle = true;
+          k++;
+          continue;
+        }
+        if (c === '"') {
+          mask[k] = 1;
+          dDouble = true;
+          k++;
+          continue;
+        }
+        if (c === "\\" && k + 1 < s.length && s[k + 1] !== "\n") {
+          mask[k] = 1;
+          mask[k + 1] = 1;
+          delim += s[k + 1];
+          k += 2;
+          continue;
+        }
+        if (/[\s;&|()<>]/.test(c)) {
+          break;
+        }
+        delim += c;
+        k++;
+      }
+      if (delim.length > 0 && k > delimStart) {
+        pendingHeredocs.push({ delim, stripTabs });
+        i = k - 1;
+        continue;
+      }
+    }
   }
   return mask;
 }
 
 export function splitShellClauseRedirAndGroup(part) {
   const s = String(part || "");
-  const trailingWs = s.match(/(\s*)$/)?.[1] || "";
-  let coreEnd = s.slice(0, s.length - trailingWs.length);
+  const fullMask = computeQuotedMask(s);
+  let wsPos = s.length;
+  while (wsPos > 0 && /\s/.test(s[wsPos - 1]) && fullMask[wsPos - 1] === 0) {
+    wsPos--;
+  }
+  const trailingWs = s.slice(wsPos);
+  let coreEnd = s.slice(0, wsPos);
   let suffix = "";
   let closedSubshells = 0;
+
+  const hdStart = fullMask.subarray(0, coreEnd.length).indexOf(3);
+  if (hdStart !== -1) {
+    suffix = coreEnd.slice(hdStart) + suffix;
+    coreEnd = coreEnd.slice(0, hdStart);
+  }
+
+  const commentStart = fullMask.subarray(0, coreEnd.length).indexOf(2);
+  if (commentStart !== -1) {
+    let wsBeforeComment = commentStart;
+    while (
+      wsBeforeComment > 0 &&
+      /\s/.test(coreEnd[wsBeforeComment - 1]) &&
+      fullMask[wsBeforeComment - 1] === 0
+    ) {
+      wsBeforeComment--;
+    }
+    suffix = coreEnd.slice(wsBeforeComment) + suffix;
+    coreEnd = coreEnd.slice(0, wsBeforeComment);
+  }
 
   while (coreEnd.length > 0) {
     const mask = computeQuotedMask(coreEnd);
     const rMatch = coreEnd.match(
-      /(\s+(?:[0-9]*>>?\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|\S+)|2>&1))$/,
+      /(\s+(?:[0-9]*>>?\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|\S+)|[0-9]*<<-?\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|\\\S+|\S+)|2>&1))$/,
     );
     if (rMatch) {
       const matchStart = coreEnd.length - rMatch[1].length;
-      const gtRel = rMatch[1].indexOf(">");
-      if (gtRel !== -1 && mask[matchStart + gtRel] === 0) {
+      const opRel = rMatch[1].search(/[<>]/);
+      if (opRel !== -1 && mask[matchStart + opRel] === 0) {
         suffix = rMatch[1] + suffix;
         coreEnd = coreEnd.slice(0, matchStart);
         continue;
@@ -377,7 +528,7 @@ export function splitShellScriptParts(script) {
 
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (mask[i] === 1) {
+    if (mask[i] !== 0) {
       cur += ch;
       continue;
     }
