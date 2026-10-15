@@ -1641,6 +1641,73 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       }),
     });
     assert.equal(warmProbe.warm, true);
+
+    const subAppDir = path.join(wsDir, "app");
+    fs.mkdirSync(subAppDir, { recursive: true });
+    fs.writeFileSync(path.join(subAppDir, "settings.gradle"), "rootProject.name = 'subapp'\n");
+    const canonicalSubApp = (fs.realpathSync.native || fs.realpathSync)(subAppDir);
+
+    // Conditional cd in a closed if block makes subsequent cwd ambiguous
+    const condIfAfterFi = resolveBuildResources(
+      "sh",
+      ["-c", "if false; then cd app; fi; ./gradlew build"],
+      wsDir,
+    );
+    assert.equal(condIfAfterFi.kind, "deny_lifecycle");
+    assert.match(condIfAfterFi.reason, /Unresolved dynamic directory change/);
+
+    // Conditional cd inside the same then branch resolves to that branch's directory
+    const condIfInsideThen = resolveBuildResources(
+      "sh",
+      ["-c", "if test -d app; then cd app && ./gradlew build; fi"],
+      wsDir,
+    );
+    assert.equal(condIfInsideThen.kind, "pure_build");
+    assert.deepEqual(condIfInsideThen.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    // Sibling else branch does not inherit then branch's cd
+    const condIfInElse = resolveBuildResources(
+      "sh",
+      ["-c", "if test -d app; then cd app; else ./gradlew build; fi"],
+      wsDir,
+    );
+    assert.equal(condIfInElse.kind, "pure_build");
+    assert.deepEqual(condIfInElse.resourceKeys, [`gradle:${canonicalWs}`]);
+
+    // Short-circuit && or || cd followed by `;` makes subsequent cwd ambiguous
+    const condAndThenSemi = resolveBuildResources(
+      "sh",
+      ["-c", "test -d app && cd app; ./gradlew build"],
+      wsDir,
+    );
+    assert.equal(condAndThenSemi.kind, "deny_lifecycle");
+    assert.match(condAndThenSemi.reason, /Unresolved dynamic directory change/);
+
+    const condOrCd = resolveBuildResources(
+      "sh",
+      ["-c", "test -d app || cd app && ./gradlew build"],
+      wsDir,
+    );
+    assert.equal(condOrCd.kind, "deny_lifecycle");
+    assert.match(condOrCd.reason, /Unresolved dynamic directory change/);
+
+    // Bazel warm daemon probe requires full workspace identity or output base (not basename-only bazel(app))
+    fs.writeFileSync(path.join(subAppDir, "MODULE.bazel"), 'module(name = "app")\n');
+    const bazelAppReqs = resolveBuildResources("bazel", ["build", "//..."], subAppDir);
+    const otherBasenameProbe = probeWarmBuildDaemons(bazelAppReqs, {
+      runner: () => ({
+        stdout: "9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=/other/work/app\n",
+      }),
+    });
+    assert.equal(otherBasenameProbe.warm, false);
+
+    const exactWorkspaceProbe = probeWarmBuildDaemons(bazelAppReqs, {
+      runner: () => ({
+        stdout: `9002 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(exactWorkspaceProbe.warm, true);
+    assert.deepEqual(exactWorkspaceProbe.daemonPids, [9002]);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

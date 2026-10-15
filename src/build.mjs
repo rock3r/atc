@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -304,19 +305,53 @@ export function splitShellClauseRedirAndGroup(part) {
 
   let leadingCore = coreEnd.trim();
   let openedSubshells = 0;
+  const leadingKeywords = [];
+  let hasCasePattern = false;
   while (leadingCore.length > 0) {
     if (/^[({]/.test(leadingCore)) {
       if (leadingCore.startsWith("(")) {
+        const leadMask = computeQuotedMask(leadingCore);
+        let closeParenBeforeWs = -1;
+        for (let i = 1; i < leadingCore.length; i++) {
+          if (leadMask[i] === 0 && /\s/.test(leadingCore[i])) break;
+          if (leadMask[i] === 0 && leadingCore[i] === ")") {
+            closeParenBeforeWs = i;
+            break;
+          }
+        }
+        if (closeParenBeforeWs > 1) {
+          hasCasePattern = true;
+          leadingCore = leadingCore.slice(closeParenBeforeWs + 1).trim();
+          continue;
+        }
         openedSubshells++;
       }
       leadingCore = leadingCore.slice(1).trim();
       continue;
     }
     const kwMatch = leadingCore.match(
-      /^(?:(?:then|else|do|if|elif|while|until|!)(?=\s|[({]|$)|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in(?=\s|[({]|$))/,
+      /^(?:(then|else|do|if|elif|while|until|fi|done|esac|!)(?=\s|[({]|$)|(for\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b[^;\n]*)?)(?=\s|[({]|$)|(case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in)(?=\s|[({]|$))/,
     );
     if (kwMatch) {
+      const kw = (kwMatch[1] || (kwMatch[2] ? "for" : "case")).toLowerCase();
+      if (kw !== "!") {
+        leadingKeywords.push(kw);
+      }
       leadingCore = leadingCore.slice(kwMatch[0].length).trim();
+      continue;
+    }
+    const leadMask = computeQuotedMask(leadingCore);
+    let closeParenIdx = -1;
+    for (let i = 0; i < leadingCore.length; i++) {
+      if (leadMask[i] === 0 && /\s/.test(leadingCore[i])) break;
+      if (leadMask[i] === 0 && leadingCore[i] === ")") {
+        closeParenIdx = i;
+        break;
+      }
+    }
+    if (closeParenIdx > 0) {
+      hasCasePattern = true;
+      leadingCore = leadingCore.slice(closeParenIdx + 1).trim();
       continue;
     }
     break;
@@ -329,6 +364,8 @@ export function splitShellClauseRedirAndGroup(part) {
     trailingWs,
     openedSubshells,
     closedSubshells,
+    leadingKeywords,
+    hasCasePattern,
   };
 }
 
@@ -695,11 +732,24 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         const script = rawScriptArg.trim();
         const rawParts = splitShellScriptParts(script);
         const clauses = [];
+        let pendingSepBefore = null;
         for (let pIdx = 0; pIdx < rawParts.length; pIdx += 2) {
           const text = rawParts[pIdx].trim();
           const sepAfter = pIdx + 1 < rawParts.length ? rawParts[pIdx + 1] : null;
           if (text) {
-            clauses.push({ text, backgrounded: sepAfter === "&" });
+            clauses.push({
+              text,
+              sepBefore: pendingSepBefore,
+              sepAfter,
+              backgrounded: sepAfter === "&",
+            });
+            pendingSepBefore = sepAfter;
+          } else if (sepAfter) {
+            if (pendingSepBefore === ";" && sepAfter === ";") {
+              pendingSepBefore = ";;";
+            } else {
+              pendingSepBefore = sepAfter;
+            }
           }
         }
         const matchedClauses = [];
@@ -708,17 +758,100 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let shellEnv = { ...baseEnv, ...envVars };
         let pushdStack = [];
         const cwdStack = [];
+        const controlStack = [];
+        let chainHasCondition = false;
+        let chainSawOrOrPipe = false;
+        let chainMutatedCwd = false;
+        let chainAnyCwdMutation = false;
+
+        const findTopControlFrame = (types = null) => {
+          for (let i = controlStack.length - 1; i >= 0; i--) {
+            const f = controlStack[i];
+            if (f.subshellDepth !== cwdStack.length) continue;
+            if (!types || types.includes(f.type)) return { frame: f, index: i };
+          }
+          return null;
+        };
+
+        const recordCwdMutation = ({ isAbsoluteTarget = false, hasCasePattern = false } = {}) => {
+          chainAnyCwdMutation = true;
+          if (chainHasCondition) {
+            chainMutatedCwd = true;
+          }
+          const inCaseBlock = Boolean(findTopControlFrame(["case"]));
+          if (
+            chainSawOrOrPipe ||
+            (hasCasePattern && !inCaseBlock)
+          ) {
+            curShellUnresolvedCwd = true;
+          }
+          for (const frame of controlStack) {
+            if (frame.subshellDepth === cwdStack.length) {
+              frame.mutatedCwd = true;
+              if (frame.phase === "cond") {
+                frame.condMutatedCwd = true;
+              }
+              if (frame.type === "loop" && !isAbsoluteTarget) {
+                curShellUnresolvedCwd = true;
+              }
+            }
+          }
+        };
+
         for (const clauseObj of clauses) {
+          const { sepBefore, sepAfter } = clauseObj;
+          if (
+            sepBefore === ";" ||
+            sepBefore === ";;" ||
+            sepBefore === "\n" ||
+            sepBefore === "&"
+          ) {
+            if (chainMutatedCwd) {
+              curShellUnresolvedCwd = true;
+            }
+            chainHasCondition = false;
+            chainSawOrOrPipe = false;
+            chainMutatedCwd = false;
+            chainAnyCwdMutation = false;
+            if (sepBefore === ";;") {
+              const topCase = findTopControlFrame(["case"])?.frame;
+              if (topCase) {
+                curShellRelCwd = topCase.entryCwd;
+                curShellUnresolvedCwd = topCase.entryUnresolvedCwd;
+                pushdStack = [...topCase.entryPushdStack];
+              }
+            }
+          } else if (sepBefore === "||" || sepBefore === "|") {
+            chainHasCondition = true;
+            chainSawOrOrPipe = true;
+            if (chainAnyCwdMutation) {
+              curShellUnresolvedCwd = true;
+            }
+          }
+
           const clause = clauseObj.text;
-          const { strippedClause, openedSubshells, closedSubshells } =
-            splitShellClauseRedirAndGroup(clause);
+          const {
+            strippedClause,
+            openedSubshells,
+            closedSubshells,
+            leadingKeywords,
+            hasCasePattern,
+          } = splitShellClauseRedirAndGroup(clause);
           for (let s = 0; s < openedSubshells; s++) {
             cwdStack.push({
               cwd: curShellRelCwd,
               unresolvedCwd: curShellUnresolvedCwd,
               shellEnv: { ...shellEnv },
               pushdStack: [...pushdStack],
+              chainHasCondition,
+              chainSawOrOrPipe,
+              chainMutatedCwd,
+              chainAnyCwdMutation,
             });
+            chainHasCondition = false;
+            chainSawOrOrPipe = false;
+            chainMutatedCwd = false;
+            chainAnyCwdMutation = false;
           }
           const popSubshells = () => {
             for (let s = 0; s < closedSubshells; s++) {
@@ -728,9 +861,154 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 curShellUnresolvedCwd = frame.unresolvedCwd;
                 shellEnv = frame.shellEnv;
                 pushdStack = frame.pushdStack;
+                chainHasCondition = frame.chainHasCondition;
+                chainSawOrOrPipe = frame.chainSawOrOrPipe;
+                chainMutatedCwd = frame.chainMutatedCwd;
+                chainAnyCwdMutation = frame.chainAnyCwdMutation;
+                while (
+                  controlStack.length > 0 &&
+                  controlStack[controlStack.length - 1].subshellDepth > cwdStack.length
+                ) {
+                  controlStack.pop();
+                }
               }
             }
           };
+
+          for (const kw of leadingKeywords || []) {
+            if (kw === "if") {
+              controlStack.push({
+                type: "if",
+                phase: "cond",
+                subshellDepth: cwdStack.length,
+                entryCwd: curShellRelCwd,
+                entryUnresolvedCwd: curShellUnresolvedCwd,
+                entryPushdStack: [...pushdStack],
+                condMutatedCwd: false,
+                mutatedCwd: false,
+              });
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "then") {
+              const found = findTopControlFrame(["if"]);
+              if (found) {
+                found.frame.phase = "then";
+              }
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "elif" || kw === "else") {
+              const found = findTopControlFrame(["if"]);
+              if (found) {
+                found.frame.phase = kw === "elif" ? "cond" : "else";
+                if (found.frame.condMutatedCwd) {
+                  curShellUnresolvedCwd = true;
+                } else {
+                  curShellRelCwd = found.frame.entryCwd;
+                  curShellUnresolvedCwd = found.frame.entryUnresolvedCwd;
+                  pushdStack = [...found.frame.entryPushdStack];
+                }
+              } else {
+                curShellUnresolvedCwd = true;
+              }
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "fi") {
+              const found = findTopControlFrame(["if"]);
+              if (found) {
+                controlStack.splice(found.index, 1);
+                if (found.frame.mutatedCwd) {
+                  curShellUnresolvedCwd = true;
+                } else {
+                  curShellRelCwd = found.frame.entryCwd;
+                  curShellUnresolvedCwd = found.frame.entryUnresolvedCwd;
+                  pushdStack = [...found.frame.entryPushdStack];
+                }
+              }
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "while" || kw === "until" || kw === "for") {
+              controlStack.push({
+                type: "loop",
+                phase: kw === "for" ? "body" : "cond",
+                subshellDepth: cwdStack.length,
+                entryCwd: curShellRelCwd,
+                entryUnresolvedCwd: curShellUnresolvedCwd,
+                entryPushdStack: [...pushdStack],
+                condMutatedCwd: false,
+                mutatedCwd: false,
+              });
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "do") {
+              const found = findTopControlFrame(["loop"]);
+              if (found) {
+                found.frame.phase = "body";
+              }
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "done") {
+              const found = findTopControlFrame(["loop"]);
+              if (found) {
+                controlStack.splice(found.index, 1);
+                if (found.frame.mutatedCwd) {
+                  curShellUnresolvedCwd = true;
+                }
+              }
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "case") {
+              controlStack.push({
+                type: "case",
+                phase: "arm",
+                subshellDepth: cwdStack.length,
+                entryCwd: curShellRelCwd,
+                entryUnresolvedCwd: curShellUnresolvedCwd,
+                entryPushdStack: [...pushdStack],
+                condMutatedCwd: false,
+                mutatedCwd: false,
+              });
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            } else if (kw === "esac") {
+              const found = findTopControlFrame(["case"]);
+              if (found) {
+                controlStack.splice(found.index, 1);
+                if (found.frame.mutatedCwd) {
+                  curShellUnresolvedCwd = true;
+                }
+              }
+              chainHasCondition = false;
+              chainSawOrOrPipe = false;
+              chainMutatedCwd = false;
+              chainAnyCwdMutation = false;
+            }
+          }
+
+          if (hasCasePattern) {
+            const topCase = findTopControlFrame(["case"])?.frame;
+            if (topCase) {
+              curShellRelCwd = topCase.entryCwd;
+              curShellUnresolvedCwd = topCase.entryUnresolvedCwd;
+              pushdStack = [...topCase.entryPushdStack];
+            }
+          }
+
           const rawTokens = tokenizeShellClause(strippedClause);
           if (rawTokens.length === 0) {
             popSubshells();
@@ -767,13 +1045,19 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             continue;
           }
           if (headTok === "popd") {
+            let isAbsPop = false;
             if (pushdStack.length > 0) {
               const popped = pushdStack.pop();
               curShellRelCwd = popped.cwd;
               curShellUnresolvedCwd = popped.unresolvedCwd;
+              isAbsPop = Boolean(popped.cwd && path.isAbsolute(popped.cwd) && !popped.unresolvedCwd);
             } else {
               curShellUnresolvedCwd = true;
             }
+            if (sepAfter === "|") {
+              curShellUnresolvedCwd = true;
+            }
+            recordCwdMutation({ isAbsoluteTarget: isAbsPop, hasCasePattern });
             popSubshells();
             continue;
           }
@@ -787,12 +1071,18 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               }
               dirIdx++;
             }
+            let isAbsTarget = false;
+            const prevCwdForOldPwd =
+              !curShellUnresolvedCwd && curShellRelCwd && path.isAbsolute(curShellRelCwd)
+                ? curShellRelCwd
+                : null;
             if (dirIdx >= rawTokens.length) {
               if (headTok === "cd") {
                 const home = shellEnv?.HOME || shellEnv?.USERPROFILE || os.homedir();
                 if (home) {
                   curShellRelCwd = home;
                   curShellUnresolvedCwd = false;
+                  isAbsTarget = path.isAbsolute(home);
                 } else {
                   curShellUnresolvedCwd = true;
                 }
@@ -802,9 +1092,10 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             } else {
               const targetDir = rawTokens[dirIdx];
               if (targetDir === "-") {
-                if (shellEnv?.OLDPWD) {
+                if (shellEnv?.OLDPWD && !curShellUnresolvedCwd) {
                   curShellRelCwd = shellEnv.OLDPWD;
                   curShellUnresolvedCwd = false;
+                  isAbsTarget = path.isAbsolute(shellEnv.OLDPWD);
                 } else {
                   curShellUnresolvedCwd = true;
                 }
@@ -823,6 +1114,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                   if (path.isAbsolute(resolvedDir)) {
                     curShellRelCwd = resolvedDir;
                     curShellUnresolvedCwd = false;
+                    isAbsTarget = true;
                   } else {
                     curShellRelCwd = curShellRelCwd
                       ? path.join(curShellRelCwd, resolvedDir)
@@ -831,9 +1123,19 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 }
               }
             }
+            if (prevCwdForOldPwd) {
+              shellEnv.OLDPWD = prevCwdForOldPwd;
+            } else {
+              delete shellEnv.OLDPWD;
+            }
+            if (sepAfter === "|") {
+              curShellUnresolvedCwd = true;
+            }
+            recordCwdMutation({ isAbsoluteTarget: isAbsTarget, hasCasePattern });
             popSubshells();
             continue;
           }
+          chainHasCondition = true;
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
             env: shellEnv,
             inShell: true,
@@ -2323,7 +2625,9 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     if (!stdout) return { warm: false, daemonPids: [] };
     const daemonPids = [];
     const wsRoot = String(buildReqs.workspaceRoot || "");
-    const wsBase = wsRoot ? path.basename(wsRoot) : "";
+    const defaultBazelOutMd5 = wsRoot
+      ? crypto.createHash("md5").update(wsRoot).digest("hex")
+      : null;
     let expectedGradleVersion = null;
     let expectedGradleJavaHome = buildReqs.envJavaHomeUnset
       ? null
@@ -2401,12 +2705,15 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           /com\.google\.devtools\.build\.lib\.bazel\.BazelMain\b/.test(cmdLine);
         if (isBazelServer) {
           const matchesOut = outKeys.some((outPath) => outPath && cmdLine.includes(outPath));
-          if (
-            matchesOut ||
-            !wsRoot ||
-            cmdLine.includes(wsRoot) ||
-            (wsBase && cmdLine.includes(`bazel(${wsBase})`))
-          ) {
+          const matchesWorkspace =
+            outKeys.length > 0
+              ? matchesOut
+              : Boolean(
+                  wsRoot &&
+                    (cmdLine.includes(wsRoot) ||
+                      (defaultBazelOutMd5 && cmdLine.includes(defaultBazelOutMd5))),
+                );
+          if (matchesWorkspace) {
             daemonPids.push(pid);
           }
         }
