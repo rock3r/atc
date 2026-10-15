@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveStateDir } from "./lock.mjs";
 
 const DEFAULT_MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
+const DEFAULT_MAX_LOG_FILES = 3;
 
 export function resolveSystemLogDir(env = process.env, platform = process.platform) {
   if (env?.ATC_LOG_DIR && String(env.ATC_LOG_DIR).trim()) {
@@ -63,6 +64,7 @@ export function flushAuditEvents(
     platform = process.platform,
     enabled = true,
     maxFileBytes = DEFAULT_MAX_LOG_BYTES,
+    maxFiles = DEFAULT_MAX_LOG_FILES,
   } = {},
 ) {
   if (!enabled || !Array.isArray(events) || events.length === 0) return;
@@ -76,8 +78,22 @@ export function flushAuditEvents(
     try {
       const st = fs.statSync(logPath);
       if (st.size >= maxFileBytes) {
+        const archiveCount = Math.max(1, Number(maxFiles || DEFAULT_MAX_LOG_FILES));
+        for (let idx = archiveCount - 1; idx >= 1; idx--) {
+          const srcArchive = path.join(logDir, `atc-audit.${idx}.jsonl`);
+          const dstArchive = path.join(logDir, `atc-audit.${idx + 1}.jsonl`);
+          if (fs.existsSync(srcArchive)) {
+            try {
+              fs.rmSync(dstArchive, { force: true });
+              fs.renameSync(srcArchive, dstArchive);
+            } catch {
+              // Best-effort archive shift
+            }
+          }
+        }
         const rotatedPath = path.join(logDir, "atc-audit.1.jsonl");
         try {
+          fs.rmSync(rotatedPath, { force: true });
           fs.renameSync(logPath, rotatedPath);
         } catch {
           // Best-effort rotation

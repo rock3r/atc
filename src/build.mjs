@@ -15,6 +15,7 @@ export function canonicalizeBuildPath(targetPath) {
 export function peelBuildWrapperTokens(cmd, args = []) {
   let curCmd = String(cmd || "");
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
+  let relCwd = null;
 
   for (let depth = 0; depth < 6; depth++) {
     const cleaned = curCmd.trim().replace(/^@+/, "");
@@ -26,6 +27,30 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       if (curArgs.length === 0) break;
       curCmd = curArgs[0];
       curArgs = curArgs.slice(1);
+      continue;
+    }
+    if (base === "xcrun") {
+      let i = 0;
+      let queryMode = false;
+      while (i < curArgs.length) {
+        const a = curArgs[i];
+        if (a === "-f" || a === "--find" || a === "--show-sdk-path" || a === "--show-sdk-version") {
+          queryMode = true;
+          break;
+        }
+        if ((a === "-sdk" || a === "--sdk" || a === "-toolchain" || a === "--toolchain") && i + 1 < curArgs.length) {
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      if (queryMode || i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      curArgs = curArgs.slice(i + 1);
       continue;
     }
     if (base === "nice") {
@@ -50,7 +75,12 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           i++;
           break;
         }
-        if ((a === "-u" || a === "--unset" || a === "-C" || a === "--chdir") && i + 1 < curArgs.length) {
+        if ((a === "-C" || a === "--chdir") && i + 1 < curArgs.length) {
+          relCwd = relCwd ? path.join(relCwd, curArgs[i + 1]) : curArgs[i + 1];
+          i += 2;
+          continue;
+        }
+        if ((a === "-u" || a === "--unset") && i + 1 < curArgs.length) {
           i += 2;
           continue;
         }
@@ -102,6 +132,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           .map((s) => s.trim())
           .filter(Boolean);
         const matchedClauses = [];
+        let curShellRelCwd = relCwd;
         for (const clause of clauses) {
           const rawTokens = clause
             .replace(/\s+[0-9]*>>?\s*\S+/g, "")
@@ -110,15 +141,38 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             .split(/\s+/)
             .filter(Boolean);
           if (rawTokens.length === 0) continue;
+          const headTok = rawTokens[0];
+          if ((headTok === "cd" || headTok === "pushd") && rawTokens.length >= 2) {
+            let dirIdx = 1;
+            while (dirIdx < rawTokens.length && rawTokens[dirIdx].startsWith("-")) {
+              dirIdx++;
+            }
+            if (dirIdx < rawTokens.length) {
+              const targetDir = rawTokens[dirIdx].replace(/^['"]|['"]$/g, "");
+              if (targetDir && targetDir !== "-") {
+                curShellRelCwd = curShellRelCwd ? path.join(curShellRelCwd, targetDir) : targetDir;
+              }
+            }
+            continue;
+          }
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           if (normalizeBuildToolName(peeled.cmd)) {
-            matchedClauses.push({ cmd: peeled.cmd, args: peeled.args });
+            const effectiveRelCwd =
+              peeled.relCwd && curShellRelCwd
+                ? path.join(curShellRelCwd, peeled.relCwd)
+                : peeled.relCwd || curShellRelCwd || null;
+            matchedClauses.push({
+              cmd: peeled.cmd,
+              args: peeled.args,
+              relCwd: effectiveRelCwd,
+            });
           }
         }
         if (matchedClauses.length > 0) {
           return {
             cmd: matchedClauses[0].cmd,
             args: matchedClauses[0].args,
+            relCwd: matchedClauses[0].relCwd || null,
             allBuildClauses: matchedClauses,
           };
         }
@@ -127,7 +181,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
     break;
   }
 
-  return { cmd: curCmd, args: curArgs, allBuildClauses: null };
+  return { cmd: curCmd, args: curArgs, relCwd, allBuildClauses: null };
 }
 
 export function normalizeBuildToolName(cmd) {
@@ -655,11 +709,13 @@ export function resolveBuildResources(
   cwd = process.cwd(),
   { forceBuild = false } = {},
 ) {
-  const { cmd, args, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const { cmd, args, relCwd, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const outerCwd = path.resolve(cwd || process.cwd());
   if (allBuildClauses && allBuildClauses.length > 1) {
-    const clauseRes = allBuildClauses.map((c) =>
-      resolveBuildResources(c.cmd, c.args, cwd, { forceBuild: false }),
-    );
+    const clauseRes = allBuildClauses.map((c) => {
+      const clauseCwd = c.relCwd ? path.resolve(outerCwd, c.relCwd) : outerCwd;
+      return resolveBuildResources(c.cmd, c.args, clauseCwd, { forceBuild: false });
+    });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
     if (deny) return deny;
     const reject = clauseRes.find((r) => r.kind === "reject_long_running");
@@ -686,7 +742,7 @@ export function resolveBuildResources(
     };
   }
   const classified = classifyBuildCommand(cmd, args);
-  const baseCwd = path.resolve(cwd || process.cwd());
+  const baseCwd = relCwd ? path.resolve(outerCwd, relCwd) : outerCwd;
   if (classified.kind === "not_build_tool") {
     if (forceBuild) {
       const canonicalRoot = canonicalizeBuildPath(baseCwd);

@@ -127,6 +127,32 @@ test("classifyBuildCommand & resolveBuildResources handle gradle, bazel, xcodebu
   assert.ok(shellMultiTool.resourceKeys.includes(`gradle:${canonicalizeBuildPath(wsDir)}`));
   assert.ok(shellMultiTool.resourceKeys.includes(`bazel:ws:${canonicalizeBuildPath(wsDir)}`));
 
+  const xcrunWrapped = resolveBuildResources(
+    "xcrun",
+    [
+      "xcodebuild",
+      "test",
+      "-scheme",
+      "App",
+      "-destination",
+      "platform=iOS Simulator,id=11111111-2222-3333-4444-555555555555",
+    ],
+    wsDir,
+  );
+  assert.equal(xcrunWrapped.kind, "device_coupled_build");
+  assert.equal(xcrunWrapped.tool, "xcodebuild");
+  assert.equal(xcrunWrapped.requiresWorkspaceLock, true);
+
+  const subRepoDir = path.join(tmp, "sub-repo");
+  fs.mkdirSync(subRepoDir, { recursive: true });
+  fs.writeFileSync(path.join(subRepoDir, "settings.gradle"), "rootProject.name = 'sub'\n");
+  const cdShellGradle = resolveBuildResources(
+    "sh",
+    ["-c", "cd sub-repo && ./gradlew assembleDebug"],
+    tmp,
+  );
+  assert.deepEqual(cdShellGradle.resourceKeys, [`gradle:${canonicalizeBuildPath(subRepoDir)}`]);
+
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -167,6 +193,17 @@ test("buildChildInvocation blocks daemon-killing commands and sanitizes ATC_BUIL
   assert.ok(bazelInv.args.some((a) => String(a).startsWith("--jobs=")));
   assert.ok(bazelInv.args.includes("--local_ram_resources=4096"));
   assert.equal(inv.env.ATC_BUILD_ID, "build_123");
+
+  const shInv = buildChildInvocation(
+    "sh",
+    ["-c", "./gradlew assembleDebug; bazel build //app:main"],
+    null,
+    "sess-1",
+    {},
+    { reservedRamMb: 4096 },
+  );
+  assert.match(shInv.args[1], /-Dorg\.gradle\.workers\.max=\d+/);
+  assert.match(shInv.args[1], /--jobs=\d+ --local_ram_resources=4096/);
 });
 
 test("evaluateCommandGuard respects coordinateBuilds toggle and always guards lifecycle & device-coupled builds", () => {
@@ -865,6 +902,19 @@ test("starved pure builds can use burst slots, default burst capacity is 1, low-
   const guardEventNames = guardEvents.map((e) => e.event);
   assert.ok(guardEventNames.includes("guard_deny"), "cmdGuard must emit guard_deny audit event");
   assert.ok(guardEventNames.includes("guard_rewrite"), "cmdGuard must emit guard_rewrite audit event");
+
+  // Verify bounded 3-file audit log rotation (.1 -> .2 -> .3)
+  const rotDir = path.join(stateDir, "rot-logs");
+  for (let i = 1; i <= 4; i++) {
+    flushAuditEvents(
+      [{ event: "build_admit", sessionId: `rot-${i}`, buildId: `b_${i}` }],
+      { env: { ATC_LOG_DIR: rotDir }, maxFileBytes: 10, maxFiles: 3 },
+    );
+  }
+  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.jsonl")));
+  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.1.jsonl")));
+  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.2.jsonl")));
+  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.3.jsonl")));
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 });

@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyBuildCommand } from "./build.mjs";
+import { classifyBuildCommand, peelBuildWrapperTokens } from "./build.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -795,7 +795,7 @@ export function buildChildInvocation(
     "powershell",
     "pwsh",
   ]).has(base);
-  if (buildClassified.requiresHeavySlot && !isShellWrapper) {
+  if (buildClassified.requiresHeavySlot) {
     const hostCpus = Math.max(1, os.cpus()?.length || 4);
     const maxConcurrent = Math.max(1, Number(buildLease?.maxConcurrentBuilds || 2));
     const jobsLimit = Math.max(
@@ -803,7 +803,54 @@ export function buildChildInvocation(
       Number(buildLease?.jobsLimit || Math.floor(hostCpus / maxConcurrent)),
     );
     const ramLimitMb = Math.max(1024, Number(buildLease?.reservedRamMb || 3072));
-    if (buildClassified.tool === "gradle") {
+    if (isShellWrapper) {
+      const cIdx = nextArgs.findIndex(
+        (a) => String(a) === "-c" || (/^-[A-Za-z]+$/.test(String(a)) && String(a).includes("c")),
+      );
+      if (cIdx !== -1 && cIdx + 1 < nextArgs.length) {
+        const rawScript = String(nextArgs[cIdx + 1] || "");
+        const parts = rawScript.split(/([;\n]|&&|\|\|)/);
+        const rewrittenParts = parts.map((part, idx) => {
+          if (idx % 2 === 1) return part;
+          const trimmed = part.trim();
+          if (!trimmed) return part;
+          const redirMatch = part.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1)(?:\s+(?:[0-9]*>>?\s*\S+|2>&1))*)\s*$/);
+          const redirSuffix = redirMatch ? redirMatch[1] : "";
+          const corePart = redirMatch ? part.slice(0, part.length - redirMatch[0].length) : part;
+          const rawTokens = corePart.trim().split(/\s+/).filter(Boolean);
+          if (rawTokens.length === 0) return part;
+          const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
+          const cClass = classifyBuildCommand(peeled.cmd, peeled.args);
+          if (!cClass.requiresHeavySlot) return part;
+          if (
+            cClass.tool === "gradle" &&
+            !/(-Dorg\.gradle\.workers\.max=|--max-workers\b)/.test(corePart)
+          ) {
+            return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}`;
+          }
+          if (cClass.tool === "bazel") {
+            const hasJobs = /(?:^|\s)--jobs(?:=|\s|$)/.test(corePart);
+            const hasRam = /(?:^|\s)--local_ram_resources(?:=|\s|$)/.test(corePart);
+            const injected = [];
+            if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
+            if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
+            if (injected.length > 0) {
+              const rewrittenCore = corePart.replace(
+                /\b(build|test|run|coverage)\b/,
+                (m) => `${m} ${injected.join(" ")}`,
+              );
+              return `${rewrittenCore}${redirSuffix}`;
+            }
+          }
+          if (cClass.tool === "xcodebuild" && !/(?:^|\s)-jobs(?:=|\s|$)/.test(corePart)) {
+            return `${corePart.trimEnd()} -jobs ${jobsLimit}${redirSuffix}`;
+          }
+          return part;
+        });
+        nextArgs = [...nextArgs];
+        nextArgs[cIdx + 1] = rewrittenParts.join("");
+      }
+    } else if (buildClassified.tool === "gradle") {
       const hasWorkersFlag = nextArgs.some((a) => {
         const s = String(a);
         return (
