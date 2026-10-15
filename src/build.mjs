@@ -8,6 +8,7 @@ import {
   joinBackslashContinuations,
   parseEnvWrapperArgs,
   parseJavaProperties,
+  parseScriptHeredocs,
   splitShellWords,
   stripOpaqueHeredocsForCheck,
 } from "./parsers.mjs";
@@ -133,6 +134,10 @@ export function tokenizeShellClauseWithSpans(clause, options = {}) {
     if (inDouble) {
       if (ch === '"') {
         inDouble = false;
+      } else if (ch === "\\" && s[i + 1] === "\n") {
+        i++;
+      } else if (ch === "\\" && s[i + 1] === "\r" && s[i + 2] === "\n") {
+        i += 2;
       } else if (
         ch === "\\" &&
         i + 1 < s.length &&
@@ -158,6 +163,14 @@ export function tokenizeShellClauseWithSpans(clause, options = {}) {
       if (!hasToken) tokStart = i;
       inDouble = true;
       hasToken = true;
+      continue;
+    }
+    if (ch === "\\" && s[i + 1] === "\n") {
+      i++;
+      continue;
+    }
+    if (ch === "\\" && s[i + 1] === "\r" && s[i + 2] === "\n") {
+      i += 2;
       continue;
     }
     if (ch === "\\" && i + 1 < s.length && /\s|['"\\$`~*?\[]/.test(s[i + 1])) {
@@ -197,7 +210,7 @@ export function tokenizeShellClause(clause, options = {}) {
   return tokenizeShellClauseWithSpans(clause, options).map((t) => t.value);
 }
 
-export function scanExecutableSubstitutions(text) {
+export function scanExecutableSubstitutions(text, { ignoreOuterSingleQuotes = false } = {}) {
   const s = String(text || "");
   const results = [];
   let inSingle = false;
@@ -211,7 +224,7 @@ export function scanExecutableSubstitutions(text) {
   const isDouble = () => (curCtx() ? curCtx().inDouble : inDouble);
   const setSingle = (v) => {
     if (curCtx()) curCtx().inSingle = v;
-    else inSingle = v;
+    else if (!ignoreOuterSingleQuotes) inSingle = v;
   };
   const setDouble = (v) => {
     if (curCtx()) curCtx().inDouble = v;
@@ -454,31 +467,43 @@ function computeQuotedMask(s) {
       mask[i] = 3;
       let cursor = i + 1;
       while (pendingHeredocs.length > 0 && cursor <= s.length) {
-        const { delim, stripTabs } = pendingHeredocs.shift();
+        const { delim, stripTabs, quoted } = pendingHeredocs.shift();
         while (cursor <= s.length) {
-          const nextNl = s.indexOf("\n", cursor);
-          const lineEnd = nextNl === -1 ? s.length : nextNl;
+          let lineEnd = s.indexOf("\n", cursor);
+          if (lineEnd === -1) lineEnd = s.length;
           let lineText = s.slice(cursor, lineEnd);
           if (lineText.endsWith("\r")) lineText = lineText.slice(0, -1);
+          if (!quoted) {
+            while (lineEnd < s.length && /(?<!\\)(?:\\\\)*\\$/.test(lineText)) {
+              lineText = lineText.slice(0, -1);
+              const nextStart = lineEnd + 1;
+              let nextEnd = s.indexOf("\n", nextStart);
+              if (nextEnd === -1) nextEnd = s.length;
+              let nextPart = s.slice(nextStart, nextEnd);
+              if (nextPart.endsWith("\r")) nextPart = nextPart.slice(0, -1);
+              lineText += nextPart;
+              lineEnd = nextEnd;
+            }
+          }
           const cmpText = stripTabs ? lineText.replace(/^\t+/, "") : lineText;
           for (let k = cursor; k < lineEnd; k++) {
             mask[k] = 3;
           }
           if (cmpText === delim) {
-            if (nextNl !== -1 && pendingHeredocs.length > 0) {
-              mask[nextNl] = 3;
-              cursor = nextNl + 1;
+            if (lineEnd < s.length && pendingHeredocs.length > 0) {
+              mask[lineEnd] = 3;
+              cursor = lineEnd + 1;
             } else {
               cursor = lineEnd;
             }
             break;
           }
-          if (nextNl === -1) {
+          if (lineEnd >= s.length) {
             cursor = s.length;
             break;
           }
-          mask[nextNl] = 3;
-          cursor = nextNl + 1;
+          mask[lineEnd] = 3;
+          cursor = lineEnd + 1;
         }
       }
       i = cursor - 1;
@@ -503,6 +528,7 @@ function computeQuotedMask(s) {
       const delimStart = k;
       let dSingle = false;
       let dDouble = false;
+      let quoted = false;
       while (k < s.length) {
         const c = s[k];
         if (dSingle) {
@@ -534,18 +560,34 @@ function computeQuotedMask(s) {
         if (c === "'") {
           mask[k] = 1;
           dSingle = true;
+          quoted = true;
           k++;
           continue;
         }
         if (c === '"') {
           mask[k] = 1;
           dDouble = true;
+          quoted = true;
           k++;
+          continue;
+        }
+        if (c === "\\" && s[k + 1] === "\n") {
+          mask[k] = 1;
+          mask[k + 1] = 1;
+          k += 2;
+          continue;
+        }
+        if (c === "\\" && s[k + 1] === "\r" && s[k + 2] === "\n") {
+          mask[k] = 1;
+          mask[k + 1] = 1;
+          mask[k + 2] = 1;
+          k += 3;
           continue;
         }
         if (c === "\\" && k + 1 < s.length && s[k + 1] !== "\n") {
           mask[k] = 1;
           mask[k + 1] = 1;
+          quoted = true;
           delim += s[k + 1];
           k += 2;
           continue;
@@ -557,7 +599,7 @@ function computeQuotedMask(s) {
         k++;
       }
       if (delim.length > 0 && k > delimStart) {
-        pendingHeredocs.push({ delim, stripTabs });
+        pendingHeredocs.push({ delim, stripTabs, quoted });
         i = k - 1;
         continue;
       }
@@ -1486,7 +1528,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let taintedEnvVars = new Set(incomingTaintedVars);
         let fnDefs = new Map(options?.fnDefs instanceof Map ? options.fnDefs : []);
         const activeFnCalls = new Set(options?.activeFnCalls instanceof Set ? options.activeFnCalls : []);
-        const candidateBuildToolEnv = {};
+        const candidateBuildToolEnv = { ...(options?.candidateBuildToolEnv || {}) };
         for (const [ek, ev] of Object.entries(shellEnv)) {
           if (typeof ev === "string" && normalizeBuildToolName(ev)) {
             candidateBuildToolEnv[ek] = ev;
@@ -1655,7 +1697,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           if (runOpts.inheritedCond) {
             outerChainConditional = true;
           }
-          const rawParts = splitShellScriptParts(String(scriptToRun || "").trim());
+          const trimmedScript = String(scriptToRun || "").trim();
+          const rawParts = splitShellScriptParts(trimmedScript);
+          const scriptHeredocs = parseScriptHeredocs(trimmedScript, rawParts);
           const clauses = [];
           let pendingSepBefore = null;
           for (let pIdx = 0; pIdx < rawParts.length; pIdx += 2) {
@@ -2032,7 +2076,16 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             popSubshells();
             continue;
           }
-          const subExecs = scanExecutableSubstitutions(strippedClause);
+          const subExecs = [...scanExecutableSubstitutions(strippedClause)];
+          for (const hd of scriptHeredocs) {
+            if (hd.opPartIdx === clauseObj.partIdx && !hd.quoted && hd.kind !== "shell") {
+              subExecs.push(
+                ...scanExecutableSubstitutions(hd.effectiveBodyText, {
+                  ignoreOuterSingleQuotes: true,
+                }),
+              );
+            }
+          }
           if (subExecs.length > 0) {
             const subBaseCwd = curShellRelCwd
               ? path.isAbsolute(curShellRelCwd)
@@ -2048,6 +2101,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 shellType,
                 fnDefs,
                 activeFnCalls,
+                candidateBuildToolEnv,
               });
               if (Array.isArray(subPeeled.allBuildClauses) && subPeeled.allBuildClauses.length > 0) {
                 for (const subC of subPeeled.allBuildClauses) {
@@ -2078,6 +2132,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                     unresolvedDynamicCwd: subUnresolvedCwd,
                   });
                 }
+              } else if (
+                subPeeled.unparseableShellReason ||
+                subPeeled.hasUnresolvedCmd ||
+                subPeeled.unresolvedDynamicCwd
+              ) {
+                hasUnresolvedCmd = true;
+                curShellUnresolvedCwd = true;
               }
             }
           }
@@ -2333,6 +2394,14 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             continue;
           }
           if (headLower === "source" || headTok === "." || headLower === "eval") {
+            const evalHeredocs = scriptHeredocs.filter(
+              (h) =>
+                h.kind === "shell" &&
+                (h.consumerPartIdx !== -1 ? h.consumerPartIdx : h.opPartIdx) === clauseObj.partIdx,
+            );
+            for (const hd of evalHeredocs) {
+              runShellScript(hd.effectiveBodyText, { inheritedCond: true });
+            }
             curShellUnresolvedCwd = true;
             recordCwdMutation({ isAbsoluteTarget: false, hasCasePattern, dirVerified: false });
             recordEnvMutation("*", {
@@ -2664,6 +2733,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             inShell: true,
             taintedVars: taintedEnvVars,
             shellType,
+            candidateBuildToolEnv,
           });
           if (Array.isArray(peeled.allBuildClauses) && peeled.allBuildClauses.length > 0) {
             for (const subC of peeled.allBuildClauses) {
@@ -2687,6 +2757,140 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 backgrounded: Boolean(clauseObj.backgrounded || peeled.backgrounded || subC.backgrounded),
                 unresolvedDynamicCwd: subUnresolvedCwd,
               });
+            }
+            popSubshells();
+            continue;
+          }
+          const shellClauseHeredocs = scriptHeredocs.filter(
+            (h) =>
+              h.kind === "shell" &&
+              (h.consumerPartIdx !== -1 ? h.consumerPartIdx : h.opPartIdx) === clauseObj.partIdx,
+          );
+          if (shellClauseHeredocs.length > 0) {
+            const hdShellCmd = stripLiteralSentinels(peeled.cmd || "");
+            const hdShellBase = (hdShellCmd.split(/[\\/]/).pop() || "")
+              .toLowerCase()
+              .replace(/\.(?:exe|cmd|bat|com|sh)$/i, "");
+            const effectiveHdShell = [
+              "sh",
+              "bash",
+              "zsh",
+              "dash",
+              "ksh",
+              "cmd",
+              "powershell",
+              "pwsh",
+            ].includes(hdShellBase)
+              ? hdShellBase
+              : base;
+            const hdEnv = { ...shellEnv, ...(peeled.envVars || {}) };
+            const hdTainted = new Set(taintedEnvVars);
+            for (const k of Object.keys(peeled.envVars || {})) {
+              hdTainted.delete(k);
+            }
+            const pArgs = Array.isArray(peeled.args) ? peeled.args : [];
+            let posStart = -1;
+            for (let ai = 0; ai < pArgs.length; ai++) {
+              const cleanA = stripLiteralSentinels(pArgs[ai]);
+              if (cleanA === "--") {
+                posStart = ai + 1;
+                break;
+              }
+              if (cleanA === "-s") {
+                posStart = ai + 1;
+                if (posStart < pArgs.length && stripLiteralSentinels(pArgs[posStart]) === "--") {
+                  posStart++;
+                }
+                break;
+              }
+            }
+            if (posStart !== -1) {
+              const posList = pArgs.slice(posStart);
+              for (let pi = 1; pi <= 9; pi++) {
+                const pk = String(pi);
+                if (pi - 1 < posList.length) {
+                  const expPos = expandInShell(posList[pi - 1], hdEnv);
+                  if (expPos.unresolved) {
+                    hdTainted.add(pk);
+                  } else {
+                    hdEnv[pk] = expPos.resolved;
+                    hdTainted.delete(pk);
+                  }
+                } else {
+                  delete hdEnv[pk];
+                  hdTainted.delete(pk);
+                }
+              }
+            }
+            const hdCwd = peeled.relCwd
+              ? path.isAbsolute(peeled.relCwd)
+                ? peeled.relCwd
+                : path.resolve(clauseBaseCwd, peeled.relCwd)
+              : clauseBaseCwd;
+            const hdRelPrefix = peeled.relCwd
+              ? path.isAbsolute(peeled.relCwd)
+                ? peeled.relCwd
+                : curShellRelCwd
+                  ? path.join(curShellRelCwd, peeled.relCwd)
+                  : peeled.relCwd
+              : curShellRelCwd || null;
+            for (const hd of shellClauseHeredocs) {
+              const hdPeeled = peelBuildWrapperTokens(
+                effectiveHdShell,
+                ["-c", hd.effectiveBodyText],
+                {
+                  env: hdEnv,
+                  cwd: hdCwd,
+                  inShell: true,
+                  taintedVars: hdTainted,
+                  shellType,
+                  fnDefs,
+                  activeFnCalls,
+                  candidateBuildToolEnv,
+                },
+              );
+              if (Array.isArray(hdPeeled.allBuildClauses) && hdPeeled.allBuildClauses.length > 0) {
+                for (const subC of hdPeeled.allBuildClauses) {
+                  const subUnresolvedCwd = Boolean(
+                    subC.unresolvedDynamicCwd ||
+                      hdPeeled.unresolvedDynamicCwd ||
+                      peeled.unresolvedDynamicCwd ||
+                      (curShellUnresolvedCwd && !(subC.relCwd && path.isAbsolute(subC.relCwd))),
+                  );
+                  const subEffectiveRelCwd = subC.relCwd
+                    ? path.isAbsolute(subC.relCwd)
+                      ? subC.relCwd
+                      : hdRelPrefix
+                        ? path.join(hdRelPrefix, subC.relCwd)
+                        : subC.relCwd
+                    : hdRelPrefix;
+                  matchedClauses.push({
+                    cmd: subC.cmd,
+                    args: subC.args,
+                    relCwd: subEffectiveRelCwd,
+                    envVars: {
+                      ...curShellEnvVars,
+                      ...(peeled.envVars || {}),
+                      ...(hdPeeled.envVars || {}),
+                      ...(subC.envVars || {}),
+                    },
+                    backgrounded: Boolean(
+                      clauseObj.backgrounded ||
+                        peeled.backgrounded ||
+                        hdPeeled.backgrounded ||
+                        subC.backgrounded,
+                    ),
+                    unresolvedDynamicCwd: subUnresolvedCwd,
+                  });
+                }
+              } else if (
+                hdPeeled.unparseableShellReason ||
+                hdPeeled.hasUnresolvedCmd ||
+                hdPeeled.unresolvedDynamicCwd
+              ) {
+                hasUnresolvedCmd = true;
+                curShellUnresolvedCwd = true;
+              }
             }
             popSubshells();
             continue;
@@ -3112,7 +3316,11 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
           'Direct "gradle --stop" is disabled under ATC because it terminates shared Gradle daemons across all active worktrees.',
       };
     }
-    if (strArgs.includes("--continuous") || strArgs.includes("-t")) {
+    if (
+      strArgs.includes("--continuous") ||
+      strArgs.includes("-t") ||
+      strArgs.includes("--foreground")
+    ) {
       return {
         kind: "reject_long_running",
         tool: "gradle",
@@ -3120,8 +3328,9 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         requiresDevice: false,
         requiresHeavySlot: true,
         requiresWorkspaceLock: true,
-        reason:
-          'Long-running "gradle --continuous" (-t) cannot hold a coordinated build slot indefinitely; run bounded build tasks instead.',
+        reason: strArgs.includes("--foreground")
+          ? 'Long-running "gradle --foreground" cannot hold a coordinated build slot indefinitely; run bounded build tasks instead.'
+          : 'Long-running "gradle --continuous" (-t) cannot hold a coordinated build slot indefinitely; run bounded build tasks instead.',
       };
     }
 
@@ -4541,22 +4750,117 @@ export function resolveBuildResources(
 
 function parseJvmHeapMb(str) {
   if (!str) return 0;
-  let maxMb = 0;
-  const re = /-(?:Xmx|Xms|XX:(?:Max|Initial|Min)HeapSize=)(\d+(?:\.\d+)?)([kKmMgGtT])?\b/g;
+  let lastMaxHeapMb = 0;
+  let lastInitHeapMb = 0;
+  const re = /-(Xmx|Xms|XX:(?:Max|Initial|Min)HeapSize=)(\d+(?:\.\d+)?)([kKmMgGtT])?\b/g;
   let m;
   while ((m = re.exec(String(str))) !== null) {
-    const num = Number(m[1]);
+    const kind = m[1];
+    const num = Number(m[2]);
     if (!Number.isFinite(num) || num <= 0) continue;
-    const unit = (m[2] || "").toLowerCase();
+    const unit = (m[3] || "").toLowerCase();
     let mb = 0;
     if (unit === "t") mb = Math.ceil(num * 1024 * 1024);
     else if (unit === "g") mb = Math.ceil(num * 1024);
     else if (unit === "m") mb = Math.ceil(num);
     else if (unit === "k") mb = Math.ceil(num / 1024);
     else mb = Math.ceil(num / (1024 * 1024));
-    if (mb > maxMb) maxMb = mb;
+    if (kind === "Xmx" || kind === "XX:MaxHeapSize=") {
+      lastMaxHeapMb = mb;
+    } else {
+      lastInitHeapMb = mb;
+    }
   }
-  return maxMb;
+  return Math.max(lastMaxHeapMb, lastInitHeapMb);
+}
+
+function parseJvmSizeBytes(rawVal) {
+  const m = String(rawVal || "")
+    .trim()
+    .match(/^(\d+(?:\.\d+)?)([kKmMgGtT])?$/);
+  if (!m) return null;
+  const num = Number(m[1]);
+  if (!Number.isFinite(num) || num < 0) return null;
+  const unit = (m[2] || "").toLowerCase();
+  if (unit === "t") return Math.round(num * 1024 * 1024 * 1024 * 1024);
+  if (unit === "g") return Math.round(num * 1024 * 1024 * 1024);
+  if (unit === "m") return Math.round(num * 1024 * 1024);
+  if (unit === "k") return Math.round(num * 1024);
+  return Math.round(num);
+}
+
+function normalizeGradleCompatJvmArgs(args) {
+  const keyed = new Map();
+  const positional = [];
+  for (const rawTok of args || []) {
+    const tok = String(rawTok || "").trim();
+    if (!tok) continue;
+    if (tok.startsWith("-Xmx") || tok.startsWith("-XX:MaxHeapSize=")) {
+      const val = tok.startsWith("-Xmx") ? tok.slice(4) : tok.slice("-XX:MaxHeapSize=".length);
+      const bytes = parseJvmSizeBytes(val);
+      keyed.set("max_heap", bytes !== null ? `bytes:${bytes}` : `raw:${val}`);
+    } else if (
+      tok.startsWith("-Xms") ||
+      tok.startsWith("-XX:InitialHeapSize=") ||
+      tok.startsWith("-XX:MinHeapSize=")
+    ) {
+      const val = tok.startsWith("-Xms") ? tok.slice(4) : tok.slice(tok.indexOf("=") + 1);
+      const bytes = parseJvmSizeBytes(val);
+      keyed.set("min_heap", bytes !== null ? `bytes:${bytes}` : `raw:${val}`);
+    } else if (tok.startsWith("-Xss") || tok.startsWith("-XX:ThreadStackSize=")) {
+      const val = tok.startsWith("-Xss")
+        ? tok.slice(4)
+        : tok.slice("-XX:ThreadStackSize=".length);
+      const bytes = parseJvmSizeBytes(val);
+      keyed.set("stack_size", bytes !== null ? `bytes:${bytes}` : `raw:${val}`);
+    } else if (tok.startsWith("-XX:+") || tok.startsWith("-XX:-")) {
+      const sign = tok[4];
+      const flagName = tok.slice(5);
+      keyed.set(`xx:${flagName}`, sign === "+" ? "true" : "false");
+    } else if (tok.startsWith("-XX:") && tok.includes("=")) {
+      const eqIdx = tok.indexOf("=");
+      const optName = tok.slice(4, eqIdx);
+      const val = tok.slice(eqIdx + 1);
+      const bytes = /Size$/i.test(optName) ? parseJvmSizeBytes(val) : null;
+      keyed.set(`xx:${optName}`, bytes !== null ? `bytes:${bytes}` : `raw:${val}`);
+    } else if (tok.startsWith("-D")) {
+      const eqIdx = tok.indexOf("=");
+      const propKey = eqIdx >= 0 ? tok.slice(2, eqIdx) : tok.slice(2);
+      const propVal = eqIdx >= 0 ? tok.slice(eqIdx + 1) : "true";
+      keyed.set(`prop:${propKey}`, propVal);
+    } else if (tok === "-ea" || tok === "-enableassertions") {
+      keyed.set("assert:user", "true");
+    } else if (tok === "-da" || tok === "-disableassertions") {
+      keyed.set("assert:user", "false");
+    } else if (tok.startsWith("-ea:") || tok.startsWith("-enableassertions:")) {
+      const target = tok.slice(tok.indexOf(":") + 1);
+      keyed.set(`assert:pkg:${target}`, "true");
+    } else if (tok.startsWith("-da:") || tok.startsWith("-disableassertions:")) {
+      const target = tok.slice(tok.indexOf(":") + 1);
+      keyed.set(`assert:pkg:${target}`, "false");
+    } else if (tok === "-esa" || tok === "-enablesystemassertions") {
+      keyed.set("assert:sys", "true");
+    } else if (tok === "-dsa" || tok === "-disablesystemassertions") {
+      keyed.set("assert:sys", "false");
+    } else {
+      positional.push(tok);
+    }
+  }
+  return { keyed, positional };
+}
+
+function gradleCompatJvmArgsEqual(expectedArgs, daemonArgs) {
+  const exp = normalizeGradleCompatJvmArgs(expectedArgs);
+  const dmn = normalizeGradleCompatJvmArgs(daemonArgs);
+  if (exp.keyed.size !== dmn.keyed.size) return false;
+  for (const [k, v] of exp.keyed.entries()) {
+    if (!dmn.keyed.has(k) || dmn.keyed.get(k) !== v) return false;
+  }
+  if (exp.positional.length !== dmn.positional.length) return false;
+  for (let i = 0; i < exp.positional.length; i++) {
+    if (exp.positional[i] !== dmn.positional[i]) return false;
+  }
+  return true;
 }
 
 function splitJvmArgTokens(rawStr) {
@@ -5694,6 +5998,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const expectedCompatJvmArgs = expectedGradleJvmArgs.filter(
             (arg) => !arg.startsWith("-Dgradle.user.home=") && !arg.startsWith("-Duser.dir="),
           );
+          const expectedCompatNorm = normalizeGradleCompatJvmArgs(expectedCompatJvmArgs);
           const daemonMainIdx = cmdLine.search(
             /\b(?:org\.gradle\.launcher\.daemon\.bootstrap\.)?GradleDaemon\b/,
           );
@@ -5705,18 +6010,16 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
               (tok) =>
                 (isGradleCompatibilityJvmArg(tok) &&
                   (tok !== "-XX:+HeapDumpOnOutOfMemoryError" ||
-                    expectedCompatJvmArgs.includes("-XX:+HeapDumpOnOutOfMemoryError"))) ||
+                    expectedCompatNorm.keyed.has("xx:HeapDumpOnOutOfMemoryError"))) ||
                 expectedCompatJvmArgs.includes(tok),
             );
           const jvmArgsMatch = hasExplicitGradleJvmArgs
-            ? expectedCompatJvmArgs.every((arg) => daemonCompatJvmArgs.includes(arg)) &&
-              daemonCompatJvmArgs.every((arg) => expectedCompatJvmArgs.includes(arg))
+            ? gradleCompatJvmArgsEqual(expectedCompatJvmArgs, daemonCompatJvmArgs)
             : daemonCompatJvmArgs.length === 0 ||
-              (daemonCompatJvmArgs.includes("-Xmx512m") &&
-                daemonCompatJvmArgs.includes("-XX:MaxMetaspaceSize=384m") &&
-                daemonCompatJvmArgs.every(
-                  (arg) => arg === "-Xmx512m" || arg === "-XX:MaxMetaspaceSize=384m",
-                ));
+              gradleCompatJvmArgsEqual(
+                ["-Xmx512m", "-XX:MaxMetaspaceSize=384m"],
+                daemonCompatJvmArgs,
+              );
           if (!jvmArgsMatch) {
             continue;
           }

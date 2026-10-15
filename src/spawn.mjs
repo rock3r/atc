@@ -17,7 +17,7 @@ import {
   splitShellScriptParts,
   tokenizeShellClause,
 } from "./build.mjs";
-import { detectUnparseableShellConstructs } from "./parsers.mjs";
+import { detectUnparseableShellConstructs, parseScriptHeredocs } from "./parsers.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -967,6 +967,7 @@ export function buildChildInvocation(
           };
 
           const parts = splitShellScriptParts(scriptText);
+          const scriptHeredocs = parseScriptHeredocs(scriptText, parts);
           const rewrittenParts = [...parts];
           for (let idx = 0; idx < parts.length; idx += 2) {
             const rawPart = parts[idx];
@@ -1225,7 +1226,28 @@ export function buildChildInvocation(
               resetChainState();
             }
 
-            const subs = scanExecutableSubstitutions(part);
+            const partHeredocs = scriptHeredocs.filter((h) => h.bodyPartIdx === idx);
+            const firstHdRelStart =
+              partHeredocs.length > 0
+                ? Math.min(...partHeredocs.map((h) => h.relBodyStart))
+                : part.length;
+            const nonHeredocPrefix = part.slice(0, firstHdRelStart);
+            const subs = [...scanExecutableSubstitutions(nonHeredocPrefix)];
+            for (const hd of partHeredocs) {
+              if (!hd.quoted && hd.kind !== "shell") {
+                for (const sub of scanExecutableSubstitutions(hd.bodyText, {
+                  ignoreOuterSingleQuotes: true,
+                })) {
+                  subs.push({
+                    ...sub,
+                    openStart: hd.relBodyStart + sub.openStart,
+                    bodyStart: hd.relBodyStart + sub.bodyStart,
+                    bodyEnd: hd.relBodyStart + sub.bodyEnd,
+                    closeEnd: hd.relBodyStart + sub.closeEnd,
+                  });
+                }
+              }
+            }
             if (subs.length > 0) {
               let subChanged = false;
               for (let si = subs.length - 1; si >= 0; si--) {
@@ -1443,6 +1465,37 @@ export function buildChildInvocation(
               continue;
             }
             if (headLower === "source" || headTok === "." || headLower === "eval") {
+              const evalHeredocs = scriptHeredocs
+                .filter(
+                  (h) =>
+                    h.kind === "shell" &&
+                    (h.consumerPartIdx !== -1 ? h.consumerPartIdx : h.opPartIdx) === idx,
+                )
+                .sort((a, b) => b.bodyStart - a.bodyStart);
+              for (const hd of evalHeredocs) {
+                const { text: rewrittenHdBody } = rewriteShellScriptInternal(
+                  hd.bodyText,
+                  curShellEnv,
+                  taintedEnvVars,
+                  fnDefs,
+                  activeFnCalls,
+                  outerCond || chainHasCondition,
+                );
+                if (rewrittenHdBody !== hd.bodyText && hd.bodyPartIdx !== -1) {
+                  if (hd.bodyPartIdx === idx) {
+                    part = `${part.slice(0, hd.relBodyStart)}${rewrittenHdBody}${part.slice(hd.relBodyEnd)}`;
+                  } else if (hd.bodyPartIdx > idx) {
+                    const targetP = parts[hd.bodyPartIdx];
+                    parts[hd.bodyPartIdx] = `${targetP.slice(0, hd.relBodyStart)}${rewrittenHdBody}${targetP.slice(hd.relBodyEnd)}`;
+                  } else {
+                    const targetP = rewrittenParts[hd.bodyPartIdx];
+                    const pos = targetP.lastIndexOf(hd.bodyText);
+                    if (pos !== -1) {
+                      rewrittenParts[hd.bodyPartIdx] = `${targetP.slice(0, pos)}${rewrittenHdBody}${targetP.slice(pos + hd.bodyText.length)}`;
+                    }
+                  }
+                }
+              }
               recordEnvMutation("*", {
                 isUnresolvedVal: true,
                 sepAfter,
@@ -1610,6 +1663,84 @@ export function buildChildInvocation(
             if (peeled.denySubkind === "unparseable_shell" && peeled.denyReason) {
               throw new Error(peeled.denyReason);
             }
+            const shellClauseHeredocs = scriptHeredocs
+              .filter(
+                (h) =>
+                  h.kind === "shell" &&
+                  (h.consumerPartIdx !== -1 ? h.consumerPartIdx : h.opPartIdx) === idx,
+              )
+              .sort((a, b) => b.bodyStart - a.bodyStart);
+            if (shellClauseHeredocs.length > 0) {
+              const hdEnv = { ...curShellEnv, ...(peeled.envVars || {}) };
+              const hdTainted = new Set(taintedEnvVars);
+              for (const k of Object.keys(peeled.envVars || {})) {
+                hdTainted.delete(k);
+              }
+              const pArgs = Array.isArray(peeled.args) ? peeled.args : [];
+              let posStart = -1;
+              for (let ai = 0; ai < pArgs.length; ai++) {
+                const cleanA = stripSentinels(pArgs[ai]);
+                if (cleanA === "--") {
+                  posStart = ai + 1;
+                  break;
+                }
+                if (cleanA === "-s") {
+                  posStart = ai + 1;
+                  if (posStart < pArgs.length && stripSentinels(pArgs[posStart]) === "--") {
+                    posStart++;
+                  }
+                  break;
+                }
+              }
+              if (posStart !== -1) {
+                const posList = pArgs.slice(posStart);
+                for (let pi = 1; pi <= 9; pi++) {
+                  const pk = String(pi);
+                  if (pi - 1 < posList.length) {
+                    const expPos = expandOrValidateShellPath(posList[pi - 1], hdEnv, {
+                      taintedVars: hdTainted,
+                      shellType,
+                    });
+                    if (expPos.unresolved) {
+                      hdTainted.add(pk);
+                    } else {
+                      hdEnv[pk] = expPos.resolved;
+                      hdTainted.delete(pk);
+                    }
+                  } else {
+                    delete hdEnv[pk];
+                    hdTainted.delete(pk);
+                  }
+                }
+              }
+              for (const hd of shellClauseHeredocs) {
+                const { text: rewrittenHdBody } = rewriteShellScriptInternal(
+                  hd.bodyText,
+                  hdEnv,
+                  hdTainted,
+                  fnDefs,
+                  activeFnCalls,
+                  outerCond || chainHasCondition,
+                );
+                if (rewrittenHdBody !== hd.bodyText && hd.bodyPartIdx !== -1) {
+                  if (hd.bodyPartIdx === idx) {
+                    part = `${part.slice(0, hd.relBodyStart)}${rewrittenHdBody}${part.slice(hd.relBodyEnd)}`;
+                  } else if (hd.bodyPartIdx > idx) {
+                    const targetP = parts[hd.bodyPartIdx];
+                    parts[hd.bodyPartIdx] = `${targetP.slice(0, hd.relBodyStart)}${rewrittenHdBody}${targetP.slice(hd.relBodyEnd)}`;
+                  } else {
+                    const targetP = rewrittenParts[hd.bodyPartIdx];
+                    const pos = targetP.lastIndexOf(hd.bodyText);
+                    if (pos !== -1) {
+                      rewrittenParts[hd.bodyPartIdx] = `${targetP.slice(0, pos)}${rewrittenHdBody}${targetP.slice(pos + hd.bodyText.length)}`;
+                    }
+                  }
+                }
+              }
+              popSubshells();
+              rewrittenParts[idx] = part;
+              continue;
+            }
             const expanded = expandShellBuildClausePaths(
               peeled.cmd,
               peeled.args,
@@ -1618,6 +1749,9 @@ export function buildChildInvocation(
             );
             const cArgs = expanded.args;
             const cClass = classifyBuildCommand(expanded.cmd, cArgs);
+            if (cClass.kind === "deny_lifecycle") {
+              throw new Error(cClass.reason);
+            }
             if (cClass.tool === "xcodebuild" && (cClass.requiresHeavySlot || cClass.requiresDevice)) {
               const explicitDestinations = [];
               for (let i = 0; i < cArgs.length; i++) {

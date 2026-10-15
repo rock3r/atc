@@ -5266,10 +5266,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   if (buildReqs.kind === "deny_lifecycle") {
     return { exitCode: 3, error: buildReqs.reason };
   }
-  if (
-    buildReqs.kind === "reject_long_running" &&
-    (isBuildFlag || isClaimFlag || Boolean(explicitPhase) || buildReqs.backgrounded)
-  ) {
+  if (buildReqs.kind === "reject_long_running") {
     return { exitCode: 3, error: buildReqs.reason };
   }
 
@@ -7976,10 +7973,7 @@ export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {})
         error: `Batch pre-flight failed on step "${id}": ${preflightBuildReqs.reason}`,
       };
     }
-    if (
-      preflightBuildReqs.kind === "reject_long_running" &&
-      (isStepBuild || isStepClaim || Boolean(stepPhase) || preflightBuildReqs.backgrounded)
-    ) {
+    if (preflightBuildReqs.kind === "reject_long_running") {
       return {
         exitCode: 3,
         error: `Batch pre-flight failed on step "${id}": ${preflightBuildReqs.reason}`,

@@ -354,54 +354,783 @@ export function parseEnvWrapperArgs(curArgs = []) {
   return { actions, cmdIndex, unknownOption };
 }
 
-export function stripOpaqueHeredocsForCheck(script) {
-  if (!script || !script.includes("<<")) return script;
-  const lines = String(script).split(/\r?\n/);
-  const out = [];
-  let activeDelim = null;
-  let stripTabs = false;
-  for (const line of lines) {
-    if (activeDelim !== null) {
-      const candidate = stripTabs ? line.replace(/^\t+/, "") : line;
-      if (candidate === activeDelim) {
-        activeDelim = null;
-        stripTabs = false;
-      }
+const SHELL_INTERPRETER_HEREDOC_BASES = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "ash",
+  "csh",
+  "tcsh",
+  "fish",
+  "cmd",
+  "powershell",
+  "pwsh",
+  "eval",
+  "source",
+  ".",
+]);
+
+const HEREDOC_TRANSPARENT_WRAPPERS = new Set([
+  "env",
+  "nice",
+  "nohup",
+  "time",
+  "timeout",
+  "stdbuf",
+  "command",
+  "builtin",
+  "exec",
+  "chrt",
+  "ionice",
+  "taskset",
+  "setsid",
+  "caffeinate",
+  "arch",
+]);
+
+const HEREDOC_WRAPPER_VALUE_FLAGS = new Set([
+  "-u",
+  "--unset",
+  "-C",
+  "--chdir",
+  "-S",
+  "--split-string",
+  "-n",
+  "--adjustment",
+  "-k",
+  "--kill-after",
+  "-s",
+  "--signal",
+  "-i",
+  "-o",
+  "-e",
+  "--input",
+  "--output",
+  "--error",
+  "-a",
+]);
+
+function extractHeredocCmdBase(token) {
+  const cleaned = stripSentinels(String(token || ""))
+    .trim()
+    .replace(/^['"]+|['"]+$/g, "")
+    .replace(/^@+/, "");
+  if (!cleaned) return "";
+  return (cleaned.split(/[\\/]/).pop() || "")
+    .toLowerCase()
+    .replace(/\.(?:exe|cmd|bat|com|sh)$/i, "");
+}
+
+function splitHeaderLineClauses(lineStr, lineOffset = 0) {
+  const clauses = [];
+  let clauseStart = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  let parenDepth = 0;
+  for (let i = 0; i < lineStr.length; i++) {
+    const ch = lineStr[i];
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
       continue;
     }
-    out.push(line);
-    let q = null;
-    for (let i = 0; i < line.length - 1; i++) {
-      const ch = line[i];
-      if (q === "'") {
-        if (ch === "'") q = null;
+    if (inBacktick) {
+      if (ch === "\\" && i + 1 < lineStr.length) {
+        i++;
         continue;
       }
-      if (q === '"') {
-        if (ch === "\\" && i + 1 < line.length) {
-          i++;
-          continue;
-        }
-        if (ch === '"') q = null;
+      if (ch === "`") inBacktick = false;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < lineStr.length) {
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(lineStr[i - 1]))) {
+      break;
+    }
+    if (ch === "(") {
+      parenDepth++;
+      continue;
+    }
+    if (ch === ")" && parenDepth > 0) {
+      parenDepth--;
+      continue;
+    }
+    if (parenDepth === 0) {
+      if ((ch === "&" && lineStr[i + 1] === "&") || (ch === "|" && lineStr[i + 1] === "|")) {
+        clauses.push({
+          start: lineOffset + clauseStart,
+          end: lineOffset + i,
+          sepAfter: `${ch}${lineStr[i + 1]}`,
+        });
+        i++;
+        clauseStart = i + 1;
         continue;
       }
-      if (ch === "'" || ch === '"') {
-        q = ch;
+      if (ch === "|") {
+        const sep = lineStr[i + 1] === "&" ? "|&" : "|";
+        clauses.push({
+          start: lineOffset + clauseStart,
+          end: lineOffset + i,
+          sepAfter: sep,
+        });
+        if (sep === "|&") i++;
+        clauseStart = i + 1;
         continue;
       }
-      if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) break;
-      if (ch === "<" && line[i + 1] === "<" && line[i + 2] !== "<") {
-        const rest = line.slice(i + 2);
-        const m = rest.match(/^(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z0-9_.-]+))/);
-        if (m) {
-          stripTabs = m[1] === "-";
-          activeDelim = m[2] || m[3] || m[4] || null;
-          break;
-        }
+      if (ch === ";") {
+        const sep = lineStr[i + 1] === ";" ? ";;" : ";";
+        clauses.push({
+          start: lineOffset + clauseStart,
+          end: lineOffset + i,
+          sepAfter: sep,
+        });
+        if (sep === ";;") i++;
+        clauseStart = i + 1;
+        continue;
+      }
+      if (
+        ch === "&" &&
+        lineStr[i + 1] !== ">" &&
+        (i === 0 || (lineStr[i - 1] !== ">" && lineStr[i - 1] !== "<"))
+      ) {
+        clauses.push({
+          start: lineOffset + clauseStart,
+          end: lineOffset + i,
+          sepAfter: "&",
+        });
+        clauseStart = i + 1;
+        continue;
       }
     }
   }
-  return out.join("\n");
+  clauses.push({
+    start: lineOffset + clauseStart,
+    end: lineOffset + lineStr.length,
+    sepAfter: null,
+  });
+  return clauses;
+}
+
+function inspectHeredocClauseCommand(rawClauseText) {
+  const hasProcessOrCmdSub = /(?:^|[^\\])(?:[<>]\(|\$\(|`)/.test(rawClauseText);
+  const writesFile = /(?:^|[^<>])>(?!&)/.test(rawClauseText);
+  let cleaned = String(rawClauseText || "")
+    .replace(/(?:[0-9]*>>?\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|\S+)|2>&1)/g, " ")
+    .trimStart();
+  const ctrlRe = /^(?:(?:if|then|else|elif|while|until|do|!)\b|[({;]\s*)+/;
+  while (ctrlRe.test(cleaned)) {
+    cleaned = cleaned.replace(ctrlRe, "").trimStart();
+  }
+  const words = splitShellWords(cleaned);
+  let idx = 0;
+  while (idx < words.length) {
+    const w = words[idx];
+    if (/^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(w)) {
+      idx++;
+      continue;
+    }
+    const base = extractHeredocCmdBase(w);
+    if (HEREDOC_TRANSPARENT_WRAPPERS.has(base)) {
+      idx++;
+      while (idx < words.length) {
+        const arg = words[idx];
+        if (arg === "--") {
+          idx++;
+          break;
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) {
+          idx++;
+          continue;
+        }
+        if (arg.startsWith("-")) {
+          if ( (base === "command" || base === "builtin") && /[vV]/.test(arg) ) {
+            break;
+          }
+          idx++;
+          if (HEREDOC_WRAPPER_VALUE_FLAGS.has(arg) && idx < words.length) {
+            idx++;
+          }
+          continue;
+        }
+        break;
+      }
+      if (base === "timeout" && idx < words.length && /^\d+(?:\.\d+)?[smhd]?$/i.test(words[idx])) {
+        idx++;
+      }
+      continue;
+    }
+    break;
+  }
+  const cmdTok = words[idx] || "";
+  const base = extractHeredocCmdBase(cmdTok);
+  const args = words.slice(idx + 1);
+  let isShellReadingStdin = false;
+  if (SHELL_INTERPRETER_HEREDOC_BASES.has(base)) {
+    if (base === "eval" || base === "source" || base === ".") {
+      isShellReadingStdin = true;
+    } else {
+      const hasInlineC = args.some((a) => {
+        if (base === "cmd") return /^\/[ck]$/i.test(a);
+        if (base === "powershell" || base === "pwsh") return /^-(?:c|command)$/i.test(a);
+        return a === "-c" || (/^-[A-Za-z]+$/.test(a) && a.includes("c") && !a.includes("s"));
+      });
+      isShellReadingStdin = !hasInlineC;
+    }
+  }
+  return {
+    base,
+    cmdTok,
+    args,
+    isShellReadingStdin,
+    writesFile: writesFile || base === "tee",
+    hasProcessOrCmdSub,
+  };
+}
+
+function extractCommandSubstitutionsFromUnquotedHeredoc(bodyText) {
+  const s = String(bodyText || "");
+  const out = [];
+  let inBacktick = false;
+  let topSub = null;
+  const stack = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const top = stack.length > 0 ? stack[stack.length - 1] : null;
+    if (top?.inSingle) {
+      if (ch === "'") top.inSingle = false;
+      continue;
+    }
+    if (inBacktick) {
+      if (ch === "\\" && i + 1 < s.length) {
+        i++;
+        continue;
+      }
+      if (ch === "`") {
+        inBacktick = false;
+        if (topSub && topSub.kind === "backtick" && stack.length === 0) {
+          out.push(s.slice(topSub.openStart, i + 1));
+          topSub = null;
+        }
+      }
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      if (!topSub && stack.length === 0) {
+        topSub = { openStart: i, kind: "backtick" };
+      }
+      continue;
+    }
+    if (ch === "$" && i + 1 < s.length && (s[i + 1] === "(" || s[i + 1] === "{")) {
+      if (s[i + 1] === "(" && s[i + 2] === "(") {
+        stack.push({ type: "arith", inSingle: false, inDouble: false });
+        stack.push({ type: "paren", inSingle: false, inDouble: false });
+        i += 2;
+        continue;
+      }
+      const isCmdSub = s[i + 1] === "(";
+      if (isCmdSub && !topSub) {
+        topSub = { openStart: i, kind: "paren", stackDepth: stack.length + 1 };
+      }
+      stack.push({ type: isCmdSub ? "paren" : "brace", inSingle: false, inDouble: false });
+      i++;
+      continue;
+    }
+    if (top) {
+      if (top.inDouble) {
+        if (ch === '"') top.inDouble = false;
+        continue;
+      }
+      if (ch === "'") {
+        top.inSingle = true;
+        continue;
+      }
+      if (ch === '"') {
+        top.inDouble = true;
+        continue;
+      }
+      if (top.type === "paren" || top.type === "arith") {
+        if (ch === "(") {
+          stack.push({ type: "paren", inSingle: false, inDouble: false });
+        } else if (ch === ")") {
+          stack.pop();
+          if (topSub && topSub.kind === "paren" && stack.length < topSub.stackDepth) {
+            out.push(s.slice(topSub.openStart, i + 1));
+            topSub = null;
+          }
+        }
+      } else if (top.type === "brace") {
+        if (ch === "{") stack.push({ type: "brace", inSingle: false, inDouble: false });
+        else if (ch === "}") stack.pop();
+      }
+    }
+  }
+  return out;
+}
+
+export function parseScriptHeredocs(script, rawParts = null) {
+  const s = String(script || "");
+  if (!s.includes("<<")) return [];
+
+  const heredocs = [];
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  const substStack = [];
+  const pendingHeredocs = [];
+  let currentLineStart = 0;
+
+  const curCtx = () => (substStack.length > 0 ? substStack[substStack.length - 1] : null);
+  const isSingle = () => (curCtx() ? curCtx().inSingle : inSingle);
+  const isDouble = () => (curCtx() ? curCtx().inDouble : inDouble);
+  const setSingle = (v) => {
+    if (curCtx()) curCtx().inSingle = v;
+    else inSingle = v;
+  };
+  const setDouble = (v) => {
+    if (curCtx()) curCtx().inDouble = v;
+    else inDouble = v;
+  };
+
+  const resolvePendingAtNewline = (nlIdx) => {
+    const headerLineEnd = nlIdx > 0 && s[nlIdx - 1] === "\r" ? nlIdx - 1 : nlIdx;
+    let cursor = nlIdx + 1;
+    const lineHeredocs = [];
+    while (pendingHeredocs.length > 0) {
+      const phd = pendingHeredocs.shift();
+      const bodyStart = cursor;
+      let bodyEnd = s.length;
+      let heredocEnd = s.length;
+      let unterminated = true;
+      while (cursor <= s.length) {
+        const lineStart = cursor;
+        let lineEnd = s.indexOf("\n", lineStart);
+        if (lineEnd === -1) lineEnd = s.length;
+        let lineText = s.slice(lineStart, lineEnd);
+        if (lineText.endsWith("\r")) lineText = lineText.slice(0, -1);
+        if (!phd.quoted) {
+          while (lineEnd < s.length && /(?<!\\)(?:\\\\)*\\$/.test(lineText)) {
+            lineText = lineText.slice(0, -1);
+            const nextStart = lineEnd + 1;
+            let nextEnd = s.indexOf("\n", nextStart);
+            if (nextEnd === -1) nextEnd = s.length;
+            let nextPart = s.slice(nextStart, nextEnd);
+            if (nextPart.endsWith("\r")) nextPart = nextPart.slice(0, -1);
+            lineText += nextPart;
+            lineEnd = nextEnd;
+          }
+        }
+        const cmpText = phd.stripTabs ? lineText.replace(/^\t+/, "") : lineText;
+        if (cmpText === phd.delim) {
+          bodyEnd = lineStart;
+          heredocEnd = lineEnd;
+          unterminated = false;
+          if (lineEnd < s.length && pendingHeredocs.length > 0) {
+            cursor = lineEnd + 1;
+          } else {
+            cursor = lineEnd;
+          }
+          break;
+        }
+        if (lineEnd >= s.length) {
+          cursor = s.length;
+          break;
+        }
+        cursor = lineEnd + 1;
+      }
+      const bodyText = s.slice(bodyStart, bodyEnd);
+      let effectiveBodyText = bodyText;
+      if (phd.stripTabs) {
+        effectiveBodyText = effectiveBodyText.replace(/^(?:\t+)|(?<=\n)\t+/g, "");
+      }
+      if (!phd.quoted) {
+        effectiveBodyText = effectiveBodyText.replace(/(?<!\\)((?:\\\\)*)\\\r?\n/g, "$1");
+      }
+      const entry = {
+        ...phd,
+        headerLineEnd,
+        bodyStart,
+        bodyEnd,
+        heredocEnd,
+        unterminated,
+        bodyText,
+        effectiveBodyText,
+        kind: "other_executable",
+        opPartIdx: -1,
+        bodyPartIdx: -1,
+        consumerPartIdx: -1,
+        relBodyStart: -1,
+        relBodyEnd: -1,
+      };
+      lineHeredocs.push(entry);
+      heredocs.push(entry);
+    }
+    return cursor;
+  };
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (isSingle()) {
+      if (ch === "'") setSingle(false);
+      continue;
+    }
+    if (inBacktick) {
+      if (ch === "\\" && i + 1 < s.length) {
+        i++;
+        continue;
+      }
+      if (ch === "`") inBacktick = false;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      inBacktick = true;
+      continue;
+    }
+    if (ch === "$" && i + 1 < s.length && (s[i + 1] === "(" || s[i + 1] === "{")) {
+      substStack.push({
+        type: s[i + 1] === "(" ? "paren" : "brace",
+        inSingle: false,
+        inDouble: false,
+      });
+      i++;
+      continue;
+    }
+    if (!isDouble() && (ch === "<" || ch === ">") && i + 1 < s.length && s[i + 1] === "(") {
+      substStack.push({ type: "paren", inSingle: false, inDouble: false });
+      i++;
+      continue;
+    }
+    if (isDouble()) {
+      if (ch === '"') setDouble(false);
+      continue;
+    }
+    if (ch === "'") {
+      setSingle(true);
+      continue;
+    }
+    if (ch === '"') {
+      setDouble(true);
+      continue;
+    }
+    if (substStack.length > 0) {
+      const top = curCtx();
+      if (top.type === "paren") {
+        if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+          while (i + 1 < s.length && s[i + 1] !== "\n") i++;
+          continue;
+        }
+        if (ch === "(") substStack.push({ type: "paren", inSingle: false, inDouble: false });
+        else if (ch === ")") substStack.pop();
+      } else if (top.type === "brace") {
+        if (ch === "{") substStack.push({ type: "brace", inSingle: false, inDouble: false });
+        else if (ch === "}") substStack.pop();
+      }
+      continue;
+    }
+    if (ch === "\n") {
+      if (pendingHeredocs.length > 0) {
+        const nextCursor = resolvePendingAtNewline(i);
+        currentLineStart = nextCursor < s.length && s[nextCursor] === "\n" ? nextCursor + 1 : nextCursor;
+        i = nextCursor - 1;
+      } else {
+        currentLineStart = i + 1;
+      }
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /[\s;&|()]/.test(s[i - 1]))) {
+      while (i + 1 < s.length && s[i + 1] !== "\n") i++;
+      continue;
+    }
+    if (ch === "<" && s[i + 1] === "<" && s[i + 2] !== "<") {
+      const opStart =
+        i > 0 && /[0-9]/.test(s[i - 1]) && (i === 1 || /[\s;&|()]/.test(s[i - 2])) ? i - 1 : i;
+      let k = i + 2;
+      const stripTabs = s[k] === "-";
+      if (stripTabs) k++;
+      while (k < s.length && (s[k] === " " || s[k] === "\t")) k++;
+      let delim = "";
+      const delimStart = k;
+      let quoted = false;
+      while (k < s.length && !/[\s;&|()<>]/.test(s[k])) {
+        if (s[k] === "$" && s[k + 1] === "'") {
+          quoted = true;
+          k += 2;
+          while (k < s.length && s[k] !== "'") {
+            if (s[k] === "\\" && k + 1 < s.length) {
+              delim += s[k + 1];
+              k += 2;
+            } else {
+              delim += s[k++];
+            }
+          }
+          if (k < s.length) k++;
+        } else if (s[k] === "'") {
+          quoted = true;
+          k++;
+          while (k < s.length && s[k] !== "'") delim += s[k++];
+          if (k < s.length) k++;
+        } else if (s[k] === '"' || (s[k] === "$" && s[k + 1] === '"')) {
+          quoted = true;
+          if (s[k] === "$") k++;
+          k++;
+          while (k < s.length && s[k] !== '"') {
+            if (s[k] === "\\" && s[k + 1] === "\n") {
+              k += 2;
+            } else if (s[k] === "\\" && s[k + 1] === "\r" && s[k + 2] === "\n") {
+              k += 3;
+            } else if (s[k] === "\\" && k + 1 < s.length && /["\\$`]/.test(s[k + 1])) {
+              delim += s[k + 1];
+              k += 2;
+            } else {
+              delim += s[k++];
+            }
+          }
+          if (k < s.length) k++;
+        } else if (s[k] === "\\" && s[k + 1] === "\n") {
+          k += 2;
+        } else if (s[k] === "\\" && s[k + 1] === "\r" && s[k + 2] === "\n") {
+          k += 3;
+        } else if (s[k] === "\\" && k + 1 < s.length) {
+          quoted = true;
+          delim += s[k + 1];
+          k += 2;
+        } else {
+          delim += s[k++];
+        }
+      }
+      if (delim.length > 0 && k > delimStart) {
+        pendingHeredocs.push({
+          opStart,
+          opEnd: k,
+          delim,
+          stripTabs,
+          quoted,
+          lineStart: currentLineStart,
+        });
+        i = k - 1;
+      }
+    }
+  }
+
+  while (pendingHeredocs.length > 0) {
+    const phd = pendingHeredocs.shift();
+    heredocs.push({
+      ...phd,
+      headerLineEnd: s.length,
+      bodyStart: s.length,
+      bodyEnd: s.length,
+      heredocEnd: s.length,
+      unterminated: true,
+      bodyText: "",
+      effectiveBodyText: "",
+      kind: "other_executable",
+      opPartIdx: -1,
+      bodyPartIdx: -1,
+      consumerPartIdx: -1,
+      relBodyStart: -1,
+      relBodyEnd: -1,
+    });
+  }
+
+  let partRanges = null;
+  if (Array.isArray(rawParts)) {
+    partRanges = [];
+    let offset = 0;
+    for (let p = 0; p < rawParts.length; p++) {
+      const len = String(rawParts[p] || "").length;
+      partRanges.push({ start: offset, end: offset + len });
+      offset += len;
+    }
+  }
+
+  const findEvenPartAtOffset = (charOffset) => {
+    if (!partRanges) return -1;
+    for (let p = 0; p < partRanges.length; p += 2) {
+      if (charOffset >= partRanges[p].start && charOffset <= partRanges[p].end) {
+        return p;
+      }
+    }
+    return -1;
+  };
+
+  for (const hd of heredocs) {
+    if (partRanges) {
+      for (let p = 0; p < partRanges.length; p += 2) {
+        if (hd.opStart >= partRanges[p].start && hd.opStart < partRanges[p].end) {
+          hd.opPartIdx = p;
+        }
+        if (hd.bodyStart >= partRanges[p].start && hd.bodyEnd <= partRanges[p].end) {
+          hd.bodyPartIdx = p;
+          hd.relBodyStart = hd.bodyStart - partRanges[p].start;
+          hd.relBodyEnd = hd.bodyEnd - partRanges[p].start;
+        }
+      }
+    }
+
+    const headerLine = s.slice(hd.lineStart, hd.headerLineEnd);
+    const clauses = splitHeaderLineClauses(headerLine, hd.lineStart);
+    const cIdx = clauses.findIndex((c) => hd.opStart >= c.start && hd.opStart <= c.end);
+    if (cIdx === -1) continue;
+    const clause = clauses[cIdx];
+
+    const sameClauseHds = heredocs.filter(
+      (h) => h.lineStart === hd.lineStart && h.opStart >= clause.start && h.opEnd <= clause.end,
+    );
+    let clauseWithoutHeredocs = "";
+    let curPos = clause.start;
+    for (const shd of sameClauseHds) {
+      clauseWithoutHeredocs += `${s.slice(curPos, shd.opStart)} `;
+      curPos = shd.opEnd;
+    }
+    clauseWithoutHeredocs += s.slice(curPos, clause.end);
+
+    const clauseInfo = inspectHeredocClauseCommand(clauseWithoutHeredocs);
+    if (clauseInfo.isShellReadingStdin) {
+      hd.kind = "shell";
+      hd.consumerPartIdx = hd.opPartIdx;
+      continue;
+    }
+
+    if (clauseInfo.base === "cat" || clauseInfo.base === "tee") {
+      if (clause.sepAfter === "|" || clause.sepAfter === "|&") {
+        let stageIdx = cIdx + 1;
+        let matchedShellConsumerOffset = -1;
+        while (stageIdx < clauses.length) {
+          const stClause = clauses[stageIdx];
+          const stText = s.slice(stClause.start, stClause.end).trim();
+          if (!stText && stageIdx === clauses.length - 1) {
+            const afterHd = s.slice(hd.heredocEnd);
+            const nextStageMatch = afterHd.match(/^(\s+)([^\n;&|]+)/);
+            if (nextStageMatch) {
+              const stInfo = inspectHeredocClauseCommand(nextStageMatch[2]);
+              if (stInfo.isShellReadingStdin) {
+                matchedShellConsumerOffset = hd.heredocEnd + nextStageMatch[1].length;
+              }
+            }
+            break;
+          }
+          const stInfo = inspectHeredocClauseCommand(stText);
+          if (stInfo.isShellReadingStdin) {
+            matchedShellConsumerOffset = stClause.start;
+            break;
+          }
+          if (
+            (stInfo.base === "cat" || stInfo.base === "tee") &&
+            (stClause.sepAfter === "|" || stClause.sepAfter === "|&")
+          ) {
+            stageIdx++;
+            continue;
+          }
+          break;
+        }
+        if (matchedShellConsumerOffset !== -1) {
+          hd.kind = "shell";
+          hd.consumerPartIdx = findEvenPartAtOffset(matchedShellConsumerOffset);
+        } else {
+          hd.kind = "other_executable";
+        }
+        continue;
+      }
+
+      const afterGroupPipe = s
+        .slice(hd.heredocEnd)
+        .match(/^(\s*[)}]+\s*\|(?!\|)\s*)([^\n;&|]+)/);
+      if (afterGroupPipe) {
+        const stInfo = inspectHeredocClauseCommand(afterGroupPipe[2]);
+        if (stInfo.isShellReadingStdin) {
+          hd.kind = "shell";
+          hd.consumerPartIdx = findEvenPartAtOffset(hd.heredocEnd + afterGroupPipe[1].length);
+        } else {
+          hd.kind = "other_executable";
+        }
+        continue;
+      }
+
+      const restOfHeaderLine = s.slice(clause.end, hd.headerLineEnd).trim();
+      const afterHeredocText = s.slice(hd.heredocEnd).trim();
+      if (
+        clauseInfo.hasProcessOrCmdSub ||
+        hd.unterminated ||
+        (clauseInfo.writesFile && (restOfHeaderLine.length > 0 || afterHeredocText.length > 0))
+      ) {
+        hd.kind = "other_executable";
+      } else {
+        hd.kind = "data";
+      }
+      continue;
+    }
+
+    hd.kind = "other_executable";
+  }
+
+  return heredocs;
+}
+
+export function stripOpaqueHeredocsForCheck(script) {
+  if (!script || !script.includes("<<")) return script;
+  const s = String(script);
+  const heredocs = parseScriptHeredocs(s);
+  if (heredocs.length === 0) return s;
+
+  const edits = [];
+  for (const hd of heredocs) {
+    if (hd.kind === "data") {
+      const replacement = hd.quoted
+        ? ""
+        : extractCommandSubstitutionsFromUnquotedHeredoc(hd.effectiveBodyText).join("\n");
+      edits.push({
+        start: hd.bodyStart,
+        end: hd.heredocEnd,
+        replacement,
+      });
+    } else {
+      edits.push({
+        start: hd.opStart,
+        end: hd.opEnd,
+        replacement: " ",
+      });
+      edits.push({
+        start: hd.bodyStart,
+        end: hd.heredocEnd,
+        replacement: hd.effectiveBodyText,
+      });
+    }
+  }
+
+  edits.sort((a, b) => b.start - a.start);
+  let out = s;
+  for (const edit of edits) {
+    out = `${out.slice(0, edit.start)}${edit.replacement}${out.slice(edit.end)}`;
+  }
+  return out;
 }
 
 /**
@@ -599,6 +1328,16 @@ export function detectUnparseableShellConstructs(script, shellType = "posix") {
     return { unparseable: false, reason: null };
   }
   const cleanScript = stripSentinels(script);
+  if (cleanScript.includes("<<")) {
+    const heredocs = parseScriptHeredocs(cleanScript);
+    if (heredocs.some((hd) => hd.kind === "other_executable" || hd.unterminated)) {
+      return {
+        unparseable: true,
+        reason:
+          'Executable or file-writing heredoc in shell command cannot be safely analyzed under ATC; run direct commands via "atc exec" or "atc batch".',
+      };
+    }
+  }
   const parsed = parseShellQuote(cleanScript, { shellType });
   if (parsed.unclosedQuote) {
     return {

@@ -3198,6 +3198,99 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       const gate = detectUnparseableShellConstructs(safeCmd);
       assert.equal(gate.unparseable, false);
     }
+
+    // 9. Executable shell heredoc bodies, duplicate Gradle JVM arg precedence, and gradle --foreground
+    const bashHeredocScript = "bash <<EOF\n./gradlew build\nEOF";
+    const bashHeredocReqs = resolveBuildResources("sh", ["-c", bashHeredocScript], dirB);
+    assert.equal(bashHeredocReqs.kind, "pure_build");
+    assert.equal(bashHeredocReqs.requiresHeavySlot, true);
+    assert.equal(bashHeredocReqs.requiresWorkspaceLock, true);
+
+    const readOnlyHeredocExec = await cmdExec(
+      stateDir,
+      ["sh", "-c", bashHeredocScript],
+      { phase: "read-only", session: "sess-ro-hd" },
+      { cwd: dirB, inventory: fakeBatchInventory },
+    );
+    assert.equal(readOnlyHeredocExec.exitCode, 3);
+    assert.match(readOnlyHeredocExec.error, /Phase conflict/);
+
+    const bashHeredocInv = buildChildInvocation(
+      "sh",
+      ["-c", bashHeredocScript],
+      null,
+      "sess-ro-hd",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      bashHeredocInv.args[1],
+      "bash <<EOF\n./gradlew build -Dorg.gradle.workers.max=4\nEOF",
+    );
+
+    const pipedHeredocScript = "cat <<EOF | bash\n./gradlew build\nEOF";
+    const pipedHeredocReqs = resolveBuildResources("sh", ["-c", pipedHeredocScript], dirB);
+    assert.equal(pipedHeredocReqs.kind, "pure_build");
+    const pipedHeredocInv = buildChildInvocation(
+      "sh",
+      ["-c", pipedHeredocScript],
+      null,
+      "sess-ro-hd",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      pipedHeredocInv.args[1],
+      "cat <<EOF | bash\n./gradlew build -Dorg.gradle.workers.max=4\nEOF",
+    );
+
+    const unquotedDataSubstScript = "cat <<EOF\n$(./gradlew build)\nEOF";
+    const unquotedDataSubstReqs = resolveBuildResources(
+      "sh",
+      ["-c", unquotedDataSubstScript],
+      dirB,
+    );
+    assert.equal(unquotedDataSubstReqs.kind, "pure_build");
+
+    const fileWriteExecHeredoc = "cat > run.sh <<'EOF'\n./gradlew build\nEOF\nsh run.sh";
+    const fileWriteExecReqs = resolveBuildResources("sh", ["-c", fileWriteExecHeredoc], dirB);
+    assert.equal(fileWriteExecReqs.kind, "deny_lifecycle");
+
+    fs.writeFileSync(
+      path.join(dirB, "gradle.properties"),
+      "org.gradle.jvmargs=-Xmx1g -Xmx8g\n",
+    );
+    const dupHeapReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(dupHeapReqs.requestedHeapMb, 8192);
+    const reversedDaemonProbe = probeWarmBuildDaemons(dupHeapReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: `7010 ${path.join(canonicalMockJdk, "bin", "java")} -Dgradle.user.home=${fakeUserHome} -Xmx8g -Xmx1g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(reversedDaemonProbe.warm, false);
+
+    const matchingEffectiveDaemonProbe = probeWarmBuildDaemons(dupHeapReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: `7011 ${path.join(canonicalMockJdk, "bin", "java")} -Dgradle.user.home=${fakeUserHome} -Xmx8g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(matchingEffectiveDaemonProbe.warm, true);
+    assert.deepEqual(matchingEffectiveDaemonProbe.daemonPids, [7011]);
+
+    const fgGradleReqs = resolveBuildResources("./gradlew", ["--foreground"], dirB);
+    assert.equal(fgGradleReqs.kind, "reject_long_running");
+    const fgGradleExec = await cmdExec(
+      stateDir,
+      ["./gradlew", "--foreground"],
+      { session: "sess-fg" },
+      { cwd: dirB, inventory: fakeBatchInventory },
+    );
+    assert.equal(fgGradleExec.exitCode, 3);
+    assert.match(fgGradleExec.error, /gradle --foreground/);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
