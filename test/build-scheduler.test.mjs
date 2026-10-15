@@ -2040,6 +2040,70 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     assert.equal(rcIosTestReqs.kind, "device_coupled_build");
     assert.equal(rcIosTestReqs.requiresDevice, true);
     assert.equal(rcIosTestReqs.targetPlatform, "ios");
+    assert.equal(rcIosTestReqs.targetSerial, "iPhone 16");
+
+    const rcIosMismatchGuard = evaluateCommandGuard(
+      `bazel --nosystem_rc --nohome_rc --bazelrc=${cmdRcFile} test //app:tests`,
+      {
+        sessionId: "sess-rc-ios",
+        activeLeases: [
+          {
+            leaseId: "lease_ios_rc",
+            sessionId: "sess-rc-ios",
+            platform: "ios",
+            serial: "11111111-2222-3333-4444-555555555555",
+            udid: "11111111-2222-3333-4444-555555555555",
+            state: "active",
+          },
+        ],
+      },
+    );
+    assert.equal(rcIosMismatchGuard.allowed, false);
+
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "bazel",
+          ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "test", "//app:tests"],
+          {
+            leaseId: "lease_ios_rc",
+            platform: "ios",
+            serial: "11111111-2222-3333-4444-555555555555",
+            udid: "11111111-2222-3333-4444-555555555555",
+          },
+          "sess-rc-ios",
+          process.env,
+          null,
+        ),
+      /Conflicting device selector "iPhone 16"/,
+    );
+
+    // Repeated bazelrc imports outside a cycle are reprocessed in place
+    const sharedImportRc = path.join(wsDir, "shared-import.bazelrc");
+    const repeatParentRc = path.join(wsDir, "repeat-parent.bazelrc");
+    const actualRepeatOut = path.join(wsDir, "bazel-repeat-actual-out");
+    const middleRepeatOut = path.join(wsDir, "bazel-repeat-middle-out");
+    fs.writeFileSync(sharedImportRc, `startup --output_base=${actualRepeatOut}\n`);
+    fs.writeFileSync(
+      repeatParentRc,
+      [
+        `import ${sharedImportRc.replace(/\\/g, "/")}`,
+        `startup --output_base=${middleRepeatOut}`,
+        `import ${sharedImportRc.replace(/\\/g, "/")}`,
+      ].join("\n") + "\n",
+    );
+    const repeatImportReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${repeatParentRc}`, "build", "//..."],
+      subAppDir,
+    );
+    assert.ok(
+      repeatImportReqs.resourceKeys.some((k) => k.endsWith("bazel-repeat-actual-out")),
+    );
+    assert.equal(
+      repeatImportReqs.resourceKeys.some((k) => k.endsWith("bazel-repeat-middle-out")),
+      false,
+    );
 
     const rcBoundedRunReqs = resolveBuildResources(
       "bazel",

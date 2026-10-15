@@ -500,6 +500,24 @@ export function buildChildInvocation(
   if (buildClassified.kind === "deny_lifecycle" && !buildClassified.unresolvedDynamicCwd) {
     throw new Error(buildClassified.reason);
   }
+  if (buildClassified.tool === "bazel" && buildClassified.targetSerial && lease) {
+    const allowedIds = new Set(
+      [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
+        .filter(Boolean)
+        .map((s) => String(s).toUpperCase()),
+    );
+    const selParts = String(buildClassified.targetSerial)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const sel of selParts) {
+      if (allowedIds.size > 0 && !allowedIds.has(sel.toUpperCase())) {
+        throw new Error(
+          `Conflicting device selector "${sel}" in atc exec; lease ${lease.leaseId || lease.deviceKey || lease.serial} is bound to "${lease.serial || lease.udid}".`,
+        );
+      }
+    }
+  }
   const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
   if (base === "emulator") {
     if (!args.includes("-list-avds") && !args.includes("-version") && !args.includes("-help")) {

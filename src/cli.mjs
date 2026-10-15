@@ -5907,22 +5907,24 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 },
               };
             }
+            const effectiveTargetSerial =
+              wrappedClass.targetSerial || buildReqs.targetSerial || null;
             const isRewritableBooted =
               leasePlat === "ios" &&
               effectiveDeviceForCheck.kind === "emulator" &&
-              String(wrappedClass.targetSerial || "").toLowerCase() === "booted";
+              String(effectiveTargetSerial || "").toLowerCase() === "booted";
             if (
-              wrappedClass.targetSerial &&
+              effectiveTargetSerial &&
               !isRewritableBooted &&
               devSerial &&
-              wrappedClass.targetSerial !== devSerial
+              effectiveTargetSerial !== devSerial
             ) {
               return {
                 mutated: false,
                 value: {
                   status: "error",
                   exitCode: 3,
-                  error: `Conflicting device selector "${wrappedClass.targetSerial}" in atc exec; lease ${effectiveDeviceForCheck.leaseId || effectiveDeviceForCheck.deviceKey} is bound to "${devSerial}".`,
+                  error: `Conflicting device selector "${effectiveTargetSerial}" in atc exec; lease ${effectiveDeviceForCheck.leaseId || effectiveDeviceForCheck.deviceKey} is bound to "${devSerial}".`,
                 },
               };
             }

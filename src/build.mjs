@@ -3311,6 +3311,71 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     const requiresDevice =
       subcmd === "mobile-install" || ((subcmd === "test" || subcmd === "run") && hasDeviceFlag);
     const targetPlatform = requiresDevice ? (hasIosDeviceFlag ? "ios" : "android") : null;
+    const selectors = [];
+    for (let i = 0; i < restArgs.length; i++) {
+      const a = String(restArgs[i]);
+      if (a === "--") continue;
+      if (a.startsWith("--device=")) {
+        selectors.push(a.slice("--device=".length));
+      } else if (a === "--device" && i + 1 < restArgs.length) {
+        selectors.push(String(restArgs[++i]));
+      } else if (a.startsWith("--test_arg=--device=")) {
+        selectors.push(a.slice("--test_arg=--device=".length));
+      } else if (a === "--test_arg=--device" && i + 1 < restArgs.length) {
+        const nextArg = String(restArgs[i + 1]);
+        if (nextArg.startsWith("--test_arg=")) {
+          selectors.push(nextArg.slice("--test_arg=".length));
+          i += 1;
+        } else if (nextArg === "--test_arg" && i + 2 < restArgs.length) {
+          selectors.push(String(restArgs[i + 2]));
+          i += 2;
+        }
+      } else if (a === "--test_arg" && i + 1 < restArgs.length) {
+        const testArgVal = String(restArgs[i + 1]);
+        if (testArgVal.startsWith("--device=")) {
+          selectors.push(testArgVal.slice("--device=".length));
+          i += 1;
+        } else if (testArgVal === "--device" && i + 2 < restArgs.length) {
+          const nextPair = String(restArgs[i + 2]);
+          if (nextPair === "--test_arg" && i + 3 < restArgs.length) {
+            selectors.push(String(restArgs[i + 3]));
+            i += 3;
+          } else if (nextPair.startsWith("--test_arg=")) {
+            selectors.push(nextPair.slice("--test_arg=".length));
+            i += 2;
+          }
+        }
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_device=/.test(a)
+      ) {
+        const val = a.slice(a.indexOf("=") + 1).trim();
+        if (val) selectors.push(val);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_device$/.test(a) &&
+        i + 1 < restArgs.length
+      ) {
+        const val = String(restArgs[++i]).trim();
+        if (val) selectors.push(val);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_version=/.test(a)
+      ) {
+        const val = a.slice(a.indexOf("=") + 1).trim();
+        if (val) selectors.push(`ios_simulator_version=${val}`);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_version$/.test(a) &&
+        i + 1 < restArgs.length
+      ) {
+        const val = String(restArgs[++i]).trim();
+        if (val) selectors.push(`ios_simulator_version=${val}`);
+      }
+    }
+    const uniqueSelectors = Array.from(new Set(selectors.filter(Boolean)));
+    const targetSerial =
+      uniqueSelectors.length === 0
+        ? null
+        : uniqueSelectors.length === 1
+          ? uniqueSelectors[0]
+          : uniqueSelectors.join(",");
 
     if (subcmd === "run" && !requiresDevice) {
       let noRunEnabled = false;
@@ -3333,6 +3398,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
           tool: "bazel",
           subcommand: subcmd,
           targetPlatform: null,
+          targetSerial: null,
           requiresDevice: false,
           requiresHeavySlot: true,
           requiresWorkspaceLock: true,
@@ -3346,6 +3412,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       kind: requiresDevice ? "device_coupled_build" : "pure_build",
       tool: "bazel",
       targetPlatform,
+      targetSerial,
       requiresDevice,
       requiresHeavySlot: true,
       requiresWorkspaceLock: true,
@@ -3677,6 +3744,20 @@ export function resolveBuildResources(
       ...clauseRes[0],
       kind,
       targetPlatform: clauseRes.find((r) => r.targetPlatform)?.targetPlatform || null,
+      targetSerial: (() => {
+        const clauseSerials = Array.from(
+          new Set(
+            clauseRes
+              .flatMap((r) => (r.targetSerial ? String(r.targetSerial).split(",") : []))
+              .filter(Boolean),
+          ),
+        );
+        return clauseSerials.length === 0
+          ? null
+          : clauseSerials.length === 1
+            ? clauseSerials[0]
+            : clauseSerials.join(",");
+      })(),
       requiresDevice,
       requiresHeavySlot,
       requiresWorkspaceLock,
@@ -4114,16 +4195,22 @@ export function resolveBuildResources(
     };
 
     if (!ignoreAllRc) {
-      const visitedRc = new Set();
-      const parseBazelrcFile = (rcPath, { required = false, depth = 0 } = {}) => {
+      const parseBazelrcFile = (
+        rcPath,
+        { required = false, depth = 0, activeStack = new Set() } = {},
+      ) => {
         if (!rcPath || rcPath === "/dev/null" || rcPath.toUpperCase() === "NUL") return;
         if (depth > 8) {
           hasCustomStartupOption = true;
           return;
         }
         const resolvedRc = canonicalizeBuildPath(rcPath);
-        if (visitedRc.has(resolvedRc)) return;
-        visitedRc.add(resolvedRc);
+        if (activeStack.has(resolvedRc)) {
+          hasCustomStartupOption = true;
+          return;
+        }
+        const nextStack = new Set(activeStack);
+        nextStack.add(resolvedRc);
         let content;
         try {
           if (!fs.existsSync(resolvedRc)) {
@@ -4147,7 +4234,11 @@ export function resolveBuildResources(
               .replace(/^['"]|['"]$/g, "")
               .replace(/%workspace%/g, canonicalRoot);
             const targetPath = path.resolve(rcDir, rawTarget);
-            parseBazelrcFile(targetPath, { required: isRequiredImport, depth: depth + 1 });
+            parseBazelrcFile(targetPath, {
+              required: isRequiredImport,
+              depth: depth + 1,
+              activeStack: nextStack,
+            });
             continue;
           }
           const startupMatch = line.match(/^startup(?::([A-Za-z0-9_.-]+))?\s+(.+)$/);
@@ -4326,13 +4417,17 @@ export function resolveBuildResources(
               new Set([osConfigName]),
             )
           : [];
-      const reclassified = classifyBuildCommand("bazel", [
+      const effectiveBazelCommandArgs = [
         subcmd,
         ...expandedFromRc.filter((t) => t !== "--"),
         ...osConfigTokens.filter((t) => t !== "--"),
         ...expandedFromCli.filter((t) => t !== "--"),
         ...(cliRestArgs.includes("--") ? cliRestArgs.slice(cliRestArgs.indexOf("--")) : []),
-      ]);
+      ];
+      const reclassified = {
+        ...classifyBuildCommand("bazel", effectiveBazelCommandArgs),
+        effectiveBazelArgs: effectiveBazelCommandArgs,
+      };
       if (reclassified.kind === "deny_lifecycle" || reclassified.kind === "read_only") {
         return {
           ...reclassified,

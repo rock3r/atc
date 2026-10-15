@@ -1318,7 +1318,8 @@ export function tokenizeSegment(
 ) {
   const tokens = [];
   const str = stripLineContinuations(String(segment || ""), { allowHashComments });
-  const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
+  const isWinPathLike = (s) =>
+    /^(?:-[^=\s]*=|[A-Za-z_][A-Za-z0-9_]*=)?(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
   let i = 0;
   while (i < str.length) {
     while (i < str.length && /\s/.test(str[i])) i++;
@@ -2824,12 +2825,15 @@ export function classifySegment(
       };
     }
     if (buildInfo.kind === "device_coupled_build") {
+      const effectiveParsed = Array.isArray(buildInfo.effectiveBazelArgs)
+        ? { ...parsed, args: buildInfo.effectiveBazelArgs }
+        : parsed;
       return {
         kind: "device_action",
         isBuildTool: true,
         buildClass: buildInfo.kind,
         targetPlatform: buildInfo.targetPlatform || "android",
-        targetSerial: extractTargetSerial(parsed),
+        targetSerial: buildInfo.targetSerial || extractTargetSerial(effectiveParsed),
         parsed,
       };
     }
