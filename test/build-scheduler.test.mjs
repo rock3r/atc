@@ -707,6 +707,73 @@ test("pruneAndSelectNextBuildTicket evaluates per-ticket device availability so 
     "bq_coalloc_ios_free",
     "Ticket B with available iOS device must be admitted even when older Ticket A's Android device is unavailable",
   );
+
+  // Generic workspace:<root> conflicts with tool-specific gradle:<root>
+  const customVsGradleSel = pruneAndSelectNextBuildTicket(
+    [
+      {
+        ticketId: "bq_custom_ws",
+        seq: 3,
+        sessionId: "sess-c",
+        waiterPid: process.pid,
+        resourceKeys: ["workspace:/ws-shared"],
+        requiresWorkspaceLock: true,
+        requiresHeavySlot: true,
+        pinnedDeviceLeaseId: null,
+        requiresDeviceCoAlloc: false,
+        enqueuedAtMs: now - 1_000,
+        starvationDeadlineMs: now + 119_000,
+        lastHeartbeatAtMs: now,
+        waitExpiresAtMs: now + 60_000,
+      },
+    ],
+    {
+      activeWorkspaces: new Set(["gradle:/ws-shared"]),
+      activeHeavyBuilds: 1,
+      maxHostBuilds: 2,
+      burstBuilds: 0,
+      leases: {},
+    },
+    now,
+  );
+  assert.equal(
+    customVsGradleSel.chosenIdx,
+    -1,
+    "Custom workspace:/ws-shared must conflict with active gradle:/ws-shared",
+  );
+
+  const gradleVsCustomSel = pruneAndSelectNextBuildTicket(
+    [
+      {
+        ticketId: "bq_gradle_ws",
+        seq: 4,
+        sessionId: "sess-d",
+        waiterPid: process.pid,
+        resourceKeys: ["gradle:/ws-shared"],
+        requiresWorkspaceLock: true,
+        requiresHeavySlot: true,
+        pinnedDeviceLeaseId: null,
+        requiresDeviceCoAlloc: false,
+        enqueuedAtMs: now - 1_000,
+        starvationDeadlineMs: now + 119_000,
+        lastHeartbeatAtMs: now,
+        waitExpiresAtMs: now + 60_000,
+      },
+    ],
+    {
+      activeWorkspaces: new Set(["workspace:/ws-shared"]),
+      activeHeavyBuilds: 1,
+      maxHostBuilds: 2,
+      burstBuilds: 0,
+      leases: {},
+    },
+    now,
+  );
+  assert.equal(
+    gradleVsCustomSel.chosenIdx,
+    -1,
+    "Tool-specific gradle:/ws-shared must conflict with active workspace:/ws-shared",
+  );
 });
 
 test("cmdExec --build --wait 0 admits immediately when slot is free and exits with code 2 when slot is busy", async () => {
@@ -1490,6 +1557,19 @@ test("cmdExec enforces matching-platform lease for device builds and keeps devic
     );
     assert.equal(wrongPlatBuild.exitCode, 3);
     assert.match(wrongPlatBuild.error, /holds no active ios device lease/);
+
+    // 3. Holding an unrelated Android lease must not satisfy --claim with a different profile selector
+    const mismatchedAvdClaim = await cmdExec(
+      stateDir,
+      ["node", "-e", "process.exit(0)"],
+      { build: true, claim: true, avd: "Pixel_8_API_35", wait: 0, session: "sess-android-only" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "sess-android-only" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.notEqual(mismatchedAvdClaim.exitCode, 0);
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }

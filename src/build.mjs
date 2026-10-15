@@ -3746,6 +3746,43 @@ export function hasValidPinnedDeviceLease(ticket, leasesByDeviceKey = {}) {
   return false;
 }
 
+export function extractBuildResourceKeyInfo(keyStr) {
+  const s = String(keyStr || "");
+  const firstColon = s.indexOf(":");
+  if (firstColon === -1) return { prefix: s, path: "" };
+  const prefix = s.slice(0, firstColon);
+  const rest = s.slice(firstColon + 1);
+  const secondColon = rest.indexOf(":");
+  if (
+    secondColon !== -1 &&
+    ["ws", "out", "dir", "dd"].includes(rest.slice(0, secondColon))
+  ) {
+    return {
+      prefix: `${prefix}:${rest.slice(0, secondColon)}`,
+      path: rest.slice(secondColon + 1),
+    };
+  }
+  return { prefix, path: rest };
+}
+
+export function doBuildResourceKeysConflict(keyA, keyB) {
+  if (!keyA || !keyB) return false;
+  if (keyA === keyB) return true;
+  const a = extractBuildResourceKeyInfo(keyA);
+  const b = extractBuildResourceKeyInfo(keyB);
+  if (!a.path || !b.path) return false;
+  if (a.prefix === "workspace" || b.prefix === "workspace") {
+    return (
+      a.path === b.path ||
+      a.path.startsWith(`${b.path}/`) ||
+      a.path.startsWith(`${b.path}\\`) ||
+      b.path.startsWith(`${a.path}/`) ||
+      b.path.startsWith(`${a.path}\\`)
+    );
+  }
+  return false;
+}
+
 export function pruneAndSelectNextBuildTicket(
   queue,
   stateView,
@@ -3812,7 +3849,12 @@ export function pruneAndSelectNextBuildTicket(
   function missingResources(ticket) {
     const missing = new Set();
     for (const ws of ticket.resourceKeys || []) {
-      if (activeWorkspaces.has(ws)) missing.add(`ws:${ws}`);
+      for (const activeWs of activeWorkspaces) {
+        if (doBuildResourceKeysConflict(ws, activeWs)) {
+          missing.add(`ws:${ws}`);
+          break;
+        }
+      }
     }
     const hasDev = Boolean(ticket.pinnedDeviceLeaseId || ticket.requiresDeviceCoAlloc);
     const isStarved =
@@ -3886,6 +3928,17 @@ export function pruneAndSelectNextBuildTicket(
           if (candUsed.has(m)) {
             blockedByEarlier = true;
             break;
+          }
+          if (m.startsWith("ws:")) {
+            const missingKey = m.slice(3);
+            if (
+              (cand.ticket.resourceKeys || []).some((ck) =>
+                doBuildResourceKeysConflict(ck, missingKey),
+              )
+            ) {
+              blockedByEarlier = true;
+              break;
+            }
           }
         }
         if (blockedByEarlier) break;
@@ -4127,7 +4180,11 @@ export function evaluateNestedBuildAdmission(
           reqPath.startsWith(`${root}/`) ||
           reqPath.startsWith(`${root}\\`),
       );
-    if (inSameWorkspace && !otherHeldKeys.has(k)) {
+    if (
+      inSameWorkspace &&
+      !otherHeldKeys.has(k) &&
+      !Array.from(otherHeldKeys).some((ok) => doBuildResourceKeysConflict(k, ok))
+    ) {
       deltaKeys.push(k);
       continue;
     }

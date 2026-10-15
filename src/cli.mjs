@@ -5368,6 +5368,44 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   let retainedBuildTicket = null;
   let coClaimInventory = options.inventory || null;
 
+  const getMatchingOwnedLeases = (leasesMap, sessionId) => {
+    let owned = Object.values(leasesMap || {}).filter(
+      (l) =>
+        l &&
+        l.state === "active" &&
+        l.sessionId === sessionId &&
+        (!platFilter || (l.platform || "android") === platFilter) &&
+        (!selectorSerial ||
+          l.serial === selectorSerial ||
+          l.udid === selectorSerial ||
+          l.coreDeviceId === selectorSerial) &&
+        (!coClaimReq ||
+          (matchesProfile(l, {
+            ...coClaimReq,
+            kind: claimFlags.kind ? coClaimReq.kind : "any",
+            snapshotLoad: null,
+          }) &&
+            !coClaimReq.wipeData &&
+            !coClaimReq.coldBoot)),
+    );
+    if (owned.length > 1 && !selectorSerial) {
+      const rawCmdStr = commandArgs
+        .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+        .join(" ");
+      const cmdClass = classifySegment(rawCmdStr);
+      const preferredPlat = cmdClass.targetPlatform || buildReqs.targetPlatform;
+      if (preferredPlat === "ios" || preferredPlat === "android") {
+        const platformMatched = owned.filter(
+          (l) => (l.platform || "android") === preferredPlat,
+        );
+        if (platformMatched.length === 1) {
+          owned = platformMatched;
+        }
+      }
+    }
+    return owned;
+  };
+
   const refreshHostAndInventory = () => {
     const curState = readState(stateDir);
     const curCfg = curState.config || DEFAULT_CONFIG;
@@ -5382,14 +5420,16 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         ancestorPids,
         processChain,
       });
-      const hasOwnedActive = Object.values(curState.leases || {}).some(
-        (l) =>
-          l &&
-          l.state === "active" &&
-          l.sessionId === preIdentity.sessionId &&
-          l.serial &&
-          l.firstSeenOfflineAtMs == null,
-      );
+      const matchingOwned = getMatchingOwnedLeases(curState.leases, preIdentity.sessionId);
+      const hasOwnedActive =
+        matchingOwned.length === 1 &&
+        Boolean(matchingOwned[0].serial) &&
+        matchingOwned[0].firstSeenOfflineAtMs == null &&
+        (!coClaimReq ||
+          (!coClaimReq.resetApp &&
+            (!coClaimReq.snapshotLoad ||
+              (matchingOwned[0].kind === "emulator" &&
+                matchingOwned[0].loadedSnapshot === coClaimReq.snapshotLoad))));
       const nowPre = Date.now();
       const cacheStale =
         !coClaimInventory ||
@@ -5454,31 +5494,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           let effectiveInventory = inventory;
 
           if (needsDeviceLease) {
-            let owned = Object.values(state.leases).filter(
-              (l) =>
-                l.state === "active" &&
-                l.sessionId === identity.sessionId &&
-                (!platFilter || (l.platform || "android") === platFilter) &&
-                (!selectorSerial ||
-                  l.serial === selectorSerial ||
-                  l.udid === selectorSerial ||
-                  l.coreDeviceId === selectorSerial),
-            );
-            if (owned.length > 1 && !selectorSerial) {
-              const rawCmdStr = commandArgs
-                .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
-                .join(" ");
-              const cmdClass = classifySegment(rawCmdStr);
-              const preferredPlat = cmdClass.targetPlatform || buildReqs.targetPlatform;
-              if (preferredPlat === "ios" || preferredPlat === "android") {
-                const platformMatched = owned.filter(
-                  (l) => (l.platform || "android") === preferredPlat,
-                );
-                if (platformMatched.length === 1) {
-                  owned = platformMatched;
-                }
-              }
-            }
+            const owned = getMatchingOwnedLeases(state.leases, identity.sessionId);
             if (owned.length > 1 && !selectorSerial) {
               return {
                 mutated: false,
@@ -5490,31 +5506,55 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               };
             }
             if (owned.length === 1) {
-              lease = owned[0];
-              if (lease.firstSeenOfflineAtMs !== null && lease.firstSeenOfflineAtMs !== undefined) {
-                return {
-                  mutated: false,
-                  value: {
-                    status: "error",
-                    exitCode: 3,
-                    error:
-                      lease.kind === "physical"
-                        ? `Physical device "${lease.serial || lease.deviceKey}" is currently disconnected. Wait for it to reconnect or run "atc claim" to release the lease.`
-                        : `Virtual device "${lease.avd || lease.serial || lease.deviceKey}" crashed or went offline; run "atc claim" within the recovery window to restart it in-place.`,
-                  },
-                };
+              const matchedLease = owned[0];
+              const needsIdempotentPrep = Boolean(
+                coClaimReq &&
+                  (coClaimReq.resetApp ||
+                    (coClaimReq.snapshotLoad &&
+                      (matchedLease.kind !== "emulator" ||
+                        matchedLease.loadedSnapshot !== coClaimReq.snapshotLoad))),
+              );
+              if (
+                matchedLease.firstSeenOfflineAtMs !== null &&
+                matchedLease.firstSeenOfflineAtMs !== undefined
+              ) {
+                if (isClaimFlag) {
+                  coClaimNeedsColdOrPrep = true;
+                  coClaimDeviceAvailable = true;
+                } else {
+                  return {
+                    mutated: false,
+                    value: {
+                      status: "error",
+                      exitCode: 3,
+                      error:
+                        matchedLease.kind === "physical"
+                          ? `Physical device "${matchedLease.serial || matchedLease.deviceKey}" is currently disconnected. Wait for it to reconnect or run "atc claim" to release the lease.`
+                          : `Virtual device "${matchedLease.avd || matchedLease.serial || matchedLease.deviceKey}" crashed or went offline; run "atc claim" within the recovery window to restart it in-place.`,
+                    },
+                  };
+                }
+              } else if (!matchedLease.serial) {
+                if (isClaimFlag) {
+                  coClaimNeedsColdOrPrep = true;
+                  coClaimDeviceAvailable = true;
+                } else {
+                  return {
+                    mutated: false,
+                    value: {
+                      status: "error",
+                      exitCode: 3,
+                      error: `Lease ${matchedLease.leaseId} (${matchedLease.avd || matchedLease.deviceKey}) has no active adb serial because its last restart failed; run "atc claim" to restart it.`,
+                    },
+                  };
+                }
+              } else if (needsIdempotentPrep) {
+                coClaimNeedsColdOrPrep = true;
+                coClaimDeviceAvailable = true;
+              } else {
+                lease = matchedLease;
+                coClaimDeviceAvailable = true;
               }
-              if (!lease.serial) {
-                return {
-                  mutated: false,
-                  value: {
-                    status: "error",
-                    exitCode: 3,
-                    error: `Lease ${lease.leaseId} (${lease.avd || lease.deviceKey}) has no active adb serial because its last restart failed; run "atc claim" to restart it.`,
-                  },
-                };
-              }
-              coClaimDeviceAvailable = true;
             } else if (!isClaimFlag) {
               return {
                 mutated: false,
