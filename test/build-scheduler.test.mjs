@@ -2053,6 +2053,29 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       fnCallEnvInv.args[1],
       'f(){ "$TOOL" -p "$1" build -Dorg.gradle.workers.max=4; }; TOOL=./gradlew; f app',
     );
+
+    // Function-local variable declarations do not leak into caller scope
+    const fnLocalReqs = resolveBuildResources(
+      "bash",
+      ["-c", 'f(){ local TOOL=./gradlew; }; f; "$TOOL" build'],
+      wsDir,
+      { env: { ...process.env, TOOL: "./bazel" } },
+    );
+    assert.equal(fnLocalReqs.kind, "pure_build");
+    assert.deepEqual(fnLocalReqs.resourceKeys, [`bazel:ws:${canonicalWs}`]);
+
+    const fnLocalInv = buildChildInvocation(
+      "bash",
+      ["-c", 'f(){ local TOOL=./gradlew; }; f; "$TOOL" build'],
+      null,
+      "sess_1",
+      { ...process.env, TOOL: "./bazel" },
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      fnLocalInv.args[1],
+      'f(){ local TOOL=./gradlew; }; f; "$TOOL" build --jobs=4 --local_ram_resources=3072',
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

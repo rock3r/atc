@@ -1433,6 +1433,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let pushdStack = [];
         const cwdStack = [];
         const controlStack = [];
+        const fnCallStack = [];
         let chainHasCondition = false;
         let chainSawOrOrPipe = false;
         let chainMutatedCwd = false;
@@ -1441,6 +1442,31 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let chainAnyEnvMutation = new Set();
         let currentClauseBackgrounded = false;
         let outerChainConditional = false;
+        const registerLocalVar = (varName) => {
+          if (fnCallStack.length === 0 || !varName) return;
+          const topFnCall = fnCallStack[fnCallStack.length - 1];
+          const cleanName = stripLiteralSentinels(varName);
+          const normKeys =
+            shellType === "cmd" || base === "powershell" || base === "pwsh"
+              ? [cleanName, cleanName.toUpperCase(), cleanName.toLowerCase()]
+              : [cleanName];
+          for (const k of normKeys) {
+            topFnCall.localVars.add(k);
+            if (!topFnCall.savedState.has(k)) {
+              topFnCall.savedState.set(k, {
+                hasEnv: k in shellEnv,
+                envVal: shellEnv[k],
+                hasCurVar: k in curShellEnvVars,
+                curVarVal: curShellEnvVars[k],
+                tainted: taintedEnvVars.has(k),
+                hasCand: k in candidateBuildToolEnv,
+                candVal: candidateBuildToolEnv[k],
+                inChainMutated: chainMutatedEnv.has(k),
+                inChainAny: chainAnyEnvMutation.has(k),
+              });
+            }
+          }
+        };
         const captureChainEntryState = () => ({
           cwd: curShellRelCwd,
           unresolvedCwd: curShellUnresolvedCwd,
@@ -1526,6 +1552,14 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             if (!currentClauseBackgrounded) {
               for (const frame of controlStack) {
                 if (frame.subshellDepth === cwdStack.length) {
+                  let isLocalSinceFrame = false;
+                  for (let fdIdx = frame.fnDepth ?? 0; fdIdx < fnCallStack.length; fdIdx++) {
+                    if (fnCallStack[fdIdx].localVars.has(k)) {
+                      isLocalSinceFrame = true;
+                      break;
+                    }
+                  }
+                  if (isLocalSinceFrame) continue;
                   frame.mutatedEnv.add(k);
                   if (frame.phase === "cond") {
                     frame.condMutatedEnv.add(k);
@@ -1759,6 +1793,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 type: "if",
                 phase: "cond",
                 subshellDepth: cwdStack.length,
+                fnDepth: fnCallStack.length,
                 entryCwd: curShellRelCwd,
                 entryUnresolvedCwd: curShellUnresolvedCwd,
                 entryPushdStack: [...pushdStack],
@@ -1832,6 +1867,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 type: "loop",
                 phase: kw === "for" ? "body" : "cond",
                 subshellDepth: cwdStack.length,
+                fnDepth: fnCallStack.length,
                 entryCwd: curShellRelCwd,
                 entryUnresolvedCwd: curShellUnresolvedCwd,
                 entryPushdStack: [...pushdStack],
@@ -1873,6 +1909,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 type: "case",
                 phase: "arm",
                 subshellDepth: cwdStack.length,
+                fnDepth: fnCallStack.length,
                 entryCwd: curShellRelCwd,
                 entryUnresolvedCwd: curShellUnresolvedCwd,
                 entryPushdStack: [...pushdStack],
@@ -2106,11 +2143,29 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 });
               }
               const clausesBeforeCall = matchedClauses.length;
+              fnCallStack.push({ localVars: new Set(), savedState: new Map() });
               activeFnCalls.add(candidateFnName);
               runShellScript(fnDef.bodyScript, {
                 inheritedCond: chainHasCondition || outerChainConditional || fnIsTainted,
               });
               activeFnCalls.delete(candidateFnName);
+              const poppedFnCall = fnCallStack.pop();
+              if (poppedFnCall && !needsSubshell) {
+                for (const [lk, saved] of poppedFnCall.savedState.entries()) {
+                  if (saved.hasEnv) shellEnv[lk] = saved.envVal;
+                  else delete shellEnv[lk];
+                  if (saved.hasCurVar) curShellEnvVars[lk] = saved.curVarVal;
+                  else delete curShellEnvVars[lk];
+                  if (saved.tainted) taintedEnvVars.add(lk);
+                  else taintedEnvVars.delete(lk);
+                  if (saved.hasCand) candidateBuildToolEnv[lk] = saved.candVal;
+                  else delete candidateBuildToolEnv[lk];
+                  if (saved.inChainMutated) chainMutatedEnv.add(lk);
+                  else chainMutatedEnv.delete(lk);
+                  if (saved.inChainAny) chainAnyEnvMutation.add(lk);
+                  else chainAnyEnvMutation.delete(lk);
+                }
+              }
               const callClauses = matchedClauses.slice(clausesBeforeCall);
               const callSig = callClauses
                 .map((c) => {
@@ -2209,6 +2264,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               (base === "cmd" && headLower === "set")
                 ? rawTokens.slice(1)
                 : rawTokens;
+            const isLocalDecl =
+              fnCallStack.length > 0 &&
+              (headLower === "local" ||
+                ((headLower === "declare" || headLower === "typeset") &&
+                  !assignTokens.some((t) =>
+                    /^-[A-Za-z]*g[A-Za-z]*$/.test(stripLiteralSentinels(t)),
+                  )));
             for (const tok of assignTokens) {
               const cleanTok = stripLiteralSentinels(tok);
               if (/^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(cleanTok)) {
@@ -2217,6 +2279,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 const isAppend = rawBeforeEq.endsWith("+");
                 const rawKey = isAppend ? rawBeforeEq.slice(0, -1) : rawBeforeEq;
                 const k = rawKey.replace(/^\$env:/i, "");
+                if (isLocalDecl) {
+                  registerLocalVar(k);
+                }
                 const rawVal = tok.slice(eqIdx + 1);
                 const expVal = expandInShell(rawVal, shellEnv);
                 const prevTainted =
@@ -2242,6 +2307,19 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 }
                 recordEnvMutation(k, {
                   isUnresolvedVal: isUnres,
+                  sepAfter,
+                  hasCasePattern,
+                });
+              } else if (
+                isLocalDecl &&
+                !cleanTok.startsWith("-") &&
+                /^[A-Za-z_][A-Za-z0-9_]*$/.test(cleanTok)
+              ) {
+                registerLocalVar(cleanTok);
+                delete shellEnv[cleanTok];
+                delete curShellEnvVars[cleanTok];
+                recordEnvMutation(cleanTok, {
+                  isUnresolvedVal: false,
                   sepAfter,
                   hasCasePattern,
                 });

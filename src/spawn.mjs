@@ -847,6 +847,7 @@ export function buildChildInvocation(
           let taintedEnvVars = new Set(initialTainted);
           let fnDefs = new Map(inheritedFnDefs instanceof Map ? inheritedFnDefs : []);
           const localFnDefs = [];
+          const localVars = new Set();
           let braceDepth = 0;
           const envStack = [];
           const controlStack = [];
@@ -1329,6 +1330,7 @@ export function buildChildInvocation(
                   for (const sk of allSimKeys) {
                     if (/^[1-9]$/.test(sk)) continue;
                     if (sk in callPrefixEnv || callPrefixTainted.has(sk)) continue;
+                    if (sim.localVars && sim.localVars.has(sk)) continue;
                     if (sim.tainted.has(sk)) {
                       recordEnvMutation(sk, {
                         isUnresolvedVal: true,
@@ -1385,6 +1387,11 @@ export function buildChildInvocation(
                 (base === "cmd" && headLower === "set")
                   ? rawTokens.slice(1)
                   : rawTokens;
+              const isLocalDecl =
+                activeFnCalls.size > 0 &&
+                (headLower === "local" ||
+                  ((headLower === "declare" || headLower === "typeset") &&
+                    !assignTokens.some((t) => /^-[A-Za-z]*g[A-Za-z]*$/.test(stripSentinels(t)))));
               for (const tok of assignTokens) {
                 const cleanTok = stripSentinels(tok);
                 if (/^(?:\$env:)?[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(cleanTok)) {
@@ -1393,6 +1400,13 @@ export function buildChildInvocation(
                   const isAppend = rawBeforeEq.endsWith("+");
                   const rawKey = isAppend ? rawBeforeEq.slice(0, -1) : rawBeforeEq;
                   const k = rawKey.replace(/^\$env:/i, "");
+                  if (isLocalDecl) {
+                    localVars.add(k);
+                    if (shellType === "cmd" || base === "powershell" || base === "pwsh") {
+                      localVars.add(k.toUpperCase());
+                      localVars.add(k.toLowerCase());
+                    }
+                  }
                   const rawVal = tok.slice(eqIdx + 1);
                   const expVal = expandOrValidateShellPath(rawVal, curShellEnv, {
                     taintedVars: taintedEnvVars,
@@ -1413,6 +1427,18 @@ export function buildChildInvocation(
                   curShellEnv[k] = finalVal;
                   recordEnvMutation(k, {
                     isUnresolvedVal: isUnres,
+                    sepAfter,
+                    hasCasePattern,
+                  });
+                } else if (
+                  isLocalDecl &&
+                  !cleanTok.startsWith("-") &&
+                  /^[A-Za-z_][A-Za-z0-9_]*$/.test(cleanTok)
+                ) {
+                  localVars.add(cleanTok);
+                  delete curShellEnv[cleanTok];
+                  recordEnvMutation(cleanTok, {
+                    isUnresolvedVal: false,
                     sepAfter,
                     hasCasePattern,
                   });
@@ -1661,6 +1687,7 @@ export function buildChildInvocation(
             text: rewrittenParts.join(""),
             env: curShellEnv,
             tainted: taintedEnvVars,
+            localVars,
           };
         };
         const rewriteShellScript = (scriptText, initialEnv, initialTainted = new Set()) =>
