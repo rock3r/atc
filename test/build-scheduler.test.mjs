@@ -1139,7 +1139,13 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       /Conflicting device selector "UNLEASED-UDID"/,
     );
 
-    // probeWarmBuildDaemons detects warm GradleDaemon and Bazel server unless --no-daemon / --batch
+    // probeWarmBuildDaemons detects warm GradleDaemon by matching wrapper version or workspace path unless --no-daemon / --batch
+    const wrapperDir = path.join(spacedAppDir, "gradle", "wrapper");
+    fs.mkdirSync(wrapperDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(wrapperDir, "gradle-wrapper.properties"),
+      "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.10-bin.zip\n",
+    );
     const gradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], spacedAppDir);
     const warmGradle = probeWarmBuildDaemons(gradleReqs, {
       runner: () => ({
@@ -1148,6 +1154,13 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     });
     assert.equal(warmGradle.warm, true);
     assert.deepEqual(warmGradle.daemonPids, [44123]);
+
+    const mismatchedGradle = probeWarmBuildDaemons(gradleReqs, {
+      runner: () => ({
+        stdout: "  44123 /Library/Java/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.9\n",
+      }),
+    });
+    assert.equal(mismatchedGradle.warm, false);
 
     const noDaemonReqs = resolveBuildResources(
       "./gradlew",
@@ -1162,6 +1175,34 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       }).warm,
       false,
     );
+
+    // Leading shell variable assignments and Windows cmd /c & pwsh -Command wrappers
+    const shellEnvReqs = resolveBuildResources(
+      "sh",
+      ["-c", "JAVA_HOME=/jdk ./gradlew connectedDebugAndroidTest"],
+      spacedAppDir,
+    );
+    assert.equal(shellEnvReqs.tool, "gradle");
+    assert.equal(shellEnvReqs.requiresDevice, true);
+
+    const winCmdReqs = resolveBuildResources(
+      "cmd",
+      ["/c", "gradlew.bat", "connectedCheck"],
+      spacedAppDir,
+    );
+    assert.equal(winCmdReqs.tool, "gradle");
+    assert.equal(winCmdReqs.requiresDevice, true);
+    assert.ok(winCmdReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
+
+    const winCmdInv = buildChildInvocation(
+      "cmd",
+      ["/c", "gradlew.bat", "assembleDebug"],
+      null,
+      "sess-round8",
+      process.env,
+      buildLease,
+    );
+    assert.match(winCmdInv.args[1], /-Dorg\.gradle\.workers\.max=4/);
 
     // timeout wrapper peeling
     const timeoutReqs = resolveBuildResources(

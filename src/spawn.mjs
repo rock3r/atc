@@ -806,11 +806,19 @@ export function buildChildInvocation(
     );
     const ramLimitMb = Math.max(1024, Number(buildLease?.reservedRamMb || 3072));
     if (isShellWrapper) {
-      const cIdx = nextArgs.findIndex(
-        (a) => String(a) === "-c" || (/^-[A-Za-z]+$/.test(String(a)) && String(a).includes("c")),
-      );
+      const cIdx = nextArgs.findIndex((a) => {
+        const s = String(a);
+        if (base === "cmd") return /^\/[ck]$/i.test(s);
+        if (base === "powershell" || base === "pwsh") return /^-(?:c|command)$/i.test(s);
+        return s === "-c" || (/^-[A-Za-z]+$/.test(s) && s.includes("c"));
+      });
       if (cIdx !== -1 && cIdx + 1 < nextArgs.length) {
-        const rawScript = String(nextArgs[cIdx + 1] || "");
+        const isMultiTokenWinShell =
+          (base === "cmd" || base === "powershell" || base === "pwsh") &&
+          nextArgs.length > cIdx + 2;
+        const rawScript = isMultiTokenWinShell
+          ? nextArgs.slice(cIdx + 1).join(" ")
+          : String(nextArgs[cIdx + 1] || "");
         const parts = rawScript.split(/([;\n]|&&|\|\||\|)/);
         const rewrittenParts = parts.map((part, idx) => {
           if (idx % 2 === 1) return part;
@@ -894,8 +902,12 @@ export function buildChildInvocation(
           }
           return part;
         });
-        nextArgs = [...nextArgs];
-        nextArgs[cIdx + 1] = rewrittenParts.join("");
+        if (isMultiTokenWinShell) {
+          nextArgs = [...nextArgs.slice(0, cIdx + 1), rewrittenParts.join("")];
+        } else {
+          nextArgs = [...nextArgs];
+          nextArgs[cIdx + 1] = rewrittenParts.join("");
+        }
       }
     } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "gradle") {
       const hasWorkersFlag = nextArgs.some((a) => {

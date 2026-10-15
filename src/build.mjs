@@ -79,8 +79,14 @@ export function peelBuildWrapperTokens(cmd, args = []) {
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
   let relCwd = null;
 
-  for (let depth = 0; depth < 6; depth++) {
+  for (let depth = 0; depth < 16; depth++) {
     const cleaned = curCmd.trim().replace(/^@+/, "");
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cleaned)) {
+      if (curArgs.length === 0) break;
+      curCmd = curArgs[0];
+      curArgs = curArgs.slice(1);
+      continue;
+    }
     const base = (cleaned.split(/[\\/]/).pop() || "")
       .toLowerCase()
       .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
@@ -214,10 +220,28 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       curArgs = curArgs.slice(i + 1);
       continue;
     }
-    if (base === "sh" || base === "bash" || base === "zsh" || base === "dash" || base === "ksh") {
-      const cIdx = curArgs.findIndex((a) => a === "-c" || (/^-[A-Za-z]+$/.test(a) && a.includes("c")));
+    if (
+      base === "sh" ||
+      base === "bash" ||
+      base === "zsh" ||
+      base === "dash" ||
+      base === "ksh" ||
+      base === "cmd" ||
+      base === "powershell" ||
+      base === "pwsh"
+    ) {
+      const cIdx = curArgs.findIndex((a) => {
+        if (base === "cmd") return /^\/[ck]$/i.test(a);
+        if (base === "powershell" || base === "pwsh") return /^-(?:c|command)$/i.test(a);
+        return a === "-c" || (/^-[A-Za-z]+$/.test(a) && a.includes("c"));
+      });
       if (cIdx !== -1 && cIdx + 1 < curArgs.length) {
-        const script = String(curArgs[cIdx + 1] || "").trim();
+        const rawScriptArg =
+          (base === "cmd" || base === "powershell" || base === "pwsh") &&
+          curArgs.length > cIdx + 2
+            ? curArgs.slice(cIdx + 1).join(" ")
+            : String(curArgs[cIdx + 1] || "");
+        const script = rawScriptArg.trim();
         const clauses = script
           .split(/(?:;|&&|\|\||\|(?!\|)|\n)+/)
           .map((s) => s.trim())
@@ -905,7 +929,14 @@ export function resolveBuildResources(
 
     const canonicalRoot = canonicalizeBuildPath(rootDir);
     const disablesDaemon = strArgs.some(
-      (a) => a === "--no-daemon" || a === "-Dorg.gradle.daemon=false",
+      (a) =>
+        a === "--no-daemon" ||
+        a === "-Dorg.gradle.daemon=false" ||
+        a.startsWith("-Dorg.gradle.jvmargs=") ||
+        a.startsWith("-Dorg.gradle.java.home=") ||
+        a === "-g" ||
+        a === "--gradle-user-home" ||
+        a.startsWith("--gradle-user-home="),
     );
     return {
       ...classified,
@@ -1568,6 +1599,42 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     const daemonPids = [];
     const wsRoot = String(buildReqs.workspaceRoot || "");
     const wsBase = wsRoot ? path.basename(wsRoot) : "";
+    let expectedGradleVersion = null;
+    let expectedGradleJavaHome = null;
+    let expectedGradleJvmArgs = [];
+    if (buildReqs.tool === "gradle" && wsRoot) {
+      try {
+        const wrapperPropsPath = path.join(wsRoot, "gradle", "wrapper", "gradle-wrapper.properties");
+        if (fs.existsSync(wrapperPropsPath)) {
+          const content = fs.readFileSync(wrapperPropsPath, "utf8");
+          const verMatch = content.match(/gradle-([0-9.]+(?:-[A-Za-z0-9.]+)?)-(?:bin|all)\.zip/);
+          if (verMatch?.[1]) {
+            expectedGradleVersion = verMatch[1];
+          }
+        }
+        const gradlePropsPath = path.join(wsRoot, "gradle.properties");
+        if (fs.existsSync(gradlePropsPath)) {
+          const propsContent = fs.readFileSync(gradlePropsPath, "utf8");
+          for (const rawPropLine of propsContent.split(/\r?\n/)) {
+            const propLine = rawPropLine.trim();
+            if (!propLine || propLine.startsWith("#")) continue;
+            const jhMatch = propLine.match(/^org\.gradle\.java\.home\s*=\s*(.+)$/);
+            if (jhMatch?.[1]) {
+              expectedGradleJavaHome = jhMatch[1].trim().replace(/\\:/g, ":");
+            }
+            const jvmMatch = propLine.match(/^org\.gradle\.jvmargs\s*=\s*(.+)$/);
+            if (jvmMatch?.[1]) {
+              expectedGradleJvmArgs = jvmMatch[1]
+                .trim()
+                .split(/\s+/)
+                .filter((tok) => tok.startsWith("-Xm") || tok.startsWith("-XX:"));
+            }
+          }
+        }
+      } catch {
+        // Ignore wrapper property read errors
+      }
+    }
     const outKeys = (buildReqs.resourceKeys || [])
       .filter((k) => String(k).startsWith("bazel:out:"))
       .map((k) => String(k).slice("bazel:out:".length));
@@ -1580,7 +1647,26 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
       const cmdLine = m[2];
       if (buildReqs.tool === "gradle") {
         if (/GradleDaemon\b/.test(cmdLine)) {
-          daemonPids.push(pid);
+          const verMatch = cmdLine.match(/GradleDaemon\s+([0-9][0-9A-Za-z.-]*)/);
+          const daemonVer = verMatch?.[1] || null;
+          if (expectedGradleVersion && daemonVer !== expectedGradleVersion) {
+            continue;
+          }
+          if (expectedGradleJavaHome && !cmdLine.includes(expectedGradleJavaHome)) {
+            continue;
+          }
+          if (
+            expectedGradleJvmArgs.length > 0 &&
+            !expectedGradleJvmArgs.every((arg) => cmdLine.includes(arg))
+          ) {
+            continue;
+          }
+          const matchesWorkspaceOrWrapper =
+            (wsRoot && cmdLine.includes(wsRoot)) ||
+            Boolean(expectedGradleVersion && daemonVer === expectedGradleVersion);
+          if (matchesWorkspaceOrWrapper) {
+            daemonPids.push(pid);
+          }
         }
       } else if (buildReqs.tool === "bazel") {
         const isBazelServer =
