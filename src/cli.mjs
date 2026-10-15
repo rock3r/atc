@@ -21,6 +21,7 @@ import {
   computeEffectiveMaxBuilds,
   evaluateNestedBuildAdmission,
   hasValidPinnedDeviceLease,
+  probeWarmBuildDaemons,
   pruneAndSelectNextBuildTicket,
   reconcileBuildLease,
   resolveBuildResources,
@@ -5348,12 +5349,16 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       options.inventory?.host ||
       (freshlyDiscoveredInventory && coClaimInventory?.host ? coClaimInventory.host : null) ||
       (needsBuildCoordination ? readHostResources(avdHome) : coClaimInventory?.host || null);
-    return { host, inventory: coClaimInventory };
+    const warmDaemonProbe =
+      needsBuildCoordination && buildReqs.requiresHeavySlot
+        ? probeWarmBuildDaemons(buildReqs, options)
+        : { warm: false, daemonPids: [] };
+    return { host, inventory: coClaimInventory, warmDaemonProbe };
   };
 
   let check;
   while (true) {
-    const { host, inventory } = refreshHostAndInventory();
+    const { host, inventory, warmDaemonProbe } = refreshHostAndInventory();
     let txRes;
     try {
       txRes = withStateTransaction(
@@ -5939,8 +5944,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           let canAdmit = Boolean(chosenTicket && chosenTicket.ticketId === ticket.ticketId);
           let ramCheck = null;
 
+          const coldEstimateMb = state.config?.buildRamEstimateMb ?? 3072;
+          const estimateMb = warmDaemonProbe.warm ? 0 : coldEstimateMb;
           if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
-            const estimateMb = state.config?.buildRamEstimateMb ?? 3072;
             ramCheck = checkUnifiedRamAdmission(state, host, estimateMb, now, {
               hysteresisMb: wasAlreadyQueued ? 0 : undefined,
             });
@@ -6031,12 +6037,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               preparingDevice: isColdPrep,
               pinnedDeviceLeaseId: lease?.leaseId || null,
               pinnedDeviceKey: lease?.deviceKey || null,
-              reservedRamMb: buildReqs.requiresHeavySlot
-                ? (state.config?.buildRamEstimateMb ?? 3072)
-                : 0,
-              ramReservationUntilMs: buildReqs.requiresHeavySlot
-                ? now + Math.max(reserveWindowMs, prepBudgetMs)
-                : 0,
+              reservedRamMb: buildReqs.requiresHeavySlot ? estimateMb : 0,
+              ramReservationUntilMs:
+                buildReqs.requiresHeavySlot && estimateMb > 0
+                  ? now + Math.max(reserveWindowMs, prepBudgetMs)
+                  : 0,
               createdAtMs: now,
               renewedAtMs: now,
               expiresAtMs: now + Math.max(ttlMs, prepBudgetMs),

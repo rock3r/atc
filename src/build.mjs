@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -797,6 +798,7 @@ export function resolveBuildResources(
       requiresDevice,
       requiresHeavySlot,
       requiresWorkspaceLock,
+      disablesDaemon: clauseRes.some((r) => r.disablesDaemon),
       workspaceRoot: clauseRes.find((r) => r.workspaceRoot)?.workspaceRoot || null,
       resourceKeys: Array.from(new Set(clauseRes.flatMap((r) => r.resourceKeys || []))),
     };
@@ -873,8 +875,12 @@ export function resolveBuildResources(
       searchStart;
 
     const canonicalRoot = canonicalizeBuildPath(rootDir);
+    const disablesDaemon = strArgs.some(
+      (a) => a === "--no-daemon" || a === "-Dorg.gradle.daemon=false",
+    );
     return {
       ...classified,
+      disablesDaemon,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
     };
@@ -882,8 +888,17 @@ export function resolveBuildResources(
 
   if (classified.tool === "bazel") {
     let outputBase = null;
+    let disablesDaemon = false;
     for (let i = 0; i < strArgs.length; i++) {
       const a = strArgs[i];
+      if (a === "--batch") {
+        disablesDaemon = true;
+        continue;
+      }
+      if (a === "--nobatch") {
+        disablesDaemon = false;
+        continue;
+      }
       if (a === "--output_base" && i + 1 < strArgs.length) {
         outputBase = path.resolve(baseCwd, strArgs[++i]);
         continue;
@@ -916,6 +931,7 @@ export function resolveBuildResources(
     }
     return {
       ...classified,
+      disablesDaemon,
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
     };
@@ -1469,4 +1485,93 @@ export function evaluateNestedBuildAdmission(
     buildLease: activeBuildLease,
     deltaKeys,
   };
+}
+
+export function probeWarmBuildDaemons(buildReqs, options = {}) {
+  if (
+    !buildReqs ||
+    (buildReqs.tool !== "gradle" && buildReqs.tool !== "bazel") ||
+    buildReqs.disablesDaemon
+  ) {
+    return { warm: false, daemonPids: [] };
+  }
+  if (typeof options.warmBuildDaemon === "boolean") {
+    return { warm: options.warmBuildDaemon, daemonPids: [] };
+  }
+  if (Array.isArray(options.inventory?.warmBuildDaemons)) {
+    const matched = options.inventory.warmBuildDaemons.filter((d) => {
+      if (!d) return false;
+      if (typeof d === "string") return d === buildReqs.tool || d === buildReqs.workspaceRoot;
+      if (d.tool && d.tool !== buildReqs.tool) return false;
+      if (d.workspaceRoot && buildReqs.workspaceRoot && d.workspaceRoot !== buildReqs.workspaceRoot) {
+        return false;
+      }
+      return true;
+    });
+    return {
+      warm: matched.length > 0,
+      daemonPids: matched.map((d) => d.pid).filter(Boolean),
+    };
+  }
+  if (options.inventory && !options.runner && !options.spawnSyncFn) {
+    return { warm: false, daemonPids: [] };
+  }
+  const platform = options.platform || process.platform;
+  if (platform === "win32" && !options.runner && !options.spawnSyncFn) {
+    return { warm: false, daemonPids: [] };
+  }
+  try {
+    let stdout = "";
+    if (typeof options.runner === "function") {
+      const res = options.runner("ps", ["-ax", "-o", "pid=,command="]);
+      stdout = String(res?.stdout || "");
+    } else {
+      const spawnFn = options.spawnSyncFn || spawnSync;
+      const res = spawnFn("ps", ["-ax", "-o", "pid=,command="], {
+        encoding: "utf8",
+        timeout: 2000,
+      });
+      if (res?.status === 0 || typeof res?.stdout === "string") {
+        stdout = String(res.stdout || "");
+      }
+    }
+    if (!stdout) return { warm: false, daemonPids: [] };
+    const daemonPids = [];
+    const wsRoot = String(buildReqs.workspaceRoot || "");
+    const wsBase = wsRoot ? path.basename(wsRoot) : "";
+    const outKeys = (buildReqs.resourceKeys || [])
+      .filter((k) => String(k).startsWith("bazel:out:"))
+      .map((k) => String(k).slice("bazel:out:".length));
+    for (const rawLine of stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const m = line.match(/^(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      const cmdLine = m[2];
+      if (buildReqs.tool === "gradle") {
+        if (/GradleDaemon\b/.test(cmdLine)) {
+          daemonPids.push(pid);
+        }
+      } else if (buildReqs.tool === "bazel") {
+        const isBazelServer =
+          /\bbazel\([^)]+\)/.test(cmdLine) ||
+          /com\.google\.devtools\.build\.lib\.bazel\.BazelMain\b/.test(cmdLine);
+        if (isBazelServer) {
+          const matchesOut = outKeys.some((outPath) => outPath && cmdLine.includes(outPath));
+          if (
+            matchesOut ||
+            !wsRoot ||
+            cmdLine.includes(wsRoot) ||
+            (wsBase && cmdLine.includes(`bazel(${wsBase})`))
+          ) {
+            daemonPids.push(pid);
+          }
+        }
+      }
+    }
+    return { warm: daemonPids.length > 0, daemonPids };
+  } catch {
+    return { warm: false, daemonPids: [] };
+  }
 }

@@ -732,21 +732,19 @@ export function buildChildInvocation(
       nextArgs = [...nextArgs, "--device", String(lease.serial)];
     }
   } else if (
-    base === "xcodebuild" ||
-    ((base === "xcrun" || base === "build-brief") &&
-      String(nextArgs[0] || "").toLowerCase() === "xcodebuild")
+    !new Set(["sh", "bash", "zsh", "dash", "ksh", "cmd", "powershell", "pwsh"]).has(base) &&
+    buildClassified.tool === "xcodebuild"
   ) {
-    const xbOffset = base === "xcodebuild" ? 0 : 1;
-    let explicitDestination = null;
-    for (let i = xbOffset; i < nextArgs.length; i++) {
-      const a = String(nextArgs[i]);
+    const peeledXb = peelBuildWrapperTokens(effectiveCmd, nextArgs);
+    const xbArgs = Array.isArray(peeledXb.args) ? peeledXb.args : nextArgs;
+    const explicitDestinations = [];
+    for (let i = 0; i < xbArgs.length; i++) {
+      const a = String(xbArgs[i]);
       if (a.startsWith("-destination=")) {
-        explicitDestination = a.slice("-destination=".length);
-        break;
-      }
-      if (a === "-destination" && i + 1 < nextArgs.length) {
-        explicitDestination = String(nextArgs[i + 1]);
-        break;
+        explicitDestinations.push(a.slice("-destination=".length));
+      } else if (a === "-destination" && i + 1 < xbArgs.length) {
+        explicitDestinations.push(String(xbArgs[i + 1]));
+        i++;
       }
     }
     const allowedIds = new Set(
@@ -754,12 +752,18 @@ export function buildChildInvocation(
         .filter(Boolean)
         .map((s) => String(s).toUpperCase()),
     );
-    if (explicitDestination && allowedIds.size > 0 && (lease?.platform || "android") === "ios") {
-      const idMatch = explicitDestination.match(/(?:^|,)\s*id=([^,\s]+)/i);
-      if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
-        throw new Error(
-          `Conflicting device selector "${idMatch?.[1] || explicitDestination}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-        );
+    if (
+      explicitDestinations.length > 0 &&
+      allowedIds.size > 0 &&
+      (lease?.platform || "android") === "ios"
+    ) {
+      for (const dest of explicitDestinations) {
+        const idMatch = dest.match(/(?:^|,)\s*id=([^,\s]+)/i);
+        if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
+          throw new Error(
+            `Conflicting device selector "${idMatch?.[1] || dest}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+          );
+        }
       }
     }
     const queryFlags = new Set([
@@ -772,11 +776,9 @@ export function buildChildInvocation(
       "-h",
       "-usage",
     ]);
-    const isQueryOnly = nextArgs
-      .slice(xbOffset)
-      .some((a) => queryFlags.has(String(a).toLowerCase()));
+    const isQueryOnly = xbArgs.some((a) => queryFlags.has(String(a).toLowerCase()));
     if (
-      !explicitDestination &&
+      explicitDestinations.length === 0 &&
       !isQueryOnly &&
       lease?.serial &&
       (lease.platform || "android") === "ios"
@@ -843,16 +845,14 @@ export function buildChildInvocation(
             }
           }
           if (cClass.tool === "xcodebuild") {
-            let explicitDestination = null;
+            const explicitDestinations = [];
             for (let i = 0; i < peeled.args.length; i++) {
               const a = String(peeled.args[i]);
               if (a.startsWith("-destination=")) {
-                explicitDestination = a.slice("-destination=".length);
-                break;
-              }
-              if (a === "-destination" && i + 1 < peeled.args.length) {
-                explicitDestination = String(peeled.args[i + 1]);
-                break;
+                explicitDestinations.push(a.slice("-destination=".length));
+              } else if (a === "-destination" && i + 1 < peeled.args.length) {
+                explicitDestinations.push(String(peeled.args[i + 1]));
+                i++;
               }
             }
             const allowedIds = new Set(
@@ -860,12 +860,18 @@ export function buildChildInvocation(
                 .filter(Boolean)
                 .map((s) => String(s).toUpperCase()),
             );
-            if (explicitDestination && allowedIds.size > 0 && (lease?.platform || "android") === "ios") {
-              const idMatch = explicitDestination.match(/(?:^|,)\s*id=([^,\s]+)/i);
-              if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
-                throw new Error(
-                  `Conflicting device selector "${idMatch?.[1] || explicitDestination}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-                );
+            if (
+              explicitDestinations.length > 0 &&
+              allowedIds.size > 0 &&
+              (lease?.platform || "android") === "ios"
+            ) {
+              for (const dest of explicitDestinations) {
+                const idMatch = dest.match(/(?:^|,)\s*id=([^,\s]+)/i);
+                if (!idMatch || !idMatch[1] || !allowedIds.has(idMatch[1].toUpperCase())) {
+                  throw new Error(
+                    `Conflicting device selector "${idMatch?.[1] || dest}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+                  );
+                }
               }
             }
             const xcodeInjected = [];
@@ -873,7 +879,7 @@ export function buildChildInvocation(
               xcodeInjected.push(`-jobs ${jobsLimit}`);
             }
             if (
-              !explicitDestination &&
+              explicitDestinations.length === 0 &&
               lease?.serial &&
               (lease.platform || "android") === "ios"
             ) {

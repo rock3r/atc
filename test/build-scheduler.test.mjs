@@ -15,6 +15,7 @@ import {
   checkUnifiedRamAdmission,
   reconcileBuildLease,
   evaluateNestedBuildAdmission,
+  probeWarmBuildDaemons,
 } from "../src/build.mjs";
 import {
   resolveAuditLogPath,
@@ -1091,6 +1092,75 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     assert.equal(
       bazelShellInv.args[1],
       "bazel --output_base=/tmp/build build --jobs=4 --local_ram_resources=3072 //app:bin",
+    );
+
+    // Wrapped xcodebuild (env FOO=1 xcodebuild test / xcrun --sdk iphonesimulator xcodebuild test)
+    const xcEnvInv = buildChildInvocation(
+      "env",
+      ["FOO=1", "xcodebuild", "test", "-scheme", "App"],
+      iosLease,
+      "sess-round6",
+      process.env,
+      buildLease,
+    );
+    assert.ok(xcEnvInv.args.includes("-destination"));
+    assert.ok(xcEnvInv.args.includes("id=SIM-UDID-999"));
+
+    const xcSdkInv = buildChildInvocation(
+      "xcrun",
+      ["--sdk", "iphonesimulator", "xcodebuild", "test", "-scheme", "App"],
+      iosLease,
+      "sess-round6",
+      process.env,
+      buildLease,
+    );
+    assert.ok(xcSdkInv.args.includes("-destination"));
+    assert.ok(xcSdkInv.args.includes("id=SIM-UDID-999"));
+
+    // Multiple -destination flags: second unleased destination must be rejected
+    assert.throws(
+      () =>
+        buildChildInvocation(
+          "xcodebuild",
+          [
+            "test",
+            "-scheme",
+            "App",
+            "-destination",
+            "id=SIM-UDID-999",
+            "-destination",
+            "id=UNLEASED-UDID",
+          ],
+          iosLease,
+          "sess-round6",
+          process.env,
+          buildLease,
+        ),
+      /Conflicting device selector "UNLEASED-UDID"/,
+    );
+
+    // probeWarmBuildDaemons detects warm GradleDaemon and Bazel server unless --no-daemon / --batch
+    const gradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], spacedAppDir);
+    const warmGradle = probeWarmBuildDaemons(gradleReqs, {
+      runner: () => ({
+        stdout: "  44123 /Library/Java/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
+      }),
+    });
+    assert.equal(warmGradle.warm, true);
+    assert.deepEqual(warmGradle.daemonPids, [44123]);
+
+    const noDaemonReqs = resolveBuildResources(
+      "./gradlew",
+      ["assembleDebug", "--no-daemon"],
+      spacedAppDir,
+    );
+    assert.equal(
+      probeWarmBuildDaemons(noDaemonReqs, {
+        runner: () => ({
+          stdout: "  44123 /Library/Java/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
+        }),
+      }).warm,
+      false,
     );
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
