@@ -1851,7 +1851,9 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
 
     // Bazel warm daemon probe requires full workspace identity or output base (not basename-only bazel(app))
     fs.writeFileSync(path.join(subAppDir, "MODULE.bazel"), 'module(name = "app")\n');
-    const bazelAppReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir);
+    const bazelAppReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir, {
+      bazelMajorVersion: 9,
+    });
     const otherBasenameProbe = probeWarmBuildDaemons(bazelAppReqs, {
       runner: () => ({
         stdout: "9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=/other/work/app\n",
@@ -1867,7 +1869,9 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.equal(customOutputBaseSameWsProbe.warm, false);
 
-    const defaultSubAppBazelOut = computeDefaultBazelOutputBases(canonicalSubApp)[0];
+    const defaultSubAppBazelOut = computeDefaultBazelOutputBases(canonicalSubApp, {
+      bazelMajorVersion: 9,
+    })[0];
     const exactWorkspaceProbe = probeWarmBuildDaemons(bazelAppReqs, {
       runner: () => ({
         stdout: `9002 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=${defaultSubAppBazelOut} --workspace_directory=${canonicalSubApp}\n`,
@@ -1875,6 +1879,68 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.equal(exactWorkspaceProbe.warm, true);
     assert.deepEqual(exactWorkspaceProbe.daemonPids, [9002]);
+
+    // macOS Bazel 8 vs Bazel 9 default output root + conservative cold fallback when version is ambiguous
+    const ambiguousDarwinReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "build", "//..."],
+      subAppDir,
+      { platform: "darwin" },
+    );
+    assert.deepEqual(
+      computeDefaultBazelOutputBases(canonicalSubApp, { platform: "darwin" }),
+      [],
+    );
+    const lingeringBazel8OnAmbiguousDarwin = probeWarmBuildDaemons(ambiguousDarwinReqs, {
+      platform: "darwin",
+      runner: () => ({
+        stdout: `9003 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=/private/var/tmp/_bazel_alice/0123456789abcdef --workspace_directory=${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(lingeringBazel8OnAmbiguousDarwin.warm, false);
+
+    const darwinV9Bases = computeDefaultBazelOutputBases(canonicalSubApp, {
+      platform: "darwin",
+      bazelMajorVersion: 9,
+      env: { USER: "alice", HOME: "/Users/alice" },
+    });
+    assert.ok(
+      darwinV9Bases.some((p) => p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/")),
+    );
+    const darwinV9XdgBases = computeDefaultBazelOutputBases(canonicalSubApp, {
+      platform: "darwin",
+      bazelMajorVersion: 9,
+      env: { USER: "alice", HOME: "/Users/alice", XDG_CACHE_HOME: "/custom/xdg" },
+    });
+    assert.ok(darwinV9XdgBases.some((p) => p.includes("/custom/xdg/bazel/_bazel_alice/")));
+    const darwinV8Bases = computeDefaultBazelOutputBases(canonicalSubApp, {
+      platform: "darwin",
+      bazelMajorVersion: 8,
+      env: { USER: "alice", HOME: "/Users/alice" },
+    });
+    assert.ok(darwinV8Bases.some((p) => p.startsWith("/private/var/tmp/_bazel_alice/")));
+
+    // POSIX username fallback ignores LOGNAME/USERNAME when USER is unset and sanitizes / and \
+    const unsetUserLognameReqs = resolveBuildResources(
+      "env",
+      ["-u", "USER", "LOGNAME=ci", "USERNAME=ci", "bazel", "--nosystem_rc", "build", "//..."],
+      subAppDir,
+      { platform: "linux", env: { USER: "stale", HOME: "/home/acct" } },
+    );
+    const unsetUserBases = computeDefaultBazelOutputBases(canonicalSubApp, {
+      buildReqs: unsetUserLognameReqs,
+      platform: "linux",
+      env: { LOGNAME: "ci", USERNAME: "ci", HOME: "/home/acct" },
+    });
+    assert.equal(
+      unsetUserBases.some((p) => p.includes("/_bazel_ci/")),
+      false,
+    );
+    const sanitizedUserBases = computeDefaultBazelOutputBases(canonicalSubApp, {
+      platform: "linux",
+      env: { USER: "CORP\\team/alice", HOME: "/home/alice" },
+    });
+    assert.ok(sanitizedUserBases.some((p) => p.includes("/_bazel_CORP_team_alice/")));
 
     // Trailing shell comments preserve comment text and insert injected flags before `#`
     const commentGradleInv = buildChildInvocation(
@@ -1992,6 +2058,7 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       "sh",
       ["-c", "./gradlew tasks && bazel --nosystem_rc build //..."],
       wsDir,
+      { bazelMajorVersion: 9 },
     );
     assert.equal(mixedWrapperReqs.clauseBuildReqs.length, 1);
     assert.equal(mixedWrapperReqs.clauseBuildReqs[0].tool, "bazel");
@@ -2001,7 +2068,9 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       }),
     });
     assert.equal(warmGradleOnlyProbe.warm, false);
-    const defaultRootBazelOut = computeDefaultBazelOutputBases(canonicalWs)[0];
+    const defaultRootBazelOut = computeDefaultBazelOutputBases(canonicalWs, {
+      bazelMajorVersion: 9,
+    })[0];
     const warmBazelProbe = probeWarmBuildDaemons(mixedWrapperReqs, {
       runner: () => ({
         stdout: `9102 bazel(root) -XX:+HeapDumpOnOutOfMemoryError --output_base=${defaultRootBazelOut} --workspace_directory=${canonicalWs}\n`,

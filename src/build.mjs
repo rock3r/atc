@@ -3455,6 +3455,7 @@ export function resolveBuildResources(
     workspace = null,
     systemBazelrcPath = undefined,
     platform = undefined,
+    bazelMajorVersion = undefined,
   } = {},
 ) {
   const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
@@ -3599,6 +3600,7 @@ export function resolveBuildResources(
         workspace,
         systemBazelrcPath,
         platform,
+        bazelMajorVersion,
       });
     });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
@@ -4151,9 +4153,9 @@ export function resolveBuildResources(
     const bazelEnvMeta = {
       baseCwd,
       platform: platform || process.platform,
+      bazelMajorVersion,
       envBazelTestTmpdir: effectiveEnvVars.TEST_TMPDIR,
       envBazelUser: effectiveEnvVars.USER,
-      envBazelLogname: effectiveEnvVars.LOGNAME,
       envBazelUsername: effectiveEnvVars.USERNAME,
       envBazelHome: effectiveEnvVars.HOME,
       envBazelUserProfile: effectiveEnvVars.USERPROFILE,
@@ -4169,6 +4171,7 @@ export function resolveBuildResources(
         buildReqs: bazelEnvMeta,
         env: baseEnv,
         platform: platform || process.platform,
+        bazelMajorVersion,
       }),
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
@@ -4853,6 +4856,11 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
   const env = options.env || process.env;
   const platform = options.platform || buildReqs?.platform || process.platform;
   const baseCwd = buildReqs?.baseCwd || process.cwd();
+  const rawMajor = options.bazelMajorVersion ?? buildReqs?.bazelMajorVersion ?? null;
+  const bazelMajor =
+    rawMajor !== null && rawMajor !== undefined && rawMajor !== ""
+      ? Number(rawMajor)
+      : null;
 
   const resolveEnvVar = (key, wrapperVal) => {
     if (wrapperVal === null || wrapperVal === "") return null;
@@ -4862,64 +4870,172 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
   };
 
   const rawTestTmpdir = resolveEnvVar("TEST_TMPDIR", buildReqs?.envBazelTestTmpdir);
-  const rawUser =
-    resolveEnvVar("USER", buildReqs?.envBazelUser) ||
-    resolveEnvVar("LOGNAME", buildReqs?.envBazelLogname) ||
-    resolveEnvVar("USERNAME", buildReqs?.envBazelUsername);
-  const rawHome =
-    resolveEnvVar("HOME", buildReqs?.envBazelHome) ||
-    resolveEnvVar("USERPROFILE", buildReqs?.envBazelUserProfile);
+  const rawPosixUser = resolveEnvVar("USER", buildReqs?.envBazelUser);
+  const rawWinUsername =
+    platform === "win32"
+      ? resolveEnvVar("USERNAME", buildReqs?.envBazelUsername)
+      : null;
+  const rawUser = platform === "win32" ? rawPosixUser || rawWinUsername : rawPosixUser;
+  const rawPosixHome = resolveEnvVar("HOME", buildReqs?.envBazelHome);
+  const rawWinUserProfile =
+    platform === "win32"
+      ? resolveEnvVar("USERPROFILE", buildReqs?.envBazelUserProfile)
+      : null;
+  const rawHome = platform === "win32" ? rawPosixHome || rawWinUserProfile : rawPosixHome;
   const rawXdgCache = resolveEnvVar("XDG_CACHE_HOME", buildReqs?.envBazelXdgCacheHome);
 
   if (
     rawTestTmpdir === "__UNRESOLVED_DYNAMIC_ENV__" ||
-    rawUser === "__UNRESOLVED_DYNAMIC_ENV__" ||
-    rawHome === "__UNRESOLVED_DYNAMIC_ENV__" ||
-    rawXdgCache === "__UNRESOLVED_DYNAMIC_ENV__"
+    rawPosixUser === "__UNRESOLVED_DYNAMIC_ENV__" ||
+    (platform === "win32" && rawWinUsername === "__UNRESOLVED_DYNAMIC_ENV__")
   ) {
     return [];
   }
 
-  const user =
+  const rawSelectedUser =
     rawUser ||
     (() => {
       try {
         return os.userInfo().username;
       } catch {
-        return "default";
+        return null;
       }
-    })() ||
-    "default";
+    })();
+  if (!rawSelectedUser) return [];
+  const user = String(rawSelectedUser).replace(/[\\/]/g, "_");
 
   const candidateRoots = [];
   if (rawTestTmpdir) {
-    const resolvedTmp = path.resolve(baseCwd, rawTestTmpdir);
-    candidateRoots.push(path.join(resolvedTmp, `_bazel_${user}`));
+    const resolvedTmp =
+      platform === "win32" &&
+      (/^[a-zA-Z]:[\\/]/.test(rawTestTmpdir) || rawTestTmpdir.startsWith("\\\\"))
+        ? path.win32.resolve(rawTestTmpdir)
+        : path.resolve(baseCwd, rawTestTmpdir);
+    const joinTmp = platform === "win32" ? path.win32.join : path.join;
+    candidateRoots.push(joinTmp(resolvedTmp, `_bazel_${user}`));
     candidateRoots.push(
-      path.join(canonicalizeBuildPath(resolvedTmp, { platform }), `_bazel_${user}`),
+      joinTmp(canonicalizeBuildPath(resolvedTmp, { platform }), `_bazel_${user}`),
     );
   } else if (platform === "darwin") {
-    candidateRoots.push(`/var/tmp/_bazel_${user}`);
-    candidateRoots.push(`/private/var/tmp/_bazel_${user}`);
+    if (bazelMajor === null || !Number.isFinite(bazelMajor) || bazelMajor <= 0) {
+      // Bazel <= 8 uses /var/tmp/_bazel_<user> on macOS while Bazel 9+ uses
+      // ~/Library/Caches/bazel/_bazel_<user> (or ${XDG_CACHE_HOME}/bazel/_bazel_<user>).
+      // Without a known major version, conservatively treat as cold so a lingering
+      // server from the other major version cannot falsely satisfy admission.
+      return [];
+    }
+    if (bazelMajor <= 8) {
+      candidateRoots.push(`/var/tmp/_bazel_${user}`);
+      candidateRoots.push(`/private/var/tmp/_bazel_${user}`);
+    } else {
+      if (
+        rawXdgCache === "__UNRESOLVED_DYNAMIC_ENV__" ||
+        rawPosixHome === "__UNRESOLVED_DYNAMIC_ENV__"
+      ) {
+        return [];
+      }
+      if (rawXdgCache) {
+        const xdgCache = path.resolve(baseCwd, rawXdgCache);
+        candidateRoots.push(path.join(xdgCache, "bazel", `_bazel_${user}`));
+        candidateRoots.push(
+          path.join(canonicalizeBuildPath(xdgCache, { platform }), "bazel", `_bazel_${user}`),
+        );
+      } else {
+        const homeDir =
+          rawPosixHome ||
+          (() => {
+            try {
+              return os.userInfo().homedir;
+            } catch {
+              return null;
+            }
+          })();
+        if (homeDir) {
+          const resolvedHome = path.resolve(baseCwd, homeDir);
+          candidateRoots.push(path.join(resolvedHome, "Library", "Caches", "bazel", `_bazel_${user}`));
+          candidateRoots.push(
+            path.join(
+              canonicalizeBuildPath(resolvedHome, { platform }),
+              "Library",
+              "Caches",
+              "bazel",
+              `_bazel_${user}`,
+            ),
+          );
+        } else {
+          candidateRoots.push(`/var/tmp/_bazel_${user}`);
+          candidateRoots.push(`/private/var/tmp/_bazel_${user}`);
+        }
+      }
+    }
   } else if (platform === "win32") {
-    const homeDir =
-      rawHome || (buildReqs?.envBazelHome === null ? null : os.homedir());
-    if (homeDir) {
-      const resolvedHome =
-        /^[a-zA-Z]:[\\/]/.test(homeDir) || homeDir.startsWith("\\\\")
-          ? path.win32.resolve(homeDir)
-          : path.resolve(baseCwd, homeDir);
-      candidateRoots.push(path.win32.join(resolvedHome, `_bazel_${user}`));
-      candidateRoots.push(
-        path.win32.join(
-          canonicalizeBuildPath(resolvedHome, { platform: "win32" }),
-          `_bazel_${user}`,
-        ),
-      );
+    if (
+      rawXdgCache === "__UNRESOLVED_DYNAMIC_ENV__" ||
+      rawPosixHome === "__UNRESOLVED_DYNAMIC_ENV__" ||
+      rawWinUserProfile === "__UNRESOLVED_DYNAMIC_ENV__"
+    ) {
+      return [];
+    }
+    if (rawXdgCache) {
+      if (bazelMajor === null || !Number.isFinite(bazelMajor) || bazelMajor <= 0) {
+        return [];
+      }
+      if (bazelMajor >= 9) {
+        const resolvedXdg =
+          /^[a-zA-Z]:[\\/]/.test(rawXdgCache) || rawXdgCache.startsWith("\\\\")
+            ? path.win32.resolve(rawXdgCache)
+            : path.resolve(baseCwd, rawXdgCache);
+        candidateRoots.push(path.win32.join(resolvedXdg, "bazel", `_bazel_${user}`));
+        candidateRoots.push(
+          path.win32.join(
+            canonicalizeBuildPath(resolvedXdg, { platform: "win32" }),
+            "bazel",
+            `_bazel_${user}`,
+          ),
+        );
+      }
+    }
+    if (candidateRoots.length === 0) {
+      const homeDir =
+        rawHome ||
+        (() => {
+          try {
+            return os.userInfo().homedir;
+          } catch {
+            return null;
+          }
+        })() ||
+        os.homedir();
+      if (homeDir) {
+        const resolvedHome =
+          /^[a-zA-Z]:[\\/]/.test(homeDir) || homeDir.startsWith("\\\\")
+            ? path.win32.resolve(homeDir)
+            : path.resolve(baseCwd, homeDir);
+        candidateRoots.push(path.win32.join(resolvedHome, `_bazel_${user}`));
+        candidateRoots.push(
+          path.win32.join(
+            canonicalizeBuildPath(resolvedHome, { platform: "win32" }),
+            `_bazel_${user}`,
+          ),
+        );
+      }
     }
   } else {
+    if (
+      rawXdgCache === "__UNRESOLVED_DYNAMIC_ENV__" ||
+      rawPosixHome === "__UNRESOLVED_DYNAMIC_ENV__"
+    ) {
+      return [];
+    }
     const homeDir =
-      rawHome || (buildReqs?.envBazelHome === null ? null : os.homedir());
+      rawPosixHome ||
+      (() => {
+        try {
+          return os.userInfo().homedir;
+        } catch {
+          return null;
+        }
+      })();
     const xdgCache = rawXdgCache
       ? path.resolve(baseCwd, rawXdgCache)
       : homeDir
@@ -4931,7 +5047,7 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
         path.join(canonicalizeBuildPath(xdgCache, { platform }), "bazel", `_bazel_${user}`),
       );
     } else {
-      candidateRoots.push(`/var/tmp/_bazel_${user}`);
+      candidateRoots.push(`/tmp/_bazel_${user}`);
     }
   }
 
@@ -5301,6 +5417,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
                   buildReqs,
                   env: options.env,
                   platform,
+                  bazelMajorVersion: options.bazelMajorVersion ?? buildReqs.bazelMajorVersion,
                 });
           const matchesWorkspace = targetOutPaths.some(
             (outPath) => outPath && matchesCmdPathBoundary(cmdLine, outPath),
