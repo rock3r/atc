@@ -17,8 +17,15 @@ export function canonicalizeBuildPath(targetPath, options = {}) {
   const isWinPath = /^[a-zA-Z]:[\\/]/.test(rawStr) || rawStr.startsWith("\\\\");
   const isWin = (options?.platform || process.platform) === "win32" || isWinPath;
   const resolved =
-    isWinPath && process.platform !== "win32" ? path.win32.resolve(rawStr) : path.resolve(rawStr);
+    isWinPath && process.platform !== "win32"
+      ? path.win32.resolve(rawStr)
+      : !isWin && process.platform === "win32" && rawStr.startsWith("/")
+        ? path.posix.resolve(rawStr)
+        : path.resolve(rawStr);
   try {
+    if (!isWin && process.platform === "win32" && rawStr.startsWith("/")) {
+      return resolved;
+    }
     const realpathFn = fs.realpathSync.native || fs.realpathSync;
     return realpathFn(resolved);
   } catch {
@@ -4904,14 +4911,24 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
   if (!rawSelectedUser) return [];
   const user = String(rawSelectedUser).replace(/[\\/]/g, "_");
 
+  const resolvePosixPath = (base, val) => {
+    const s = String(val || "");
+    if (s.startsWith("/")) return path.posix.resolve(s);
+    const b = String(base || "");
+    if (b.startsWith("/")) return path.posix.resolve(b, s);
+    return path.resolve(b, s);
+  };
+
   const candidateRoots = [];
   if (rawTestTmpdir) {
     const resolvedTmp =
       platform === "win32" &&
       (/^[a-zA-Z]:[\\/]/.test(rawTestTmpdir) || rawTestTmpdir.startsWith("\\\\"))
         ? path.win32.resolve(rawTestTmpdir)
-        : path.resolve(baseCwd, rawTestTmpdir);
-    const joinTmp = platform === "win32" ? path.win32.join : path.join;
+        : platform === "win32"
+          ? path.resolve(baseCwd, rawTestTmpdir)
+          : resolvePosixPath(baseCwd, rawTestTmpdir);
+    const joinTmp = platform === "win32" ? path.win32.join : path.posix.join;
     candidateRoots.push(joinTmp(resolvedTmp, `_bazel_${user}`));
     candidateRoots.push(
       joinTmp(canonicalizeBuildPath(resolvedTmp, { platform }), `_bazel_${user}`),
@@ -4935,10 +4952,14 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
         return [];
       }
       if (rawXdgCache) {
-        const xdgCache = path.resolve(baseCwd, rawXdgCache);
-        candidateRoots.push(path.join(xdgCache, "bazel", `_bazel_${user}`));
+        const xdgCache = resolvePosixPath(baseCwd, rawXdgCache);
+        candidateRoots.push(path.posix.join(xdgCache, "bazel", `_bazel_${user}`));
         candidateRoots.push(
-          path.join(canonicalizeBuildPath(xdgCache, { platform }), "bazel", `_bazel_${user}`),
+          path.posix.join(
+            canonicalizeBuildPath(xdgCache, { platform }),
+            "bazel",
+            `_bazel_${user}`,
+          ),
         );
       } else {
         const homeDir =
@@ -4951,10 +4972,12 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
             }
           })();
         if (homeDir) {
-          const resolvedHome = path.resolve(baseCwd, homeDir);
-          candidateRoots.push(path.join(resolvedHome, "Library", "Caches", "bazel", `_bazel_${user}`));
+          const resolvedHome = resolvePosixPath(baseCwd, homeDir);
           candidateRoots.push(
-            path.join(
+            path.posix.join(resolvedHome, "Library", "Caches", "bazel", `_bazel_${user}`),
+          );
+          candidateRoots.push(
+            path.posix.join(
               canonicalizeBuildPath(resolvedHome, { platform }),
               "Library",
               "Caches",
@@ -5037,21 +5060,21 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
         }
       })();
     const xdgCache = rawXdgCache
-      ? path.resolve(baseCwd, rawXdgCache)
+      ? resolvePosixPath(baseCwd, rawXdgCache)
       : homeDir
-        ? path.join(path.resolve(baseCwd, homeDir), ".cache")
+        ? path.posix.join(resolvePosixPath(baseCwd, homeDir), ".cache")
         : null;
     if (xdgCache) {
-      candidateRoots.push(path.join(xdgCache, "bazel", `_bazel_${user}`));
+      candidateRoots.push(path.posix.join(xdgCache, "bazel", `_bazel_${user}`));
       candidateRoots.push(
-        path.join(canonicalizeBuildPath(xdgCache, { platform }), "bazel", `_bazel_${user}`),
+        path.posix.join(canonicalizeBuildPath(xdgCache, { platform }), "bazel", `_bazel_${user}`),
       );
     } else {
       candidateRoots.push(`/tmp/_bazel_${user}`);
     }
   }
 
-  const joinFn = platform === "win32" ? path.win32.join : path.join;
+  const joinFn = platform === "win32" ? path.win32.join : path.posix.join;
   const bases = [];
   for (const root of candidateRoots) {
     if (!root) continue;
