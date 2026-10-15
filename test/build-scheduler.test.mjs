@@ -39,6 +39,7 @@ import {
   cmdGuard,
   cmdStatus,
   cmdConfig,
+  parseCliArgs,
 } from "../src/cli.mjs";
 
 function makeTempDir() {
@@ -444,10 +445,22 @@ test("cmdExec --claim performs atomic device + build co-allocation without holdi
     { mode: 0o755 },
   );
 
+  const parsedSelector = parseCliArgs([
+    "exec",
+    "--claim",
+    "--type phone --api >=35",
+    "--",
+    "./gradlew",
+    "connectedDebugAndroidTest",
+  ]);
+  assert.equal(parsedSelector.flags.claim, true);
+  assert.equal(parsedSelector.flags.type, "phone");
+  assert.equal(parsedSelector.flags.api, ">=35");
+
   const res = await cmdExec(
     stateDir,
     [fakeGradlew, "connectedDebugAndroidTest"],
-    { claim: true, session: "sess-coalloc" },
+    { claim: "--type phone --api >=35", session: "sess-coalloc" },
     {
       cwd: wsDir,
       inventory: fakeInventory,
@@ -457,19 +470,67 @@ test("cmdExec --claim performs atomic device + build co-allocation without holdi
   assert.equal(res.exitCode, 0);
 
   const afterState = readState(stateDir);
-  assert.equal(Object.keys(afterState.leases).length, 1);
-  assert.equal(afterState.leases["Pixel_7_API_35"].sessionId, "sess-coalloc");
+  assert.deepEqual(
+    afterState.leases,
+    {},
+    "One-shot cmdExec --claim must release the co-allocated device lease on exit",
+  );
   assert.deepEqual(afterState.buildLeases, {});
 
   const events = readRecentAuditEvents(stateDir, { limit: 20 }).map((e) => e.event);
   assert.ok(events.includes("device_claim"));
   assert.ok(events.includes("build_co_alloc_admit"));
   assert.ok(events.includes("build_release"));
+  assert.ok(events.includes("device_free"));
+
+  // Pre-existing session lease must NOT be released when running cmdExec --claim
+  const preClaim = cmdClaim(
+    stateDir,
+    { type: "phone", api: ">=35", session: "sess-preexisting" },
+    { inventory: fakeInventory, env: { ...process.env, ATC_SESSION_ID: "sess-preexisting" } },
+  );
+  assert.equal(preClaim.exitCode, 0);
+
+  const preExec = await cmdExec(
+    stateDir,
+    [fakeGradlew, "connectedDebugAndroidTest"],
+    { claim: true, session: "sess-preexisting" },
+    {
+      cwd: wsDir,
+      inventory: fakeInventory,
+      env: { ...process.env, ATC_SESSION_ID: "sess-preexisting" },
+    },
+  );
+  assert.equal(preExec.exitCode, 0);
+  const afterPreState = readState(stateDir);
+  assert.equal(
+    Object.keys(afterPreState.leases).length,
+    1,
+    "Pre-existing session lease must remain active after cmdExec --claim",
+  );
+
+  // Also verify buildChildInvocation injects -destination id=<udid> for xcodebuild test under iOS lease
+  const iosXb = buildChildInvocation(
+    "xcodebuild",
+    ["test", "-scheme", "App"],
+    {
+      leaseId: "lease_ios_1",
+      platform: "ios",
+      kind: "emulator",
+      serial: "D9746857-ABCD-4321-9999-111122223333",
+    },
+    "sess-ios",
+    {},
+  );
+  assert.deepEqual(iosXb.args.slice(-2), [
+    "-destination",
+    "id=D9746857-ABCD-4321-9999-111122223333",
+  ]);
 
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
-test("evaluateNestedBuildAdmission allows same-workspace re-entrant builds and fails fast on cross-workspace deadlock", () => {
+test("evaluateNestedBuildAdmission allows same-workspace re-entrant builds (including cross-tool KMP delta keys) and fails fast on cross-workspace deadlock", () => {
   const state = createDefaultState();
   state.buildLeases.build_parent = {
     buildId: "build_parent",
@@ -477,21 +538,24 @@ test("evaluateNestedBuildAdmission allows same-workspace re-entrant builds and f
     state: "active",
     opId: "op_parent",
     opNonce: "nonce_parent",
-    resourceKeys: ["gradle:/repo-a"],
+    workspaceRoot: "/repo-a",
+    resourceKeys: ["xcode:/repo-a", "workspace:/repo-a"],
     requiresWorkspaceLock: true,
     requiresHeavySlot: true,
     workerPid: process.pid,
   };
 
-  const sameWs = evaluateNestedBuildAdmission(state, {
+  const sameWsCrossTool = evaluateNestedBuildAdmission(state, {
     inheritedOpId: "op_parent",
     inheritedNonce: "nonce_parent",
     ancestorPids: [process.pid],
-    requestedKeys: ["gradle:/repo-a"],
+    requestedKeys: ["gradle:/repo-a", "workspace:/repo-a"],
     requiresHeavySlot: true,
   });
-  assert.equal(sameWs.reentrant, true);
-  assert.equal(sameWs.deadlockHazard, false);
+  assert.equal(sameWsCrossTool.reentrant, true);
+  assert.equal(sameWsCrossTool.deadlockHazard, false);
+  assert.deepEqual(sameWsCrossTool.deltaKeys, ["gradle:/repo-a"]);
+  assert.ok(state.buildLeases.build_parent.resourceKeys.includes("gradle:/repo-a"));
 
   const crossWs = evaluateNestedBuildAdmission(state, {
     inheritedOpId: "op_parent",

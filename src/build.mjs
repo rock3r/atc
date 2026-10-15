@@ -1217,15 +1217,61 @@ export function evaluateNestedBuildAdmission(
     };
   }
 
-  const heldKeys = new Set(activeBuildLease.resourceKeys || []);
-  for (const k of requestedKeys || []) {
-    if (!heldKeys.has(k)) {
-      return {
-        reentrant: false,
-        deadlockHazard: true,
-        reason: `Nested build requests workspace resource "${k}" not held by parent build operation ${activeBuildLease.buildId} (held: ${Array.from(heldKeys).join(", ")}). Failing fast to prevent self-deadlock.`,
-      };
+  const extractKeyPath = (keyStr) => {
+    const s = String(keyStr || "");
+    const firstColon = s.indexOf(":");
+    if (firstColon === -1) return "";
+    const rest = s.slice(firstColon + 1);
+    const secondColon = rest.indexOf(":");
+    if (
+      secondColon !== -1 &&
+      ["ws", "out", "dir", "dd"].includes(rest.slice(0, secondColon))
+    ) {
+      return rest.slice(secondColon + 1);
     }
+    return rest;
+  };
+
+  const heldKeys = new Set(activeBuildLease.resourceKeys || []);
+  const heldRoots = new Set();
+  if (activeBuildLease.workspaceRoot) {
+    heldRoots.add(String(activeBuildLease.workspaceRoot));
+  }
+  for (const hk of heldKeys) {
+    const p = extractKeyPath(hk);
+    if (p) heldRoots.add(p);
+  }
+
+  const otherHeldKeys = new Set();
+  for (const b of Object.values(state?.buildLeases || {})) {
+    if (!b || b.buildId === activeBuildLease.buildId) continue;
+    if (b.state !== "active" && b.state !== "draining") continue;
+    for (const ok of b.resourceKeys || []) {
+      otherHeldKeys.add(ok);
+    }
+  }
+
+  const deltaKeys = [];
+  for (const k of requestedKeys || []) {
+    if (heldKeys.has(k)) continue;
+    const reqPath = extractKeyPath(k);
+    const inSameWorkspace =
+      Boolean(reqPath) &&
+      Array.from(heldRoots).some(
+        (root) =>
+          reqPath === root ||
+          reqPath.startsWith(`${root}/`) ||
+          reqPath.startsWith(`${root}\\`),
+      );
+    if (inSameWorkspace && !otherHeldKeys.has(k)) {
+      deltaKeys.push(k);
+      continue;
+    }
+    return {
+      reentrant: false,
+      deadlockHazard: true,
+      reason: `Nested build requests workspace resource "${k}" not held by parent build operation ${activeBuildLease.buildId} (held: ${Array.from(heldKeys).join(", ")}). Failing fast to prevent self-deadlock.`,
+    };
   }
   if (requiresHeavySlot && !activeBuildLease.requiresHeavySlot) {
     return {
@@ -1242,9 +1288,14 @@ export function evaluateNestedBuildAdmission(
     };
   }
 
+  if (deltaKeys.length > 0) {
+    activeBuildLease.resourceKeys = Array.from(new Set([...heldKeys, ...deltaKeys]));
+  }
+
   return {
     reentrant: true,
     deadlockHazard: false,
     buildLease: activeBuildLease,
+    deltaKeys,
   };
 }

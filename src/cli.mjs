@@ -324,6 +324,38 @@ function validateCommandFlags(flags, allowedSet, subcommand) {
   return null;
 }
 
+function tokenizeClaimSelectorString(raw) {
+  const tokens = [];
+  let cur = "";
+  let quote = null;
+  const s = String(raw || "").trim();
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else if (ch === "\\" && quote === '"' && i + 1 < s.length) {
+        cur += s[++i];
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (cur.length > 0) {
+        tokens.push(cur);
+        cur = "";
+      }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.length > 0) {
+    tokens.push(cur);
+  }
+  return tokens;
+}
+
 export function parseCliArgs(argv) {
   const args = [...argv];
   const dashDashIdx = args.indexOf("--");
@@ -351,12 +383,22 @@ export function parseCliArgs(argv) {
       flags.play = false;
       continue;
     }
+    if (tok === "--claim") {
+      flags.claim = true;
+      if (i + 1 < mainArgs.length) {
+        const nextTok = String(mainArgs[i + 1]);
+        if (/\s/.test(nextTok)) {
+          const extraTokens = tokenizeClaimSelectorString(mainArgs[++i]);
+          mainArgs.splice(i + 1, 0, ...extraTokens);
+        }
+      }
+      continue;
+    }
     if (
       [
         "--ios",
         "--android",
         "--build",
-        "--claim",
         "--create-if-missing",
         "--wipe-data",
         "--cold",
@@ -382,6 +424,17 @@ export function parseCliArgs(argv) {
         .replace(/^-+/, "")
         .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       const rawVal = tok.slice(eqIdx + 1);
+      if (
+        key === "claim" &&
+        !["true", "false", "1", "0", "yes", "no", "on", "off", ""].includes(
+          rawVal.trim().toLowerCase(),
+        )
+      ) {
+        flags.claim = true;
+        const extraTokens = tokenizeClaimSelectorString(rawVal);
+        mainArgs.splice(i + 1, 0, ...extraTokens);
+        continue;
+      }
       flags[key] = BOOLEAN_FLAG_KEYS.has(key) ? parseBoolFlag(rawVal) : rawVal;
       continue;
     }
@@ -5104,6 +5157,16 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 }
 
 export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
+  if (
+    typeof flags?.claim === "string" &&
+    flags.claim.trim() &&
+    !["true", "false", "1", "0", "yes", "no", "on", "off"].includes(
+      flags.claim.trim().toLowerCase(),
+    )
+  ) {
+    const parsedSelector = parseCliArgs(["exec", ...tokenizeClaimSelectorString(flags.claim)]);
+    flags = { ...parsedSelector.flags, ...flags, claim: true };
+  }
   const unknownFlagErr = validateCommandFlags(flags, EXEC_ALLOWED_FLAGS, "exec");
   if (unknownFlagErr) {
     return { exitCode: 1, error: unknownFlagErr };
@@ -5155,10 +5218,14 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   );
 
   // If --claim is requested without build coordination, claim the device first via cmdClaim
+  let coAllocatedLeaseId = null;
   if (isClaimFlag && !needsBuildCoordination) {
     const claimRes = cmdClaim(stateDir, claimFlags, options);
     if (claimRes.exitCode !== 0) {
       return claimRes;
+    }
+    if (!claimRes.idempotent && claimRes.lease?.leaseId) {
+      coAllocatedLeaseId = claimRes.lease.leaseId;
     }
   }
 
@@ -5640,6 +5707,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                   exitCode: 0,
                   lease,
                   buildLease: null,
+                  coAllocatedDevice: Boolean(
+                    coAllocatedLeaseId && lease.leaseId === coAllocatedLeaseId,
+                  ),
                   sessionId: identity.sessionId,
                   ttlMs,
                 },
@@ -5713,6 +5783,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 opId: nested.buildLease.opId,
                 workspaceRoot: buildReqs.workspaceRoot,
                 tool: buildReqs.tool,
+                deltaKeys: nested.deltaKeys || [],
               });
             }
             if (lease) {
@@ -5722,12 +5793,15 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
             }
             return {
-              mutated: Boolean(lease),
+              mutated: Boolean(lease || (nested.deltaKeys && nested.deltaKeys.length > 0)),
               value: {
                 status: "admitted",
                 exitCode: 0,
                 lease,
                 buildLease: nested.buildLease,
+                coAllocatedDevice: Boolean(
+                  coAllocatedLeaseId && lease && lease.leaseId === coAllocatedLeaseId,
+                ),
                 reentrant: true,
                 sessionId: identity.sessionId,
                 ttlMs,
@@ -6020,6 +6094,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 exitCode: 0,
                 lease,
                 buildLease,
+                coAllocatedDevice: Boolean(
+                  coAllocatedDevice ||
+                    (coAllocatedLeaseId && lease && lease.leaseId === coAllocatedLeaseId),
+                ),
                 reentrant: false,
                 sessionId: identity.sessionId,
                 ttlMs,
@@ -6148,6 +6226,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         return claimRes || { exitCode: 1, error: "Device claim failed during co-allocation." };
       }
       const claimedLease = claimRes.lease;
+      const coldCreatedNewLease = Boolean(!claimRes.idempotent);
+      if (coldCreatedNewLease && claimedLease?.leaseId) {
+        coAllocatedLeaseId = claimedLease.leaseId;
+      }
       let postClaimValidationError = null;
       const leasePlat = claimedLease.platform || "android";
       const devSerial = claimedLease.serial || claimedLease.udid;
@@ -6198,22 +6280,32 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         }
       }
       if (postClaimValidationError) {
-        if (txRes.buildLease?.buildId) {
-          try {
-            withStateTransaction(
-              stateDir,
-              (state) => {
-                if (state.buildLeases?.[txRes.buildLease.buildId]) {
-                  delete state.buildLeases[txRes.buildLease.buildId];
-                  return { mutated: true };
+        try {
+          withStateTransaction(
+            stateDir,
+            (state) => {
+              let mutated = false;
+              if (txRes.buildLease?.buildId && state.buildLeases?.[txRes.buildLease.buildId]) {
+                delete state.buildLeases[txRes.buildLease.buildId];
+                mutated = true;
+              }
+              if (coldCreatedNewLease) {
+                const { key, lease: cur } = findLeaseEntry(
+                  state,
+                  claimedLease.deviceKey,
+                  claimedLease.leaseId,
+                );
+                if (cur && cur.leaseId === claimedLease.leaseId) {
+                  delete state.leases[key];
+                  mutated = true;
                 }
-                return { mutated: false };
-              },
-              options,
-            );
-          } catch {
-            // Best-effort rollback of reserved build lease
-          }
+              }
+              return { mutated };
+            },
+            options,
+          );
+        } catch {
+          // Best-effort rollback of reserved build and device leases
         }
         return { exitCode: 3, error: postClaimValidationError };
       }
@@ -6284,6 +6376,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         exitCode: 0,
         lease: claimedLease,
         buildLease: postClaimTx.buildLease,
+        coAllocatedDevice: coldCreatedNewLease,
         reentrant: false,
         sessionId: txRes.sessionId,
         ttlMs: txRes.ttlMs,
@@ -6523,22 +6616,62 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         );
       }
       if (check.lease) {
-        finishLeaseWorker(
-          stateDir,
-          check.lease.deviceKey,
-          check.lease.leaseId,
-          check.ttlMs,
-          options,
-          (cur) => {
-            if (spawnedChildPid) {
-              if (keepSpawnedChildGroup && !check.buildLease) {
-                syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
-              } else {
+        if (check.coAllocatedDevice) {
+          withStateTransaction(
+            stateDir,
+            (state, { auditEvents }) => {
+              const { key, lease: cur } = findLeaseEntry(
+                state,
+                check.lease.deviceKey,
+                check.lease.leaseId,
+              );
+              if (!cur || cur.leaseId !== check.lease.leaseId) {
+                return { mutated: false };
+              }
+              if (spawnedChildPid) {
                 removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
               }
-            }
-          },
-        );
+              removeLeaseWorker(cur, process.pid, options.livenessCheck || isPidAlive);
+              if (keepSpawnedChildGroup) {
+                cur.releaseOnWorkerExit = true;
+                syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+                return { mutated: true };
+              }
+              delete state.leases[key];
+              if (Array.isArray(auditEvents)) {
+                auditEvents.push({
+                  event: "device_free",
+                  sessionId: check.sessionId,
+                  leaseId: cur.leaseId,
+                  deviceKey: key,
+                  platform: cur.platform,
+                  kind: cur.kind,
+                  serial: cur.serial,
+                  reason: "exec_claim_exit",
+                });
+              }
+              return { mutated: true };
+            },
+            options,
+          );
+        } else {
+          finishLeaseWorker(
+            stateDir,
+            check.lease.deviceKey,
+            check.lease.leaseId,
+            check.ttlMs,
+            options,
+            (cur) => {
+              if (spawnedChildPid) {
+                if (keepSpawnedChildGroup && !check.buildLease) {
+                  syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+                } else {
+                  removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+                }
+              }
+            },
+          );
+        }
       }
     } catch {
       // Best-effort workerPid cleanup

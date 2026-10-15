@@ -731,6 +731,58 @@ export function buildChildInvocation(
     ) {
       nextArgs = [...nextArgs, "--device", String(lease.serial)];
     }
+  } else if (
+    base === "xcodebuild" ||
+    ((base === "xcrun" || base === "build-brief") &&
+      String(nextArgs[0] || "").toLowerCase() === "xcodebuild")
+  ) {
+    const xbOffset = base === "xcodebuild" ? 0 : 1;
+    let explicitDestination = null;
+    for (let i = xbOffset; i < nextArgs.length; i++) {
+      const a = String(nextArgs[i]);
+      if (a.startsWith("-destination=")) {
+        explicitDestination = a.slice("-destination=".length);
+        break;
+      }
+      if (a === "-destination" && i + 1 < nextArgs.length) {
+        explicitDestination = String(nextArgs[i + 1]);
+        break;
+      }
+    }
+    const allowedIds = new Set(
+      [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
+        .filter(Boolean)
+        .map((s) => String(s).toUpperCase()),
+    );
+    if (explicitDestination && allowedIds.size > 0) {
+      const idMatch = explicitDestination.match(/(?:^|,)\s*id=([^,\s]+)/i);
+      if (idMatch && idMatch[1] && !allowedIds.has(idMatch[1].toUpperCase())) {
+        throw new Error(
+          `Conflicting device selector "${idMatch[1]}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
+        );
+      }
+    }
+    const queryFlags = new Set([
+      "-list",
+      "-showbuildsettings",
+      "-showdestinations",
+      "-version",
+      "-help",
+      "--help",
+      "-h",
+      "-usage",
+    ]);
+    const isQueryOnly = nextArgs
+      .slice(xbOffset)
+      .some((a) => queryFlags.has(String(a).toLowerCase()));
+    if (
+      !explicitDestination &&
+      !isQueryOnly &&
+      lease?.serial &&
+      (lease.platform || "android") === "ios"
+    ) {
+      nextArgs = [...nextArgs, "-destination", `id=${lease.serial}`];
+    }
   }
 
   const sanitizedBaseEnv = { ...baseEnv };
