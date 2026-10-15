@@ -175,8 +175,8 @@ sequenceDiagram
 | Priority Tier | Who qualifies | Slot ceiling | Why it exists |
 |---|---|---|---|
 | **Tier 0 (`starved`)** | Any queued build ticket waiting `>= 120 s` (`buildReorderWindowSec`) | Base + Burst (`maxConcurrentBuilds + maxDeviceHolderBurstBuilds`) | Guarantees strict upper bound on wait time so pure builds never starve indefinitely. |
-| **Tier 1 (`device-holder`)** | Session holds an online `"active"` device lease, or is co-allocating via `atc exec --claim` | Base + Burst (`2 + 1 = 3` default) | Prevents **Reverse Starvation**: an agent holding a scarce emulator/phone never waits behind pure CPU builds to compile and install its APK/IPA. |
-| **Tier 2 (`pure-build`)** | Pure CPU build (`./gradlew assembleDebug`, `bazel build`, `xcodebuild build`) with no device lease | Base (`maxConcurrentBuilds = 2` default) | Throttles background compilation so the host retains enough RAM and CPU for active emulators and simulators. |
+| **Tier 1 (`device-holder`)** | Session holds an online `"active"` device lease, or is co-allocating via `atc exec --claim` | Base + Burst (`maxConcurrentBuilds = "auto"` `[1..4]` + `1` burst) | Prevents **Reverse Starvation**: an agent holding a scarce emulator/phone never waits behind pure CPU builds to compile and install its APK/IPA. |
+| **Tier 2 (`pure-build`)** | Pure CPU build (`./gradlew assembleDebug`, `bazel build`, `xcodebuild build`) with no device lease | Base (`maxConcurrentBuilds = "auto"`, `[1..4]`) | Throttles background compilation so the host retains enough RAM and CPU for active emulators and simulators. |
 
 Even when global build slots are free, two builds targeting the **same workspace root or output base** cannot run concurrently without corrupting incremental caches or blocking on internal tool mutexes. `atc` extracts canonical workspace keys and serializes colliding builds in `state.buildQueue`:
 
@@ -287,13 +287,13 @@ atc snapshot load logged_in
 
 Every device claim, release, queue wait, build slot admission, `"draining"` daemon reconciliation, command guard block, and garbage-collection sweep is appended to a structured JSONL audit log (`atc-audit.jsonl`) outside `atc.lock`.
 
-| OS | Default audit log location (`getDefaultAuditLogDir()`) | Override |
+| OS | Default audit log location (`resolveSystemLogDir()`) | Override |
 |---|---|---|
-| **macOS** | `~/Library/Logs/atc/atc-audit.jsonl` | `ATC_LOG_DIR=/path` or `atc config set auditLogPath /path/file.jsonl` |
-| **Linux** | `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` (default `~/.local/state/atc/logs/atc-audit.jsonl`) | `ATC_LOG_DIR=/path` or `atc config set auditLogPath /path/file.jsonl` |
-| **Windows** | `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` | `ATC_LOG_DIR=/path` or `atc config set auditLogPath /path/file.jsonl` |
+| **macOS** | `~/Library/Logs/atc/atc-audit.jsonl` | `ATC_LOG_DIR=/path/to/dir` or `atc config set auditLogging false` |
+| **Linux** | `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` (default `~/.local/state/atc/logs/atc-audit.jsonl`) | `ATC_LOG_DIR=/path/to/dir` or `atc config set auditLogging false` |
+| **Windows** | `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` | `ATC_LOG_DIR=/path/to/dir` or `atc config set auditLogging false` |
 
-Each line is a self-contained JSON object (`schemaVersion: 1`) with `ts` (ISO-8601), `epochMs`, `pid`, `sessionId`, `category` (`"lease"`, `"build"`, `"queue"`, `"guard"`, `"gc"`), `event`, and structured metadata (`opId`, `leaseId`, `deviceKey`, `tool`, `tier`, `workspaceKeys`, `durationMs`, `exitCode`). When `atc-audit.jsonl` exceeds `auditLogMaxBytes` (`10 MB` default), `atc` automatically rotates up to `auditLogMaxFiles` (`3` rotated `.1`, `.2`, `.3` archives).
+Each line is a self-contained JSON object (`schemaVersion: 1`) with `ts` (ISO-8601), `epochMs`, `pid`, `sessionId`, `category` (`"lease"`, `"build"`, `"queue"`, `"guard"`, `"gc"`), `event`, and structured metadata (`opId`, `leaseId`, `deviceKey`, `tool`, `tier`, `workspaceKeys`, `durationMs`, `exitCode`). When `atc-audit.jsonl` exceeds `10 MB`, `atc` automatically rotates up to `3` rotated `.1`, `.2`, `.3` archives.
 
 ```bash
 # Watch live lease, build, and guard events across all agents on your Mac

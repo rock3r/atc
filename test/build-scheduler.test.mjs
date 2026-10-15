@@ -1162,6 +1162,43 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       }).warm,
       false,
     );
+
+    // timeout wrapper peeling
+    const timeoutReqs = resolveBuildResources(
+      "timeout",
+      ["-k", "30s", "10m", "./gradlew", "assembleDebug"],
+      spacedAppDir,
+    );
+    assert.equal(timeoutReqs.tool, "gradle");
+    assert.ok(timeoutReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
+
+    // Single-pipe stage splitting in shell wrapper
+    const pipedGradleInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build | tee build.log"],
+      null,
+      "sess-round7",
+      process.env,
+      buildLease,
+    );
+    assert.equal(
+      pipedGradleInv.args[1],
+      "./gradlew build -Dorg.gradle.workers.max=4 | tee build.log",
+    );
+
+    // Shell-wrapped xcodebuild test-without-building pins destination without requiring heavy slot
+    const testWithoutBuildingInv = buildChildInvocation(
+      "sh",
+      ["-c", "xcodebuild test-without-building -scheme App"],
+      iosLease,
+      "sess-round7",
+      process.env,
+      null,
+    );
+    assert.equal(
+      testWithoutBuildingInv.args[1],
+      "xcodebuild test-without-building -scheme App -destination id=SIM-UDID-999",
+    );
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }

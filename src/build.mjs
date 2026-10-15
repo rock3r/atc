@@ -129,6 +129,35 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       curArgs = curArgs.slice(i + 1);
       continue;
     }
+    if (base === "timeout") {
+      let i = 0;
+      while (i < curArgs.length) {
+        const a = curArgs[i];
+        if (a === "--") {
+          i++;
+          break;
+        }
+        if (
+          (a === "-k" || a === "--kill-after" || a === "-s" || a === "--signal") &&
+          i + 1 < curArgs.length
+        ) {
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      if (i < curArgs.length && /^\d+(?:\.\d+)?[smhd]?$/.test(curArgs[i])) {
+        i += 1;
+      }
+      if (i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      curArgs = curArgs.slice(i + 1);
+      continue;
+    }
     if (base === "env") {
       let i = 0;
       while (i < curArgs.length) {
@@ -190,7 +219,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       if (cIdx !== -1 && cIdx + 1 < curArgs.length) {
         const script = String(curArgs[cIdx + 1] || "").trim();
         const clauses = script
-          .split(/(?:;|&&|\|\||\n)+/)
+          .split(/(?:;|&&|\|\||\|(?!\|)|\n)+/)
           .map((s) => s.trim())
           .filter(Boolean);
         const matchedClauses = [];

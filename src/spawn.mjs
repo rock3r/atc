@@ -797,7 +797,7 @@ export function buildChildInvocation(
     "powershell",
     "pwsh",
   ]).has(base);
-  if (buildClassified.requiresHeavySlot) {
+  if (buildClassified.requiresHeavySlot || buildClassified.requiresDevice || isShellWrapper) {
     const hostCpus = Math.max(1, os.cpus()?.length || 4);
     const maxConcurrent = Math.max(1, Number(buildLease?.maxConcurrentBuilds || 2));
     const jobsLimit = Math.max(
@@ -811,40 +811,21 @@ export function buildChildInvocation(
       );
       if (cIdx !== -1 && cIdx + 1 < nextArgs.length) {
         const rawScript = String(nextArgs[cIdx + 1] || "");
-        const parts = rawScript.split(/([;\n]|&&|\|\|)/);
+        const parts = rawScript.split(/([;\n]|&&|\|\||\|)/);
         const rewrittenParts = parts.map((part, idx) => {
           if (idx % 2 === 1) return part;
           const trimmed = part.trim();
           if (!trimmed) return part;
-          const redirMatch = part.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1)(?:\s+(?:[0-9]*>>?\s*\S+|2>&1))*)\s*$/);
+          const trailingWs = part.match(/(\s*)$/)?.[1] || "";
+          const partNoTrail = part.slice(0, part.length - trailingWs.length);
+          const redirMatch = partNoTrail.match(/(\s+(?:[0-9]*>>?\s*\S+|2>&1)(?:\s+(?:[0-9]*>>?\s*\S+|2>&1))*)$/);
           const redirSuffix = redirMatch ? redirMatch[1] : "";
-          const corePart = redirMatch ? part.slice(0, part.length - redirMatch[0].length) : part;
+          const corePart = redirMatch ? partNoTrail.slice(0, partNoTrail.length - redirMatch[0].length) : partNoTrail;
           const rawTokens = tokenizeShellClause(corePart.trim());
           if (rawTokens.length === 0) return part;
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           const cClass = classifyBuildCommand(peeled.cmd, peeled.args);
-          if (!cClass.requiresHeavySlot) return part;
-          if (
-            cClass.tool === "gradle" &&
-            !/(-Dorg\.gradle\.workers\.max=|--max-workers\b)/.test(corePart)
-          ) {
-            return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}`;
-          }
-          if (cClass.tool === "bazel") {
-            const hasJobs = /(?:^|\s)--jobs(?:=|\s|$)/.test(corePart);
-            const hasRam = /(?:^|\s)--local_ram_resources(?:=|\s|$)/.test(corePart);
-            const injected = [];
-            if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
-            if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
-            if (injected.length > 0) {
-              const rewrittenCore = corePart.replace(
-                /(\bbazel(?:isk|w)?(?:\.(?:exe|cmd|bat))?(?:\s+(?:"[^"]*"|'[^']*'|[^\s"'])+)*?\s+)(build|test|run|coverage)(?=\s|$)/i,
-                (_, prefix, sub) => `${prefix}${sub} ${injected.join(" ")}`,
-              );
-              return `${rewrittenCore}${redirSuffix}`;
-            }
-          }
-          if (cClass.tool === "xcodebuild") {
+          if (cClass.tool === "xcodebuild" && (cClass.requiresHeavySlot || cClass.requiresDevice)) {
             const explicitDestinations = [];
             for (let i = 0; i < peeled.args.length; i++) {
               const a = String(peeled.args[i]);
@@ -875,7 +856,7 @@ export function buildChildInvocation(
               }
             }
             const xcodeInjected = [];
-            if (!/(?:^|\s)-jobs(?:=|\s|$)/.test(corePart)) {
+            if (cClass.requiresHeavySlot && !/(?:^|\s)-jobs(?:=|\s|$)/.test(corePart)) {
               xcodeInjected.push(`-jobs ${jobsLimit}`);
             }
             if (
@@ -886,7 +867,29 @@ export function buildChildInvocation(
               xcodeInjected.push(`-destination id=${lease.serial}`);
             }
             if (xcodeInjected.length > 0) {
-              return `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}`;
+              return `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}${trailingWs}`;
+            }
+            return part;
+          }
+          if (!cClass.requiresHeavySlot) return part;
+          if (
+            cClass.tool === "gradle" &&
+            !/(-Dorg\.gradle\.workers\.max=|--max-workers\b)/.test(corePart)
+          ) {
+            return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
+          }
+          if (cClass.tool === "bazel") {
+            const hasJobs = /(?:^|\s)--jobs(?:=|\s|$)/.test(corePart);
+            const hasRam = /(?:^|\s)--local_ram_resources(?:=|\s|$)/.test(corePart);
+            const injected = [];
+            if (!hasJobs) injected.push(`--jobs=${jobsLimit}`);
+            if (!hasRam) injected.push(`--local_ram_resources=${ramLimitMb}`);
+            if (injected.length > 0) {
+              const rewrittenCore = corePart.replace(
+                /(\bbazel(?:isk|w)?(?:\.(?:exe|cmd|bat))?(?:\s+(?:"[^"]*"|'[^']*'|[^\s"'])+)*?\s+)(build|test|run|coverage)(?=\s|$)/i,
+                (_, prefix, sub) => `${prefix}${sub} ${injected.join(" ")}`,
+              );
+              return `${rewrittenCore}${redirSuffix}${trailingWs}`;
             }
           }
           return part;
@@ -894,7 +897,7 @@ export function buildChildInvocation(
         nextArgs = [...nextArgs];
         nextArgs[cIdx + 1] = rewrittenParts.join("");
       }
-    } else if (buildClassified.tool === "gradle") {
+    } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "gradle") {
       const hasWorkersFlag = nextArgs.some((a) => {
         const s = String(a);
         return (
@@ -912,7 +915,7 @@ export function buildChildInvocation(
           nextArgs = [...nextArgs, flag];
         }
       }
-    } else if (buildClassified.tool === "bazel") {
+    } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "bazel") {
       const bazelBuildSubs = new Set(["build", "test", "run", "coverage"]);
       const subIdx = nextArgs.findIndex((a) => bazelBuildSubs.has(String(a).toLowerCase()));
       if (subIdx !== -1) {
@@ -935,7 +938,7 @@ export function buildChildInvocation(
           ];
         }
       }
-    } else if (buildClassified.tool === "xcodebuild") {
+    } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "xcodebuild") {
       const hasJobs = nextArgs.some((a) => {
         const s = String(a);
         return s === "-jobs" || s.startsWith("-jobs=");

@@ -74,22 +74,22 @@ flowchart TD
     CoAlloc -- "Tier 1/2/3 Cold Boot" --> Prep["Write 'starting' device + 'preparing_device' build lease\nBoot emulator outside lock -> activate build lease"]
 
     Mode -- "Pure build or existing lease" --> Queue["Under atc.lock:\ncomputeBuildTier() -> Tier 0 (starved >=120s) | Tier 1 (device-holder) | Tier 2 (pure)"]
-    Queue --> Admit["canAdmitBuildCandidate():\n1. Workspace mutex (active + draining)\n2. Slot ceiling (Base vs Base + Burst)\n3. Unified RAM check (cold daemon + preparingDevice + unaccounted <10s builds)"]
+    Queue --> Admit["canAdmitBuildCandidate():\n1. Workspace mutex (active + draining)\n2. Slot ceiling (Base vs Base + Burst)\n3. Unified RAM check (cold daemon + preparingDevice + unaccounted <30s builds)"]
     Admit --> Spawn["Outside atc.lock:\nExport ATC_BUILD_OP_ID + inject worker/RAM flags\n(--jobs / -Dorg.gradle.workers.max / -jobs)"]
     Spawn --> Drain["On exit -> release immediately if clean;\nenter 'draining' (5s cooldown / 30s cap) on abort or lingering PGID"]
 ```
 
 ### Unified RAM accounting across emulators and builds
 
-Because host `availableRamMb` already reflects the resident memory (RSS) of warm Gradle/Bazel daemons and running emulators that faulted in their pages more than `10 s` ago, naive subtraction would double-count memory. `atc` prevents both double-counting and transient race windows:
-- **Cold vs. Warm Build Daemons (`probeWarmBuildDaemons`):** Outside `atc.lock`, `ps -ax -o pid=,rss=,command=` identifies whether a warm `GradleDaemon` or `bazel(<workspace>)` server already exists for the target workspace. Warm daemons require `0 MB` additional RAM; cold daemons require `config.buildRamEstimateMb` (`4096 MB`).
-- **Unaccounted `<10 s` Window (`computeUnaccountedBuildRamMb`):** Active builds in their first `10,000 ms` of execution—plus any `"preparing_device"` build reservations waiting for a cold emulator boot—are subtracted from `availableRamMb` during both `cmdClaim` emulator boot admission (`src/android.mjs`) and `canAdmitBuildCandidate` (`src/build.mjs`).
+Because host `availableRamMb` already reflects the resident memory (RSS) of warm Gradle/Bazel daemons and running emulators that faulted in their pages more than `30 s` ago, naive subtraction would double-count memory. `atc` prevents both double-counting and transient race windows:
+- **Cold vs. Warm Build Daemons (`probeWarmBuildDaemons`):** Outside `atc.lock`, `ps -ax -o pid=,command=` identifies whether a warm `GradleDaemon` or `bazel(<workspace>)` server already exists for the target workspace. Warm daemons require `0 MB` additional RAM; cold daemons require `config.buildRamEstimateMb` (`3072 MB` default).
+- **Unaccounted `<30 s` Window (`computeUnaccountedBuildRamMb`):** Active builds in their first `30,000 ms` (`buildRamReservationWindowSec = 30`) of execution—plus any `"preparing_device"` build reservations waiting for a cold emulator boot—are subtracted from `availableRamMb` during both `cmdClaim` emulator boot admission (`src/android.mjs`) and `checkUnifiedRamAdmission` (`src/build.mjs`).
 
 ## Structured JSONL audit logging (`src/logger.mjs`)
 
 To keep `atc.lock` hold times under `20 ms`, audit logging is decoupled into two stages:
-1. **In-Memory Staging (`recordAuditEvent`):** Inside `withStateTransaction(stateDir, fn)`, state transitions (`lease.claim`, `lease.free`, `build.start`, `build.drain`, `build.complete`, `queue.enqueue`, `guard.deny`, `gc.reap`) append lightweight objects to `state._pendingAuditEvents`. This array is stripped before `state.json` is serialized to disk.
-2. **Post-Lock Append & Rotation (`flushAuditEvents`):** Inside the `finally` block of `withStateTransaction`—**after** `atc.lock` is released—`flushAuditEvents` serializes each event as a single JSON line (`fs.appendFileSync(..., { mode: 0o600 })`) to the OS log directory (`~/Library/Logs/atc/atc-audit.jsonl` on macOS, `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` on Linux, `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` on Windows) and rotates `.1`..`.3` archives when `size >= auditLogMaxBytes` (`10 MB`).
+1. **In-Memory Staging (`auditEvents`):** Inside `withStateTransaction(stateDir, fn)`, state transitions (`device_claim`, `device_free`, `build_admit`, `build_draining`, `build_release`, `build_queue_enter`, `guard_deny`, `gc_prune_*`) append lightweight objects to the transaction's `auditEvents` list.
+2. **Post-Lock Append & Rotation (`flushAuditEvents`):** Inside the `finally` block of `withStateTransaction`—**after** `atc.lock` is released—`flushAuditEvents` serializes each event as a single JSON line (`fs.appendFileSync(..., { mode: 0o600 })`) to the OS log directory (`~/Library/Logs/atc/atc-audit.jsonl` on macOS, `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` on Linux, `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` on Windows) and rotates `.1`..`.3` archives when `size >= 10 MB`.
 
 ## Code map and on-disk state
 
