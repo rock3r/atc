@@ -1590,6 +1590,43 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       shellIfInv.args[1],
       "if test -f settings.gradle; then ./gradlew build -Dorg.gradle.workers.max=4; else bazel build --jobs=4 --local_ram_resources=3072 //app; fi",
     );
+
+    const expandedVarReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'cd "$PROJECT_DIR" && ./gradlew build'],
+      os.tmpdir(),
+      { env: { ...process.env, PROJECT_DIR: wsDir } },
+    );
+    assert.equal(expandedVarReqs.kind, "pure_build");
+    assert.equal(expandedVarReqs.tool, "gradle");
+    assert.ok(
+      expandedVarReqs.resourceKeys.some((k) =>
+        k.endsWith(fs.realpathSync(wsDir)),
+      ),
+    );
+
+    const unresolvedVarReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'cd "$UNSET_PROJECT_DIR_XYZ" && ./gradlew build'],
+      wsDir,
+      { env: {} },
+    );
+    assert.equal(unresolvedVarReqs.kind, "deny_lifecycle");
+    assert.match(unresolvedVarReqs.reason, /Unresolved dynamic directory change/);
+
+    const unsetJavaHomeReqs = resolveBuildResources(
+      "env",
+      ["-u", "JAVA_HOME", "./gradlew", "build"],
+      wsDir,
+    );
+    assert.equal(unsetJavaHomeReqs.envJavaHomeUnset, true);
+    const warmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
+      env: { JAVA_HOME: "/nonexistent/parent/java" },
+      runner: () => ({
+        stdout: `4242 /Library/Java/Standard/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
+      }),
+    });
+    assert.equal(warmProbe.warm, true);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

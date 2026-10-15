@@ -274,10 +274,48 @@ export function splitShellScriptParts(script) {
   return parts;
 }
 
-export function peelBuildWrapperTokens(cmd, args = []) {
+export function expandOrValidateShellPath(rawPath, envMap = process.env) {
+  let p = String(rawPath || "");
+  if (!p) return { resolved: "", unresolved: false };
+  if (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) {
+    const home = envMap?.HOME || envMap?.USERPROFILE || os.homedir();
+    if (!home) return { resolved: null, unresolved: true };
+    p = p === "~" ? home : path.join(home, p.slice(2));
+  } else if (p.startsWith("~")) {
+    return { resolved: null, unresolved: true };
+  }
+  if (p.includes("`") || p.includes("$(") || /[*?\[]/.test(p)) {
+    return { resolved: null, unresolved: true };
+  }
+  if (p.includes("$")) {
+    let unresolved = false;
+    p = p.replace(/\$(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (_m, braced, plain) => {
+      const varName = braced !== undefined ? braced : plain;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) {
+        unresolved = true;
+        return "";
+      }
+      const val = envMap?.[varName];
+      if (val === undefined || val === null || String(val) === "") {
+        unresolved = true;
+        return "";
+      }
+      return String(val);
+    });
+    if (unresolved || p.includes("$")) {
+      return { resolved: null, unresolved: true };
+    }
+  }
+  return { resolved: p, unresolved: false };
+}
+
+export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
   let curCmd = String(cmd || "");
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
   let relCwd = null;
+  let unresolvedDynamicCwd = false;
+  const baseEnv = options?.env || process.env;
+  const inShell = Boolean(options?.inShell);
   const envVars = {};
 
   for (let depth = 0; depth < 16; depth++) {
@@ -427,19 +465,41 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           i++;
           break;
         }
+        if (a === "-" || a === "-i" || a === "--ignore-environment") {
+          for (const k of Object.keys(envVars)) {
+            delete envVars[k];
+          }
+          envVars.JAVA_HOME = null;
+          i++;
+          continue;
+        }
         if ((a === "-C" || a === "--chdir") && i + 1 < curArgs.length) {
-          const nextDir = curArgs[i + 1];
-          relCwd = path.isAbsolute(nextDir)
-            ? nextDir
-            : relCwd
-              ? path.join(relCwd, nextDir)
-              : nextDir;
+          const rawNextDir = curArgs[i + 1];
+          const exp = inShell
+            ? expandOrValidateShellPath(rawNextDir, { ...baseEnv, ...envVars })
+            : { resolved: rawNextDir, unresolved: false };
+          if (exp.unresolved) {
+            unresolvedDynamicCwd = true;
+          } else {
+            const nextDir = exp.resolved;
+            if (path.isAbsolute(nextDir)) {
+              relCwd = nextDir;
+              unresolvedDynamicCwd = false;
+            } else {
+              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+            }
+          }
           i += 2;
           continue;
         }
         if ((a === "-u" || a === "--unset") && i + 1 < curArgs.length) {
-          delete envVars[curArgs[i + 1]];
+          envVars[curArgs[i + 1]] = null;
           i += 2;
+          continue;
+        }
+        if (a.startsWith("--unset=") && a.length > "--unset=".length) {
+          envVars[a.slice("--unset=".length)] = null;
+          i++;
           continue;
         }
         if (a.startsWith("-")) {
@@ -539,6 +599,8 @@ export function peelBuildWrapperTokens(cmd, args = []) {
         }
         const matchedClauses = [];
         let curShellRelCwd = relCwd;
+        let curShellUnresolvedCwd = unresolvedDynamicCwd;
+        let shellEnv = { ...baseEnv, ...envVars };
         let pushdStack = [];
         const cwdStack = [];
         for (const clauseObj of clauses) {
@@ -546,13 +608,20 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           const { strippedClause, openedSubshells, closedSubshells } =
             splitShellClauseRedirAndGroup(clause);
           for (let s = 0; s < openedSubshells; s++) {
-            cwdStack.push({ cwd: curShellRelCwd, pushdStack: [...pushdStack] });
+            cwdStack.push({
+              cwd: curShellRelCwd,
+              unresolvedCwd: curShellUnresolvedCwd,
+              shellEnv: { ...shellEnv },
+              pushdStack: [...pushdStack],
+            });
           }
           const popSubshells = () => {
             for (let s = 0; s < closedSubshells; s++) {
               if (cwdStack.length > 0) {
                 const frame = cwdStack.pop();
                 curShellRelCwd = frame.cwd;
+                curShellUnresolvedCwd = frame.unresolvedCwd;
+                shellEnv = frame.shellEnv;
                 pushdStack = frame.pushdStack;
               }
             }
@@ -563,36 +632,112 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             continue;
           }
           const headTok = rawTokens[0];
-          if (headTok === "popd") {
-            if (pushdStack.length > 0) {
-              curShellRelCwd = pushdStack.pop();
-            }
-            popSubshells();
-            continue;
-          }
-          if ((headTok === "cd" || headTok === "pushd") && rawTokens.length >= 2) {
-            let dirIdx = 1;
-            while (dirIdx < rawTokens.length && rawTokens[dirIdx].startsWith("-")) {
-              dirIdx++;
-            }
-            if (dirIdx < rawTokens.length) {
-              const targetDir = rawTokens[dirIdx];
-              if (targetDir && targetDir !== "-") {
-                if (headTok === "pushd") {
-                  pushdStack.push(curShellRelCwd);
-                }
-                curShellRelCwd = path.isAbsolute(targetDir)
-                  ? targetDir
-                  : curShellRelCwd
-                    ? path.join(curShellRelCwd, targetDir)
-                    : targetDir;
+          if (
+            headTok === "export" ||
+            rawTokens.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
+          ) {
+            const assignTokens = headTok === "export" ? rawTokens.slice(1) : rawTokens;
+            for (const tok of assignTokens) {
+              if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+                const eqIdx = tok.indexOf("=");
+                const k = tok.slice(0, eqIdx);
+                const rawVal = tok.slice(eqIdx + 1);
+                const expVal = expandOrValidateShellPath(rawVal, shellEnv);
+                const finalVal = expVal.unresolved ? rawVal : expVal.resolved;
+                shellEnv[k] = finalVal;
+                envVars[k] = finalVal;
               }
             }
             popSubshells();
             continue;
           }
-          const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
+          if (headTok === "unset") {
+            for (const tok of rawTokens.slice(1)) {
+              if (!tok.startsWith("-")) {
+                delete shellEnv[tok];
+                envVars[tok] = null;
+              }
+            }
+            popSubshells();
+            continue;
+          }
+          if (headTok === "popd") {
+            if (pushdStack.length > 0) {
+              const popped = pushdStack.pop();
+              curShellRelCwd = popped.cwd;
+              curShellUnresolvedCwd = popped.unresolvedCwd;
+            } else {
+              curShellUnresolvedCwd = true;
+            }
+            popSubshells();
+            continue;
+          }
+          if (headTok === "cd" || headTok === "pushd") {
+            let dirIdx = 1;
+            while (dirIdx < rawTokens.length && rawTokens[dirIdx].startsWith("-")) {
+              if (rawTokens[dirIdx] === "-") break;
+              if (rawTokens[dirIdx] === "--") {
+                dirIdx++;
+                break;
+              }
+              dirIdx++;
+            }
+            if (dirIdx >= rawTokens.length) {
+              if (headTok === "cd") {
+                const home = shellEnv?.HOME || shellEnv?.USERPROFILE || os.homedir();
+                if (home) {
+                  curShellRelCwd = home;
+                  curShellUnresolvedCwd = false;
+                } else {
+                  curShellUnresolvedCwd = true;
+                }
+              } else {
+                curShellUnresolvedCwd = true;
+              }
+            } else {
+              const targetDir = rawTokens[dirIdx];
+              if (targetDir === "-") {
+                if (shellEnv?.OLDPWD) {
+                  curShellRelCwd = shellEnv.OLDPWD;
+                  curShellUnresolvedCwd = false;
+                } else {
+                  curShellUnresolvedCwd = true;
+                }
+              } else if (targetDir) {
+                if (headTok === "pushd") {
+                  pushdStack.push({
+                    cwd: curShellRelCwd,
+                    unresolvedCwd: curShellUnresolvedCwd,
+                  });
+                }
+                const exp = expandOrValidateShellPath(targetDir, shellEnv);
+                if (exp.unresolved) {
+                  curShellUnresolvedCwd = true;
+                } else {
+                  const resolvedDir = exp.resolved;
+                  if (path.isAbsolute(resolvedDir)) {
+                    curShellRelCwd = resolvedDir;
+                    curShellUnresolvedCwd = false;
+                  } else {
+                    curShellRelCwd = curShellRelCwd
+                      ? path.join(curShellRelCwd, resolvedDir)
+                      : resolvedDir;
+                  }
+                }
+              }
+            }
+            popSubshells();
+            continue;
+          }
+          const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
+            env: shellEnv,
+            inShell: true,
+          });
           if (normalizeBuildToolName(peeled.cmd)) {
+            const clauseUnresolvedCwd = Boolean(
+              peeled.unresolvedDynamicCwd ||
+                (curShellUnresolvedCwd && !(peeled.relCwd && path.isAbsolute(peeled.relCwd))),
+            );
             const effectiveRelCwd = peeled.relCwd
               ? path.isAbsolute(peeled.relCwd)
                 ? peeled.relCwd
@@ -606,6 +751,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
               relCwd: effectiveRelCwd,
               envVars: { ...envVars, ...(peeled.envVars || {}) },
               backgrounded: Boolean(clauseObj.backgrounded || peeled.backgrounded),
+              unresolvedDynamicCwd: clauseUnresolvedCwd,
             });
           }
           popSubshells();
@@ -617,6 +763,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             relCwd: matchedClauses[0].relCwd || null,
             envVars: matchedClauses[0].envVars || { ...envVars },
             backgrounded: matchedClauses.some((c) => c.backgrounded),
+            unresolvedDynamicCwd: matchedClauses.some((c) => c.unresolvedDynamicCwd),
             allBuildClauses: matchedClauses,
           };
         }
@@ -625,7 +772,15 @@ export function peelBuildWrapperTokens(cmd, args = []) {
     break;
   }
 
-  return { cmd: curCmd, args: curArgs, relCwd, envVars, backgrounded: false, allBuildClauses: null };
+  return {
+    cmd: curCmd,
+    args: curArgs,
+    relCwd,
+    envVars,
+    backgrounded: false,
+    unresolvedDynamicCwd,
+    allBuildClauses: null,
+  };
 }
 
 export function normalizeBuildToolName(cmd) {
@@ -792,8 +947,9 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = []) {
   return `${s.slice(0, insertPos)} ${injectedFlags.join(" ")}${s.slice(insertPos)}`;
 }
 
-export function classifyBuildCommand(rawCmd, rawArgs = []) {
-  const { cmd, args, backgrounded, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
+  const { cmd, args, backgrounded, unresolvedDynamicCwd, allBuildClauses } =
+    peelBuildWrapperTokens(rawCmd, rawArgs, options);
   if (backgrounded) {
     return {
       kind: "reject_long_running",
@@ -805,6 +961,19 @@ export function classifyBuildCommand(rawCmd, rawArgs = []) {
       backgrounded: true,
       reason:
         "Backgrounded build commands (`&`) cannot be coordinated by atc exec because the shell exits before the build finishes.",
+    };
+  }
+  if (unresolvedDynamicCwd) {
+    return {
+      kind: "deny_lifecycle",
+      tool: normalizeBuildToolName(cmd) || "multi",
+      targetPlatform: null,
+      requiresDevice: false,
+      requiresHeavySlot: false,
+      requiresWorkspaceLock: false,
+      unresolvedDynamicCwd: true,
+      reason:
+        "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
     };
   }
   if (allBuildClauses && allBuildClauses.length > 1) {
@@ -1198,12 +1367,11 @@ export function resolveBuildResources(
   rawCmd,
   rawArgs = [],
   cwd = process.cwd(),
-  { forceBuild = false, inheritedEnvVars = null } = {},
+  { forceBuild = false, inheritedEnvVars = null, env = process.env } = {},
 ) {
-  const { cmd, args, relCwd, envVars, backgrounded, allBuildClauses } = peelBuildWrapperTokens(
-    rawCmd,
-    rawArgs,
-  );
+  const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
+  const { cmd, args, relCwd, envVars, backgrounded, unresolvedDynamicCwd, allBuildClauses } =
+    peelBuildWrapperTokens(rawCmd, rawArgs, { env: baseEnv });
   if (backgrounded) {
     return {
       kind: "reject_long_running",
@@ -1219,6 +1387,21 @@ export function resolveBuildResources(
         "Backgrounded build commands (`&`) cannot be coordinated by atc exec because the shell exits before the build finishes.",
     };
   }
+  if (unresolvedDynamicCwd) {
+    return {
+      kind: "deny_lifecycle",
+      tool: normalizeBuildToolName(cmd) || "multi",
+      targetPlatform: null,
+      requiresDevice: false,
+      requiresHeavySlot: false,
+      requiresWorkspaceLock: false,
+      unresolvedDynamicCwd: true,
+      workspaceRoot: null,
+      resourceKeys: [],
+      reason:
+        "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
+    };
+  }
   const effectiveEnvVars = { ...(inheritedEnvVars || {}), ...(envVars || {}) };
   const outerCwd = path.resolve(cwd || process.cwd());
   if (allBuildClauses && allBuildClauses.length > 1) {
@@ -1227,6 +1410,7 @@ export function resolveBuildResources(
       return resolveBuildResources(c.cmd, c.args, clauseCwd, {
         forceBuild: false,
         inheritedEnvVars: c.envVars || effectiveEnvVars,
+        env,
       });
     });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
@@ -1361,10 +1545,13 @@ export function resolveBuildResources(
         a === "--gradle-user-home" ||
         a.startsWith("--gradle-user-home="),
     );
+    const envJavaHomeUnset =
+      effectiveEnvVars.JAVA_HOME === null || effectiveEnvVars.JAVA_HOME === "";
     return {
       ...classified,
       disablesDaemon,
-      envJavaHome: effectiveEnvVars.JAVA_HOME || null,
+      envJavaHome: envJavaHomeUnset ? "" : effectiveEnvVars.JAVA_HOME || null,
+      envJavaHomeUnset,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
     };
@@ -2033,7 +2220,9 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     const wsRoot = String(buildReqs.workspaceRoot || "");
     const wsBase = wsRoot ? path.basename(wsRoot) : "";
     let expectedGradleVersion = null;
-    let expectedGradleJavaHome = buildReqs.envJavaHome || options.env?.JAVA_HOME || null;
+    let expectedGradleJavaHome = buildReqs.envJavaHomeUnset
+      ? null
+      : buildReqs.envJavaHome || options.env?.JAVA_HOME || null;
     let expectedGradleJvmArgs = [];
     if (buildReqs.tool === "gradle" && wsRoot) {
       try {

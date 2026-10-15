@@ -5184,11 +5184,15 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
   const [cmd, ...args] = commandArgs;
   const cwd = options.cwd || process.cwd();
+  const callerEnv = options.env || process.env;
   const isBuildFlag = parseBoolFlag(flags.build);
   const isClaimFlag = parseBoolFlag(flags.claim);
   const selectorSerial = flags.serial || flags.udid || null;
 
-  const buildReqs = resolveBuildResources(cmd, args, cwd, { forceBuild: isBuildFlag });
+  const buildReqs = resolveBuildResources(cmd, args, cwd, {
+    forceBuild: isBuildFlag,
+    env: callerEnv,
+  });
   if (buildReqs.kind === "deny_lifecycle") {
     return { exitCode: 3, error: buildReqs.reason };
   }
@@ -5243,6 +5247,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const claimFlags = Object.fromEntries(
     Object.entries(flags).filter(([k]) => k !== "build" && k !== "claim"),
   );
+  if (!claimFlags.platform && !claimFlags.ios && !claimFlags.android && requiredDevicePlatform) {
+    claimFlags.platform = requiredDevicePlatform;
+  }
 
   // If --claim is requested without build coordination, claim the device first via cmdClaim
   let coAllocatedLeaseId = null;
@@ -5300,7 +5307,6 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const processChain =
     options.processChain ||
     (needsBuildCoordination ? getAncestorProcessChain(rawPpid) : []);
-  const callerEnv = options.env || process.env;
   const inheritedOpId = callerEnv.ATC_BUILD_OP_ID
     ? String(callerEnv.ATC_BUILD_OP_ID).trim()
     : null;
