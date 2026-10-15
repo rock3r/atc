@@ -1794,6 +1794,53 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     assert.equal(pwshPushPopReqs.kind, "pure_build");
     assert.ok(pwshPushPopReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
     assert.ok(pwshPushPopReqs.resourceKeys.includes(`gradle:${canonicalWs}`));
+
+    // Single-quoted path tokens preserve literal `$VAR` without expanding environment variables
+    const literalDollarDir = path.join(wsDir, "$PROJECT_DIR");
+    fs.mkdirSync(literalDollarDir, { recursive: true });
+    fs.writeFileSync(path.join(literalDollarDir, "settings.gradle"), 'rootProject.name = "literal"\n');
+    const canonicalLiteralDollar = fs.realpathSync(literalDollarDir);
+    const singleQuotedFlagReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew -p '$PROJECT_DIR' build"],
+      wsDir,
+      { env: { ...process.env, PROJECT_DIR: subAppDir } },
+    );
+    assert.equal(singleQuotedFlagReqs.kind, "pure_build");
+    assert.deepEqual(singleQuotedFlagReqs.resourceKeys, [`gradle:${canonicalLiteralDollar}`]);
+
+    // Conditional environment assignments taint subsequent expansions of that variable
+    const condEnvReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'if false; then export PROJECT_DIR=/wrong; fi; ./gradlew -p "$PROJECT_DIR" build'],
+      wsDir,
+      { env: { ...process.env, PROJECT_DIR: subAppDir } },
+    );
+    assert.equal(condEnvReqs.kind, "deny_lifecycle");
+    assert.match(condEnvReqs.reason, /Unresolved dynamic directory change/);
+
+    // Mixed workspace-only + heavy build wrapper probes the sole heavy clause (`bazel`), not `gradle`
+    fs.writeFileSync(path.join(wsDir, "MODULE.bazel"), 'module(name = "root")\n');
+    const mixedWrapperReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew tasks && bazel build //..."],
+      wsDir,
+    );
+    assert.equal(mixedWrapperReqs.clauseBuildReqs.length, 1);
+    assert.equal(mixedWrapperReqs.clauseBuildReqs[0].tool, "bazel");
+    const warmGradleOnlyProbe = probeWarmBuildDaemons(mixedWrapperReqs, {
+      runner: () => ({
+        stdout: `9101 java org.gradle.launcher.daemon.bootstrap.GradleDaemon -Duser.dir=${canonicalWs}\n`,
+      }),
+    });
+    assert.equal(warmGradleOnlyProbe.warm, false);
+    const warmBazelProbe = probeWarmBuildDaemons(mixedWrapperReqs, {
+      runner: () => ({
+        stdout: `9102 bazel(root) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalWs}\n`,
+      }),
+    });
+    assert.equal(warmBazelProbe.warm, true);
+    assert.deepEqual(warmBazelProbe.daemonPids, [9102]);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
