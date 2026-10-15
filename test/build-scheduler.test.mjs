@@ -1627,6 +1627,19 @@ test("cmdExec --claim releases newly claimed device when pre-spawn validation fa
     );
     assert.equal(bazelTestArgConflict.exitCode, 3);
     assert.match(bazelTestArgConflict.error, /Conflicting device selector "emulator-5556"/);
+
+    const bazelRunAfterDashDashConflict = await cmdExec(
+      stateDir,
+      ["bazel", "run", "//app:bin", "--", "--device=emulator-5556"],
+      { claim: true, session: "agent-claim-validation-fail" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "agent-claim-validation-fail" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.equal(bazelRunAfterDashDashConflict.exitCode, 3);
+    assert.match(bazelRunAfterDashDashConflict.error, /Conflicting device selector "emulator-5556"/);
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2228,6 +2241,37 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       }),
     });
     assert.equal(prefixCollisionProbe.warm, false);
+
+    // Bazel --output_user_root derives output_base and does not match default-root servers
+    const isolatedBazelRoot = path.join(wsDir, "bazel-user-root");
+    fs.mkdirSync(isolatedBazelRoot, { recursive: true });
+    const bazelUserRootReqs = resolveBuildResources(
+      "bazel",
+      [`--output_user_root=${isolatedBazelRoot}`, "build", "//..."],
+      subAppDir,
+    );
+    assert.ok(bazelUserRootReqs.resourceKeys.some((k) => k.startsWith("bazel:out:")));
+    const defaultRootBazelProbe = probeWarmBuildDaemons(bazelUserRootReqs, {
+      runner: () => ({
+        stdout: `9004 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(defaultRootBazelProbe.warm, false);
+
+    // env -i clears inherited GRADLE_USER_HOME so warm probe does not fall back to caller's GRADLE_USER_HOME
+    const envIgnoreGradleHomeReqs = resolveBuildResources(
+      "env",
+      ["-i", `PATH=${mockJdkBin}`, "./gradlew", "build"],
+      wsDir,
+    );
+    assert.equal(envIgnoreGradleHomeReqs.envGradleUserHomeUnset, true);
+    const inheritedHomeLeakProbe = probeWarmBuildDaemons(envIgnoreGradleHomeReqs, {
+      env: { GRADLE_USER_HOME: isolatedGradleHome, JAVA_HOME: canonicalMockJdkHome },
+      runner: () => ({
+        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} -Dgradle.user.home=${isolatedGradleHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${envIgnoreGradleHomeReqs.workspaceRoot}\n`,
+      }),
+    });
+    assert.equal(inheritedHomeLeakProbe.warm, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

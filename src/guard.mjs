@@ -2138,7 +2138,7 @@ export function extractTargetSerial(parsed) {
     const selectors = [];
     for (let i = 0; i < args.length; i++) {
       const a = String(args[i]);
-      if (a === "--") break;
+      if (a === "--") continue;
       if (a.startsWith("--device=")) {
         selectors.push(a.slice("--device=".length));
       } else if (a === "--device" && i + 1 < args.length) {

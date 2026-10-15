@@ -1140,6 +1140,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
     options?.taintedVars instanceof Set ? new Set(options.taintedVars) : new Set();
   const incomingShellType = options?.shellType || "posix";
   const envVars = {};
+  let clearedInheritedEnv = false;
 
   for (let depth = 0; depth < 16; depth++) {
     const cleaned = stripLiteralSentinels(curCmd).trim().replace(/^@+/, "");
@@ -1320,8 +1321,10 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           for (const k of Object.keys(envVars)) {
             delete envVars[k];
           }
+          clearedInheritedEnv = true;
           envVars.JAVA_HOME = null;
           envVars.PATH = null;
+          envVars.GRADLE_USER_HOME = null;
           i++;
           continue;
         }
@@ -1460,7 +1463,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         const shellType = base === "cmd" ? "cmd" : "posix";
         let curShellRelCwd = relCwd;
         let curShellUnresolvedCwd = unresolvedDynamicCwd;
-        let shellEnv = { ...baseEnv, ...envVars };
+        let shellEnv = clearedInheritedEnv ? { ...envVars } : { ...baseEnv, ...envVars };
         let curShellEnvVars = { ...envVars };
         let taintedEnvVars = new Set(incomingTaintedVars);
         let fnDefs = new Map(options?.fnDefs instanceof Map ? options.fnDefs : []);
@@ -3184,19 +3187,19 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       };
     }
 
-    const hasIosDeviceFlag = bazelFlags.some(
+    const hasIosDeviceFlag = restArgs.some(
       (a) => a === "--ios_simulator_device" || a.startsWith("--ios_simulator_device="),
     );
-    const hasAndroidDeviceFlag = bazelFlags.some(
+    const hasAndroidDeviceFlag = restArgs.some(
       (a, idx) =>
         a === "--device" ||
         a.startsWith("--device=") ||
         a === "--test_arg=--device" ||
         a.startsWith("--test_arg=--device=") ||
         (a === "--test_arg" &&
-          idx + 1 < bazelFlags.length &&
-          (bazelFlags[idx + 1] === "--device" ||
-            String(bazelFlags[idx + 1]).startsWith("--device="))),
+          idx + 1 < restArgs.length &&
+          (restArgs[idx + 1] === "--device" ||
+            String(restArgs[idx + 1]).startsWith("--device="))),
     );
     const hasDeviceFlag = hasIosDeviceFlag || hasAndroidDeviceFlag;
     const requiresDevice =
@@ -3570,6 +3573,7 @@ export function resolveBuildResources(
 
   if (classified.tool === "bazel") {
     let outputBase = null;
+    let outputUserRoot = null;
     let disablesDaemon = false;
     for (let i = 0; i < strArgs.length; i++) {
       const a = strArgs[i];
@@ -3587,6 +3591,14 @@ export function resolveBuildResources(
       }
       if (a.startsWith("--output_base=")) {
         outputBase = path.resolve(baseCwd, a.slice("--output_base=".length));
+        continue;
+      }
+      if (a === "--output_user_root" && i + 1 < strArgs.length) {
+        outputUserRoot = path.resolve(baseCwd, strArgs[++i]);
+        continue;
+      }
+      if (a.startsWith("--output_user_root=")) {
+        outputUserRoot = path.resolve(baseCwd, a.slice("--output_user_root=".length));
         continue;
       }
       if (BAZEL_STARTUP_VALUE_FLAGS.has(a)) {
@@ -3607,13 +3619,18 @@ export function resolveBuildResources(
       ]) || baseCwd;
 
     const canonicalRoot = canonicalizeBuildPath(rootDir);
+    const canonicalUserRoot = outputUserRoot ? canonicalizeBuildPath(outputUserRoot) : null;
     const resourceKeys = [`bazel:ws:${canonicalRoot}`];
     if (outputBase) {
       resourceKeys.push(`bazel:out:${canonicalizeBuildPath(outputBase)}`);
+    } else if (canonicalUserRoot) {
+      const wsMd5 = crypto.createHash("md5").update(canonicalRoot).digest("hex");
+      resourceKeys.push(`bazel:out:${path.join(canonicalUserRoot, wsMd5)}`);
     }
     return {
       ...classified,
       disablesDaemon,
+      bazelOutputUserRoot: canonicalUserRoot,
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
     };
@@ -4483,9 +4500,17 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const matchesDefaultMd5 =
             defaultBazelOutMd5 &&
             new RegExp(`(?:^|[\\\\/=])${defaultBazelOutMd5}(?:$|[\\\\/\\s"'])`, "i").test(cmdLine);
+          const matchesUserRootAndWs = Boolean(
+            buildReqs.bazelOutputUserRoot &&
+              matchesCmdPathBoundary(cmdLine, buildReqs.bazelOutputUserRoot, {
+                allowSubpath: true,
+              }) &&
+              wsRoot &&
+              (matchesCmdPathBoundary(cmdLine, wsRoot) || matchesDefaultMd5),
+          );
           const matchesWorkspace =
             outKeys.length > 0
-              ? matchesOut
+              ? matchesOut || matchesUserRootAndWs
               : Boolean(
                   wsRoot && (matchesCmdPathBoundary(cmdLine, wsRoot) || matchesDefaultMd5),
                 );
