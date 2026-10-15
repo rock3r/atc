@@ -2023,6 +2023,36 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       bashFnInv.args[1],
       "function run_build { ./gradlew build -Dorg.gradle.workers.max=4; }; run_build",
     );
+
+    // Function bodies are evaluated at their call-site cwd and environment
+    const fnCallCwdReqs = resolveBuildResources(
+      "bash",
+      ["-c", "f(){ ./gradlew build; }; cd app; f"],
+      wsDir,
+    );
+    assert.equal(fnCallCwdReqs.kind, "pure_build");
+    assert.deepEqual(fnCallCwdReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    const fnCallEnvReqs = resolveBuildResources(
+      "bash",
+      ["-c", 'f(){ "$TOOL" -p "$1" build; }; TOOL=./gradlew; f app'],
+      wsDir,
+    );
+    assert.equal(fnCallEnvReqs.kind, "pure_build");
+    assert.deepEqual(fnCallEnvReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
+
+    const fnCallEnvInv = buildChildInvocation(
+      "bash",
+      ["-c", 'f(){ "$TOOL" -p "$1" build; }; TOOL=./gradlew; f app'],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      fnCallEnvInv.args[1],
+      'f(){ "$TOOL" -p "$1" build -Dorg.gradle.workers.max=4; }; TOOL=./gradlew; f app',
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

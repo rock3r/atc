@@ -605,8 +605,18 @@ export function splitShellClauseRedirAndGroup(part) {
           p--;
         }
         if (p >= 0 && (coreEnd[p] === ")" || coreEnd[p] === "}") && mask[p] === 0) {
-          if (coreEnd[p] === ")") parens++;
-          else braces++;
+          if (coreEnd[p] === ")") {
+            let q = p - 1;
+            while (q >= 0 && /\s/.test(coreEnd[q]) && mask[q] === 0) {
+              q--;
+            }
+            if (q >= 0 && coreEnd[q] === "(" && mask[q] === 0) {
+              break;
+            }
+            parens++;
+          } else {
+            braces++;
+          }
           stripPos = p;
           while (stripPos > 0 && /\s/.test(coreEnd[stripPos - 1]) && mask[stripPos - 1] === 0) {
             stripPos--;
@@ -626,11 +636,18 @@ export function splitShellClauseRedirAndGroup(part) {
     break;
   }
 
-  let leadingCore = coreEnd.trim();
+  let leadPos = 0;
+  while (leadPos < coreEnd.length && /\s/.test(coreEnd[leadPos])) {
+    leadPos++;
+  }
+  let leadingCore = coreEnd.slice(leadPos);
   let openedSubshells = 0;
   let openedBraces = 0;
   const leadingKeywords = [];
   const forLoopVars = [];
+  const functionNames = [];
+  let functionOpenChar = null;
+  let functionBodyStartOffset = -1;
   let hasCasePattern = false;
   while (leadingCore.length > 0) {
     if (/^[({]/.test(leadingCore)) {
@@ -646,18 +663,22 @@ export function splitShellClauseRedirAndGroup(part) {
         }
         if (closeParenBeforeWs > 1) {
           hasCasePattern = true;
-          leadingCore = leadingCore.slice(closeParenBeforeWs + 1).trim();
+          leadPos += closeParenBeforeWs + 1;
+          while (leadPos < coreEnd.length && /\s/.test(coreEnd[leadPos])) leadPos++;
+          leadingCore = coreEnd.slice(leadPos);
           continue;
         }
         openedSubshells++;
       } else {
         openedBraces++;
       }
-      leadingCore = leadingCore.slice(1).trim();
+      leadPos += 1;
+      while (leadPos < coreEnd.length && /\s/.test(coreEnd[leadPos])) leadPos++;
+      leadingCore = coreEnd.slice(leadPos);
       continue;
     }
     const kwMatch = leadingCore.match(
-      /^(?:(then|else|do|if|elif|while|until|fi|done|esac|!)(?=\s|[({]|$)|(for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+in\b[^;\n]*)?)(?=\s|[({]|$)|(case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in)(?=\s|[({]|$)|((?:function\s+[A-Za-z_][A-Za-z0-9_.-]*(?:\s*\(\s*\))?|[A-Za-z_][A-Za-z0-9_.-]*\s*\(\s*\)))(?=\s|[({]|$))/,
+      /^(?:(then|else|do|if|elif|while|until|fi|done|esac|!)(?=\s|[({]|$)|(for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+in\b[^;\n]*)?)(?=\s|[({]|$)|(case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in)(?=\s|[({]|$)|((?:function\s+([A-Za-z_][A-Za-z0-9_.-]*)(?:\s*\(\s*\))?|([A-Za-z_][A-Za-z0-9_.-]*)\s*\(\s*\)))(?=\s|[({]|$))/,
     );
     if (kwMatch) {
       const kw = (
@@ -670,7 +691,18 @@ export function splitShellClauseRedirAndGroup(part) {
       if (kwMatch[3]) {
         forLoopVars.push(kwMatch[3]);
       }
-      leadingCore = leadingCore.slice(kwMatch[0].length).trim();
+      leadPos += kwMatch[0].length;
+      while (leadPos < coreEnd.length && /\s/.test(coreEnd[leadPos])) leadPos++;
+      if (kwMatch[6] || kwMatch[7]) {
+        functionNames.push(kwMatch[6] || kwMatch[7]);
+        if (coreEnd[leadPos] === "{" || coreEnd[leadPos] === "(") {
+          functionOpenChar = coreEnd[leadPos];
+          functionBodyStartOffset = leadPos + 1;
+          leadingCore = coreEnd.slice(leadPos);
+          break;
+        }
+      }
+      leadingCore = coreEnd.slice(leadPos);
       continue;
     }
     const leadMask = computeQuotedMask(leadingCore);
@@ -684,7 +716,9 @@ export function splitShellClauseRedirAndGroup(part) {
     }
     if (closeParenIdx > 0) {
       hasCasePattern = true;
-      leadingCore = leadingCore.slice(closeParenIdx + 1).trim();
+      leadPos += closeParenIdx + 1;
+      while (leadPos < coreEnd.length && /\s/.test(coreEnd[leadPos])) leadPos++;
+      leadingCore = coreEnd.slice(leadPos);
       continue;
     }
     break;
@@ -692,7 +726,7 @@ export function splitShellClauseRedirAndGroup(part) {
 
   return {
     corePart: coreEnd,
-    strippedClause: leadingCore,
+    strippedClause: leadingCore.trim(),
     redirSuffix: suffix,
     trailingWs,
     openedSubshells,
@@ -701,8 +735,72 @@ export function splitShellClauseRedirAndGroup(part) {
     closedBraces,
     leadingKeywords,
     forLoopVars,
+    functionNames,
+    functionOpenChar,
+    functionBodyStartOffset,
     hasCasePattern,
   };
+}
+
+export function extractShellFunctionSpan(rawParts, startPartIdx, splitInfo = null) {
+  const info = splitInfo || splitShellClauseRedirAndGroup(rawParts[startPartIdx]);
+  if (!info.functionNames || info.functionNames.length === 0) return null;
+  const fnName = info.functionNames[info.functionNames.length - 1];
+  let openChar = info.functionOpenChar;
+  let bodyStartPartIdx = startPartIdx;
+  let bodyStartOffset = info.functionBodyStartOffset;
+  if (!openChar) {
+    for (let p = startPartIdx + 2; p < rawParts.length; p += 2) {
+      const t = String(rawParts[p] || "");
+      const m = t.match(/^\s*([({])/);
+      if (m) {
+        openChar = m[1];
+        bodyStartPartIdx = p;
+        bodyStartOffset = m[0].length;
+        break;
+      }
+      if (t.trim().length > 0) break;
+    }
+  }
+  if (!openChar || bodyStartOffset < 0) return null;
+  const closeChar = openChar === "{" ? "}" : ")";
+  let depth = 1;
+  for (let p = bodyStartPartIdx; p < rawParts.length; p += 2) {
+    const partStr = String(rawParts[p] || "");
+    const mask = computeQuotedMask(partStr);
+    const startI = p === bodyStartPartIdx ? bodyStartOffset : 0;
+    for (let i = startI; i < partStr.length; i++) {
+      if (mask[i] !== 0) continue;
+      if (partStr[i] === openChar) {
+        depth++;
+      } else if (partStr[i] === closeChar) {
+        depth--;
+        if (depth === 0) {
+          const bodyScript =
+            bodyStartPartIdx === p
+              ? partStr.slice(bodyStartOffset, i)
+              : rawParts[bodyStartPartIdx].slice(bodyStartOffset) +
+                rawParts.slice(bodyStartPartIdx + 1, p).join("") +
+                partStr.slice(0, i);
+          const trailingInfo = splitShellClauseRedirAndGroup(partStr.slice(i + 1));
+          return {
+            name: fnName,
+            names: [...info.functionNames],
+            startPartIdx,
+            bodyStartPartIdx,
+            bodyStartOffset,
+            endPartIdx: p,
+            bodyEndOffset: i,
+            bodyScript,
+            isSubshellFn: openChar === "(",
+            trailingClosedSubshells: trailingInfo.closedSubshells || 0,
+            trailingClosedBraces: trailingInfo.closedBraces || 0,
+          };
+        }
+      }
+    }
+  }
+  return null;
 }
 
 export function splitShellScriptParts(script) {
@@ -777,10 +875,10 @@ export function expandOrValidateShellPath(rawPath, envMap = process.env, options
   if (/(?<!\uE000)\$/.test(p)) {
     let unresolved = false;
     p = p.replace(
-      /(?<!\uE000)\$(?:\{(?:env:)?([^}]*)\}|(?:env:)?([A-Za-z_][A-Za-z0-9_]*))/gi,
+      /(?<!\uE000)\$(?:\{(?:env:)?([^}]*)\}|(?:env:)?([A-Za-z_][A-Za-z0-9_]*|[1-9]))/gi,
       (_m, braced, plain) => {
         const varName = braced !== undefined ? braced : plain;
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(varName)) {
+        if (!/^(?:[A-Za-z_][A-Za-z0-9_]*|[1-9])$/.test(varName)) {
           unresolved = true;
           return "";
         }
@@ -1315,41 +1413,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             : String(curArgs[cIdx + 1] || ""),
         );
         const script = rawScriptArg.trim();
-        const rawParts = splitShellScriptParts(script);
         const isAmpersandBackground = base !== "cmd";
-        const clauses = [];
-        let pendingSepBefore = null;
-        for (let pIdx = 0; pIdx < rawParts.length; pIdx += 2) {
-          const text = rawParts[pIdx].trim();
-          const sepAfter = pIdx + 1 < rawParts.length ? rawParts[pIdx + 1] : null;
-          if (text) {
-            clauses.push({
-              text,
-              sepBefore: pendingSepBefore,
-              sepAfter,
-              backgrounded: isAmpersandBackground && sepAfter === "&",
-            });
-            pendingSepBefore = sepAfter;
-          } else if (sepAfter) {
-            if (pendingSepBefore === ";" && sepAfter === ";") {
-              pendingSepBefore = ";;";
-            } else {
-              pendingSepBefore = sepAfter;
-            }
-          }
-        }
-        if (isAmpersandBackground) {
-          for (let ci = clauses.length - 1; ci > 0; ci--) {
-            if (
-              clauses[ci].backgrounded &&
-              (clauses[ci].sepBefore === "&&" ||
-                clauses[ci].sepBefore === "||" ||
-                clauses[ci].sepBefore === "|")
-            ) {
-              clauses[ci - 1].backgrounded = true;
-            }
-          }
-        }
         const matchedClauses = [];
         const shellType = base === "cmd" ? "cmd" : "posix";
         let curShellRelCwd = relCwd;
@@ -1357,6 +1421,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let shellEnv = { ...baseEnv, ...envVars };
         let curShellEnvVars = { ...envVars };
         let taintedEnvVars = new Set(incomingTaintedVars);
+        let fnDefs = new Map(options?.fnDefs instanceof Map ? options.fnDefs : []);
+        const activeFnCalls = new Set(options?.activeFnCalls instanceof Set ? options.activeFnCalls : []);
         const candidateBuildToolEnv = {};
         for (const [ek, ev] of Object.entries(shellEnv)) {
           if (typeof ev === "string" && normalizeBuildToolName(ev)) {
@@ -1374,6 +1440,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let chainMutatedEnv = new Set();
         let chainAnyEnvMutation = new Set();
         let currentClauseBackgrounded = false;
+        let outerChainConditional = false;
         const captureChainEntryState = () => ({
           cwd: curShellRelCwd,
           unresolvedCwd: curShellUnresolvedCwd,
@@ -1405,7 +1472,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           dirVerified = true,
         } = {}) => {
           chainAnyCwdMutation = true;
-          if (chainHasCondition || !dirVerified) {
+          if (chainHasCondition || outerChainConditional || !dirVerified) {
             chainMutatedCwd = true;
           }
           const inCaseBlock = Boolean(findTopControlFrame(["case"]));
@@ -1443,7 +1510,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           const inCaseBlock = Boolean(findTopControlFrame(["case"]));
           for (const k of normKeys) {
             chainAnyEnvMutation.add(k);
-            if (chainHasCondition) {
+            if (chainHasCondition || outerChainConditional) {
               chainMutatedEnv.add(k);
             }
             if (
@@ -1453,7 +1520,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               (hasCasePattern && !inCaseBlock)
             ) {
               taintedEnvVars.add(k);
-            } else if (!chainHasCondition) {
+            } else if (!chainHasCondition && !outerChainConditional) {
               taintedEnvVars.delete(k);
             }
             if (!currentClauseBackgrounded) {
@@ -1470,6 +1537,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         };
 
         const resetChainState = () => {
+          for (const fd of fnDefs.values()) {
+            if (fd.definedInCondChain) {
+              fd.tainted = true;
+              fd.definedInCondChain = false;
+            }
+          }
           chainHasCondition = false;
           chainSawOrOrPipe = false;
           chainMutatedCwd = false;
@@ -1479,162 +1552,209 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           chainEntryState = captureChainEntryState();
         };
 
-        for (const clauseObj of clauses) {
-          const { sepBefore, sepAfter } = clauseObj;
-          currentClauseBackgrounded = Boolean(clauseObj.backgrounded);
-          if (
-            sepBefore === ";" ||
-            sepBefore === ";;" ||
-            sepBefore === "\n" ||
-            sepBefore === "&"
-          ) {
-            if (sepBefore === "&" && isAmpersandBackground) {
-              curShellRelCwd = chainEntryState.cwd;
-              curShellUnresolvedCwd = chainEntryState.unresolvedCwd;
-              pushdStack = [...chainEntryState.pushdStack];
-              shellEnv = { ...chainEntryState.shellEnv };
-              curShellEnvVars = { ...chainEntryState.envVars };
-              taintedEnvVars = new Set(chainEntryState.taintedEnvVars);
-            } else {
-              if (chainMutatedCwd) {
+        const runShellScript = (scriptToRun, runOpts = {}) => {
+          const prevOuterCond = outerChainConditional;
+          if (runOpts.inheritedCond) {
+            outerChainConditional = true;
+          }
+          const rawParts = splitShellScriptParts(String(scriptToRun || "").trim());
+          const clauses = [];
+          let pendingSepBefore = null;
+          for (let pIdx = 0; pIdx < rawParts.length; pIdx += 2) {
+            const text = rawParts[pIdx].trim();
+            const sepAfter = pIdx + 1 < rawParts.length ? rawParts[pIdx + 1] : null;
+            if (text) {
+              clauses.push({
+                text,
+                rawPart: rawParts[pIdx],
+                partIdx: pIdx,
+                sepBefore: pendingSepBefore,
+                sepAfter,
+                backgrounded: isAmpersandBackground && sepAfter === "&",
+              });
+              pendingSepBefore = sepAfter;
+            } else if (sepAfter) {
+              if (pendingSepBefore === ";" && sepAfter === ";") {
+                pendingSepBefore = ";;";
+              } else {
+                pendingSepBefore = sepAfter;
+              }
+            }
+          }
+          if (isAmpersandBackground) {
+            for (let ci = clauses.length - 1; ci > 0; ci--) {
+              if (
+                clauses[ci].backgrounded &&
+                (clauses[ci].sepBefore === "&&" ||
+                  clauses[ci].sepBefore === "||" ||
+                  clauses[ci].sepBefore === "|")
+              ) {
+                clauses[ci - 1].backgrounded = true;
+              }
+            }
+          }
+
+          for (let cIdx = 0; cIdx < clauses.length; cIdx++) {
+            const clauseObj = clauses[cIdx];
+            const { sepBefore, sepAfter } = clauseObj;
+            currentClauseBackgrounded = Boolean(clauseObj.backgrounded);
+            if (
+              sepBefore === ";" ||
+              sepBefore === ";;" ||
+              sepBefore === "\n" ||
+              sepBefore === "&"
+            ) {
+              if (sepBefore === "&" && isAmpersandBackground) {
+                curShellRelCwd = chainEntryState.cwd;
+                curShellUnresolvedCwd = chainEntryState.unresolvedCwd;
+                pushdStack = [...chainEntryState.pushdStack];
+                shellEnv = { ...chainEntryState.shellEnv };
+                curShellEnvVars = { ...chainEntryState.envVars };
+                taintedEnvVars = new Set(chainEntryState.taintedEnvVars);
+              } else {
+                if (chainMutatedCwd) {
+                  curShellUnresolvedCwd = true;
+                }
+                for (const k of chainMutatedEnv) {
+                  taintedEnvVars.add(k);
+                }
+              }
+              if (sepBefore === ";;") {
+                const topCase = findTopControlFrame(["case"])?.frame;
+                if (topCase) {
+                  for (const fd of fnDefs.values()) {
+                    if (fd.definedInFrame === topCase) fd.tainted = true;
+                  }
+                  curShellRelCwd = topCase.entryCwd;
+                  curShellUnresolvedCwd = topCase.entryUnresolvedCwd;
+                  pushdStack = [...topCase.entryPushdStack];
+                  shellEnv = { ...topCase.entryShellEnv };
+                  curShellEnvVars = { ...topCase.entryEnvVars };
+                  taintedEnvVars = new Set(topCase.entryTaintedEnv);
+                }
+              }
+              resetChainState();
+            } else if (sepBefore === "||" || sepBefore === "|") {
+              chainHasCondition = true;
+              chainSawOrOrPipe = true;
+              if (chainAnyCwdMutation) {
                 curShellUnresolvedCwd = true;
               }
-              for (const k of chainMutatedEnv) {
+              for (const k of chainAnyEnvMutation) {
                 taintedEnvVars.add(k);
               }
             }
-            if (sepBefore === ";;") {
-              const topCase = findTopControlFrame(["case"])?.frame;
-              if (topCase) {
-                curShellRelCwd = topCase.entryCwd;
-                curShellUnresolvedCwd = topCase.entryUnresolvedCwd;
-                pushdStack = [...topCase.entryPushdStack];
-                shellEnv = { ...topCase.entryShellEnv };
-                curShellEnvVars = { ...topCase.entryEnvVars };
-                taintedEnvVars = new Set(topCase.entryTaintedEnv);
-              }
-            }
-            resetChainState();
-          } else if (sepBefore === "||" || sepBefore === "|") {
-            chainHasCondition = true;
-            chainSawOrOrPipe = true;
-            if (chainAnyCwdMutation) {
-              curShellUnresolvedCwd = true;
-            }
-            for (const k of chainAnyEnvMutation) {
-              taintedEnvVars.add(k);
-            }
-          }
 
-          const clause = clauseObj.text;
-          const {
-            strippedClause,
-            openedSubshells,
-            closedSubshells,
-            openedBraces,
-            closedBraces,
-            leadingKeywords,
-            forLoopVars,
-            hasCasePattern,
-          } = splitShellClauseRedirAndGroup(clause);
-          for (let s = 0; s < openedSubshells; s++) {
-            cwdStack.push({
-              cwd: curShellRelCwd,
-              unresolvedCwd: curShellUnresolvedCwd,
-              shellEnv: { ...shellEnv },
-              envVars: { ...curShellEnvVars },
-              taintedEnvVars: new Set(taintedEnvVars),
-              braceDepth,
-              pushdStack: [...pushdStack],
-              chainHasCondition,
-              chainSawOrOrPipe,
-              chainMutatedCwd,
-              chainAnyCwdMutation,
-              chainMutatedEnv: new Set(chainMutatedEnv),
-              chainAnyEnvMutation: new Set(chainAnyEnvMutation),
-              chainEntryState: {
-                cwd: chainEntryState.cwd,
-                unresolvedCwd: chainEntryState.unresolvedCwd,
-                pushdStack: [...chainEntryState.pushdStack],
-                shellEnv: { ...chainEntryState.shellEnv },
-                envVars: { ...chainEntryState.envVars },
-                taintedEnvVars: new Set(chainEntryState.taintedEnvVars),
-              },
-            });
-            resetChainState();
-          }
-          const prevBraceDepth = braceDepth;
-          braceDepth += openedBraces || 0;
-          const popSubshells = () => {
-            if (closedBraces > 0) {
-              braceDepth = Math.max(0, braceDepth - closedBraces);
-              while (true) {
-                const topFn = findTopControlFrame(["function"]);
-                if (!topFn || topFn.frame.braceDepth < braceDepth) break;
-                controlStack.splice(topFn.index, 1);
-                if (topFn.frame.mutatedCwd) {
-                  curShellUnresolvedCwd = true;
-                } else {
-                  curShellRelCwd = topFn.frame.entryCwd;
-                  curShellUnresolvedCwd = topFn.frame.entryUnresolvedCwd;
-                  pushdStack = [...topFn.frame.entryPushdStack];
-                }
-                shellEnv = { ...topFn.frame.entryShellEnv };
-                curShellEnvVars = { ...topFn.frame.entryEnvVars };
-                taintedEnvVars = new Set(topFn.frame.entryTaintedEnv);
-                for (const k of topFn.frame.mutatedEnv) {
-                  taintedEnvVars.add(k);
-                }
-                resetChainState();
-              }
-            }
-            for (let s = 0; s < closedSubshells; s++) {
-              if (cwdStack.length > 0) {
-                const frame = cwdStack.pop();
-                curShellRelCwd = frame.cwd;
-                curShellUnresolvedCwd = frame.unresolvedCwd;
-                shellEnv = frame.shellEnv;
-                curShellEnvVars = frame.envVars;
-                taintedEnvVars = frame.taintedEnvVars;
-                braceDepth = frame.braceDepth ?? braceDepth;
-                pushdStack = frame.pushdStack;
-                chainHasCondition = frame.chainHasCondition;
-                chainSawOrOrPipe = frame.chainSawOrOrPipe;
-                chainMutatedCwd = frame.chainMutatedCwd;
-                chainAnyCwdMutation = frame.chainAnyCwdMutation;
-                chainMutatedEnv = frame.chainMutatedEnv;
-                chainAnyEnvMutation = frame.chainAnyEnvMutation;
-                chainEntryState = frame.chainEntryState;
-                while (
-                  controlStack.length > 0 &&
-                  controlStack[controlStack.length - 1].subshellDepth > cwdStack.length
-                ) {
-                  controlStack.pop();
-                }
-              }
-            }
-          };
-
-          for (const kw of leadingKeywords || []) {
-            if (kw === "function") {
-              controlStack.push({
-                type: "function",
-                phase: "body",
-                subshellDepth: cwdStack.length,
-                braceDepth: prevBraceDepth,
-                entryCwd: curShellRelCwd,
-                entryUnresolvedCwd: curShellUnresolvedCwd,
-                entryPushdStack: [...pushdStack],
-                entryShellEnv: { ...shellEnv },
-                entryEnvVars: { ...curShellEnvVars },
-                entryTaintedEnv: new Set(taintedEnvVars),
-                condMutatedCwd: false,
-                mutatedCwd: false,
-                condMutatedEnv: new Set(),
-                mutatedEnv: new Set(),
+            const clause = clauseObj.text;
+            const splitInfo = splitShellClauseRedirAndGroup(clauseObj.rawPart || clause);
+            const {
+              strippedClause,
+              openedSubshells,
+              closedSubshells,
+              openedBraces,
+              closedBraces,
+              leadingKeywords,
+              forLoopVars,
+              functionNames,
+              hasCasePattern,
+            } = splitInfo;
+            const isFunctionDecl = Array.isArray(functionNames) && functionNames.length > 0;
+            for (let s = 0; s < openedSubshells; s++) {
+              cwdStack.push({
+                cwd: curShellRelCwd,
+                unresolvedCwd: curShellUnresolvedCwd,
+                shellEnv: { ...shellEnv },
+                envVars: { ...curShellEnvVars },
+                taintedEnvVars: new Set(taintedEnvVars),
+                fnDefs: new Map(fnDefs),
+                braceDepth,
+                pushdStack: [...pushdStack],
+                chainHasCondition,
+                chainSawOrOrPipe,
+                chainMutatedCwd,
+                chainAnyCwdMutation,
+                chainMutatedEnv: new Set(chainMutatedEnv),
+                chainAnyEnvMutation: new Set(chainAnyEnvMutation),
+                chainEntryState: {
+                  cwd: chainEntryState.cwd,
+                  unresolvedCwd: chainEntryState.unresolvedCwd,
+                  pushdStack: [...chainEntryState.pushdStack],
+                  shellEnv: { ...chainEntryState.shellEnv },
+                  envVars: { ...chainEntryState.envVars },
+                  taintedEnvVars: new Set(chainEntryState.taintedEnvVars),
+                },
               });
               resetChainState();
-            } else if (kw === "if") {
+            }
+            braceDepth += openedBraces || 0;
+            const popSubshells = (
+              cBraces = isFunctionDecl ? 0 : closedBraces,
+              cSubshells = isFunctionDecl ? 0 : closedSubshells,
+            ) => {
+              if (cBraces > 0) {
+                braceDepth = Math.max(0, braceDepth - cBraces);
+              }
+              for (let s = 0; s < cSubshells; s++) {
+                if (cwdStack.length > 0) {
+                  const frame = cwdStack.pop();
+                  curShellRelCwd = frame.cwd;
+                  curShellUnresolvedCwd = frame.unresolvedCwd;
+                  shellEnv = frame.shellEnv;
+                  curShellEnvVars = frame.envVars;
+                  taintedEnvVars = frame.taintedEnvVars;
+                  if (frame.fnDefs) fnDefs = frame.fnDefs;
+                  braceDepth = frame.braceDepth ?? braceDepth;
+                  pushdStack = frame.pushdStack;
+                  chainHasCondition = frame.chainHasCondition;
+                  chainSawOrOrPipe = frame.chainSawOrOrPipe;
+                  chainMutatedCwd = frame.chainMutatedCwd;
+                  chainAnyCwdMutation = frame.chainAnyCwdMutation;
+                  chainMutatedEnv = frame.chainMutatedEnv;
+                  chainAnyEnvMutation = frame.chainAnyEnvMutation;
+                  chainEntryState = frame.chainEntryState;
+                  while (
+                    controlStack.length > 0 &&
+                    controlStack[controlStack.length - 1].subshellDepth > cwdStack.length
+                  ) {
+                    controlStack.pop();
+                  }
+                }
+              }
+            };
+
+            let handledFunctionDecl = false;
+            for (const kw of leadingKeywords || []) {
+              if (kw === "function") {
+                const fnSpan = extractShellFunctionSpan(rawParts, clauseObj.partIdx, splitInfo);
+                if (fnSpan) {
+                  for (const fnName of fnSpan.names || [fnSpan.name]) {
+                    const isCondFn =
+                      outerChainConditional ||
+                      chainHasCondition ||
+                      chainSawOrOrPipe ||
+                      fnDefs.has(fnName);
+                    const prevDef = fnDefs.get(fnName);
+                    fnDefs.set(fnName, {
+                      ...fnSpan,
+                      name: fnName,
+                      tainted: isCondFn,
+                      prevDefs: prevDef ? [...(prevDef.prevDefs || []), prevDef] : [],
+                      definedInFrame: controlStack[controlStack.length - 1] || null,
+                      definedInCondChain: chainHasCondition || outerChainConditional,
+                      called: false,
+                    });
+                  }
+                  while (
+                    cIdx + 1 < clauses.length &&
+                    clauses[cIdx + 1].partIdx <= fnSpan.endPartIdx
+                  ) {
+                    cIdx++;
+                  }
+                  popSubshells(fnSpan.trailingClosedBraces || 0, fnSpan.trailingClosedSubshells || 0);
+                  handledFunctionDecl = true;
+                  break;
+                }
+              } else if (kw === "if") {
               controlStack.push({
                 type: "if",
                 phase: "cond",
@@ -1660,6 +1780,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             } else if (kw === "elif" || kw === "else") {
               const found = findTopControlFrame(["if"]);
               if (found) {
+                for (const fd of fnDefs.values()) {
+                  if (fd.definedInFrame === found.frame) fd.tainted = true;
+                }
                 found.frame.phase = kw === "elif" ? "cond" : "else";
                 if (found.frame.condMutatedCwd) {
                   curShellUnresolvedCwd = true;
@@ -1681,6 +1804,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             } else if (kw === "fi") {
               const found = findTopControlFrame(["if"]);
               if (found) {
+                for (const fd of fnDefs.values()) {
+                  if (fd.definedInFrame === found.frame) fd.tainted = true;
+                }
                 controlStack.splice(found.index, 1);
                 if (found.frame.mutatedCwd) {
                   curShellUnresolvedCwd = true;
@@ -1727,6 +1853,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             } else if (kw === "done") {
               const found = findTopControlFrame(["loop"]);
               if (found) {
+                for (const fd of fnDefs.values()) {
+                  if (fd.definedInFrame === found.frame) fd.tainted = true;
+                }
                 controlStack.splice(found.index, 1);
                 if (found.frame.mutatedCwd) {
                   curShellUnresolvedCwd = true;
@@ -1759,6 +1888,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             } else if (kw === "esac") {
               const found = findTopControlFrame(["case"]);
               if (found) {
+                for (const fd of fnDefs.values()) {
+                  if (fd.definedInFrame === found.frame) fd.tainted = true;
+                }
                 controlStack.splice(found.index, 1);
                 if (found.frame.mutatedCwd) {
                   curShellUnresolvedCwd = true;
@@ -1774,9 +1906,16 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             }
           }
 
+          if (handledFunctionDecl) {
+            continue;
+          }
+
           if (hasCasePattern) {
             const topCase = findTopControlFrame(["case"])?.frame;
             if (topCase) {
+              for (const fd of fnDefs.values()) {
+                if (fd.definedInFrame === topCase) fd.tainted = true;
+              }
               curShellRelCwd = topCase.entryCwd;
               curShellUnresolvedCwd = topCase.entryUnresolvedCwd;
               pushdStack = [...topCase.entryPushdStack];
@@ -1806,6 +1945,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 inShell: true,
                 taintedVars: taintedEnvVars,
                 shellType,
+                fnDefs,
+                activeFnCalls,
               });
               if (Array.isArray(subPeeled.allBuildClauses) && subPeeled.allBuildClauses.length > 0) {
                 for (const subC of subPeeled.allBuildClauses) {
@@ -1841,6 +1982,195 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           }
           const headTok = stripLiteralSentinels(rawTokens[0]);
           const headLower = headTok.toLowerCase();
+          let fnTokIdx = 0;
+          const callPrefixEnv = {};
+          const callPrefixTainted = new Set();
+          while (
+            fnTokIdx < rawTokens.length &&
+            /^[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(stripLiteralSentinels(rawTokens[fnTokIdx]))
+          ) {
+            const pTok = rawTokens[fnTokIdx];
+            const eqIdx = pTok.indexOf("=");
+            const rawBeforeEq = stripLiteralSentinels(pTok.slice(0, eqIdx));
+            const isAppend = rawBeforeEq.endsWith("+");
+            const k = isAppend ? rawBeforeEq.slice(0, -1) : rawBeforeEq;
+            const rawVal = pTok.slice(eqIdx + 1);
+            const expVal = expandInShell(rawVal, shellEnv);
+            if (expVal.unresolved) {
+              callPrefixTainted.add(k);
+            } else {
+              callPrefixEnv[k] = isAppend
+                ? String(shellEnv[k] ?? "") + expVal.resolved
+                : expVal.resolved;
+            }
+            fnTokIdx++;
+          }
+          const candidateFnName =
+            fnTokIdx < rawTokens.length ? stripLiteralSentinels(rawTokens[fnTokIdx]) : "";
+          if (candidateFnName && fnDefs.has(candidateFnName)) {
+            const fnDef = fnDefs.get(candidateFnName);
+            fnDef.called = true;
+            const fnIsTainted = Boolean(
+              fnDef.tainted ||
+                (fnDef.definedInFrame && !controlStack.includes(fnDef.definedInFrame)),
+            );
+            if (activeFnCalls.has(candidateFnName)) {
+              curShellUnresolvedCwd = true;
+              recordCwdMutation({ isAbsoluteTarget: false, hasCasePattern, dirVerified: false });
+              recordEnvMutation("*", {
+                isUnresolvedVal: true,
+                sepAfter,
+                hasCasePattern,
+              });
+            } else {
+              if (fnIsTainted) {
+                curShellUnresolvedCwd = true;
+                recordCwdMutation({ isAbsoluteTarget: false, hasCasePattern, dirVerified: false });
+                recordEnvMutation("*", {
+                  isUnresolvedVal: true,
+                  sepAfter,
+                  hasCasePattern,
+                });
+                for (const pd of fnDef.prevDefs || []) {
+                  runShellScript(pd.bodyScript, { inheritedCond: true });
+                }
+              }
+              const callArgs = rawTokens.slice(fnTokIdx + 1);
+              const savedPosEnv = {};
+              const savedPosTaint = new Set();
+              for (let pi = 1; pi <= 9; pi++) {
+                const pk = String(pi);
+                savedPosEnv[pk] = shellEnv[pk];
+                if (taintedEnvVars.has(pk)) savedPosTaint.add(pk);
+                if (pi - 1 < callArgs.length) {
+                  const expArg = expandInShell(callArgs[pi - 1], shellEnv);
+                  if (expArg.unresolved) {
+                    taintedEnvVars.add(pk);
+                  } else {
+                    shellEnv[pk] = expArg.resolved;
+                    taintedEnvVars.delete(pk);
+                  }
+                } else {
+                  delete shellEnv[pk];
+                  taintedEnvVars.delete(pk);
+                }
+              }
+              const savedPrefixEnv = new Map();
+              for (const pk of [...Object.keys(callPrefixEnv), ...callPrefixTainted]) {
+                savedPrefixEnv.set(pk, {
+                  hasEnv: pk in shellEnv,
+                  envVal: shellEnv[pk],
+                  hasCurVar: pk in curShellEnvVars,
+                  curVarVal: curShellEnvVars[pk],
+                  tainted: taintedEnvVars.has(pk),
+                });
+              }
+              for (const [pk, pv] of Object.entries(callPrefixEnv)) {
+                shellEnv[pk] = pv;
+                curShellEnvVars[pk] = pv;
+                taintedEnvVars.delete(pk);
+              }
+              for (const pk of callPrefixTainted) {
+                taintedEnvVars.add(pk);
+              }
+              const needsSubshell = Boolean(
+                fnDef.isSubshellFn ||
+                  clauseObj.backgrounded ||
+                  sepAfter === "|" ||
+                  sepBefore === "|",
+              );
+              if (needsSubshell) {
+                cwdStack.push({
+                  cwd: curShellRelCwd,
+                  unresolvedCwd: curShellUnresolvedCwd,
+                  shellEnv: { ...shellEnv },
+                  envVars: { ...curShellEnvVars },
+                  taintedEnvVars: new Set(taintedEnvVars),
+                  fnDefs: new Map(fnDefs),
+                  braceDepth,
+                  pushdStack: [...pushdStack],
+                  chainHasCondition,
+                  chainSawOrOrPipe,
+                  chainMutatedCwd,
+                  chainAnyCwdMutation,
+                  chainMutatedEnv: new Set(chainMutatedEnv),
+                  chainAnyEnvMutation: new Set(chainAnyEnvMutation),
+                  chainEntryState: {
+                    cwd: chainEntryState.cwd,
+                    unresolvedCwd: chainEntryState.unresolvedCwd,
+                    pushdStack: [...chainEntryState.pushdStack],
+                    shellEnv: { ...chainEntryState.shellEnv },
+                    envVars: { ...chainEntryState.envVars },
+                    taintedEnvVars: new Set(chainEntryState.taintedEnvVars),
+                  },
+                });
+              }
+              const clausesBeforeCall = matchedClauses.length;
+              activeFnCalls.add(candidateFnName);
+              runShellScript(fnDef.bodyScript, {
+                inheritedCond: chainHasCondition || outerChainConditional || fnIsTainted,
+              });
+              activeFnCalls.delete(candidateFnName);
+              const callClauses = matchedClauses.slice(clausesBeforeCall);
+              const callSig = callClauses
+                .map((c) => {
+                  const cl = classifyBuildCommand(c.cmd, c.args);
+                  return `${cl.tool || "none"}:${Boolean(cl.requiresHeavySlot)}:${Boolean(cl.requiresDevice)}`;
+                })
+                .join(",");
+              if (!fnDef.producedClauses) fnDef.producedClauses = [];
+              fnDef.producedClauses.push(...callClauses);
+              if (fnDef.firstCallSig === undefined) {
+                fnDef.firstCallSig = callSig;
+              } else if (fnDef.firstCallSig !== callSig) {
+                for (const pc of fnDef.producedClauses) {
+                  pc.unresolvedDynamicCwd = true;
+                }
+              }
+              if (needsSubshell && cwdStack.length > 0) {
+                const frame = cwdStack.pop();
+                curShellRelCwd = frame.cwd;
+                curShellUnresolvedCwd = frame.unresolvedCwd;
+                shellEnv = frame.shellEnv;
+                curShellEnvVars = frame.envVars;
+                taintedEnvVars = frame.taintedEnvVars;
+                if (frame.fnDefs) fnDefs = frame.fnDefs;
+                braceDepth = frame.braceDepth ?? braceDepth;
+                pushdStack = frame.pushdStack;
+                chainHasCondition = frame.chainHasCondition;
+                chainSawOrOrPipe = frame.chainSawOrOrPipe;
+                chainMutatedCwd = frame.chainMutatedCwd;
+                chainAnyCwdMutation = frame.chainAnyCwdMutation;
+                chainMutatedEnv = frame.chainMutatedEnv;
+                chainAnyEnvMutation = frame.chainAnyEnvMutation;
+                chainEntryState = frame.chainEntryState;
+              }
+              for (const [pk, saved] of savedPrefixEnv.entries()) {
+                if (saved.hasEnv) shellEnv[pk] = saved.envVal;
+                else delete shellEnv[pk];
+                if (saved.hasCurVar) curShellEnvVars[pk] = saved.curVarVal;
+                else delete curShellEnvVars[pk];
+                if (saved.tainted) taintedEnvVars.add(pk);
+                else taintedEnvVars.delete(pk);
+              }
+              for (let pi = 1; pi <= 9; pi++) {
+                const pk = String(pi);
+                if (savedPosEnv[pk] === undefined) {
+                  delete shellEnv[pk];
+                } else {
+                  shellEnv[pk] = savedPosEnv[pk];
+                }
+                if (savedPosTaint.has(pk)) {
+                  taintedEnvVars.add(pk);
+                } else {
+                  taintedEnvVars.delete(pk);
+                }
+              }
+            }
+            chainHasCondition = true;
+            popSubshells();
+            continue;
+          }
           if (headLower === "source" || headTok === "." || headLower === "eval") {
             curShellUnresolvedCwd = true;
             recordCwdMutation({ isAbsoluteTarget: false, hasCasePattern, dirVerified: false });
@@ -1849,6 +2179,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               sepAfter,
               hasCasePattern,
             });
+            for (const fd of fnDefs.values()) {
+              if (!activeFnCalls.has(fd.name)) {
+                activeFnCalls.add(fd.name);
+                runShellScript(fd.bodyScript, { inheritedCond: true });
+                activeFnCalls.delete(fd.name);
+              }
+            }
             popSubshells();
             continue;
           }
@@ -2219,7 +2556,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             });
           }
           popSubshells();
-        }
+          }
+          outerChainConditional = prevOuterCond;
+        };
+
+        runShellScript(script);
+
         if (matchedClauses.length > 0) {
           return {
             cmd: matchedClauses[0].cmd,
