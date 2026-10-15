@@ -922,7 +922,11 @@ export function buildChildInvocation(
         );
       });
       if (!hasWorkersFlag) {
-        const dashDash = nextArgs.indexOf("--");
+        const gCmdIdx =
+          normalizeBuildToolName(effectiveCmd) === "gradle"
+            ? -1
+            : nextArgs.findIndex((a) => normalizeBuildToolName(String(a)) === "gradle");
+        const dashDash = nextArgs.indexOf("--", gCmdIdx + 1);
         const flag = `-Dorg.gradle.workers.max=${jobsLimit}`;
         if (dashDash !== -1) {
           nextArgs = [...nextArgs.slice(0, dashDash), flag, ...nextArgs.slice(dashDash)];

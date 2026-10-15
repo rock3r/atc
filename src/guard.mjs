@@ -113,8 +113,11 @@ const WRAPPER_VALUE_FLAGS = new Set([
   "-R",
   "-T",
   "-k",
+  "--kill-after",
   "-s",
+  "--signal",
   "-n",
+  "--adjustment",
   "-o",
   "+o",
   "--rcfile",
@@ -1835,7 +1838,10 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx++];
           if (flag === "--") break;
-          if ((flag === "-k" || flag === "-s") && idx < tokens.length) {
+          if (
+            (flag === "-k" || flag === "--kill-after" || flag === "-s" || flag === "--signal") &&
+            idx < tokens.length
+          ) {
             idx++;
           }
         }
@@ -1888,7 +1894,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           const flag = tokens[idx];
           idx++;
           if (flag === "--") break;
-          if (flag === "-n" && idx < tokens.length) {
+          if ((flag === "-n" || flag === "--adjustment") && idx < tokens.length) {
             idx++;
           }
         }

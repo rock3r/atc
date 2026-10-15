@@ -172,11 +172,22 @@ export function splitShellClauseRedirAndGroup(part) {
 
   let leadingCore = coreEnd.trim();
   let openedSubshells = 0;
-  while (leadingCore.length > 0 && /^[({]/.test(leadingCore)) {
-    if (leadingCore.startsWith("(")) {
-      openedSubshells++;
+  while (leadingCore.length > 0) {
+    if (/^[({]/.test(leadingCore)) {
+      if (leadingCore.startsWith("(")) {
+        openedSubshells++;
+      }
+      leadingCore = leadingCore.slice(1).trim();
+      continue;
     }
-    leadingCore = leadingCore.slice(1).trim();
+    const kwMatch = leadingCore.match(
+      /^(?:(?:then|else|do|if|elif|while|until|!)(?=\s|[({]|$)|case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in(?=\s|[({]|$))/,
+    );
+    if (kwMatch) {
+      leadingCore = leadingCore.slice(kwMatch[0].length).trim();
+      continue;
+    }
+    break;
   }
 
   return {
@@ -283,10 +294,49 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       .toLowerCase()
       .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
 
-    if (base === "build-brief" || base === "time" || base === "nohup") {
+    if (
+      base === "then" ||
+      base === "else" ||
+      base === "do" ||
+      base === "if" ||
+      base === "elif" ||
+      base === "while" ||
+      base === "until" ||
+      cleaned === "!"
+    ) {
       if (curArgs.length === 0) break;
       curCmd = curArgs[0];
       curArgs = curArgs.slice(1);
+      continue;
+    }
+    if (base === "build-brief" || base === "time" || base === "nohup") {
+      let i = 0;
+      if (base === "time") {
+        while (i < curArgs.length) {
+          const a = curArgs[i];
+          if (a === "--") {
+            i += 1;
+            break;
+          }
+          if (
+            (a === "-f" || a === "--format" || a === "-o" || a === "--output") &&
+            i + 1 < curArgs.length
+          ) {
+            i += 2;
+            continue;
+          }
+          if (a.startsWith("-")) {
+            i += 1;
+            continue;
+          }
+          break;
+        }
+      } else if (base === "nohup" && curArgs[0] === "--") {
+        i = 1;
+      }
+      if (i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      curArgs = curArgs.slice(i + 1);
       continue;
     }
     if (base === "xcrun") {
@@ -294,6 +344,10 @@ export function peelBuildWrapperTokens(cmd, args = []) {
       let queryMode = false;
       while (i < curArgs.length) {
         const a = curArgs[i];
+        if (a === "--") {
+          i += 1;
+          break;
+        }
         if (a === "-f" || a === "--find" || a === "--show-sdk-path" || a === "--show-sdk-version") {
           queryMode = true;
           break;
@@ -315,12 +369,21 @@ export function peelBuildWrapperTokens(cmd, args = []) {
     }
     if (base === "nice") {
       let i = 0;
-      while (i < curArgs.length && curArgs[i].startsWith("-")) {
-        if (curArgs[i] === "-n" && i + 1 < curArgs.length) {
-          i += 2;
-        } else {
+      while (i < curArgs.length) {
+        const a = curArgs[i];
+        if (a === "--") {
           i += 1;
+          break;
         }
+        if ((a === "-n" || a === "--adjustment") && i + 1 < curArgs.length) {
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          i += 1;
+          continue;
+        }
+        break;
       }
       if (i >= curArgs.length) break;
       curCmd = curArgs[i];
@@ -701,8 +764,19 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = []) {
   if (!injectedFlags || injectedFlags.length === 0) return corePart;
   const s = String(corePart || "");
   let leadingOffset = 0;
-  while (leadingOffset < s.length && /[\s({]/.test(s[leadingOffset])) {
-    leadingOffset++;
+  while (leadingOffset < s.length) {
+    if (/[\s({]/.test(s[leadingOffset])) {
+      leadingOffset++;
+      continue;
+    }
+    const kwMatch = s
+      .slice(leadingOffset)
+      .match(/^(?:then|else|do|if|elif|while|until|!)(?=\s|[({]|$)/);
+    if (kwMatch) {
+      leadingOffset += kwMatch[0].length;
+      continue;
+    }
+    break;
   }
   const spans = tokenizeShellClauseWithSpans(s.slice(leadingOffset));
   const bazelIdx = spans.findIndex((t) => normalizeBuildToolName(t.value) === "bazel");

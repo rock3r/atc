@@ -1536,3 +1536,61 @@ test("cmdExec --claim releases newly claimed device when pre-spawn validation fa
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and inject worker limits", () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-ctrl-kw-"));
+  try {
+    fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
+    const niceReqs = resolveBuildResources(
+      "nice",
+      ["--adjustment", "5", "./gradlew", "connectedCheck"],
+      wsDir,
+    );
+    assert.equal(niceReqs.kind, "device_coupled_build");
+    assert.equal(niceReqs.tool, "gradle");
+    assert.equal(niceReqs.requiresDevice, true);
+    assert.equal(niceReqs.requiresHeavySlot, true);
+    assert.ok(niceReqs.resourceKeys.some((k) => k.startsWith("gradle:")));
+
+    const niceInv = buildChildInvocation(
+      "nice",
+      ["--adjustment", "5", "./gradlew", "connectedCheck"],
+      { serial: "emulator-5554", leaseId: "lease_1", platform: "android", kind: "emulator" },
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.deepEqual(niceInv.args, [
+      "--adjustment",
+      "5",
+      "./gradlew",
+      "connectedCheck",
+      "-Dorg.gradle.workers.max=4",
+    ]);
+
+    const shellIfReqs = resolveBuildResources(
+      "sh",
+      ["-c", "if test -f settings.gradle; then ./gradlew build; fi"],
+      wsDir,
+      { forceBuild: true },
+    );
+    assert.equal(shellIfReqs.kind, "pure_build");
+    assert.equal(shellIfReqs.tool, "gradle");
+    assert.ok(shellIfReqs.resourceKeys.some((k) => k.startsWith("gradle:")));
+
+    const shellIfInv = buildChildInvocation(
+      "sh",
+      ["-c", "if test -f settings.gradle; then ./gradlew build; else bazel build //app; fi"],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      shellIfInv.args[1],
+      "if test -f settings.gradle; then ./gradlew build -Dorg.gradle.workers.max=4; else bazel build --jobs=4 --local_ram_resources=3072 //app; fi",
+    );
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
