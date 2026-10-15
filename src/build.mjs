@@ -1358,6 +1358,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           envVars.USER = null;
           envVars.LOGNAME = null;
           envVars.USERNAME = null;
+          envVars.BAZELRC = null;
         } else if (act.type === "chdir") {
           const rawNextDir = act.rawDir;
           const exp = inShell
@@ -4145,6 +4146,25 @@ export function resolveBuildResources(
         parseBazelrcFile(path.join(path.resolve(baseCwd, effectiveHomeForBazel), ".bazelrc"), {
           required: false,
         });
+      }
+      const effectiveBazelrcEnv =
+        effectiveEnvVars.BAZELRC === null || effectiveEnvVars.BAZELRC === ""
+          ? null
+          : effectiveEnvVars.BAZELRC !== undefined
+            ? String(effectiveEnvVars.BAZELRC)
+            : baseEnv.BAZELRC
+              ? String(baseEnv.BAZELRC)
+              : null;
+      if (effectiveBazelrcEnv === "__UNRESOLVED_DYNAMIC_ENV__") {
+        hasCustomStartupOption = true;
+      } else if (effectiveBazelrcEnv) {
+        for (const rawEnvRc of effectiveBazelrcEnv.split(",")) {
+          if (!rawEnvRc || rawEnvRc === "/dev/null" || rawEnvRc.toUpperCase() === "NUL") {
+            continue;
+          }
+          const expandedRc = String(rawEnvRc).replace(/%workspace%/g, canonicalRoot);
+          parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
+        }
       }
       for (const rawExplicitRc of explicitBazelrcPaths) {
         if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") break;

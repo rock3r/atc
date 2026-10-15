@@ -237,12 +237,12 @@ Because multiple agents on the same machine may invoke different cached versions
 3. **Lifecycle Guardrails for Physical Devices:** Physical devices cannot be booted or stopped (`--stop` on `atc free` is a no-op with a warning on physical leases, and Priority-3 idle eviction never targets `kind: "physical"`). They do not count toward `maxRunningEmulators`.
 
 ### 4.2 Host-Agnostic Session Identity & `anchorPid` Resolution
-Agent tool calls execute in ephemeral subshells, so `process.pid` of `atc claim` exits immediately. Furthermore, ATC must work seamlessly across **Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code, and plain terminals** — whether or not the host supports command-rewriting hooks, and even when multiple agents work in the **same repository directory (`cwd`)**:
+Agent tool calls execute in ephemeral subshells, so `process.pid` of `atc claim` exits immediately. ATC must identify sessions across **Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code, and plain terminals**. Session identity must work without command-rewriting hooks and distinguish agents that share the **same repository directory (`cwd`)**:
 
 1. **Explicit CLI Flag, Lease Token, or Env Var (Highest Priority, Universal):**
    - `--session <id>`, `ATC_SESSION_ID`, or `--lease <leaseId>` / `ATC_LEASE_ID` (with `anchorPid = parseEnvInt(ATC_ANCHOR_PID) || null`). Any agent or script can pass `--session` or `ATC_LEASE_ID` directly with zero hook dependencies.
 2. **Extension / Hook Command Rewrite (Pi, Antigravity, Gemini CLI, Claude Code):**
-   - On hosts whose tool-call extension or `PreToolUse` hook supports command rewriting (`event.input.command` in Pi's `tool_call` extension, `overwrite` in Antigravity/Gemini CLI, or `hookSpecificOutput.updatedInput` in Claude Code), calling `atc` without `--session` automatically prepends `ATC_SESSION_ID=<id> ATC_ANCHOR_PID=<agentPid>`. This provides **exact, collision-free session identity in 0ms** even when multiple sessions run concurrently in the same `cwd`.
+   - On hosts whose tool-call extension or `PreToolUse` hook supports command rewriting (`event.input.command` in Pi's `tool_call` extension, `overwrite` in Antigravity/Gemini CLI, or `hookSpecificOutput.updatedInput` in Claude Code), calling `atc` without `--session` automatically prepends `ATC_SESSION_ID=<id> ATC_ANCHOR_PID=<agentPid>`. ATC reads the session identity directly from these variables, including when multiple sessions share the same `cwd`.
 3. **Ambient Agent Environment Variables:**
    - Checks standard session/conversation variables exported by agent runtimes: `CODEX_SESSION_ID`, `PI_SESSION_ID`, `CURSOR_TRACE_ID`, `CURSOR_SESSION_ID`, `ANTIGRAVITY_CONVERSATION_ID`, `GEMINI_SESSION_ID`, `CLAUDE_SESSION_ID`, `CONVERSATION_ID`.
 4. **PID-Keyed Hook Breadcrumb (`state.hookSessions`, for non-rewriting hooks like Codex & Cursor):**
@@ -584,9 +584,11 @@ Node.js >= 20.12 throws `EINVAL` when spawning `.bat` or `.cmd` files on Windows
 
 ---
 
-## 9. ATC 2.0 Roadmap: Agent Traffic Control (Multiplatform iOS & Android)
+## 9. Historical ATC 2.0 Plan: Multiplatform iOS & Android
 
-While **1.0** ships as **Android Traffic Control**, the `state.json` schema (§4), lock boundary (§3.2), session identity ladder (§4.2), bounded-window scheduler (§5.3), and hook architecture (§7) are intentionally designed so that **2.0 evolves into Agent Traffic Control (ATC)** — adding macOS iOS Simulator (`xcrun simctl`) and physical iOS device (`xcrun devicectl`) support via a sibling `src/ios.mjs` backend with **zero breaking changes to `state.json` or the 1.0 CLI**.
+ATC **2.1.0** ships Android and iOS support. This section preserves the **2.0** plan and its original requirements; use [the user guide](docs/user-guide.md) for current behavior.
+
+ATC **1.0** shipped as **Android Traffic Control**. The **2.0** plan added iOS Simulator (`xcrun simctl`) and physical iOS device (`xcrun devicectl`) support through `src/ios.mjs`. It required compatibility with the 1.0 `state.json` schema and CLI. The plan retained the lock boundary (§3.2), session identity ladder (§4.2), bounded-window scheduler (§5.3), and hook architecture (§7).
 
 > **Strict Agnosticism Boundary ("Not Our Business"):** Just as on Android, ATC 2.0 only coordinates **who owns which device, lifecycle/snapshot preparation, and target-pinning guardrails**. What an agent actually builds, signs, or runs on the leased device — including Apple code-signing certificates, provisioning profiles, Developer Mode toggles, or locked physical screens — is strictly the agent's responsibility, not ATC's.
 
@@ -654,7 +656,7 @@ If ATC treated a failing discovery command (`xcrun simctl list` or `android emul
 
 1. **Zero-`sudo` `DEVELOPER_DIR` Auto-Fallback (macOS / Xcode):**
    - A common macOS trap occurs when `xcode-select -p` points to `/Library/Developer/CommandLineTools` (which lacks `simctl` and `devicectl`) even though `Xcode.app` is installed.
-   - If `xcrun simctl` fails with `unable to find utility "simctl"` and `/Applications/Xcode.app/Contents/Developer` exists on disk, ATC automatically retries and spawns `xcrun` with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` in its child environment — fixing the issue in 0ms without requiring `sudo xcode-select -s`.
+   - If `xcrun simctl` fails with `unable to find utility "simctl"` and `/Applications/Xcode.app/Contents/Developer` exists on disk, ATC retries automatically. It sets `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` in the child `xcrun` environment. The retry uses that Xcode installation without changing the system setting or requiring `sudo xcode-select -s`.
 2. **Platform- & Kind-Scoped Fail-Fast Classification (Never Queue on Broken Tooling, Never Block Unrelated Claims):**
    - Pre-flight errors are strictly scoped to the **requested `platform` and `requestedKind`**:
      - An Xcode/iOS toolchain failure never blocks an Android claim (and vice versa; in `atc status`, errors on an unrequested platform are surfaced as non-fatal `diagnostics` warnings).
@@ -722,5 +724,4 @@ stateDiagram-v2
   - **Linux:** `${XDG_STATE_HOME || ~/.local/state}/atc/logs/atc-audit.jsonl`
   - **Windows:** `${LOCALAPPDATA}\atc\logs\atc-audit.jsonl`
 - **Strict Lock Boundary (`auditEvents` -> `flushAuditEvents`):** Inside `withStateTransaction`, events are staged in memory on `auditEvents`. After `atc.lock` is released in `finally`, `flushAuditEvents` writes JSONL records (`mode: 0o600`) and performs size-bounded log rotation (`10 MB` max file size, `3` rotated archives).
-
 

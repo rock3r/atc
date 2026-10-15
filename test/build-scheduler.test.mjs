@@ -1960,6 +1960,36 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     );
     assert.equal(disabledExpungeReqs.kind, "workspace_only");
 
+    // BAZELRC environment variable (single or comma-separated) loads startup options between home and CLI rc files
+    const envRc1 = path.join(wsDir, "env1.bazelrc");
+    const envRc2 = path.join(wsDir, "env2.bazelrc");
+    const envOutBase = path.join(wsDir, "bazel-env-out");
+    fs.writeFileSync(envRc1, `startup --output_base=${envOutBase}\n`);
+    fs.writeFileSync(envRc2, "startup --host_jvm_args=-Xmx6g\n");
+    const bazelrcEnvReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "build", "//..."],
+      subAppDir,
+      { env: { ...process.env, BAZELRC: `${envRc1},${envRc2}` } },
+    );
+    assert.ok(
+      bazelrcEnvReqs.resourceKeys.some((k) => k.startsWith("bazel:out:") && k.endsWith("bazel-env-out")),
+    );
+    assert.equal(bazelrcEnvReqs.requestedHeapMb, 6144);
+    assert.equal(bazelrcEnvReqs.disablesDaemon, true);
+
+    const unsetBazelrcEnvReqs = resolveBuildResources(
+      "env",
+      ["-u", "BAZELRC", "bazel", "--nosystem_rc", "--nohome_rc", "build", "//..."],
+      subAppDir,
+      { env: { ...process.env, BAZELRC: `${envRc1},${envRc2}` } },
+    );
+    assert.equal(
+      unsetBazelrcEnvReqs.resourceKeys.some((k) => k.startsWith("bazel:out:")),
+      false,
+    );
+    assert.equal(unsetBazelrcEnvReqs.requestedHeapMb, 0);
+
     // Trailing shell comments preserve comment text and insert injected flags before `#`
     const commentGradleInv = buildChildInvocation(
       "sh",
