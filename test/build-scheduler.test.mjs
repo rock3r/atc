@@ -2076,6 +2076,65 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       fnLocalInv.args[1],
       'f(){ local TOOL=./gradlew; }; f; "$TOOL" build --jobs=4 --local_ram_resources=3072',
     );
+
+    // Parameter-expanded build executable fallback (${GRADLE:-./gradlew}) and fail-closed on unresolved --build
+    const paramFallbackReqs = resolveBuildResources(
+      "sh",
+      ["-c", "${GRADLE:-./gradlew} build"],
+      wsDir,
+      { env: {}, forceBuild: true },
+    );
+    assert.equal(paramFallbackReqs.kind, "pure_build");
+    assert.deepEqual(paramFallbackReqs.resourceKeys, [`gradle:${canonicalWs}`]);
+
+    const paramFallbackInv = buildChildInvocation(
+      "sh",
+      ["-c", "${GRADLE:-./gradlew} build"],
+      null,
+      "sess_1",
+      {},
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(paramFallbackInv.args[1], "${GRADLE:-./gradlew} build -Dorg.gradle.workers.max=4");
+
+    const paramUnresolvedForceReqs = resolveBuildResources(
+      "sh",
+      ["-c", "${GRADLE:?missing} build"],
+      wsDir,
+      { env: {}, forceBuild: true },
+    );
+    assert.equal(paramUnresolvedForceReqs.kind, "deny_lifecycle");
+
+    // GRADLE_USER_HOME isolation in warm daemon probe
+    const isolatedGradleHome = path.join(wsDir, "isolated-gradle-home");
+    const gradleUserHomeReqs = resolveBuildResources(
+      "env",
+      [`GRADLE_USER_HOME=${isolatedGradleHome}`, "./gradlew", "build"],
+      wsDir,
+    );
+    assert.equal(gradleUserHomeReqs.envGradleUserHome, isolatedGradleHome);
+    const defaultHomeWarmProbe = probeWarmBuildDaemons(gradleUserHomeReqs, {
+      env: { JAVA_HOME: canonicalMockJdkHome },
+      runner: () => ({
+        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${gradleUserHomeReqs.workspaceRoot}\n`,
+      }),
+    });
+    assert.equal(defaultHomeWarmProbe.warm, false);
+    const matchingHomeWarmProbe = probeWarmBuildDaemons(gradleUserHomeReqs, {
+      env: { JAVA_HOME: canonicalMockJdkHome },
+      runner: () => ({
+        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} -Dgradle.user.home=${isolatedGradleHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${gradleUserHomeReqs.workspaceRoot}\n`,
+      }),
+    });
+    assert.equal(matchingHomeWarmProbe.warm, true);
+
+    // Bazel warm daemon probe requires path-component boundary (rejects /work/app2 for /work/app)
+    const prefixCollisionProbe = probeWarmBuildDaemons(bazelAppReqs, {
+      runner: () => ({
+        stdout: `9003 bazel(app2) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}2\n`,
+      }),
+    });
+    assert.equal(prefixCollisionProbe.warm, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

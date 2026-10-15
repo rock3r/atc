@@ -877,6 +877,48 @@ export function expandOrValidateShellPath(rawPath, envMap = process.env, options
     p = p.replace(
       /(?<!\uE000)\$(?:\{(?:env:)?([^}]*)\}|(?:env:)?([A-Za-z_][A-Za-z0-9_]*|[1-9]))/gi,
       (_m, braced, plain) => {
+        if (braced !== undefined && !/^(?:[A-Za-z_][A-Za-z0-9_]*|[1-9])$/.test(braced)) {
+          const paramMatch =
+            shellType !== "cmd"
+              ? braced.match(/^([A-Za-z_][A-Za-z0-9_]*|[1-9])(:-|-(?!-)|:\+|\+)(.*)$/)
+              : null;
+          if (!paramMatch) {
+            unresolved = true;
+            return "";
+          }
+          const [, pVar, op, fallbackRaw] = paramMatch;
+          if (
+            taintedVars?.has("*") ||
+            taintedVars?.has(pVar) ||
+            taintedVars?.has(pVar.toUpperCase())
+          ) {
+            unresolved = true;
+            return "";
+          }
+          const rawVal = envMap?.[pVar] ?? envMap?.[pVar.toUpperCase()];
+          const isSet = rawVal !== undefined && rawVal !== null;
+          const isNonEmpty = isSet && String(rawVal) !== "";
+          if (op === ":-" || op === "-") {
+            if (op === ":-" ? isNonEmpty : isSet) {
+              return String(rawVal);
+            }
+            const fb = expandOrValidateShellPath(fallbackRaw, envMap, options);
+            if (fb.unresolved || !fb.resolved) {
+              unresolved = true;
+              return "";
+            }
+            return fb.resolved;
+          }
+          if (op === ":+" ? isNonEmpty : isSet) {
+            const fb = expandOrValidateShellPath(fallbackRaw, envMap, options);
+            if (fb.unresolved) {
+              unresolved = true;
+              return "";
+            }
+            return fb.resolved;
+          }
+          return "";
+        }
         const varName = braced !== undefined ? braced : plain;
         if (!/^(?:[A-Za-z_][A-Za-z0-9_]*|[1-9])$/.test(varName)) {
           unresolved = true;
@@ -1442,6 +1484,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let chainAnyEnvMutation = new Set();
         let currentClauseBackgrounded = false;
         let outerChainConditional = false;
+        let hasUnresolvedCmd = false;
         const registerLocalVar = (varName) => {
           if (fnCallStack.length === 0 || !varName) return;
           const topFnCall = fnCallStack[fnCallStack.length - 1];
@@ -2585,6 +2628,10 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             popSubshells();
             continue;
           }
+          const cmdOnlyExp = expandOrValidateShellPath(peeled.cmd, shellEnv, {
+            taintedVars: taintedEnvVars,
+            shellType,
+          });
           const expandedClause = expandShellBuildClausePaths(
             peeled.cmd,
             peeled.args,
@@ -2604,6 +2651,17 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             if (candidateExp.resolved && normalizeBuildToolName(candidateExp.resolved)) {
               matchedToolCmd = candidateExp.resolved;
               forceUnresolvedCmd = true;
+            } else if (cmdOnlyExp.unresolved) {
+              const rawCleanCmd = stripLiteralSentinels(peeled.cmd);
+              const embeddedToolMatch = rawCleanCmd.match(
+                /(?:^|[^A-Za-z0-9_])(gradlew(?:\.bat)?|gradle(?:\.bat|\.cmd)?|bazel(?:isk)?(?:\.exe|\.bat|\.cmd)?|xcodebuild)(?:$|[^A-Za-z0-9_])/i,
+              );
+              if (embeddedToolMatch?.[1]) {
+                matchedToolCmd = embeddedToolMatch[1];
+                forceUnresolvedCmd = true;
+              } else {
+                hasUnresolvedCmd = true;
+              }
             }
           }
           if (matchedToolCmd) {
@@ -2623,6 +2681,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             const mergedClauseEnvVars = { ...curShellEnvVars, ...(peeled.envVars || {}) };
             if (taintedEnvVars.has("JAVA_HOME") && !(peeled.envVars && "JAVA_HOME" in peeled.envVars)) {
               mergedClauseEnvVars.JAVA_HOME = "__UNRESOLVED_DYNAMIC_ENV__";
+            }
+            if (
+              taintedEnvVars.has("GRADLE_USER_HOME") &&
+              !(peeled.envVars && "GRADLE_USER_HOME" in peeled.envVars)
+            ) {
+              mergedClauseEnvVars.GRADLE_USER_HOME = "__UNRESOLVED_DYNAMIC_ENV__";
             }
             matchedClauses.push({
               cmd: matchedToolCmd,
@@ -2647,8 +2711,22 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             relCwd: matchedClauses[0].relCwd || null,
             envVars: matchedClauses[0].envVars || { ...curShellEnvVars },
             backgrounded: matchedClauses.some((c) => c.backgrounded),
-            unresolvedDynamicCwd: matchedClauses.some((c) => c.unresolvedDynamicCwd),
+            unresolvedDynamicCwd:
+              hasUnresolvedCmd || matchedClauses.some((c) => c.unresolvedDynamicCwd),
+            hasUnresolvedCmd,
             allBuildClauses: matchedClauses,
+          };
+        }
+        if (hasUnresolvedCmd) {
+          return {
+            cmd: inShell ? curCmd : stripLiteralSentinels(curCmd),
+            args: inShell ? curArgs : curArgs.map(stripLiteralSentinels),
+            relCwd,
+            envVars,
+            backgrounded: false,
+            unresolvedDynamicCwd,
+            hasUnresolvedCmd: true,
+            allBuildClauses: null,
           };
         }
       }
@@ -3281,8 +3359,16 @@ export function resolveBuildResources(
   { forceBuild = false, inheritedEnvVars = null, env = process.env } = {},
 ) {
   const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
-  const { cmd, args, relCwd, envVars, backgrounded, unresolvedDynamicCwd, allBuildClauses } =
-    peelBuildWrapperTokens(rawCmd, rawArgs, { env: baseEnv, cwd });
+  const {
+    cmd,
+    args,
+    relCwd,
+    envVars,
+    backgrounded,
+    unresolvedDynamicCwd,
+    hasUnresolvedCmd,
+    allBuildClauses,
+  } = peelBuildWrapperTokens(rawCmd, rawArgs, { env: baseEnv, cwd });
   if (backgrounded) {
     return {
       kind: "reject_long_running",
@@ -3298,7 +3384,7 @@ export function resolveBuildResources(
         "Backgrounded build commands (`&`) cannot be coordinated by atc exec because the shell exits before the build finishes.",
     };
   }
-  if (unresolvedDynamicCwd) {
+  if (unresolvedDynamicCwd || (forceBuild && hasUnresolvedCmd)) {
     return {
       kind: "deny_lifecycle",
       tool: normalizeBuildToolName(cmd) || "multi",
@@ -3454,12 +3540,15 @@ export function resolveBuildResources(
         a.startsWith("--java-home=") ||
         a === "-g" ||
         a === "--gradle-user-home" ||
-        a.startsWith("--gradle-user-home="),
+        a.startsWith("--gradle-user-home=") ||
+        a.startsWith("-Dgradle.user.home="),
     );
     const envJavaHomeUnset =
       effectiveEnvVars.JAVA_HOME === null || effectiveEnvVars.JAVA_HOME === "";
     const envPathUnset =
       effectiveEnvVars.PATH === null || effectiveEnvVars.PATH === "";
+    const envGradleUserHomeUnset =
+      effectiveEnvVars.GRADLE_USER_HOME === null || effectiveEnvVars.GRADLE_USER_HOME === "";
     return {
       ...classified,
       disablesDaemon,
@@ -3467,6 +3556,8 @@ export function resolveBuildResources(
       envJavaHomeUnset,
       envPath: envPathUnset ? "" : effectiveEnvVars.PATH || null,
       envPathUnset,
+      envGradleUserHome: envGradleUserHomeUnset ? "" : effectiveEnvVars.GRADLE_USER_HOME || null,
+      envGradleUserHomeUnset,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
     };
@@ -4140,6 +4231,50 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     let expectedGradleJavaHome = buildReqs.envJavaHomeUnset
       ? null
       : buildReqs.envJavaHome || options.env?.JAVA_HOME || null;
+    const expectedGradleUserHome = buildReqs.envGradleUserHomeUnset
+      ? null
+      : buildReqs.envGradleUserHome || options.env?.GRADLE_USER_HOME || null;
+    if (expectedGradleUserHome === "__UNRESOLVED_DYNAMIC_ENV__") {
+      return { warm: false, daemonPids: [] };
+    }
+    const matchesCmdPathBoundary = (cmdLine, targetPath, { allowSubpath = false } = {}) => {
+      if (!cmdLine || !targetPath) return false;
+      const cleanTarget = String(targetPath).replace(/[\\/]+$/, "");
+      if (!cleanTarget) return false;
+      let searchFrom = 0;
+      while (searchFrom < cmdLine.length) {
+        const idx = cmdLine.indexOf(cleanTarget, searchFrom);
+        if (idx === -1) return false;
+        searchFrom = idx + 1;
+        const prevCh = idx > 0 ? cmdLine[idx - 1] : "";
+        const prevOk = idx === 0 || /[\s="'(:;]/.test(prevCh);
+        if (!prevOk) continue;
+        let endIdx = idx + cleanTarget.length;
+        if (!allowSubpath) {
+          while (
+            endIdx < cmdLine.length &&
+            (cmdLine[endIdx] === "/" || cmdLine[endIdx] === "\\")
+          ) {
+            endIdx++;
+          }
+          const nextCh = endIdx < cmdLine.length ? cmdLine[endIdx] : "";
+          if (endIdx === cmdLine.length || /[\s="'),;]/.test(nextCh)) {
+            return true;
+          }
+        } else {
+          const nextCh = endIdx < cmdLine.length ? cmdLine[endIdx] : "";
+          if (
+            endIdx === cmdLine.length ||
+            nextCh === "/" ||
+            nextCh === "\\" ||
+            /[\s="'),;]/.test(nextCh)
+          ) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
     let expectedGradleJvmArgs = [];
     if (buildReqs.tool === "gradle" && wsRoot) {
       try {
@@ -4241,7 +4376,25 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           if (expectedGradleVersion && daemonVer !== expectedGradleVersion) {
             continue;
           }
-          if (expectedGradleJavaHome && !cmdLine.includes(expectedGradleJavaHome)) {
+          if (
+            expectedGradleJavaHome &&
+            !matchesCmdPathBoundary(cmdLine, expectedGradleJavaHome, { allowSubpath: true }) &&
+            !matchesCmdPathBoundary(cmdLine, canonicalizeBuildPath(expectedGradleJavaHome), {
+              allowSubpath: true,
+            })
+          ) {
+            continue;
+          }
+          if (expectedGradleUserHome) {
+            if (
+              !matchesCmdPathBoundary(cmdLine, expectedGradleUserHome, { allowSubpath: true }) &&
+              !matchesCmdPathBoundary(cmdLine, canonicalizeBuildPath(expectedGradleUserHome), {
+                allowSubpath: true,
+              })
+            ) {
+              continue;
+            }
+          } else if (cmdLine.includes("-Dgradle.user.home=")) {
             continue;
           }
           if (
@@ -4251,7 +4404,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
             continue;
           }
           const matchesWorkspaceOrWrapper =
-            (wsRoot && cmdLine.includes(wsRoot)) ||
+            (wsRoot && matchesCmdPathBoundary(cmdLine, wsRoot, { allowSubpath: true })) ||
             Boolean(expectedGradleVersion && daemonVer === expectedGradleVersion);
           if (matchesWorkspaceOrWrapper) {
             daemonPids.push(pid);
@@ -4262,14 +4415,17 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           /\bbazel\([^)]+\)/.test(cmdLine) ||
           /com\.google\.devtools\.build\.lib\.bazel\.BazelMain\b/.test(cmdLine);
         if (isBazelServer) {
-          const matchesOut = outKeys.some((outPath) => outPath && cmdLine.includes(outPath));
+          const matchesOut = outKeys.some(
+            (outPath) => outPath && matchesCmdPathBoundary(cmdLine, outPath),
+          );
+          const matchesDefaultMd5 =
+            defaultBazelOutMd5 &&
+            new RegExp(`(?:^|[\\\\/=])${defaultBazelOutMd5}(?:$|[\\\\/\\s"'])`, "i").test(cmdLine);
           const matchesWorkspace =
             outKeys.length > 0
               ? matchesOut
               : Boolean(
-                  wsRoot &&
-                    (cmdLine.includes(wsRoot) ||
-                      (defaultBazelOutMd5 && cmdLine.includes(defaultBazelOutMd5))),
+                  wsRoot && (matchesCmdPathBoundary(cmdLine, wsRoot) || matchesDefaultMd5),
                 );
           if (matchesWorkspace) {
             daemonPids.push(pid);
