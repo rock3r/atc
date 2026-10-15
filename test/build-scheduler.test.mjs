@@ -1148,6 +1148,7 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     );
     const gradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], spacedAppDir);
     const warmGradle = probeWarmBuildDaemons(gradleReqs, {
+      env: { PATH: "" },
       runner: () => ({
         stdout: "  44123 /Library/Java/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
       }),
@@ -1156,6 +1157,7 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     assert.deepEqual(warmGradle.daemonPids, [44123]);
 
     const mismatchedGradle = probeWarmBuildDaemons(gradleReqs, {
+      env: { PATH: "" },
       runner: () => ({
         stdout: "  44123 /Library/Java/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.9\n",
       }),
@@ -1904,6 +1906,34 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       propSubstringInv.args[1],
       "./gradlew build -Pnote='-Dorg.gradle.workers.max=99' -Dorg.gradle.workers.max=4",
     );
+
+    // Unverified `cd /missing; ./gradlew build` marks subsequent cwd unresolved
+    const missingCdSemiReqs = resolveBuildResources(
+      "sh",
+      ["-c", "cd /nonexistent-dir-atc-xyz; ./gradlew build"],
+      wsDir,
+    );
+    assert.equal(missingCdSemiReqs.kind, "deny_lifecycle");
+    assert.match(missingCdSemiReqs.reason, /Unresolved dynamic directory change/);
+
+    // Sourced shell scripts (`source` / `.`) taint cwd and environment state
+    const sourcedScriptReqs = resolveBuildResources(
+      "sh",
+      ["-c", 'source vars.sh; ./gradlew -p "$PROJECT_DIR" build'],
+      wsDir,
+      { env: { ...process.env, PROJECT_DIR: subAppDir } },
+    );
+    assert.equal(sourcedScriptReqs.kind, "deny_lifecycle");
+    assert.match(sourcedScriptReqs.reason, /Unresolved dynamic directory change/);
+
+    // Shell `+=` append assignments update tracked variable values before path expansion
+    const appendAssignReqs = resolveBuildResources(
+      "bash",
+      ["-c", 'A=ap; A+=p; ./gradlew -p "$A" build'],
+      wsDir,
+    );
+    assert.equal(appendAssignReqs.kind, "pure_build");
+    assert.deepEqual(appendAssignReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
