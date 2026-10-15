@@ -2,13 +2,13 @@
 
 Coordinate exclusive Android and iOS device leases across concurrent coding agents without a daemon.
 
-Status: `v2.1.0` · Updated `2026-10-12` · Node.js >= 20 on macOS, Linux, and Windows.
+Status: `v2.1.0` · Updated `2026-10-15` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 
-When two coding agents share a machine, they collide on emulators, iOS Simulators, and USB phones. One agent installs an APK or shuts down a simulator while another agent inspects the screen. Unscoped `adb` and `xcrun simctl` commands fail once a second device boots, and crashed turns leave orphan locks.
+When two coding agents share a machine, they collide on emulators, iOS Simulators, USB phones, and heavy Gradle/Bazel/Xcode builds. One agent installs an APK or shuts down a simulator while another agent inspects the screen, or two concurrent `./gradlew` / `bazel` builds saturate RAM and thrash shared project workspaces while holding an emulator hostage. Unscoped `adb` and `xcrun simctl` commands fail once a second device boots, and crashed turns leave orphan locks.
 
-`atc` (Agent Traffic Control) serializes device access through a user-private `state.json` file under an atomic directory lock (`atc.lock`). Agents claim a device by hardware/OS profile, run commands inside `atc exec` with a 15-second heartbeat, restore QEMU or APFS snapshots, and free the lease when done.
+`atc` (Agent Traffic Control) serializes device access and heavy build slots through a user-private `state.json` file under an atomic directory lock (`atc.lock`). Agents claim a device by hardware/OS profile, run commands inside `atc exec` with a 15-second heartbeat, co-schedule Gradle/Bazel/`xcodebuild` builds via `atc exec --build` or `atc exec --claim "..."` without cross-starvation, restore QEMU or APFS snapshots, and free the lease when done. Every state transition is recorded to an OS-native structured JSONL audit log (`atc-audit.jsonl`).
 
 `atc` is a cooperative coordinator, not a kernel sandbox. Any local process that skips `atc` can still open a socket to `adb` (`localhost:5037`) or `CoreSimulatorService`. Installing the `atc` host plugin closes that gap for coding agents by checking and rewriting shell commands before they run.
 
@@ -17,9 +17,11 @@ When two coding agents share a machine, they collide on emulators, iOS Simulator
 | Setup & fleet check | [Install the CLI and inspect your fleet](#install-the-cli-and-inspect-your-fleet-in-one-command) |
 | Single-agent flow | [One agent claims by profile and runs with a 15-second heartbeat](#one-agent-claims-by-profile-and-runs-with-a-15-second-heartbeat) |
 | Multi-agent contention | [Warm jobs jump ahead within 120 seconds without starving cold boots](#warm-jobs-jump-ahead-within-120-seconds-without-starving-cold-boots) |
+| Build + device co-scheduling | [Co-schedule Gradle, Bazel, and Xcode builds without cross-starvation](#co-schedule-gradle-bazel-and-xcode-builds-without-cross-starvation) |
 | Kotlin Multiplatform (KMP) | [One KMP session holds an Android lease and an iOS lease at once](#one-kmp-session-holds-an-android-lease-and-an-ios-lease-at-once) |
 | Crashes & disconnects | [Crashed virtual devices reboot in place; unplugged phones fail in 15 seconds](#crashed-virtual-devices-reboot-in-place-unplugged-phones-fail-in-15-seconds) |
 | Snapshots & clean resets | [Snapshots reset emulator and simulator state in under two seconds](#snapshots-reset-emulator-and-simulator-state-in-under-two-seconds) |
+| System audit logging | [Inspect structured JSONL audit logs for debugging and bug reports](#inspect-structured-jsonl-audit-logs-for-debugging-and-bug-reports) |
 | Coordination Q&A | [Questions on how coordination works](#questions-on-how-coordination-works) |
 | CLI & exit codes | [Commands and exit codes map every failure to one action](#commands-and-exit-codes-map-every-failure-to-one-action) |
 
@@ -34,11 +36,12 @@ atc status
 
 ```text
 Host Capacity: 16735 MB RAM avail · 29989 MB disk free
-  emu slots: 0/2 · sim slots: 0/4
+  emu slots: 0/2 · sim slots: 0/4 · build slots: 0/2 (+1 burst)
   Running (2): adb-2A191FDH3007B7, 00008120-000464CE2E44C01E
   Offline (40): Opus_API37, Pixel_9, Wear_OS_Small_Round,
                 iPhone 16 Pro, Apple Watch Series 10 (46mm)
   Leases  (0): none
+  Builds  (0): none
   Queue   (0): none
 ```
 
@@ -131,6 +134,82 @@ flowchart LR
 | `t = 10s` | Agent C requests `--type phone --api ">=35"`. Agent A frees `Pixel_9`. | Ticket #1 has waited 10 s (`< 120s`). Agent C jumps ahead and claims warm `Pixel_9` in `< 20 ms`. |
 | `t = 125s` | Agent C frees `Pixel_9`. Agent D requests `--type phone --api 36`. | Ticket #1 is past 120 s (frozen at Priority #0). `atc` blocks Agent D, stops `Pixel_9`, and boots `Wear_OS` for Agent B. |
 
+## Co-schedule Gradle, Bazel, and Xcode builds without cross-starvation
+
+When multiple coding agents run `./gradlew`, `bazel`, or `xcodebuild` concurrently on one machine, two cross-starvation deadlocks happen without co-scheduling:
+
+1. **Device-Wait-While-Holding-Build (Forward Starvation):** An agent starts `./gradlew connectedDebugAndroidTest` or `xcodebuild test`, consuming a build slot and 4+ GB of daemon RAM while blocking inside the build waiting for a busy emulator/simulator.
+2. **Build-Wait-While-Holding-Device (Reverse Starvation):** An agent claims an emulator first, then tries to compile its test APK, but gets stuck behind three pure `./gradlew assembleDebug` builds—holding the scarce emulator idle while waiting for a compiler slot.
+
+`atc` eliminates both hazards by coupling build slots and device leases under `atc.lock` using a **3-tier priority build scheduler**, **per-workspace locks**, and **burst build slots for active device holders**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AgentA as Agent A (Device + Test)
+    participant AgentB as Agent B (Pure Build)
+    participant ATC as atc Co-Scheduler (atc.lock)
+    participant Build as Build Slot & Daemon
+    participant Dev as Emulator / Simulator
+
+    Note over AgentA,Dev: Mode 1: One-Shot Co-Allocation (atc exec --claim)
+    AgentA->>ATC: atc exec --claim "--type phone --api >=35" -- ./gradlew connectedDebugAndroidTest
+    alt Warm device ready (Tier 0)
+        ATC->>ATC: Atomically claim device + Tier 1 build slot in one transaction
+    else Cold boot required (Tier 1/2/3)
+        ATC->>ATC: Reserve "starting" device + "preparing_device" build slot
+        ATC->>Dev: Boot emulator outside lock (build slot already reserved)
+        ATC->>ATC: Activate both device lease & build lease
+    end
+
+    Note over AgentA,Dev: Mode 2: Interactive Session (Already Holding Device)
+    AgentB->>ATC: atc exec --build -- ./gradlew assembleDebug (Tier 2: Pure Build)
+    AgentA->>ATC: atc exec -- ./gradlew installDebug (Tier 1: Device Holder)
+    ATC-->>AgentA: Tier 1 jumps ahead of Tier 2 (or uses +1 burst slot) so leased device never sits idle!
+    AgentA->>Build: Spawns ./gradlew (ATC_BUILD_OP_ID exported for zero-deadlock nested builds)
+    Build-->>AgentA: Build exits -> 2.5s "draining" cooldown waits for daemon lock release
+```
+
+### Three-tier build priority and workspace mutual exclusion
+
+| Priority Tier | Who qualifies | Slot ceiling | Why it exists |
+|---|---|---|---|
+| **Tier 0 (`starved`)** | Any queued build ticket waiting `>= 120 s` (`buildReorderWindowSec`) | Base + Burst (`maxConcurrentBuilds + maxDeviceHolderBurstBuilds`) | Guarantees strict upper bound on wait time so pure builds never starve indefinitely. |
+| **Tier 1 (`device-holder`)** | Session holds an online `"active"` device lease, or is co-allocating via `atc exec --claim` | Base + Burst (`2 + 1 = 3` default) | Prevents **Reverse Starvation**: an agent holding a scarce emulator/phone never waits behind pure CPU builds to compile and install its APK/IPA. |
+| **Tier 2 (`pure-build`)** | Pure CPU build (`./gradlew assembleDebug`, `bazel build`, `xcodebuild build`) with no device lease | Base (`maxConcurrentBuilds = 2` default) | Throttles background compilation so the host retains enough RAM and CPU for active emulators and simulators. |
+
+Even when global build slots are free, two builds targeting the **same workspace root or output base** cannot run concurrently without corrupting incremental caches or blocking on internal tool mutexes. `atc` extracts canonical workspace keys and serializes colliding builds in `state.buildQueue`:
+
+| Build tool | Extracted `workspaceKeys` | Daemon & re-entrancy protections |
+|---|---|---|
+| `gradle` / `./gradlew` | `gradle:<canonicalProjectRoot>` + `gradle:dir:<--project-dir>` | Blocks `--stop` (`exit 2`); injects `-Dorg.gradle.workers.max=<N>`; holds `"draining"` state for up to `2500 ms` after CLI exit until the Gradle daemon releases its workspace lock. |
+| `bazel` / `bazelisk` / `./bazelw` | `bazel:ws:<workspaceRoot>` + `bazel:out:<--output_base>` | Blocks `shutdown` and `clean --expunge` (`exit 2`); injects `--jobs=<N>` and `--local_ram_resources=<MB>`; holds `"draining"` state while the Bazel server PID is active. |
+| `xcodebuild` | `xcode:<projectOrWorkspaceDir>` + `xcode:dd:<derivedDataPath>` | Injects `-jobs <N>` unless already passed; coordinates `-derivedDataPath` access across concurrent iOS/macOS sessions. |
+
+### Re-entrant sub-builds (zero nested deadlocks)
+
+Real-world builds frequently invoke nested builds—for example, `xcodebuild` Run Script phases invoking `./gradlew :shared:embedAndSignAppleFrameworkForXcode` in KMP projects, or Bazel `genrule` steps invoking Gradle.
+
+When `atc exec` starts a top-level build, it exports `ATC_BUILD_OP_ID=<opId>` and `ATC_BUILD_OP_NONCE=<nonce>`. If a child process inside that tree invokes `atc exec --build` (or is intercepted by `atc hook pre-tool-use`), `atc` verifies the parent build lease's `opId`, `nonce`, and live worker process group:
+- **Same workspace keys:** Admitted immediately (`reentrantReuse`) in `< 1 ms` without consuming a second build slot or deadlocking on the parent's workspace lock.
+- **Additional workspace keys:** Acquires only the delta workspace keys without charging an extra global concurrency slot.
+
+```bash
+# 1. Pure build (no device needed) — coordinates RAM, CPU jobs, and workspace lock
+atc exec --build -- ./gradlew assembleDebug
+atc exec --build -- bazel build //app:main
+
+# 2. One-shot atomic device + build co-allocation (claims device, runs build+test, frees both)
+atc exec --claim "--type phone --api >=35" -- ./gradlew connectedDebugAndroidTest
+atc exec --claim "--ios --type phone --os >=18.0" -- xcodebuild test -scheme App
+
+# 3. Interactive device session — Tier 1 priority + burst slot assigned automatically
+atc claim --type phone --api ">=35"
+atc exec -- ./gradlew installDebug
+atc exec -- adb shell am start -n com.example/.MainActivity
+atc free
+```
+
 ## One KMP session holds an Android lease and an iOS lease at once
 
 Kotlin Multiplatform (KMP), Flutter, and React Native tasks on macOS often test Android and iOS side by side in the same agent session. A session can hold one Android lease and one iOS lease at the same time.
@@ -202,6 +281,26 @@ atc claim --type phone --api 36 --snapshot-load default_boot --reset-app com.exa
 atc snapshot save logged_in
 atc exec -- ./gradlew connectedDebugAndroidTest
 atc snapshot load logged_in
+```
+
+## Inspect structured JSONL audit logs for debugging and bug reports
+
+Every device claim, release, queue wait, build slot admission, `"draining"` daemon reconciliation, command guard block, and garbage-collection sweep is appended to a structured JSONL audit log (`atc-audit.jsonl`) outside `atc.lock`.
+
+| OS | Default audit log location (`getDefaultAuditLogDir()`) | Override |
+|---|---|---|
+| **macOS** | `~/Library/Logs/atc/atc-audit.jsonl` | `ATC_LOG_DIR=/path` or `atc config set auditLogPath /path/file.jsonl` |
+| **Linux** | `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` (default `~/.local/state/atc/logs/atc-audit.jsonl`) | `ATC_LOG_DIR=/path` or `atc config set auditLogPath /path/file.jsonl` |
+| **Windows** | `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` | `ATC_LOG_DIR=/path` or `atc config set auditLogPath /path/file.jsonl` |
+
+Each line is a self-contained JSON object (`schemaVersion: 1`) with `ts` (ISO-8601), `epochMs`, `pid`, `sessionId`, `category` (`"lease"`, `"build"`, `"queue"`, `"guard"`, `"gc"`), `event`, and structured metadata (`opId`, `leaseId`, `deviceKey`, `tool`, `tier`, `workspaceKeys`, `durationMs`, `exitCode`). When `atc-audit.jsonl` exceeds `auditLogMaxBytes` (`10 MB` default), `atc` automatically rotates up to `auditLogMaxFiles` (`3` rotated `.1`, `.2`, `.3` archives).
+
+```bash
+# Watch live lease, build, and guard events across all agents on your Mac
+tail -f ~/Library/Logs/atc/atc-audit.jsonl | jq .
+
+# Filter for build co-scheduling and workspace contention events
+grep '"category":"build"' ~/Library/Logs/atc/atc-audit.jsonl | tail -n 20
 ```
 
 ## Questions on how coordination works
@@ -277,10 +376,11 @@ atc config set allowPhysicalDevices never
 
 Android emulators boot full QEMU virtual machines with dedicated guest RAM, while iOS Simulators run as lightweight user-space containers sharing the macOS kernel. `atc` tracks them in separate pools:
 
-| Pool | Config key & default | Admission check before boot |
+| Pool | Config key & default | Admission check before boot / start |
 |---|---|---|
-| Android QEMU emulators | `maxRunningEmulators = 2` | Available host RAM must cover `ramSizeMb + 1024 MB overhead + minFreeRamMb (2048 MB)`, plus `2048 MB` free disk. |
+| Android QEMU emulators | `maxRunningEmulators = 2` | Available host RAM must cover `ramSizeMb + 1024 MB overhead + minFreeRamMb (2048 MB)` plus unaccounted `<10 s` starting builds, and `2048 MB` free disk. |
 | iOS Simulators (macOS) | `maxRunningSimulators = 4` | Target volume must have at least `minFreeDiskMb (2048 MB)` free disk space. |
+| Heavy builds (`gradle` / `bazel` / `xcodebuild`) | `maxConcurrentBuilds = 2` (`+1` burst for device holders) | Per-workspace key lock + RAM check (`buildRamEstimateMb = 4096 MB` for cold daemons + `preparingDevice` reservations + `minFreeRamMb`). |
 | Physical devices | Unlimited (`0` virtual slots) | Must be online in `adb devices` or `xcrun devicectl list devices`. |
 
 ## Commands and exit codes map every failure to one action
@@ -289,15 +389,15 @@ Run `atc guide [workflow|profiles|snapshots|multi-agent|traps]` at any time to r
 
 | Command | What it does |
 |---|---|
-| `atc status [--ios\|--android] [--type <t>] [--api\|--os <spec>] [--json]` | Show host RAM/disk, `emu slots`, `sim slots`, `running`/`offline`/`creatable` devices, `leases`, and `queue`. |
+| `atc status [--ios\|--android] [--type <t>] [--api\|--os <spec>] [--json]` | Show host RAM/disk, `emu slots`, `sim slots`, `build slots`, `running`/`offline`/`creatable` devices, `leases`, `builds`, and `queue`. |
 | `atc claim [--ios\|--android] [--type <t>] [--api\|--os <spec>] [flags]` | Claim a lease (`--play`, `--no-play`, `--avd`, `--udid`, `--serial`, `--kind`, `--snapshot-load`, `--wipe-data`, `--cold`, `--reset-app`, `--create-if-missing`, `--ttl`, `--wait`). |
-| `atc exec [--ios\|--android] [--serial <id>] -- <cmd> [args...]` | Run a command with target env/flags injected, worker process-group tracking, and a 15 s heartbeat. |
+| `atc exec [--build] [--claim "<flags>"] [--ios\|--android] [--serial <id>] -- <cmd>` | Run a device and/or build command with target env/flags injected, 3-tier build slot coordination, worker process-group tracking, and a 15 s heartbeat. |
 | `atc snapshot <list\|save\|load\|delete> [<name>] [--ios\|--android]` | Manage QEMU snapshots (Android) or APFS copy-on-write clones (iOS Simulator). |
 | `atc renew [<target>] [--ios\|--android] [--ttl <sec>] [--json]` | Extend an active lease's TTL. |
 | `atc free [<target>] [--ios\|--android] [--snapshot-save <n>] [--stop]` | Release one or all leases held by the caller session. |
-| `atc guide [workflow\|profiles\|snapshots\|multi-agent\|traps] [--json]` | Print built-in documentation topics. |
-| `atc config <get\|set> [key] [val]` | Read or update config (`maxRunningEmulators`, `maxRunningSimulators`, `minFreeRamMb`, `allowPhysicalDevices`). |
-| `atc gc` | Prune expired leases, dead anchor/worker PIDs, and stale queue tickets. |
+| `atc guide [workflow\|profiles\|snapshots\|multi-agent\|traps] [--json]` | Print built-in documentation topics (aliases `build`, `builds`, `coscheduling`, `audit`, `logs` supported). |
+| `atc config <get\|set> [key] [val]` | Read or update config (`maxRunningEmulators`, `maxRunningSimulators`, `coordinateBuilds`, `maxConcurrentBuilds`, `maxDeviceHolderBurstBuilds`, `buildRamEstimateMb`, `minFreeRamMb`, `allowPhysicalDevices`, `auditLogging`). |
+| `atc gc` | Prune expired leases, dead anchor/worker PIDs, drained build leases, and stale queue tickets. |
 | `atc guard [--format=json] <command>` | Check whether a shell command is allowed, blocked, or rewritten under `atc`. |
 | `atc hook <pre-tool-use\|stop>` | Host hook entrypoint for Claude Code, Codex, Gemini CLI, Antigravity, and Cursor. |
 | `atc mcp` | Start the stdio MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`). |

@@ -289,7 +289,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 
   const evalResult = withStateTransaction(
     stateDir,
-    (state, { now }) => {
+    (state, { now, auditEvents }) => {
       const hookEntry = recordHookSession(state, {
         anchorPid: norm.anchorPid,
         sessionId: norm.sessionId,
@@ -344,16 +344,31 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
           }
         : options.runningCountByPlatform;
 
+      const coordinateBuilds =
+        options.coordinateBuilds !== undefined
+          ? Boolean(options.coordinateBuilds)
+          : Boolean(state.config?.coordinateBuilds);
+
       const guardRes = evaluateCommandGuard(norm.command, {
         sessionId: norm.sessionId,
         anchorPid: norm.anchorPid,
         activeLeases,
         runningCount,
         runningCountByPlatform,
+        coordinateBuilds,
         platform: options.platform,
       });
 
       if (guardRes.allowed && norm.hostFormat === "cursor" && guardRes.hasDirectDeviceAction) {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "guard_deny",
+            sessionId: norm.sessionId,
+            hostFormat: norm.hostFormat,
+            command: norm.command,
+            reason: "cursor_cannot_rewrite_device_action",
+          });
+        }
         return {
           mutated: true,
           value: {
@@ -364,6 +379,28 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
             rewrittenCommand: null,
           },
         };
+      }
+
+      if (!guardRes.allowed) {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "guard_deny",
+            sessionId: norm.sessionId,
+            hostFormat: norm.hostFormat,
+            command: norm.command,
+            reason: guardRes.reason,
+          });
+        }
+      } else if (guardRes.rewrittenCommand && norm.hostFormat !== "cursor") {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "guard_rewrite",
+            sessionId: norm.sessionId,
+            hostFormat: norm.hostFormat,
+            command: norm.command,
+            rewrittenCommand: guardRes.rewrittenCommand,
+          });
+        }
       }
 
       if (guardRes.allowed && guardRes.renewLease) {

@@ -1,20 +1,21 @@
 # atc architecture
 
-How the `atc` CLI, the lock-serialized state file, the 3-tier Android and iOS fleet discovery, the warm-affinity queue, and the multi-agent hooks fit together.
+How the `atc` CLI, the lock-serialized state file, the 3-tier Android and iOS fleet discovery, the warm-affinity queue, the 3-tier build + device co-scheduler, the JSONL audit logger, and the multi-agent hooks fit together.
 
-Status: `v2.1.0` · Updated `2026-10-12` · Node.js >= 20 on macOS, Linux, and Windows.
+Status: `v2.1.0` · Updated `2026-10-15` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 
-An agent claims exclusive access to an Android emulator (AVD), an iOS Simulator, or a physical USB/Wi-Fi device, runs commands under `atc exec -- <cmd>`, and frees the lease when done. All coordination runs through a user-private `state.json` file guarded by an atomic directory lock (`atc.lock`) with no daemon and zero npm dependencies.
+An agent claims exclusive access to an Android emulator (AVD), an iOS Simulator, or a physical USB/Wi-Fi device, runs commands and heavy builds under `atc exec -- <cmd>`, and frees the lease when done. All coordination runs through a user-private `state.json` file guarded by an atomic directory lock (`atc.lock`) with no daemon and zero npm dependencies.
 
-The CLI carries its own documentation (`atc guide`), enforces lease boundaries (`atc guard` and `atc hook pre-tool-use`), and frees leases when a turn ends (`atc hook stop`) or when an agent PID dies. An optional stdio MCP server (`atc mcp`) exposes the same operations over JSON-RPC 2.0.
+The CLI carries its own documentation (`atc guide`), enforces lease and build boundaries (`atc guard` and `atc hook pre-tool-use`), co-schedules Gradle/Bazel/Xcode builds alongside device leases (`src/build.mjs`), records structured JSONL audit logs (`src/logger.mjs`), and frees leases when a turn ends (`atc hook stop`) or when an agent PID dies. An optional stdio MCP server (`atc mcp`) exposes the same operations over JSON-RPC 2.0.
 
 | Invariant | Guarantee | Where enforced |
 |---|---|---|
-| Zero subprocesses under `atc.lock` | Fleet discovery runs before acquiring `atc.lock`; boot, wipe, snapshot, and stop run after releasing `atc.lock` under `"starting"` or `"stopping"` states. Lock hold time stays under `20 ms`. | `src/cli.mjs`, `src/lock.mjs` |
+| Zero subprocesses under `atc.lock` | Fleet discovery and daemon RAM probes run before acquiring `atc.lock`; boot, wipe, snapshot, stop, build execution, and JSONL audit disk I/O run after releasing `atc.lock`. Lock hold time stays under `20 ms`. | `src/cli.mjs`, `src/lock.mjs`, `src/build.mjs`, `src/logger.mjs` |
 | No personal-phone hijack | Default claims set `--kind emulator`. Physical Android and iOS devices require `--serial`, `--udid`, or `--kind physical\|any` and use `0` virtual slots. | `src/cli.mjs`, `src/state.mjs` |
 | Warm-affinity fairness ceiling | Warm `Tier 0` matches can jump ahead of cold-boot tickets within `reorderWindowSec` (`120 s`). At `120 s`, waiting tickets freeze at Priority #0. | `src/state.mjs` (`canJumpAhead`) |
+| Build + device cross-starvation freedom | Active device holders and `atc exec --claim` co-allocations receive Tier 1 priority + burst build slots (`maxDeviceHolderBurstBuilds`), while cold-boot co-allocations reserve a `"preparing_device"` build slot before booting so the device never sits idle post-boot. | `src/build.mjs`, `src/cli.mjs`, `src/state.mjs` |
 | Virtual crash recovery vs. physical fail-fast | Crashed virtual devices hold a `45 s` reservation for in-place reboot (`expiresAtMs` preserved). Disconnected physical devices fail fast after `15 s` with a tombstone. | `src/state.mjs` (`reconcileOfflineLeases`), `src/cli.mjs` |
 
 ## Every critical section under `atc.lock` finishes in under 20 ms
@@ -57,6 +58,39 @@ When a session holds one Android lease and one iOS lease (Kotlin Multiplatform /
 
 `evaluateCommandGuard()` fast-paths commands that do not mention `adb`, `emulator`, `android`, `gradlew`, `simctl`, `devicectl`, or `xcodebuild` in under `2 ms` without reading `state.json`. Direct lifecycle commands (`emulator -avd`, `adb emu kill`, `xcrun simctl boot|shutdown|erase|delete`) are blocked with exit code `2`. Compound commands (`adb ... && xcrun simctl ...`) are rewritten segment by segment using `execSerialByPlatform`.
 
+## Build + device co-scheduling architecture (`src/build.mjs`)
+
+To prevent forward starvation (holding a compiler slot while waiting for a device) and reverse starvation (holding a scarce emulator while waiting behind pure CPU builds), `cmdExec` and `src/build.mjs` coordinate `state.buildLeases` and `state.buildQueue` inside the same `<20 ms` `atc.lock` transactions as device leases.
+
+```mermaid
+flowchart TD
+    Start["atc exec [--build] [--claim] -- <cmd>"] --> Probe["Outside atc.lock:\nclassifyBuildCommand() + probeWarmBuildDaemons()\n(workspaceKeys, daemonPids, requiresDevice)"]
+    Probe --> Reentrant{"ATC_BUILD_OP_ID\nin env?"}
+    Reentrant -- "Yes (valid parent opId + nonce + live PGID)" --> Delta["evaluateNestedBuildAdmission()\nReuse parent slot (<1ms); acquire only delta workspaceKeys"]
+    Reentrant -- "No (top-level build)" --> Mode{"Device needed?"}
+
+    Mode -- "atc exec --claim (Co-allocation)" --> CoAlloc["Under atc.lock:\nVerify BOTH device candidate AND Tier 1 build slot"]
+    CoAlloc -- "Tier 0 Warm Device" --> BothActive["Activate device lease + build lease atomically"]
+    CoAlloc -- "Tier 1/2/3 Cold Boot" --> Prep["Write 'starting' device + 'preparing_device' build lease\nBoot emulator outside lock -> activate build lease"]
+
+    Mode -- "Pure build or existing lease" --> Queue["Under atc.lock:\ncomputeBuildTier() -> Tier 0 (starved >=120s) | Tier 1 (device-holder) | Tier 2 (pure)"]
+    Queue --> Admit["canAdmitBuildCandidate():\n1. Workspace mutex (active + draining)\n2. Slot ceiling (Base vs Base + Burst)\n3. Unified RAM check (cold daemon + preparingDevice + unaccounted <10s builds)"]
+    Admit --> Spawn["Outside atc.lock:\nExport ATC_BUILD_OP_ID + inject worker/RAM flags\n(--jobs / -Dorg.gradle.workers.max / -jobs)"]
+    Spawn --> Drain["On exit -> transition to 'draining' (2500ms cooldown)\nWait for Gradle/Bazel daemon lock release, then delete"]
+```
+
+### Unified RAM accounting across emulators and builds
+
+Because host `availableRamMb` already reflects the resident memory (RSS) of warm Gradle/Bazel daemons and running emulators that faulted in their pages more than `10 s` ago, naive subtraction would double-count memory. `atc` prevents both double-counting and transient race windows:
+- **Cold vs. Warm Build Daemons (`probeWarmBuildDaemons`):** Outside `atc.lock`, `ps -ax -o pid=,rss=,command=` identifies whether a warm `GradleDaemon` or `bazel(<workspace>)` server already exists for the target workspace. Warm daemons require `0 MB` additional RAM; cold daemons require `config.buildRamEstimateMb` (`4096 MB`).
+- **Unaccounted `<10 s` Window (`computeUnaccountedBuildRamMb`):** Active builds in their first `10,000 ms` of execution—plus any `"preparing_device"` build reservations waiting for a cold emulator boot—are subtracted from `availableRamMb` during both `cmdClaim` emulator boot admission (`src/android.mjs`) and `canAdmitBuildCandidate` (`src/build.mjs`).
+
+## Structured JSONL audit logging (`src/logger.mjs`)
+
+To keep `atc.lock` hold times under `20 ms`, audit logging is decoupled into two stages:
+1. **In-Memory Staging (`recordAuditEvent`):** Inside `withStateTransaction(stateDir, fn)`, state transitions (`lease.claim`, `lease.free`, `build.start`, `build.drain`, `build.complete`, `queue.enqueue`, `guard.deny`, `gc.reap`) append lightweight objects to `state._pendingAuditEvents`. This array is stripped before `state.json` is serialized to disk.
+2. **Post-Lock Append & Rotation (`flushAuditEvents`):** Inside the `finally` block of `withStateTransaction`—**after** `atc.lock` is released—`flushAuditEvents` serializes each event as a single JSON line (`fs.appendFileSync(..., { mode: 0o600 })`) to the OS log directory (`~/Library/Logs/atc/atc-audit.jsonl` on macOS, `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` on Linux, `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` on Windows) and rotates `.1`..`.3` archives when `size >= auditLogMaxBytes` (`10 MB`).
+
 ## Code map and on-disk state
 
 | Module | Path | Responsibility |
@@ -65,17 +99,20 @@ When a session holds one Android lease and one iOS lease (Kotlin Multiplatform /
 | Built-in guides | `src/guide.mjs`, `src/guides/*.md` | Markdown topics (`workflow`, `profiles`, `snapshots`, `multi-agent`, `traps`) served by `atc guide` and `atc_guide`. |
 | Atomic lock | `src/lock.mjs` | Directory mutex (`mkdir <stateDir>/atc.lock`), `owner.json` nonce check, stale-lock breaking, and atomic `state.json` write + `fsync` + `rename`. |
 | State & scheduler | `src/state.mjs` | Schema validation, corruption quarantine, dead-PID GC, 6-step session identity ladder, `watch`/`wear` profile matching, and warm-affinity queue selection. |
+| Build co-scheduler | `src/build.mjs` | Gradle/Bazel/`xcodebuild` classifier, workspace key extraction, 3-tier priority scheduler, `"draining"` daemon reconciliation, re-entrant sub-build admission, and CPU/RAM flag shaping. |
+| System audit logger | `src/logger.mjs` | OS-native log directory resolution, lock-free JSONL event staging (`recordAuditEvent`), post-lock disk flushing (`flushAuditEvents`), and size-bounded rotation. |
 | Android probes | `src/android.mjs` | Android 3-tier discovery, `.avd/config.ini` + dead-PID `.lock` cleanup, RAM/disk admission, and QEMU boot/stop/snapshot helpers. |
 | iOS probes | `src/ios.mjs` | iOS/watchOS/tvOS/visionOS discovery (`simctl` + `devicectl`), simulator boot/shutdown/erase/create, privacy/container app reset, and APFS `cp -cR` snapshots. |
 | Worker liveness | `src/heartbeat.mjs` | Cross-platform process-group tracking (`workerPgids`, POSIX start tokens, Windows CIM `CreationDate` trees) and orphan process-tree reaping. |
-| Spawner | `src/spawn.mjs` | Subprocess runner, Windows `.exe`/`.cmd` resolution, and Android/iOS target flag injection. |
-| Command guard | `src/guard.mjs` | Shell tokenizer, per-platform command classifier, and loop/compound command rewriter. |
+| Spawner | `src/spawn.mjs` | Subprocess runner, Windows `.exe`/`.cmd` resolution, and Android/iOS/build target flag injection. |
+| Command guard | `src/guard.mjs` | Shell tokenizer, per-platform + build daemon command classifier, and loop/compound command rewriter. |
 | Host hooks & MCP | `src/hook.mjs`, `src/mcp.mjs` | `PreToolUse` and `Stop` adapters for Claude Code, Codex, Cursor, Antigravity, and Gemini CLI, plus the stdio JSON-RPC 2.0 MCP server. |
 
 | On-disk path | Written by | Contents |
 |---|---|---|
-| `<stateDir>/state.json` | `src/lock.mjs` | Active/transitional leases, wait queue tickets, `disconnectedPhysicalLeases` tombstones, config overrides, and hook PID breadcrumbs (`mode 0600`). |
+| `<stateDir>/state.json` | `src/lock.mjs` | Active/transitional device leases, wait queue tickets, `buildLeases`, `buildQueue`, `disconnectedPhysicalLeases` tombstones, config overrides, and hook PID breadcrumbs (`mode 0600`). |
 | `<stateDir>/atc.lock/owner.json` | `src/lock.mjs` | Lock holder `{ pid, createdAtMs, nonce }` checked before every atomic rename. |
+| `~/Library/Logs/atc/atc-audit.jsonl` (macOS) | `src/logger.mjs` | Append-only JSONL audit log of lease, build, queue, guard, and GC events (`mode 0600`, rotated at `10 MB`). |
 | `~/.android/avd/<Name>.avd/snapshots/<snap>/` | QEMU / `adb` | QEMU snapshots discovered by `src/android.mjs` and restored via `atc snapshot`. |
 | `~/.atc-snapshots/<udid>/<snap>/data/` | `src/ios.mjs` | APFS copy-on-write (`cp -cR`) clones of `~/Library/Developer/CoreSimulator/Devices/<udid>/data`. |
 
@@ -83,6 +120,6 @@ When a session holds one Android lease and one iOS lease (Kotlin Multiplatform /
 
 | Command | Coverage |
 |---|---|
-| `npm test` (`node --test test/*.test.mjs`) | 18 integration suites covering lock serialization, corruption quarantine, dead-PID GC, `45 s` virtual crash recovery, `15 s` physical disconnect fail-fast, warm-affinity scheduling, RAM/disk admission, shell guard rewriting, hooks, Android & iOS `atc exec` injection, APFS snapshots, KMP dual-lease routing, `atc guide`, and `atc mcp`. |
+| `npm test` (`node --test test/*.test.mjs`) | 33 integration suites covering lock serialization, corruption quarantine, dead-PID GC, `45 s` virtual crash recovery, `15 s` physical disconnect fail-fast, warm-affinity scheduling, 3-tier build + device co-scheduling, re-entrant builds, `"draining"` daemon locks, JSONL audit logging, RAM/disk admission, shell guard rewriting, hooks, Android & iOS `atc exec` injection, APFS snapshots, KMP dual-lease routing, `atc guide`, and `atc mcp`. |
 | `npm run check` | Syntax check (`node --check`) across all `.mjs` files plus the full integration test suite. |
 | `npm run release:verify` | Version parity check across `package.json`, `plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/atc/SKILL.md`, and `skills/atc/skill-source.json`. |

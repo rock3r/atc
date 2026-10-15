@@ -1,11 +1,12 @@
 import path from "node:path";
+import { classifyBuildCommand } from "./build.mjs";
 
 const FAST_PATH_REGEX =
-  /(?:^|(?<![A-Za-z0-9]))(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?=$|(?![A-Za-z0-9]))/i;
+  /(?:^|(?<![A-Za-z0-9]))(android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild|atc)(?=$|(?![A-Za-z0-9]))/i;
 const GUARDED_TOOL_NAMES_RE_SRC =
-  "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild)";
+  "(?:android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild)";
 const TOOL_NAMES_RE_SRC =
-  "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
+  "(?:android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild|atc)";
 const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%@-]+(?:\\.[A-Za-z0-9_+~%@-]+)*";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`(?<=.)\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const TOOL_WRAPPER_AFFIX_RE = new RegExp(
@@ -244,6 +245,7 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "id",
   "hostname",
   "jq",
+  "pioneer",
   "true",
   "false",
   "which",
@@ -318,6 +320,9 @@ const TOOL_NAMES = [
   "emulator",
   "gradlew",
   "gradle",
+  "bazel",
+  "bazelisk",
+  "bazelw",
   "xcrun",
   "simctl",
   "devicectl",
@@ -2123,6 +2128,36 @@ export function extractTargetSerial(parsed) {
     }
     return parsed.envVars.SIMULATOR_UDID || parsed.envVars.ATC_DEVICE_SERIAL || null;
   }
+  if (baseCmd === "bazel" || baseCmd === "bazelisk" || baseCmd === "bazelw") {
+    const selectors = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = String(args[i]);
+      if (a === "--") break;
+      if (a.startsWith("--device=")) {
+        selectors.push(a.slice("--device=".length));
+      } else if (a === "--device" && i + 1 < args.length) {
+        selectors.push(String(args[i + 1]));
+        i += 1;
+      } else if (a.startsWith("--ios_simulator_device=")) {
+        const val = a.slice("--ios_simulator_device=".length);
+        if (UUID_RE.test(val)) selectors.push(val);
+      } else if (a === "--ios_simulator_device" && i + 1 < args.length) {
+        const val = String(args[i + 1]);
+        if (UUID_RE.test(val)) selectors.push(val);
+        i += 1;
+      }
+    }
+    if (selectors.length > 0) {
+      const unique = Array.from(new Set(selectors));
+      return unique.length === 1 ? unique[0] : unique.join(",");
+    }
+    return (
+      parsed.envVars.ANDROID_SERIAL ||
+      parsed.envVars.SIMULATOR_UDID ||
+      parsed.envVars.ATC_DEVICE_SERIAL ||
+      null
+    );
+  }
   if (baseCmd === "adb") {
     const selectors = [];
     let subIdx = 0;
@@ -2264,10 +2299,35 @@ export function classifySegment(
             a === "--role" ||
             a === "--anchor-pid" ||
             a === "--lease" ||
-            a === "--state-dir") &&
+            a === "--state-dir" ||
+            a === "--type" ||
+            a === "--api" ||
+            a === "--os" ||
+            a === "--kind" ||
+            a === "--avd" ||
+            a === "--udid" ||
+            a === "--platform" ||
+            a === "--wait" ||
+            a === "--wait-sec" ||
+            a === "--ttl" ||
+            a === "--ttl-sec" ||
+            a === "--reason" ||
+            a === "--snapshot-load" ||
+            a === "--snapshot-save-on-free" ||
+            a === "--reset-app" ||
+            a === "--abi" ||
+            a === "--services" ||
+            a === "--reorder-window" ||
+            a === "--reorder-window-sec") &&
           i + 1 < scanEnd
         ) {
+          if (a === "--udid") {
+            atcSerialFlag = args[i + 1];
+          }
           i += 2;
+        } else if (a.startsWith("--udid=")) {
+          atcSerialFlag = a.slice("--udid=".length);
+          i += 1;
         } else if (a.startsWith("--")) {
           i += 1;
         } else {
@@ -2397,65 +2457,34 @@ export function classifySegment(
   }
 
   if (baseCmd === "xcodebuild") {
-    const valueFlags = new Set([
-      "-project",
-      "-workspace",
-      "-scheme",
-      "-target",
-      "-configuration",
-      "-sdk",
-      "-destination",
-      "-destination-timeout",
-      "-derivedDataPath",
-      "-resultBundlePath",
-      "-xcconfig",
-      "-archivePath",
-      "-exportPath",
-      "-exportOptionsPlist",
-      "-only-testing",
-      "-skip-testing",
-      "-testPlan",
-    ]);
-    const buildActions = [];
-    const destinations = [];
-    for (let i = 0; i < args.length; i++) {
-      const a = String(args[i]);
-      if (a === "-destination" && i + 1 < args.length) {
-        destinations.push(String(args[i + 1]));
-        i += 1;
-        continue;
-      }
-      if (a.startsWith("-destination=")) {
-        destinations.push(a.slice("-destination=".length));
-        continue;
-      }
-      if (valueFlags.has(a) && i + 1 < args.length) {
-        i += 1;
-        continue;
-      }
-      if (a.startsWith("-") || a.includes("=")) {
-        continue;
-      }
-      buildActions.push(a.toLowerCase());
+    const buildInfo = classifyBuildCommand(baseCmd, args);
+    if (buildInfo.kind === "deny_lifecycle") {
+      return { kind: "deny_lifecycle", reason: buildInfo.reason, parsed };
     }
-    const hasTestAction = buildActions.some(
-      (act) => act === "test" || act === "test-without-building",
-    );
-    if (!hasTestAction) {
-      return { kind: "ignore", parsed };
+    if (buildInfo.kind === "device_coupled_build") {
+      return {
+        kind: "device_action",
+        isBuildTool: true,
+        buildClass: buildInfo.kind,
+        targetPlatform: buildInfo.targetPlatform || "ios",
+        targetSerial: extractTargetSerial(parsed),
+        parsed,
+      };
     }
-    if (
-      destinations.length > 0 &&
-      destinations.every(
-        (d) => /\bplatform=macOS\b/i.test(d) || /\bgeneric\/platform=/i.test(d),
-      )
-    ) {
-      return { kind: "ignore", parsed };
+    if (buildInfo.kind === "read_only") {
+      return {
+        kind: "read_only",
+        isBuildTool: true,
+        buildClass: buildInfo.kind,
+        targetPlatform: "ios",
+        parsed,
+      };
     }
     return {
-      kind: "device_action",
-      targetPlatform: "ios",
-      targetSerial: extractTargetSerial(parsed),
+      kind: "ignore",
+      isBuildTool: true,
+      buildClass: buildInfo.kind,
+      rejectReason: buildInfo.reason || null,
       parsed,
     };
   }
@@ -2711,34 +2740,42 @@ export function classifySegment(
     };
   }
 
-  // Precedence 4: Gradle connectedAndroidTest and install/uninstall tasks
-  if (baseCmd === "gradlew" || baseCmd === "gradle") {
-    const hasDeviceTask = args.some((a) => {
-      if (!a || a.startsWith("-")) return false;
-      const taskName = a.split(":").pop() || "";
-      if (/^(connected.*androidtest|connectedcheck|devicecheck)$/i.test(taskName)) {
-        return true;
-      }
-      if (/^uninstall([A-Z0-9_].*)?$/i.test(taskName)) {
-        return true;
-      }
-      if (
-        /^install([A-Z0-9_].*)?$/i.test(taskName) &&
-        !/^install(Dist|BootDist|ShadowDist|Maven|ToMavenLocal)$/i.test(taskName)
-      ) {
-        return true;
-      }
-      return false;
-    });
-    if (hasDeviceTask) {
+  // Precedence 4: Gradle and Bazel build/test/install tasks and daemon lifecycle guardrails
+  if (
+    baseCmd === "gradlew" ||
+    baseCmd === "gradle" ||
+    baseCmd === "bazel" ||
+    baseCmd === "bazelisk" ||
+    baseCmd === "bazelw"
+  ) {
+    const buildInfo = classifyBuildCommand(baseCmd, args);
+    if (buildInfo.kind === "deny_lifecycle") {
+      return {
+        kind: "deny_lifecycle",
+        reason: buildInfo.reason,
+        parsed,
+      };
+    }
+    if (buildInfo.kind === "device_coupled_build") {
       return {
         kind: "device_action",
-        targetPlatform: "android",
+        isBuildTool: true,
+        buildClass: buildInfo.kind,
+        targetPlatform: buildInfo.targetPlatform || "android",
         targetSerial: extractTargetSerial(parsed),
         parsed,
       };
     }
-    return { kind: "ignore", parsed };
+    if (buildInfo.kind === "read_only") {
+      return { kind: "read_only", isBuildTool: true, buildClass: buildInfo.kind, parsed };
+    }
+    return {
+      kind: "ignore",
+      isBuildTool: true,
+      buildClass: buildInfo.kind,
+      rejectReason: buildInfo.reason || null,
+      parsed,
+    };
   }
 
   // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`, `eval adb shell ...`)
@@ -2814,6 +2851,7 @@ export function classifySegment(
     if (innerEntries.length > 0) {
       let chosen = { kind: "ignore", parsed };
       const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
+      const buildRank = { workspace_only: 1, pure_build: 2, reject_long_running: 3 };
       for (const { script: inner, vars: baseInnerVars } of innerEntries) {
         const innerVars = { ...baseInnerVars };
         for (const subSeg of splitShellSegments(inner, { allowHashComments: innerAllowHash })) {
@@ -2829,6 +2867,12 @@ export function classifySegment(
             delete innerVars.__atc_stripped_android_serial;
           }
           if ((rank[subClass.kind] || 0) > (rank[chosen.kind] || 0)) {
+            chosen = subClass;
+          } else if (
+            (subClass.kind === "read_only" || subClass.kind === "ignore") &&
+            subClass.kind === chosen.kind &&
+            (buildRank[subClass.buildClass] || 0) > (buildRank[chosen.buildClass] || 0)
+          ) {
             chosen = subClass;
           } else if (subClass.kind === "device_action" && chosen.kind === "device_action") {
             if (subClass.targetSerial === "<stripped-ANDROID_SERIAL>") {
@@ -2848,7 +2892,7 @@ export function classifySegment(
           }
         }
       }
-      if (chosen.kind !== "ignore") {
+      if (chosen.kind !== "ignore" || chosen.buildClass) {
         return chosen;
       }
       if (handledCWrapper) {
@@ -4775,12 +4819,20 @@ function rewriteCompoundCommand(
     anchorPid,
     execSerial,
     execSerialByPlatform = null,
+    coordinateBuilds = false,
     platform = "win32",
     inheritedShellVars = null,
     inheritedLoopDepth = 0,
   },
 ) {
-  const rewriteOpts = { sessionId, anchorPid, execSerial, execSerialByPlatform, platform };
+  const rewriteOpts = {
+    sessionId,
+    anchorPid,
+    execSerial,
+    execSerialByPlatform,
+    coordinateBuilds,
+    platform,
+  };
   const isWin = platform === "win32";
   const sessionFlag = sessionId
     ? anchorPid
@@ -5152,16 +5204,26 @@ function rewriteCompoundCommand(
           loopDepth = Math.max(0, loopDepth - doneMatches.length);
         }
       };
+      const isCoordinatedBuildStage =
+        Boolean(coordinateBuilds) &&
+        c.kind === "read_only" &&
+        (c.buildClass === "pure_build" || c.buildClass === "workspace_only");
       if (subRewrite.changed) {
         trimmed = subRewrite.rewrittenStage;
-        if (c.kind !== "device_action" && c.kind !== "atc") {
+        if (c.kind !== "device_action" && c.kind !== "atc" && !isCoordinatedBuildStage) {
           finishLoopDepth();
           return trimmed;
         }
       }
       const stageExecSerial =
         (c.targetPlatform && execSerialByPlatform?.[c.targetPlatform]) || execSerial;
-      if (c.kind === "device_action" && stageExecSerial) {
+      const stageExecFlag =
+        c.kind === "device_action" && stageExecSerial
+          ? `--serial ${stageExecSerial}`
+          : isCoordinatedBuildStage
+            ? "--build"
+            : null;
+      if (stageExecFlag) {
         let prefix = "";
         let cmdBody = trimmed;
         const ctrlMatch = trimmed.match(LEADING_CONTROL_PREFIX_RE);
@@ -5186,12 +5248,12 @@ function rewriteCompoundCommand(
         }
         finishLoopDepth();
         if (isWin) {
-          return `${prefix}atc exec${sessionFlag} --serial ${stageExecSerial} -- ${cmdBody}${suffix}`;
+          return `${prefix}atc exec${sessionFlag} ${stageExecFlag} -- ${cmdBody}${suffix}`;
         }
         const isSimpleStage =
           !/[<>|&;`()\r\n]/.test(cmdBody) && !requiresShellExecution(cmdBody);
         if (isSimpleStage) {
-          return `${prefix}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${cmdBody}${suffix}`;
+          return `${prefix}${posixEnvPrefix}atc exec ${stageExecFlag} -- ${cmdBody}${suffix}`;
         }
         const specialBashRefs = extractReferencedBashSpecialVars(cmdBody);
         const dynamicVarNames = new Set(
@@ -5812,7 +5874,7 @@ function rewriteCompoundCommand(
             (hasPositionalParams ? ' "$@"' : "");
           const bashExec = usesExtglob ? "bash -O extglob" : "bash";
           const zeroArg = hasZeroParam ? '"$0"' : "bash";
-          return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
+          return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec ${stageExecFlag} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
         }
         const needsOuterNoglob =
           hasUnquotedAlias ||
@@ -5837,7 +5899,7 @@ function rewriteCompoundCommand(
           : hasZeroParam
             ? ' "$0"'
             : "";
-        return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
+        return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec ${stageExecFlag} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && c.subcommand && sessionFlags) {
         const hasSession =
@@ -5912,6 +5974,7 @@ export function evaluateCommandGuard(
     offlineLeases = [],
     runningCount = 0,
     runningCountByPlatform = null,
+    coordinateBuilds = false,
     platform = process.platform,
   } = {},
 ) {
@@ -5932,6 +5995,7 @@ export function evaluateCommandGuard(
   const segments = splitShellSegments(command);
   let needsAtcRewrite = false;
   let hasDeviceAction = false;
+  let hasBuildAction = false;
   let hasUnscopedDeviceAction = false;
   const targetSerials = new Set();
   const unscopedPlatformSerials = new Set();
@@ -5953,6 +6017,21 @@ export function evaluateCommandGuard(
       delete shellVars.__atc_stripped_android_serial;
     }
     if (c.kind === "ignore" || c.kind === "read_only") {
+      if (coordinateBuilds && c.buildClass === "reject_long_running") {
+        return {
+          allowed: false,
+          reason:
+            c.rejectReason ||
+            `Blocked by ATC build guardrail: "${seg}" is a continuous/watch build command that would pin a build slot indefinitely. Run one-shot builds under ATC or bypass build coordination for watch mode.`,
+          rewrittenCommand: null,
+        };
+      }
+      if (
+        coordinateBuilds &&
+        (c.buildClass === "pure_build" || c.buildClass === "workspace_only")
+      ) {
+        hasBuildAction = true;
+      }
       continue;
     }
 
@@ -6039,21 +6118,29 @@ export function evaluateCommandGuard(
           };
         }
         if (segPlatform === "ios") {
+          const coAllocHint = c.isBuildTool
+            ? `\n  Or claim & build atomically: atc exec --claim --ios --type phone -- ${seg}`
+            : "";
           return {
             allowed: false,
             reason:
               `Blocked by ATC guardrail: command "${seg}" interacts with an iOS device/simulator, but session "${sessionId || "current"}" holds no active device lease.\n` +
               `  1. Claim a device first:  atc claim --ios --type phone\n` +
-              `  2. Run your command via:  atc exec -- ${seg}`,
+              `  2. Run your command via:  atc exec -- ${seg}` +
+              coAllocHint,
             rewrittenCommand: null,
           };
         }
+        const coAllocHint = c.isBuildTool
+          ? `\n  Or claim & build atomically: atc exec --claim --type phone --api 36 -- ${seg}`
+          : "";
         return {
           allowed: false,
           reason:
             `Blocked by ATC guardrail: command "${seg}" interacts with an Android device, but session "${sessionId || "current"}" holds no active device lease.\n` +
             `  1. Claim a device first:  atc claim --type phone --api 36\n` +
-            `  2. Run your command via:  atc exec -- ${seg}`,
+            `  2. Run your command via:  atc exec -- ${seg}` +
+            coAllocHint,
           rewrittenCommand: null,
         };
       }
@@ -6147,6 +6234,7 @@ export function evaluateCommandGuard(
         anchorPid,
         execSerial,
         execSerialByPlatform,
+        coordinateBuilds,
         platform: "win32",
       });
     } else {
@@ -6163,6 +6251,7 @@ export function evaluateCommandGuard(
           anchorPid,
           execSerial,
           execSerialByPlatform,
+          coordinateBuilds,
           platform,
         });
       } else {
@@ -6180,6 +6269,53 @@ export function evaluateCommandGuard(
         const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
         const escaped = `'${String(noglobPrelude + nounsetPrelude + command).replace(/'/g, `'\\''`)}'`;
         rewrittenCommand = `${flagsEnv}${envPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}`;
+      }
+    }
+  } else if (hasBuildAction && coordinateBuilds) {
+    const isSimpleSingleCommand =
+      segments.length === 1 &&
+      !needsAtcRewrite &&
+      !/[<>|&;`()\r\n]/.test(command) &&
+      !requiresShellExecution(command);
+    if (isWin) {
+      rewrittenCommand = rewriteCompoundCommand(command, {
+        sessionId,
+        anchorPid,
+        execSerial: null,
+        coordinateBuilds: true,
+        platform: "win32",
+      });
+    } else {
+      const envPrefix = sessionId
+        ? anchorPid
+          ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
+          : `ATC_SESSION_ID=${sessionId} `
+        : "";
+      if (isSimpleSingleCommand) {
+        rewrittenCommand = `${envPrefix}atc exec --build -- ${command}`;
+      } else if (segments.length > 1) {
+        rewrittenCommand = rewriteCompoundCommand(command, {
+          sessionId,
+          anchorPid,
+          execSerial: null,
+          coordinateBuilds: true,
+          platform,
+        });
+      } else {
+        const usesExtglob = stageUsesExtglob(command);
+        const needsOuterNoglob = usesExtglob || stageContainsUnquotedGlob(command);
+        const needsOuterNounset = stageContainsUnboundVarOrParam(command);
+        const flagsEnv = needsOuterNoglob || needsOuterNounset ? '__atc_flags="$-" ' : "";
+        const noglobPrelude = needsOuterNoglob
+          ? "case $__atc_flags in *f*) set -f;; esac; "
+          : "";
+        const nounsetPrelude = needsOuterNounset
+          ? "case $__atc_flags in *u*) set -u;; esac; "
+          : "";
+        const targetShell = usesExtglob || stageRequiresBashShell(command) ? "bash" : "sh";
+        const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
+        const escaped = `'${String(noglobPrelude + nounsetPrelude + command).replace(/'/g, `'\\''`)}'`;
+        rewrittenCommand = `${flagsEnv}${envPrefix}atc exec --build -- ${shellExec} -c ${escaped}`;
       }
     }
   } else if (needsAtcRewrite && sessionId) {

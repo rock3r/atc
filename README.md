@@ -9,14 +9,14 @@ Coordinate exclusive Android and iOS device leases across concurrent coding agen
 
 ## Overview
 
-When two coding agents share a machine, they collide on Android emulators, iOS Simulators, and USB phones. `atc` serializes access through a user-private `state.json` file under an atomic directory lock (`atc.lock`) with `<20 ms` in-memory critical sections and zero npm dependencies.
+When two coding agents share a machine, they collide on Android emulators, iOS Simulators, USB phones, and heavy Gradle/Bazel/Xcode builds. `atc` serializes access through a user-private `state.json` file under an atomic directory lock (`atc.lock`) with `<20 ms` in-memory critical sections and zero npm dependencies.
 
-Agents claim a device by hardware/OS profile, run `adb`, `./gradlew connected*`, `android` CLI, `xcrun simctl`, `xcrun devicectl`, or `xcodebuild` commands inside `atc exec` with a 15-second heartbeat, restore QEMU or APFS copy-on-write snapshots, and free the lease when done.
+Agents claim a device by hardware/OS profile, run `adb`, `./gradlew connected*`, `android` CLI, `xcrun simctl`, `xcrun devicectl`, or `xcodebuild` commands inside `atc exec` with a 15-second heartbeat, co-schedule pure or device-coupled builds (`atc exec --build`, `atc exec --claim`) without cross-starvation, restore QEMU or APFS copy-on-write snapshots, and free the lease when done. All lease, build, queue, and guard transitions are logged to `~/Library/Logs/atc/atc-audit.jsonl` (macOS) for auditing and bug reports.
 
 | Component | What it does |
 |---|---|
-| `atc` CLI | Discovers running, offline, and creatable Android & iOS devices; manages TTL leases (including dual-lease Kotlin Multiplatform / KMP sessions) and a 120-second warm-affinity wait queue; injects target flags in `atc exec`; and manages QEMU and APFS snapshots. |
-| `atc` skill & hooks | Agent skill (`skills/atc/SKILL.md`) plus `PreToolUse` and `Stop` hooks (`hooks.json`, `hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, `extensions/atc/index.ts`) that block unscoped device access and rewrite commands into `atc exec`. |
+| `atc` CLI | Discovers running, offline, and creatable Android & iOS devices; manages TTL leases (including dual-lease Kotlin Multiplatform / KMP sessions), a 120-second warm-affinity device queue, and a 3-tier priority build queue (`gradle`, `bazel`, `xcodebuild`); injects target and worker/RAM flags in `atc exec`; and manages QEMU and APFS snapshots. |
+| `atc` skill & hooks | Agent skill (`skills/atc/SKILL.md`) plus `PreToolUse` and `Stop` hooks (`hooks.json`, `hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, `extensions/atc/index.ts`) that block unscoped device access or daemon kills (`--stop`, `shutdown`) and rewrite commands into `atc exec`. |
 | `atc mcp` | Optional stdio JSON-RPC 2.0 MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`). |
 
 ## Requirements and install
@@ -56,6 +56,10 @@ atc claim --ios --type phone --os ">=18.0" --wait 300   # claim a warm or offlin
 atc exec -- xcrun simctl launch booted com.example.app  # rewrites "booted" to your leased UDID
 atc snapshot save clean_state                           # save APFS copy-on-write (cp -cR) clone
 atc free
+
+# Build + device co-scheduling (Gradle / Bazel / xcodebuild)
+atc exec --build -- ./gradlew assembleDebug             # coordinate pure build slot + workspace lock
+atc exec --claim "--type phone --api >=35" -- ./gradlew connectedDebugAndroidTest
 ```
 
 ## Commands
@@ -63,13 +67,13 @@ atc free
 | Command | What it does |
 |---|---|
 | `atc guide [topic]` | Built-in guides: `workflow` (default), `profiles`, `snapshots`, `multi-agent`, `traps` (`--json` supported). |
-| `atc status [--ios\|--android] [--type <type>] [--api\|--os <spec>] [--json]` | Host RAM/disk capacity, `emu slots`, `sim slots`, `running` devices, `offline` AVDs/Simulators, `creatable` profiles, `leases`, and `queue`. |
+| `atc status [--ios\|--android] [--type <type>] [--api\|--os <spec>] [--json]` | Host RAM/disk capacity, `emu slots`, `sim slots`, `build slots`, `running` devices, `offline` AVDs/Simulators, `creatable` profiles, `leases`, `builds`, and `queue`. |
 | `atc claim [flags]` | Claim a lease by `--ios`/`--android`, `--type` (`phone`, `tablet`, `foldable`, `desktop`, `watch`/`wear`, `xr`, `tv`), `--api`/`--os`, `--play`/`--no-play`, `--avd`, `--udid`, or `--serial`. |
-| `atc exec [--ios\|--android] [--serial <id>] -- <cmd> [args...]` | Run a command with target env/flags (`ANDROID_SERIAL`, `--device`, `ATC_IOS_UDID`, `booted` -> `<udid>`), process-group tracking, and a 15 s heartbeat. |
+| `atc exec [--build] [--claim "<flags>"] [--ios\|--android] [--serial <id>] -- <cmd>` | Run a command with target env/flags (`ANDROID_SERIAL`, `--device`, `ATC_IOS_UDID`, `booted` -> `<udid>`), 3-tier build co-scheduling, process-group tracking, and a 15 s heartbeat. |
 | `atc renew [<target>] [--ios\|--android] [--ttl <sec>]` | Extend an active lease's TTL expiration. |
 | `atc snapshot <list\|save\|load\|delete> [<name>] [--ios\|--android]` | List, save, restore, or delete QEMU snapshots (Android) or APFS copy-on-write snapshots (iOS Simulator). |
 | `atc free [<target>] [--ios\|--android] [--snapshot-save <name>] [--stop]` | Release one or all leases held by the caller session. |
-| `atc config <get\|set> [key] [val]` | Read or update settings (`maxRunningEmulators`, `maxRunningSimulators`, `minFreeRamMb`, `allowPhysicalDevices`). |
+| `atc config <get\|set> [key] [val]` | Read or update settings (`maxRunningEmulators`, `maxRunningSimulators`, `coordinateBuilds`, `maxConcurrentBuilds`, `minFreeRamMb`, `allowPhysicalDevices`, `auditLogging`). |
 | `atc gc` | Prune expired leases, dead anchor/worker PIDs, and stale queue tickets. |
 | `atc guard [--format=json] <command>` | Check whether a shell command is allowed, blocked, or rewritten under `atc`. |
 | `atc hook <pre-tool-use\|stop>` | Lifecycle hook handler for Claude Code, Codex, GitHub Copilot CLI, Gemini CLI, Antigravity, and Cursor. |

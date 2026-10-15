@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { classifyBuildCommand } from "./build.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -85,7 +86,12 @@ export function resolveExecutable(
   const normalizedCommand = hasPathSep ? command.replace(/\//g, path.sep) : command;
   const lower = normalizedCommand.toLowerCase();
   const isGradlew =
-    lower === "gradlew" || lower === "gradlew.bat" || lower === "gradlew.cmd";
+    lower === "gradlew" ||
+    lower === "gradlew.bat" ||
+    lower === "gradlew.cmd" ||
+    lower === "bazelw" ||
+    lower === "bazelw.bat" ||
+    lower === "bazelw.cmd";
   if (hasPathSep && (lower.endsWith(".cmd") || lower.endsWith(".bat"))) {
     return { executable: path.resolve(cwd, normalizedCommand), isBatch: true };
   }
@@ -417,7 +423,14 @@ function findAndroidSubcommand(args) {
   return { subIdx, sub, actIdx, action };
 }
 
-export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
+export function buildChildInvocation(
+  cmd,
+  args,
+  lease,
+  sessionId,
+  baseEnv = process.env,
+  buildLease = null,
+) {
   let effectiveCmd = cmd;
   let effectiveArgs = [...args];
   let useDefaultStandardPath = false;
@@ -456,6 +469,10 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
   cmd = effectiveCmd;
   args = effectiveArgs;
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
+  const buildClassified = classifyBuildCommand(cmd, args);
+  if (buildClassified.kind === "deny_lifecycle") {
+    throw new Error(buildClassified.reason);
+  }
   const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
   if (base === "emulator") {
     if (!args.includes("-list-avds") && !args.includes("-version") && !args.includes("-help")) {
@@ -507,7 +524,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       const a = String(args[subIdx]);
       if (a === "-d" || a === "-e" || a === "-t" || a.startsWith("-t")) {
         throw new Error(
-          `Non-serial adb device selector "${a}" is not permitted under ATC; use -s "${lease.serial}" or omit selector flags to use ANDROID_SERIAL.`,
+          `Non-serial adb device selector "${a}" is not permitted under ATC; use -s "${lease?.serial || "<serial>"}" or omit selector flags to use ANDROID_SERIAL.`,
         );
       }
       if (a === "--one-device" || a.startsWith("--one-device=")) {
@@ -517,7 +534,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       }
       if (a.startsWith("-s") && a.length > 2) {
         const inlineSerial = a.slice(2);
-        if (lease.serial && inlineSerial !== lease.serial) {
+        if (lease?.serial && inlineSerial !== lease.serial) {
           throw new Error(
             `Conflicting device selector "${inlineSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
           );
@@ -527,7 +544,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       }
       if (a === "-s" && subIdx + 1 < args.length) {
         const explicitSerial = String(args[subIdx + 1]);
-        if (lease.serial && explicitSerial !== lease.serial) {
+        if (lease?.serial && explicitSerial !== lease.serial) {
           throw new Error(
             `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
           );
@@ -573,14 +590,14 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     if (adbSub === "attach" || adbSub === "detach") {
       const usbTargets = adbRest.filter((a) => !a.startsWith("-"));
       if (usbTargets.length === 0) {
-        if (!lease.serial) {
+        if (!lease?.serial) {
           throw new Error(
             `Bare "adb ${adbSub}" is disabled under ATC when the lease has no bound serial; specify the leased target serial explicitly.`,
           );
         }
       } else {
         for (const target of usbTargets) {
-          if (lease.serial && target !== lease.serial) {
+          if (lease?.serial && target !== lease.serial) {
             throw new Error(
               `Conflicting device selector "${target}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
             );
@@ -596,7 +613,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
         );
       }
       for (const target of disconnectTargets) {
-        if (lease.serial && target !== lease.serial) {
+        if (lease?.serial && target !== lease.serial) {
           throw new Error(
             `Conflicting device selector "${target}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
           );
@@ -617,7 +634,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       } else if (a === "-s" && i + 1 < args.length) {
         explicitSerial = String(args[i + 1]);
       }
-      if (explicitSerial && lease.serial && explicitSerial !== lease.serial) {
+      if (explicitSerial && lease?.serial && explicitSerial !== lease.serial) {
         throw new Error(
           `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
         );
@@ -647,7 +664,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       );
     }
     const readOnlySimSubs = new Set(["list", "help", "diagnose", "getenv"]);
-    if (simSub && !readOnlySimSubs.has(simSub) && lease.serial) {
+    if (simSub && !readOnlySimSubs.has(simSub) && lease?.serial) {
       // Find first non-flag target argument after simSub
       let targetIdx = subIdx + 1;
       while (targetIdx < nextArgs.length && String(nextArgs[targetIdx]).startsWith("-")) {
@@ -692,7 +709,7 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
       }
     }
     const allowedIds = new Set(
-      [lease.serial, lease.udid, lease.coreDeviceId, lease.profile?.coreDeviceId]
+      [lease?.serial, lease?.udid, lease?.coreDeviceId, lease?.profile?.coreDeviceId]
         .filter(Boolean)
         .map((s) => String(s).toUpperCase()),
     );
@@ -709,35 +726,51 @@ export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = proc
     if (
       !explicitDevice &&
       !isHelp &&
-      lease.serial &&
+      lease?.serial &&
       (devctlSub === "device" || devctlSub === "manage")
     ) {
       nextArgs = [...nextArgs, "--device", String(lease.serial)];
     }
   }
 
-  const leasePlatform = lease.platform || "android";
+  const sanitizedBaseEnv = { ...baseEnv };
+  delete sanitizedBaseEnv.ATC_BUILD_OP_ID;
+  delete sanitizedBaseEnv.ATC_BUILD_OP_NONCE;
+  delete sanitizedBaseEnv.ATC_BUILD_ID;
+
+  const leasePlatform = lease ? lease.platform || "android" : null;
   const env = {
-    ...baseEnv,
+    ...sanitizedBaseEnv,
     ...(useDefaultStandardPath && process.platform !== "win32"
       ? { PATH: "/usr/bin:/bin" }
       : {}),
-    ...(leasePlatform === "ios"
+    ...(lease
       ? {
-          ...(lease.kind === "emulator" ? { SIMULATOR_UDID: lease.serial } : {}),
+          ...(leasePlatform === "ios"
+            ? {
+                ...(lease.kind === "emulator" ? { SIMULATOR_UDID: lease.serial } : {}),
+              }
+            : {
+                ANDROID_SERIAL: lease.serial,
+              }),
+          ATC_PLATFORM: leasePlatform,
+          ATC_DEVICE_SERIAL: lease.serial,
+          ATC_LEASE_ID: lease.leaseId,
         }
-      : {
-          ANDROID_SERIAL: lease.serial,
-        }),
-    ATC_PLATFORM: leasePlatform,
-    ATC_DEVICE_SERIAL: lease.serial,
-    ATC_LEASE_ID: lease.leaseId,
+      : {}),
+    ...(buildLease && buildLease.opId && buildLease.opNonce
+      ? {
+          ATC_BUILD_OP_ID: buildLease.opId,
+          ATC_BUILD_OP_NONCE: buildLease.opNonce,
+          ATC_BUILD_ID: buildLease.buildId || buildLease.opId,
+        }
+      : {}),
     ATC_SESSION_ID: sessionId,
   };
   if (base === "android" && androidParsed) {
     const hasDeviceFlag = nextArgs.some((a) => a === "--device" || a.startsWith("--device="));
     const isHelp = nextArgs.includes("--help") || nextArgs.includes("-h");
-    if (!hasDeviceFlag && !isHelp && lease.serial) {
+    if (!hasDeviceFlag && !isHelp && lease?.serial) {
       if (["run", "install", "layout"].includes(androidParsed.sub)) {
         nextArgs = [
           ...nextArgs.slice(0, androidParsed.subIdx + 1),
@@ -761,11 +794,19 @@ function terminateChildTree(childPid, signal = "SIGTERM", options = {}) {
 }
 
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
-  const invocation = buildChildInvocation(cmd, args, lease, sessionId, options.env);
+  const invocation = buildChildInvocation(
+    cmd,
+    args,
+    lease,
+    sessionId,
+    options.env,
+    options.buildLease || null,
+  );
   const detachChild = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
     stdio: options.stdio || "inherit",
     env: invocation.env,
+    cwd: options.cwd,
     detached: detachChild,
   });
 
@@ -891,6 +932,20 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
 
     child.on("error", (err) => {
       cleanupListenersAndTimers();
+      if (typeof options.onChildExit === "function") {
+        try {
+          options.onChildExit({
+            childPid,
+            exitedCleanly: false,
+            exitCode: 1,
+            code: 1,
+            signal: null,
+            aborted: true,
+          });
+        } catch {
+          // Best-effort exit callback
+        }
+      }
       reject(err);
     });
 
@@ -898,26 +953,41 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
       const effectiveSignal = signal || wrapperSignal;
       const finishClose = () => {
         cleanupListenersAndTimers();
+        let resolvedExitCode = 1;
+        if (wrapperSignal) {
+          const sigNum = os.constants?.signals?.[wrapperSignal];
+          resolvedExitCode = typeof sigNum === "number" ? 128 + sigNum : 1;
+        } else if (typeof code === "number") {
+          resolvedExitCode = code;
+        } else if (effectiveSignal) {
+          const sigNum = os.constants?.signals?.[effectiveSignal];
+          resolvedExitCode = typeof sigNum === "number" ? 128 + sigNum : 1;
+        }
+        if (typeof options.onChildExit === "function") {
+          try {
+            options.onChildExit({
+              childPid,
+              exitedCleanly: !effectiveSignal,
+              exitCode: resolvedExitCode,
+              code: resolvedExitCode,
+              signal: effectiveSignal || null,
+              aborted: Boolean(
+                effectiveSignal ||
+                  resolvedExitCode === 130 ||
+                  resolvedExitCode === 137 ||
+                  resolvedExitCode === 143,
+              ),
+            });
+          } catch {
+            // Best-effort exit callback
+          }
+        }
         try {
           onHeartbeat();
         } catch {
           // Ignore final heartbeat error
         }
-        if (wrapperSignal) {
-          const sigNum = os.constants?.signals?.[wrapperSignal];
-          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
-          return;
-        }
-        if (typeof code === "number") {
-          resolve(code);
-          return;
-        }
-        if (effectiveSignal) {
-          const sigNum = os.constants?.signals?.[effectiveSignal];
-          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
-          return;
-        }
-        resolve(1);
+        resolve(resolvedExitCode);
       };
 
       if (childPid && isProcessGroupAlive(childPid)) {
@@ -934,6 +1004,12 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
               sleepSync(25);
             }
           }
+          finishClose();
+          return;
+        }
+        if (options.buildMode) {
+          // Do not block or kill detached shared build daemons (GradleDaemon, kotlin-daemon, Bazel server)
+          // when the build client wrapper exits normally.
           finishClose();
           return;
         }

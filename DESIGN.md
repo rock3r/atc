@@ -503,7 +503,11 @@ atc/
 │   ├── guides/                        # Embedded Markdown guides (workflow, profiles, snapshots, multi-agent, traps)
 │   ├── lock.mjs
 │   ├── state.mjs
+│   ├── build.mjs                      # 3-tier build + device co-scheduler, workspace locks & daemon draining
+│   ├── logger.mjs                     # OS-native structured JSONL audit logger & log rotator
 │   ├── android.mjs
+│   ├── ios.mjs
+│   ├── heartbeat.mjs
 │   ├── spawn.mjs
 │   ├── guard.mjs                      # Host-agnostic shell command classifier & rewriter
 │   ├── hook.mjs                       # Stdin JSON adapter for PreToolUse / Stop hooks
@@ -666,4 +670,56 @@ If ATC treated a failing discovery command (`xcrun simctl list` or `android emul
      | **Android (Linux `emu`)** | `/dev/kvm` missing or `EACCES` when attempting to boot an x86_64 emulator | Fail fast: *"Linux KVM acceleration unavailable (`/dev/kvm` permission denied). Add user to the `kvm` group."* |
 3. **Allowlisting SDK / Setup Commands in `atc guard` (§7.1 & §9.4):**
    - Non-device setup and inspection commands — `android sdk ...`, `sdkmanager ...`, `xcodebuild (-version|-showsdks|-list|-downloadPlatform|-checkFirstLaunchStatus)`, `xcrun simctl (list|help|runtime)`, and `xcrun devicectl (list|help)` — are classified as **Allowed without a device lease** so agents can install user-space SDK packages/runtimes or inspect toolchains unimpeded.
+
+---
+
+## 10. Build + Device Co-Scheduling & System Audit Logging
+
+### 10.1 Cross-Starvation Hazards & Co-Scheduling Model
+When multiple coding agents run heavy builds (`./gradlew`, `bazel`/`bazelisk`/`./bazelw`, `xcodebuild`) alongside mobile emulators and devices, independent queues cause two cross-starvation deadlocks:
+1. **Forward Starvation (Device-Wait-While-Holding-Build):** A device-coupled build (`./gradlew connectedDebugAndroidTest`, `xcodebuild test`) acquires a compiler slot and 4+ GB of daemon RAM before checking whether a target device is free, stalling the build pool while waiting for a device.
+2. **Reverse Starvation (Build-Wait-While-Holding-Device):** An interactive agent claims a scarce emulator first (`atc claim`), then invokes `./gradlew installDebug` or `assembleDebug`, getting queued behind pure CPU builds from other agents while holding the emulator idle.
+
+ATC solves both hazards via **coupled admission under `atc.lock` (`src/build.mjs`)**:
+- **Atomic One-Shot Co-Allocation (`atc exec --claim "<flags>" -- <cmd>`):** Verifies and reserves **both** a matching device candidate and a Tier 1 build slot inside the same `<20ms` state transaction. If the device requires a cold boot (`Tier 1/2/3`), ATC writes a `"starting"` device lease and a `"preparing_device"` build lease simultaneously so the build slot and workspace keys are waiting the moment the emulator finishes booting.
+- **3-Tier Priority Build Queue (`state.buildQueue`) + Burst Slot (`maxDeviceHolderBurstBuilds`):**
+  - **Tier 0 (`starved`):** Any build ticket queued `>= buildReorderWindowSec` (`120s`). Eligible for Base + Burst slots (`maxConcurrentBuilds + maxDeviceHolderBurstBuilds`).
+  - **Tier 1 (`device-holder`):** Any caller holding an online `"active"` device lease or co-allocating via `--claim`. Eligible for Base + Burst slots (`2 + 1 = 3` default) and jumps ahead of Tier 2 tickets that have waited `< 120s`.
+  - **Tier 2 (`pure-build`):** Pure compilation tasks without a device lease (`atc exec --build -- ./gradlew assembleDebug`). Capped at `maxConcurrentBuilds` (`2` default).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Queued: state.buildQueue (when workspace busy, slots full, or RAM low)
+    [*] --> PreparingDevice: atc exec --claim (Tier 1/2/3 cold device boot)
+    [*] --> Active: Immediate admission (Tier 0/1/2 or re-entrant reuse)
+    Queued --> Active: Slot + workspaceKeys + RAM available
+    PreparingDevice --> Active: Device boot completes -> transition to active
+    Active --> Draining: Wrapper PID exits (2500ms daemon lock release cooldown)
+    Draining --> [*]: Daemon idle / 2500ms elapsed -> delete buildLease
+```
+
+### 10.2 Per-Workspace Mutual Exclusion, Daemon Safety & Re-Entrant Sub-Builds
+1. **Multi-Key Workspace Locking (`workspaceKeys`):**
+   - **Gradle (`gradle` / `./gradlew`):** Locks both the root workspace (`gradle:<rootDir>`, walking up to the highest `settings.gradle[.kts]` or `gradlew`) and the subproject (`gradle:dir:<projectDir>`).
+   - **Bazel (`bazel` / `bazelisk` / `./bazelw`):** Locks both the workspace root (`bazel:ws:<rootDir>`, via `MODULE.bazel` / `WORKSPACE`) and any explicit `--output_base` (`bazel:out:<outputBase>`).
+   - **Xcode (`xcodebuild`):** Locks the project/workspace directory (`xcode:<dir>`) and any explicit `-derivedDataPath` (`xcode:dd:<path>`).
+2. **Daemon Kill Blocking & `"draining"` Cooldown (`buildDaemonDrainMs = 2500`):**
+   - `atc guard` blocks global daemon termination commands (`./gradlew --stop`, `bazel shutdown`, `bazel clean --expunge`) with exit code `2` so one agent cannot crash another agent's compilation.
+   - Because Gradle and Bazel client wrappers can exit milliseconds before their background daemon releases its workspace lock, `cmdExec` transitions finished build leases to `state: "draining"` (`drainingUntilMs = now + 2500`). `reconcileDrainingBuildLeases()` keeps the workspace keys locked against other sessions until the daemon exits or `drainingUntilMs` elapses.
+3. **Re-Entrant Nested Build Admission (`ATC_BUILD_OP_ID` & `ATC_BUILD_OP_NONCE`):**
+   - `atc exec` exports `ATC_BUILD_OP_ID=<opId>` and `ATC_BUILD_OP_NONCE=<nonce>` into the child environment.
+   - When a nested build (e.g., an `xcodebuild` Run Script phase invoking `./gradlew` in a KMP project) runs inside the parent's live process group, `evaluateNestedBuildAdmission()` validates the parent lease's `opId`, `nonce`, and worker PGID liveness, reusing the parent's concurrency slot (`reentrantReuse`) and acquiring only delta `workspaceKeys` not already held by the parent.
+
+### 10.3 Unified Host RAM Accounting & CPU Flag Shaping
+- **Warm vs. Cold Daemon RAM (`probeWarmBuildDaemons`):** Outside `atc.lock`, ATC inspects `ps -ax -o pid=,rss=,command=` to detect whether a warm `GradleDaemon` or `bazel(<workspace>)` server already covers the target workspace. Warm daemons require `0 MB` additional RAM; cold daemons require `config.buildRamEstimateMb` (`4096 MB`).
+- **Unaccounted Build RAM Window (`computeUnaccountedBuildRamMb`):** Both emulator boot admission (`src/android.mjs`) and build admission (`src/build.mjs`) subtract the estimated RAM of `"preparing_device"` reservations plus `"active"` cold-daemon builds started `< 10,000 ms` ago (whose pages have not yet faulted into OS `availableRamMb`).
+- **Automatic Worker Thread Shaping (`injectBuildResourceFlags`):** Unless the user/agent already passed explicit concurrency flags, `atc exec` injects `-Dorg.gradle.workers.max=<N>` (Gradle), `--jobs=<N>` + `--local_ram_resources=<MB>` (Bazel), or `-jobs <N>` (`xcodebuild`), where `N = max(2, floor(cpuCount / maxConcurrentBuilds))`.
+
+### 10.4 OS-Native Structured JSONL System Audit Logging (`src/logger.mjs`)
+- **Default OS Log Paths (`getDefaultAuditLogDir`):**
+  - **macOS:** `~/Library/Logs/atc/atc-audit.jsonl`
+  - **Linux:** `${XDG_STATE_HOME || ~/.local/state}/atc/logs/atc-audit.jsonl`
+  - **Windows:** `${LOCALAPPDATA}\atc\logs\atc-audit.jsonl`
+- **Strict Lock Boundary (`recordAuditEvent` -> `flushAuditEvents`):** Inside `withStateTransaction`, events are staged in memory on `state._pendingAuditEvents`. After `atc.lock` is released in `finally`, `flushAuditEvents` writes JSONL records (`mode: 0o600`) and performs size-bounded log rotation (`auditLogMaxBytes = 10 MB`, `auditLogMaxFiles = 3`).
+
 

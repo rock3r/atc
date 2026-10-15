@@ -4,7 +4,7 @@ Android Traffic Control (`atc`) does not collect any data. The CLI and plugin co
 
 ## Local operation
 
-The plugin helps your coding agent run the `atc` CLI against the Android SDK (`adb`, `emulator`, and the official `android` CLI) on your computer. Lease records, queue tickets, and configuration stay on your local filesystem under your user-private state directory (`~/.local/share/atc`, `~/Library/Application Support/atc`, or `%LOCALAPPDATA%\atc`); they are never sent over the network by `atc`.
+The plugin helps your coding agent run the `atc` CLI against the Android SDK (`adb`, `emulator`, and the official `android` CLI), Xcode (`xcrun simctl`, `xcrun devicectl`), and local build tools (`gradle`, `bazel`, `xcodebuild`) on your computer. Lease records, build slots, queue tickets, configuration, and local JSONL audit logs (`~/Library/Logs/atc/atc-audit.jsonl`, `~/.local/state/atc/logs/atc-audit.jsonl`, or `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl`) stay on your local filesystem under your user-private state and log directories (`~/.local/share/atc`, `~/Library/Application Support/atc`, or `%LOCALAPPDATA%\atc`); they are never sent over the network by `atc`.
 
 ## Third-party services
 
