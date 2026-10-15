@@ -2272,6 +2272,21 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       }),
     });
     assert.equal(inheritedHomeLeakProbe.warm, false);
+
+    // command/builtin-wrapped cd updates active shell directory for subsequent build invocations
+    const commandCdReqs = resolveBuildResources(
+      "sh",
+      ["-c", "command cd app; ./gradlew build"],
+      wsDir,
+    );
+    assert.ok(commandCdReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
+
+    const builtinCdReqs = resolveBuildResources(
+      "bash",
+      ["-c", "builtin cd app; ./gradlew build"],
+      wsDir,
+    );
+    assert.ok(builtinCdReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

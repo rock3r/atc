@@ -6160,6 +6160,12 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             state.buildLeases[buildId] = buildLease;
 
             if (!lease && coClaimNeedsColdOrPrep) {
+              retainedBuildTicket = {
+                ticketId: ticket.ticketId,
+                seq: ticket.seq,
+                enqueuedAtMs: ticket.enqueuedAtMs,
+                starvationDeadlineMs: ticket.starvationDeadlineMs,
+              };
               return {
                 mutated: true,
                 value: {
@@ -6167,6 +6173,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                   buildLease,
                   sessionId: identity.sessionId,
                   ttlMs,
+                  waitSec,
                   waitExpiresAtMs,
                   waitedMs: Math.max(0, now - ticket.enqueuedAtMs),
                 },
@@ -6304,16 +6311,12 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }
 
     if (txRes.status === "needs_cold_claim") {
-      const remainingWaitSec = Math.max(
-        0,
-        Math.ceil(((txRes.waitExpiresAtMs ?? startWaitMs) - Date.now()) / 1000),
-      );
       const effectiveClaimFlags = {
         ...claimFlags,
         ...(claimFlags.platform || claimFlags.ios || claimFlags.android
           ? {}
           : { platform: resolvedClaimPlatform }),
-        wait: remainingWaitSec,
+        wait: 0,
       };
       let claimRes;
       try {
@@ -6343,8 +6346,18 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             // Best-effort rollback of reserved build lease
           }
         }
+        if (
+          claimRes?.exitCode === 2 &&
+          (txRes.waitSec ?? 0) > 0 &&
+          Date.now() < (txRes.waitExpiresAtMs ?? startWaitMs)
+        ) {
+          coClaimInventory = null;
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
         return claimRes || { exitCode: 1, error: "Device claim failed during co-allocation." };
       }
+      retainedBuildTicket = null;
       const claimedLease = claimRes.lease;
       const coldCreatedNewLease = Boolean(!claimRes.idempotent);
       if (coldCreatedNewLease && claimedLease?.leaseId) {

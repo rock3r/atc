@@ -1222,6 +1222,49 @@ export function buildChildInvocation(
               rewrittenParts[idx] = part;
               continue;
             }
+            let unwrappedCommandOrBuiltin = false;
+            while (rawTokens.length > 1) {
+              const firstClean = stripSentinels(rawTokens[0]).toLowerCase();
+              if (firstClean === "builtin") {
+                rawTokens.shift();
+                if (rawTokens[0] && stripSentinels(rawTokens[0]) === "--") {
+                  rawTokens.shift();
+                }
+                unwrappedCommandOrBuiltin = true;
+                continue;
+              }
+              if (firstClean === "command") {
+                let ci = 1;
+                let isQuery = false;
+                while (ci < rawTokens.length) {
+                  const ca = stripSentinels(rawTokens[ci]);
+                  if (ca === "--") {
+                    ci++;
+                    break;
+                  }
+                  if (ca.startsWith("-") && /[vV]/.test(ca)) {
+                    isQuery = true;
+                    break;
+                  }
+                  if (ca.startsWith("-")) {
+                    ci++;
+                    continue;
+                  }
+                  break;
+                }
+                if (!isQuery && ci < rawTokens.length) {
+                  rawTokens.splice(0, ci);
+                  unwrappedCommandOrBuiltin = true;
+                  continue;
+                }
+              }
+              break;
+            }
+            if (rawTokens.length === 0) {
+              popSubshells();
+              rewrittenParts[idx] = part;
+              continue;
+            }
             const headTok = stripSentinels(rawTokens[0]);
             const headLower = headTok.toLowerCase();
             let fnTokIdx = 0;
@@ -1252,7 +1295,7 @@ export function buildChildInvocation(
             }
             const candidateFnName =
               fnTokIdx < rawTokens.length ? stripSentinels(rawTokens[fnTokIdx]) : "";
-            if (candidateFnName && fnDefs.has(candidateFnName)) {
+            if (!unwrappedCommandOrBuiltin && candidateFnName && fnDefs.has(candidateFnName)) {
               const fnDef = fnDefs.get(candidateFnName);
               const fnIsTainted = Boolean(
                 fnDef.tainted ||

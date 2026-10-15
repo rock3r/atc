@@ -1388,6 +1388,14 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       curArgs = curArgs.slice(i + 1);
       continue;
     }
+    if (base === "builtin") {
+      let i = 0;
+      if (curArgs[0] === "--") i = 1;
+      if (i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      curArgs = curArgs.slice(i + 1);
+      continue;
+    }
     if (base === "command") {
       let i = 0;
       let queryMode = false;
@@ -2063,6 +2071,48 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               }
             }
           }
+          let unwrappedCommandOrBuiltin = false;
+          while (rawTokens.length > 1) {
+            const firstClean = stripLiteralSentinels(rawTokens[0]).toLowerCase();
+            if (firstClean === "builtin") {
+              rawTokens.shift();
+              if (rawTokens[0] && stripLiteralSentinels(rawTokens[0]) === "--") {
+                rawTokens.shift();
+              }
+              unwrappedCommandOrBuiltin = true;
+              continue;
+            }
+            if (firstClean === "command") {
+              let ci = 1;
+              let isQuery = false;
+              while (ci < rawTokens.length) {
+                const ca = stripLiteralSentinels(rawTokens[ci]);
+                if (ca === "--") {
+                  ci++;
+                  break;
+                }
+                if (ca.startsWith("-") && /[vV]/.test(ca)) {
+                  isQuery = true;
+                  break;
+                }
+                if (ca.startsWith("-")) {
+                  ci++;
+                  continue;
+                }
+                break;
+              }
+              if (!isQuery && ci < rawTokens.length) {
+                rawTokens.splice(0, ci);
+                unwrappedCommandOrBuiltin = true;
+                continue;
+              }
+            }
+            break;
+          }
+          if (rawTokens.length === 0) {
+            popSubshells();
+            continue;
+          }
           const headTok = stripLiteralSentinels(rawTokens[0]);
           const headLower = headTok.toLowerCase();
           let fnTokIdx = 0;
@@ -2090,7 +2140,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           }
           const candidateFnName =
             fnTokIdx < rawTokens.length ? stripLiteralSentinels(rawTokens[fnTokIdx]) : "";
-          if (candidateFnName && fnDefs.has(candidateFnName)) {
+          if (!unwrappedCommandOrBuiltin && candidateFnName && fnDefs.has(candidateFnName)) {
             const fnDef = fnDefs.get(candidateFnName);
             fnDef.called = true;
             const fnIsTainted = Boolean(
