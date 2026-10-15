@@ -558,6 +558,7 @@ export function splitShellClauseRedirAndGroup(part) {
   let coreEnd = s.slice(0, wsPos);
   let suffix = "";
   let closedSubshells = 0;
+  let closedBraces = 0;
 
   const hdStart = fullMask.subarray(0, coreEnd.length).indexOf(3);
   if (hdStart !== -1) {
@@ -616,6 +617,7 @@ export function splitShellClauseRedirAndGroup(part) {
       }
       if (parens + braces > 0) {
         closedSubshells += parens;
+        closedBraces += braces;
         suffix = coreEnd.slice(stripPos) + suffix;
         coreEnd = coreEnd.slice(0, stripPos);
         continue;
@@ -626,6 +628,7 @@ export function splitShellClauseRedirAndGroup(part) {
 
   let leadingCore = coreEnd.trim();
   let openedSubshells = 0;
+  let openedBraces = 0;
   const leadingKeywords = [];
   const forLoopVars = [];
   let hasCasePattern = false;
@@ -647,15 +650,20 @@ export function splitShellClauseRedirAndGroup(part) {
           continue;
         }
         openedSubshells++;
+      } else {
+        openedBraces++;
       }
       leadingCore = leadingCore.slice(1).trim();
       continue;
     }
     const kwMatch = leadingCore.match(
-      /^(?:(then|else|do|if|elif|while|until|fi|done|esac|!)(?=\s|[({]|$)|(for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+in\b[^;\n]*)?)(?=\s|[({]|$)|(case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in)(?=\s|[({]|$))/,
+      /^(?:(then|else|do|if|elif|while|until|fi|done|esac|!)(?=\s|[({]|$)|(for\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+in\b[^;\n]*)?)(?=\s|[({]|$)|(case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in)(?=\s|[({]|$)|((?:function\s+[A-Za-z_][A-Za-z0-9_.-]*(?:\s*\(\s*\))?|[A-Za-z_][A-Za-z0-9_.-]*\s*\(\s*\)))(?=\s|[({]|$))/,
     );
     if (kwMatch) {
-      const kw = (kwMatch[1] || (kwMatch[2] ? "for" : "case")).toLowerCase();
+      const kw = (
+        kwMatch[1] ||
+        (kwMatch[2] ? "for" : kwMatch[4] ? "case" : "function")
+      ).toLowerCase();
       if (kw !== "!") {
         leadingKeywords.push(kw);
       }
@@ -689,6 +697,8 @@ export function splitShellClauseRedirAndGroup(part) {
     trailingWs,
     openedSubshells,
     closedSubshells,
+    openedBraces,
+    closedBraces,
     leadingKeywords,
     forLoopVars,
     hasCasePattern,
@@ -1347,6 +1357,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         let shellEnv = { ...baseEnv, ...envVars };
         let curShellEnvVars = { ...envVars };
         let taintedEnvVars = new Set(incomingTaintedVars);
+        const candidateBuildToolEnv = {};
+        for (const [ek, ev] of Object.entries(shellEnv)) {
+          if (typeof ev === "string" && normalizeBuildToolName(ev)) {
+            candidateBuildToolEnv[ek] = ev;
+          }
+        }
+        let braceDepth = 0;
         let pushdStack = [];
         const cwdStack = [];
         const controlStack = [];
@@ -1514,6 +1531,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             strippedClause,
             openedSubshells,
             closedSubshells,
+            openedBraces,
+            closedBraces,
             leadingKeywords,
             forLoopVars,
             hasCasePattern,
@@ -1525,6 +1544,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               shellEnv: { ...shellEnv },
               envVars: { ...curShellEnvVars },
               taintedEnvVars: new Set(taintedEnvVars),
+              braceDepth,
               pushdStack: [...pushdStack],
               chainHasCondition,
               chainSawOrOrPipe,
@@ -1543,7 +1563,31 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             });
             resetChainState();
           }
+          const prevBraceDepth = braceDepth;
+          braceDepth += openedBraces || 0;
           const popSubshells = () => {
+            if (closedBraces > 0) {
+              braceDepth = Math.max(0, braceDepth - closedBraces);
+              while (true) {
+                const topFn = findTopControlFrame(["function"]);
+                if (!topFn || topFn.frame.braceDepth < braceDepth) break;
+                controlStack.splice(topFn.index, 1);
+                if (topFn.frame.mutatedCwd) {
+                  curShellUnresolvedCwd = true;
+                } else {
+                  curShellRelCwd = topFn.frame.entryCwd;
+                  curShellUnresolvedCwd = topFn.frame.entryUnresolvedCwd;
+                  pushdStack = [...topFn.frame.entryPushdStack];
+                }
+                shellEnv = { ...topFn.frame.entryShellEnv };
+                curShellEnvVars = { ...topFn.frame.entryEnvVars };
+                taintedEnvVars = new Set(topFn.frame.entryTaintedEnv);
+                for (const k of topFn.frame.mutatedEnv) {
+                  taintedEnvVars.add(k);
+                }
+                resetChainState();
+              }
+            }
             for (let s = 0; s < closedSubshells; s++) {
               if (cwdStack.length > 0) {
                 const frame = cwdStack.pop();
@@ -1552,6 +1596,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 shellEnv = frame.shellEnv;
                 curShellEnvVars = frame.envVars;
                 taintedEnvVars = frame.taintedEnvVars;
+                braceDepth = frame.braceDepth ?? braceDepth;
                 pushdStack = frame.pushdStack;
                 chainHasCondition = frame.chainHasCondition;
                 chainSawOrOrPipe = frame.chainSawOrOrPipe;
@@ -1571,7 +1616,25 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           };
 
           for (const kw of leadingKeywords || []) {
-            if (kw === "if") {
+            if (kw === "function") {
+              controlStack.push({
+                type: "function",
+                phase: "body",
+                subshellDepth: cwdStack.length,
+                braceDepth: prevBraceDepth,
+                entryCwd: curShellRelCwd,
+                entryUnresolvedCwd: curShellUnresolvedCwd,
+                entryPushdStack: [...pushdStack],
+                entryShellEnv: { ...shellEnv },
+                entryEnvVars: { ...curShellEnvVars },
+                entryTaintedEnv: new Set(taintedEnvVars),
+                condMutatedCwd: false,
+                mutatedCwd: false,
+                condMutatedEnv: new Set(),
+                mutatedEnv: new Set(),
+              });
+              resetChainState();
+            } else if (kw === "if") {
               controlStack.push({
                 type: "if",
                 phase: "cond",
@@ -1833,6 +1896,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                     : expVal.resolved;
                 shellEnv[k] = finalVal;
                 curShellEnvVars[k] = finalVal;
+                if (normalizeBuildToolName(finalVal)) {
+                  candidateBuildToolEnv[k] = finalVal;
+                  if (shellType === "cmd" || base === "powershell" || base === "pwsh") {
+                    candidateBuildToolEnv[k.toUpperCase()] = finalVal;
+                    candidateBuildToolEnv[k.toLowerCase()] = finalVal;
+                  }
+                }
                 recordEnvMutation(k, {
                   isUnresolvedVal: isUnres,
                   sepAfter,
@@ -1868,6 +1938,11 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 : expVal.resolved;
             shellEnv[k] = finalVal;
             curShellEnvVars[k] = finalVal;
+            if (normalizeBuildToolName(finalVal)) {
+              candidateBuildToolEnv[k] = finalVal;
+              candidateBuildToolEnv[k.toUpperCase()] = finalVal;
+              candidateBuildToolEnv[k.toLowerCase()] = finalVal;
+            }
             recordEnvMutation(k, {
               isUnresolvedVal: isUnres,
               sepAfter,
@@ -2101,9 +2176,25 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             shellEnv,
             { taintedVars: taintedEnvVars, shellType },
           );
-          if (normalizeBuildToolName(expandedClause.cmd)) {
+          let matchedToolCmd = normalizeBuildToolName(expandedClause.cmd)
+            ? expandedClause.cmd
+            : null;
+          let forceUnresolvedCmd = false;
+          if (!matchedToolCmd && expandedClause.unresolved) {
+            const candidateExp = expandOrValidateShellPath(
+              peeled.cmd,
+              { ...shellEnv, ...candidateBuildToolEnv },
+              { shellType },
+            );
+            if (candidateExp.resolved && normalizeBuildToolName(candidateExp.resolved)) {
+              matchedToolCmd = candidateExp.resolved;
+              forceUnresolvedCmd = true;
+            }
+          }
+          if (matchedToolCmd) {
             const clauseUnresolvedCwd = Boolean(
-              peeled.unresolvedDynamicCwd ||
+              forceUnresolvedCmd ||
+                peeled.unresolvedDynamicCwd ||
                 expandedClause.unresolved ||
                 (curShellUnresolvedCwd && !(peeled.relCwd && path.isAbsolute(peeled.relCwd))),
             );
@@ -2119,7 +2210,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               mergedClauseEnvVars.JAVA_HOME = "__UNRESOLVED_DYNAMIC_ENV__";
             }
             matchedClauses.push({
-              cmd: expandedClause.cmd,
+              cmd: matchedToolCmd,
               args: expandedClause.args,
               relCwd: effectiveRelCwd,
               envVars: mergedClauseEnvVars,
@@ -2300,21 +2391,28 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = [], op
     }
     const kwMatch = s
       .slice(leadingOffset)
-      .match(/^(?:then|else|do|if|elif|while|until|!)(?=\s|[({]|$)/);
+      .match(
+        /^(?:(?:then|else|do|if|elif|while|until|fi|done|esac|!)|(for\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b[^;\n]*)?)|(case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in)|(?:function\s+[A-Za-z_][A-Za-z0-9_.-]*(?:\s*\(\s*\))?|[A-Za-z_][A-Za-z0-9_.-]*\s*\(\s*\)))(?=\s|[({]|$)/,
+      );
     if (kwMatch) {
       leadingOffset += kwMatch[0].length;
       continue;
     }
     break;
   }
-  const spans = tokenizeShellClauseWithSpans(s.slice(leadingOffset));
+  const spans = tokenizeShellClauseWithSpans(s.slice(leadingOffset), { markLiterals: true });
   const bazelIdx = spans.findIndex((t) => {
-    const exp = options?.env ? expandOrValidateShellPath(t.value, options.env) : null;
+    const exp = options?.env
+      ? expandOrValidateShellPath(t.value, options.env, {
+          taintedVars: options.taintedVars,
+          shellType: options.shellType,
+        })
+      : null;
     const candidate = exp && !exp.unresolved && exp.resolved ? exp.resolved : t.value;
-    return normalizeBuildToolName(candidate) === "bazel";
+    return normalizeBuildToolName(stripLiteralSentinels(candidate)) === "bazel";
   });
   if (bazelIdx === -1) return corePart;
-  const afterBazel = spans.slice(bazelIdx + 1).map((t) => t.value);
+  const afterBazel = spans.slice(bazelIdx + 1).map((t) => stripLiteralSentinels(t.value));
   const subRelIdx = findBazelSubcommandIndex(
     afterBazel,
     new Set(["build", "test", "run", "coverage"]),
@@ -2341,6 +2439,46 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         "Backgrounded build commands (`&`) cannot be coordinated by atc exec because the shell exits before the build finishes.",
     };
   }
+  if (allBuildClauses && allBuildClauses.length >= 1) {
+    const clauseResults = allBuildClauses.map((c) => classifyBuildCommand(c.cmd, c.args));
+    const deny = clauseResults.find((r) => r.kind === "deny_lifecycle");
+    if (deny) return deny;
+    const reject = clauseResults.find((r) => r.kind === "reject_long_running");
+    if (reject) return reject;
+    if (unresolvedDynamicCwd) {
+      return {
+        kind: "deny_lifecycle",
+        tool: normalizeBuildToolName(cmd) || "multi",
+        targetPlatform: null,
+        requiresDevice: false,
+        requiresHeavySlot: false,
+        requiresWorkspaceLock: false,
+        unresolvedDynamicCwd: true,
+        reason:
+          "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
+      };
+    }
+    if (allBuildClauses.length > 1) {
+      const requiresDevice = clauseResults.some((r) => r.requiresDevice);
+      const requiresHeavySlot = clauseResults.some((r) => r.requiresHeavySlot);
+      const requiresWorkspaceLock = clauseResults.some((r) => r.requiresWorkspaceLock);
+      const kind = requiresDevice
+        ? "device_coupled_build"
+        : requiresHeavySlot
+          ? "pure_build"
+          : requiresWorkspaceLock
+            ? "workspace_only"
+            : "not_build_tool";
+      return {
+        ...clauseResults[0],
+        kind,
+        targetPlatform: clauseResults.find((r) => r.targetPlatform)?.targetPlatform || null,
+        requiresDevice,
+        requiresHeavySlot,
+        requiresWorkspaceLock,
+      };
+    }
+  }
   if (unresolvedDynamicCwd) {
     return {
       kind: "deny_lifecycle",
@@ -2352,31 +2490,6 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       unresolvedDynamicCwd: true,
       reason:
         "Unresolved dynamic directory change in shell wrapper cannot be mapped to a workspace lock; expand or export the target directory variable before invoking atc exec.",
-    };
-  }
-  if (allBuildClauses && allBuildClauses.length > 1) {
-    const clauseResults = allBuildClauses.map((c) => classifyBuildCommand(c.cmd, c.args));
-    const deny = clauseResults.find((r) => r.kind === "deny_lifecycle");
-    if (deny) return deny;
-    const reject = clauseResults.find((r) => r.kind === "reject_long_running");
-    if (reject) return reject;
-    const requiresDevice = clauseResults.some((r) => r.requiresDevice);
-    const requiresHeavySlot = clauseResults.some((r) => r.requiresHeavySlot);
-    const requiresWorkspaceLock = clauseResults.some((r) => r.requiresWorkspaceLock);
-    const kind = requiresDevice
-      ? "device_coupled_build"
-      : requiresHeavySlot
-        ? "pure_build"
-        : requiresWorkspaceLock
-          ? "workspace_only"
-          : "not_build_tool";
-    return {
-      ...clauseResults[0],
-      kind,
-      targetPlatform: clauseResults.find((r) => r.targetPlatform)?.targetPlatform || null,
-      requiresDevice,
-      requiresHeavySlot,
-      requiresWorkspaceLock,
     };
   }
   const tool = normalizeBuildToolName(cmd);

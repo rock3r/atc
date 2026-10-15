@@ -481,8 +481,8 @@ export function buildChildInvocation(
   cmd = effectiveCmd;
   args = effectiveArgs;
   const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
-  const buildClassified = classifyBuildCommand(cmd, args);
-  if (buildClassified.kind === "deny_lifecycle") {
+  const buildClassified = classifyBuildCommand(cmd, args, { env: baseEnv || process.env });
+  if (buildClassified.kind === "deny_lifecycle" && !buildClassified.unresolvedDynamicCwd) {
     throw new Error(buildClassified.reason);
   }
   const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
@@ -832,31 +832,351 @@ export function buildChildInvocation(
           ? nextArgs.slice(cIdx + 1).join(" ")
           : String(nextArgs[cIdx + 1] || "");
         const shellType = base === "cmd" ? "cmd" : "posix";
+        const isAmpersandBackground = base !== "cmd";
         const stripSentinels = (v) => String(v || "").replaceAll("\uE000", "");
-        const rewriteShellScript = (scriptText, initialEnv) => {
-          const curShellEnv = { ...(initialEnv || {}) };
-          const parts = splitShellScriptParts(scriptText);
-          const rewrittenParts = parts.map((rawPart, idx) => {
-            if (idx % 2 === 1) return rawPart;
-            let part = rawPart;
-            const subs = scanExecutableSubstitutions(part);
-            if (subs.length > 0) {
-              for (let si = subs.length - 1; si >= 0; si--) {
-                const sub = subs[si];
-                const rewrittenBody = rewriteShellScript(sub.body, curShellEnv);
-                if (rewrittenBody !== sub.body) {
-                  part = `${part.slice(0, sub.bodyStart)}${rewrittenBody}${part.slice(sub.bodyEnd)}`;
+        const rewriteShellScript = (scriptText, initialEnv, initialTainted = new Set()) => {
+          let curShellEnv = { ...(initialEnv || {}) };
+          let taintedEnvVars = new Set(initialTainted);
+          let braceDepth = 0;
+          const envStack = [];
+          const controlStack = [];
+          let chainHasCondition = false;
+          let chainSawOrOrPipe = false;
+          let chainMutatedEnv = new Set();
+          let chainAnyEnvMutation = new Set();
+          let currentClauseBackgrounded = false;
+          const captureChainEntryState = () => ({
+            shellEnv: { ...curShellEnv },
+            taintedEnvVars: new Set(taintedEnvVars),
+          });
+          let chainEntryState = captureChainEntryState();
+
+          const findTopControlFrame = (types = null) => {
+            for (let i = controlStack.length - 1; i >= 0; i--) {
+              const f = controlStack[i];
+              if (f.subshellDepth !== envStack.length) continue;
+              if (!types || types.includes(f.type)) return { frame: f, index: i };
+            }
+            return null;
+          };
+
+          const resetChainState = () => {
+            chainHasCondition = false;
+            chainSawOrOrPipe = false;
+            chainMutatedEnv = new Set();
+            chainAnyEnvMutation = new Set();
+            chainEntryState = captureChainEntryState();
+          };
+
+          const recordEnvMutation = (
+            varName,
+            { isUnresolvedVal = false, sepAfter = null, hasCasePattern = false } = {},
+          ) => {
+            if (!varName) return;
+            const cleanName = stripSentinels(varName);
+            const normKeys =
+              shellType === "cmd" || base === "powershell" || base === "pwsh"
+                ? [cleanName, cleanName.toUpperCase(), cleanName.toLowerCase()]
+                : [cleanName];
+            const inCaseBlock = Boolean(findTopControlFrame(["case"]));
+            for (const k of normKeys) {
+              chainAnyEnvMutation.add(k);
+              if (chainHasCondition) {
+                chainMutatedEnv.add(k);
+              }
+              if (
+                isUnresolvedVal ||
+                chainSawOrOrPipe ||
+                sepAfter === "|" ||
+                (hasCasePattern && !inCaseBlock)
+              ) {
+                taintedEnvVars.add(k);
+              } else if (!chainHasCondition) {
+                taintedEnvVars.delete(k);
+              }
+              if (!currentClauseBackgrounded) {
+                for (const frame of controlStack) {
+                  if (frame.subshellDepth === envStack.length) {
+                    frame.mutatedEnv.add(k);
+                    if (frame.phase === "cond") {
+                      frame.condMutatedEnv.add(k);
+                    }
+                  }
                 }
               }
             }
+          };
+
+          const parts = splitShellScriptParts(scriptText);
+          const rewrittenParts = parts.map((rawPart, idx) => {
+            if (idx % 2 === 1) return rawPart;
+            const sepBefore = idx >= 2 ? parts[idx - 1].trim() || "\n" : null;
+            const sepAfter = idx + 1 < parts.length ? parts[idx + 1].trim() || "\n" : null;
+            currentClauseBackgrounded = isAmpersandBackground && sepAfter === "&";
+
+            if (
+              sepBefore === ";" ||
+              sepBefore === ";;" ||
+              sepBefore === "\n" ||
+              sepBefore === "&"
+            ) {
+              if (sepBefore === "&" && isAmpersandBackground) {
+                curShellEnv = { ...chainEntryState.shellEnv };
+                taintedEnvVars = new Set(chainEntryState.taintedEnvVars);
+              } else {
+                for (const k of chainMutatedEnv) {
+                  taintedEnvVars.add(k);
+                }
+              }
+              if (sepBefore === ";;") {
+                const topCase = findTopControlFrame(["case"])?.frame;
+                if (topCase) {
+                  curShellEnv = { ...topCase.entryShellEnv };
+                  taintedEnvVars = new Set(topCase.entryTaintedEnv);
+                }
+              }
+              resetChainState();
+            } else if (sepBefore === "||" || sepBefore === "|") {
+              chainHasCondition = true;
+              chainSawOrOrPipe = true;
+              for (const k of chainAnyEnvMutation) {
+                taintedEnvVars.add(k);
+              }
+            }
+
+            let part = rawPart;
+            let {
+              corePart,
+              strippedClause,
+              redirSuffix,
+              trailingWs,
+              openedSubshells,
+              closedSubshells,
+              openedBraces,
+              closedBraces,
+              leadingKeywords,
+              forLoopVars,
+              hasCasePattern,
+            } = splitShellClauseRedirAndGroup(part);
+
+            for (let s = 0; s < openedSubshells; s++) {
+              envStack.push({
+                shellEnv: { ...curShellEnv },
+                taintedEnvVars: new Set(taintedEnvVars),
+                braceDepth,
+                chainHasCondition,
+                chainSawOrOrPipe,
+                chainMutatedEnv: new Set(chainMutatedEnv),
+                chainAnyEnvMutation: new Set(chainAnyEnvMutation),
+                chainEntryState: {
+                  shellEnv: { ...chainEntryState.shellEnv },
+                  taintedEnvVars: new Set(chainEntryState.taintedEnvVars),
+                },
+              });
+              resetChainState();
+            }
+            const prevBraceDepth = braceDepth;
+            braceDepth += openedBraces || 0;
+
+            const popSubshells = () => {
+              if (closedBraces > 0) {
+                braceDepth = Math.max(0, braceDepth - closedBraces);
+                while (true) {
+                  const topFn = findTopControlFrame(["function"]);
+                  if (!topFn || topFn.frame.braceDepth < braceDepth) break;
+                  controlStack.splice(topFn.index, 1);
+                  curShellEnv = { ...topFn.frame.entryShellEnv };
+                  taintedEnvVars = new Set(topFn.frame.entryTaintedEnv);
+                  for (const k of topFn.frame.mutatedEnv) {
+                    taintedEnvVars.add(k);
+                  }
+                  resetChainState();
+                }
+              }
+              for (let s = 0; s < closedSubshells; s++) {
+                if (envStack.length > 0) {
+                  const frame = envStack.pop();
+                  curShellEnv = frame.shellEnv;
+                  taintedEnvVars = frame.taintedEnvVars;
+                  braceDepth = frame.braceDepth ?? braceDepth;
+                  chainHasCondition = frame.chainHasCondition;
+                  chainSawOrOrPipe = frame.chainSawOrOrPipe;
+                  chainMutatedEnv = frame.chainMutatedEnv;
+                  chainAnyEnvMutation = frame.chainAnyEnvMutation;
+                  chainEntryState = frame.chainEntryState;
+                  while (
+                    controlStack.length > 0 &&
+                    controlStack[controlStack.length - 1].subshellDepth > envStack.length
+                  ) {
+                    controlStack.pop();
+                  }
+                }
+              }
+            };
+
+            for (const kw of leadingKeywords || []) {
+              if (kw === "function") {
+                controlStack.push({
+                  type: "function",
+                  phase: "body",
+                  subshellDepth: envStack.length,
+                  braceDepth: prevBraceDepth,
+                  entryShellEnv: { ...curShellEnv },
+                  entryTaintedEnv: new Set(taintedEnvVars),
+                  condMutatedEnv: new Set(),
+                  mutatedEnv: new Set(),
+                });
+                resetChainState();
+              } else if (kw === "if") {
+                controlStack.push({
+                  type: "if",
+                  phase: "cond",
+                  subshellDepth: envStack.length,
+                  entryShellEnv: { ...curShellEnv },
+                  entryTaintedEnv: new Set(taintedEnvVars),
+                  condMutatedEnv: new Set(),
+                  mutatedEnv: new Set(),
+                });
+                resetChainState();
+              } else if (kw === "then") {
+                const found = findTopControlFrame(["if"]);
+                if (found) {
+                  found.frame.phase = "then";
+                }
+                resetChainState();
+              } else if (kw === "elif" || kw === "else") {
+                const found = findTopControlFrame(["if"]);
+                if (found) {
+                  found.frame.phase = kw === "elif" ? "cond" : "else";
+                  curShellEnv = { ...found.frame.entryShellEnv };
+                  taintedEnvVars = new Set(found.frame.entryTaintedEnv);
+                  for (const k of found.frame.condMutatedEnv) {
+                    taintedEnvVars.add(k);
+                  }
+                }
+                resetChainState();
+              } else if (kw === "fi") {
+                const found = findTopControlFrame(["if"]);
+                if (found) {
+                  controlStack.splice(found.index, 1);
+                  curShellEnv = { ...found.frame.entryShellEnv };
+                  taintedEnvVars = new Set(found.frame.entryTaintedEnv);
+                  for (const k of found.frame.mutatedEnv) {
+                    taintedEnvVars.add(k);
+                  }
+                }
+                resetChainState();
+              } else if (kw === "while" || kw === "until" || kw === "for") {
+                const loopMutatedEnv = new Set(forLoopVars || []);
+                for (const fv of loopMutatedEnv) {
+                  taintedEnvVars.add(fv);
+                }
+                controlStack.push({
+                  type: "loop",
+                  phase: kw === "for" ? "body" : "cond",
+                  subshellDepth: envStack.length,
+                  entryShellEnv: { ...curShellEnv },
+                  entryTaintedEnv: new Set(taintedEnvVars),
+                  condMutatedEnv: new Set(),
+                  mutatedEnv: loopMutatedEnv,
+                });
+                resetChainState();
+              } else if (kw === "do") {
+                const found = findTopControlFrame(["loop"]);
+                if (found) {
+                  found.frame.phase = "body";
+                }
+                resetChainState();
+              } else if (kw === "done") {
+                const found = findTopControlFrame(["loop"]);
+                if (found) {
+                  controlStack.splice(found.index, 1);
+                  curShellEnv = { ...found.frame.entryShellEnv };
+                  taintedEnvVars = new Set(found.frame.entryTaintedEnv);
+                  for (const k of found.frame.mutatedEnv) {
+                    taintedEnvVars.add(k);
+                  }
+                }
+                resetChainState();
+              } else if (kw === "case") {
+                controlStack.push({
+                  type: "case",
+                  phase: "arm",
+                  subshellDepth: envStack.length,
+                  entryShellEnv: { ...curShellEnv },
+                  entryTaintedEnv: new Set(taintedEnvVars),
+                  condMutatedEnv: new Set(),
+                  mutatedEnv: new Set(),
+                });
+                resetChainState();
+              } else if (kw === "esac") {
+                const found = findTopControlFrame(["case"]);
+                if (found) {
+                  controlStack.splice(found.index, 1);
+                  curShellEnv = { ...found.frame.entryShellEnv };
+                  taintedEnvVars = new Set(found.frame.entryTaintedEnv);
+                  for (const k of found.frame.mutatedEnv) {
+                    taintedEnvVars.add(k);
+                  }
+                }
+                resetChainState();
+              }
+            }
+
+            if (hasCasePattern) {
+              const topCase = findTopControlFrame(["case"])?.frame;
+              if (topCase) {
+                curShellEnv = { ...topCase.entryShellEnv };
+                taintedEnvVars = new Set(topCase.entryTaintedEnv);
+              }
+              resetChainState();
+            }
+
+            const subs = scanExecutableSubstitutions(part);
+            if (subs.length > 0) {
+              let subChanged = false;
+              for (let si = subs.length - 1; si >= 0; si--) {
+                const sub = subs[si];
+                const rewrittenBody = rewriteShellScript(
+                  sub.body,
+                  curShellEnv,
+                  taintedEnvVars,
+                );
+                if (rewrittenBody !== sub.body) {
+                  part = `${part.slice(0, sub.bodyStart)}${rewrittenBody}${part.slice(sub.bodyEnd)}`;
+                  subChanged = true;
+                }
+              }
+              if (subChanged) {
+                const reSplit = splitShellClauseRedirAndGroup(part);
+                corePart = reSplit.corePart;
+                strippedClause = reSplit.strippedClause;
+                redirSuffix = reSplit.redirSuffix;
+                trailingWs = reSplit.trailingWs;
+              }
+            }
+
             const trimmed = part.trim();
-            if (!trimmed) return part;
-            const { corePart, strippedClause, redirSuffix, trailingWs } =
-              splitShellClauseRedirAndGroup(part);
+            if (!trimmed) {
+              popSubshells();
+              return part;
+            }
             const rawTokens = tokenizeShellClause(strippedClause, { markLiterals: true });
-            if (rawTokens.length === 0) return part;
+            if (rawTokens.length === 0) {
+              popSubshells();
+              return part;
+            }
             const headTok = stripSentinels(rawTokens[0]);
             const headLower = headTok.toLowerCase();
+            if (headLower === "source" || headTok === "." || headLower === "eval") {
+              recordEnvMutation("*", {
+                isUnresolvedVal: true,
+                sepAfter,
+                hasCasePattern,
+              });
+              popSubshells();
+              return part;
+            }
             if (
               headLower === "export" ||
               headLower === "local" ||
@@ -886,16 +1206,31 @@ export function buildChildInvocation(
                   const rawKey = isAppend ? rawBeforeEq.slice(0, -1) : rawBeforeEq;
                   const k = rawKey.replace(/^\$env:/i, "");
                   const rawVal = tok.slice(eqIdx + 1);
-                  const expVal = expandOrValidateShellPath(rawVal, curShellEnv, { shellType });
+                  const expVal = expandOrValidateShellPath(rawVal, curShellEnv, {
+                    taintedVars: taintedEnvVars,
+                    shellType,
+                  });
+                  const prevTainted =
+                    isAppend &&
+                    (taintedEnvVars.has("*") ||
+                      taintedEnvVars.has(k) ||
+                      taintedEnvVars.has(k.toUpperCase()));
+                  const isUnres = expVal.unresolved || prevTainted;
                   const prevVal = isAppend ? String(curShellEnv[k] ?? "") : "";
-                  const finalVal = expVal.unresolved
+                  const finalVal = isUnres
                     ? stripSentinels(rawVal)
                     : isAppend
                       ? prevVal + expVal.resolved
                       : expVal.resolved;
                   curShellEnv[k] = finalVal;
+                  recordEnvMutation(k, {
+                    isUnresolvedVal: isUnres,
+                    sepAfter,
+                    hasCasePattern,
+                  });
                 }
               }
+              popSubshells();
               return part;
             }
             if (
@@ -908,13 +1243,28 @@ export function buildChildInvocation(
               const k = headTok.replace(/^\$env:/i, "");
               const isAppend = stripSentinels(rawTokens[1] || "") === "+=";
               const rawVal = rawTokens.slice(2).join(" ");
-              const expVal = expandOrValidateShellPath(rawVal, curShellEnv, { shellType });
+              const expVal = expandOrValidateShellPath(rawVal, curShellEnv, {
+                taintedVars: taintedEnvVars,
+                shellType,
+              });
+              const prevTainted =
+                isAppend &&
+                (taintedEnvVars.has("*") ||
+                  taintedEnvVars.has(k) ||
+                  taintedEnvVars.has(k.toUpperCase()));
+              const isUnres = expVal.unresolved || prevTainted;
               const prevVal = isAppend ? String(curShellEnv[k] ?? "") : "";
-              curShellEnv[k] = expVal.unresolved
+              curShellEnv[k] = isUnres
                 ? stripSentinels(rawVal)
                 : isAppend
                   ? prevVal + expVal.resolved
                   : expVal.resolved;
+              recordEnvMutation(k, {
+                isUnresolvedVal: isUnres,
+                sepAfter,
+                hasCasePattern,
+              });
+              popSubshells();
               return part;
             }
             if (headLower === "unset") {
@@ -922,20 +1272,43 @@ export function buildChildInvocation(
                 const cleanTok = stripSentinels(tok);
                 if (!cleanTok.startsWith("-")) {
                   delete curShellEnv[cleanTok];
+                  recordEnvMutation(cleanTok, {
+                    isUnresolvedVal: false,
+                    sepAfter,
+                    hasCasePattern,
+                  });
                 }
               }
+              popSubshells();
               return part;
             }
+            if (headLower === "read") {
+              const readVars = rawTokens
+                .slice(1)
+                .map(stripSentinels)
+                .filter((t) => !t.startsWith("-") && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+              for (const rv of readVars.length > 0 ? readVars : ["REPLY"]) {
+                recordEnvMutation(rv, {
+                  isUnresolvedVal: true,
+                  sepAfter,
+                  hasCasePattern,
+                });
+              }
+              popSubshells();
+              return part;
+            }
+            chainHasCondition = true;
             const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
               env: curShellEnv,
               inShell: true,
+              taintedVars: taintedEnvVars,
               shellType,
             });
             const expanded = expandShellBuildClausePaths(
               peeled.cmd,
               peeled.args,
               curShellEnv,
-              { shellType },
+              { taintedVars: taintedEnvVars, shellType },
             );
             const cArgs = expanded.args;
             const cClass = classifyBuildCommand(expanded.cmd, cArgs);
@@ -984,12 +1357,16 @@ export function buildChildInvocation(
               ) {
                 xcodeInjected.push(`-destination id=${lease.serial}`);
               }
+              popSubshells();
               if (xcodeInjected.length > 0) {
                 return `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}${trailingWs}`;
               }
               return part;
             }
-            if (!cClass.requiresHeavySlot) return part;
+            if (!cClass.requiresHeavySlot) {
+              popSubshells();
+              return part;
+            }
             if (cClass.tool === "gradle") {
               const hasWorkersFlag = cArgs.some((a) => {
                 const s = String(a);
@@ -999,6 +1376,7 @@ export function buildChildInvocation(
                   s.startsWith("-Dorg.gradle.workers.max=")
                 );
               });
+              popSubshells();
               if (!hasWorkersFlag) {
                 return `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
               }
@@ -1019,10 +1397,14 @@ export function buildChildInvocation(
               if (injected.length > 0) {
                 const rewrittenCore = injectBazelFlagsIntoShellClause(corePart, injected, {
                   env: curShellEnv,
+                  taintedVars: taintedEnvVars,
+                  shellType,
                 });
+                popSubshells();
                 return `${rewrittenCore}${redirSuffix}${trailingWs}`;
               }
             }
+            popSubshells();
             return part;
           });
           return rewrittenParts.join("");

@@ -1978,6 +1978,51 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       toolVarInv.args[1],
       'TOOL=./gradlew; "$TOOL" build -Dorg.gradle.workers.max=4',
     );
+
+    // Conditional assignments taint build-tool variables in both classifier and rewriter
+    const condToolReqs = resolveBuildResources(
+      "bash",
+      ["-c", 'if false; then TOOL=./gradlew; fi; "$TOOL" build'],
+      wsDir,
+      { env: { ...process.env, TOOL: "./bazel" } },
+    );
+    assert.equal(condToolReqs.kind, "deny_lifecycle");
+    assert.match(condToolReqs.reason, /Unresolved dynamic directory change/);
+
+    const condToolInv = buildChildInvocation(
+      "bash",
+      ["-c", 'if false; then TOOL=./gradlew; fi; "$TOOL" build'],
+      null,
+      "sess_1",
+      { ...process.env, TOOL: "./bazel" },
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      condToolInv.args[1],
+      'if false; then TOOL=./gradlew; fi; "$TOOL" build',
+    );
+
+    // Bash/Zsh function declarations (`function name { ...; }`) are classified and rewritten
+    const bashFnReqs = resolveBuildResources(
+      "bash",
+      ["-c", "function run_build { ./gradlew build; }; run_build"],
+      wsDir,
+    );
+    assert.equal(bashFnReqs.kind, "pure_build");
+    assert.deepEqual(bashFnReqs.resourceKeys, [`gradle:${canonicalWs}`]);
+
+    const bashFnInv = buildChildInvocation(
+      "bash",
+      ["-c", "function run_build { ./gradlew build; }; run_build"],
+      null,
+      "sess_1",
+      process.env,
+      { jobsLimit: 4, reservedRamMb: 3072 },
+    );
+    assert.equal(
+      bashFnInv.args[1],
+      "function run_build { ./gradlew build -Dorg.gradle.workers.max=4; }; run_build",
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
