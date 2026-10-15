@@ -6054,7 +6054,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           let canAdmit = Boolean(chosenTicket && chosenTicket.ticketId === ticket.ticketId);
           let ramCheck = null;
 
-          const coldEstimateMb = state.config?.buildRamEstimateMb ?? 3072;
+          const coldEstimateMb = Math.max(
+            state.config?.buildRamEstimateMb ?? 3072,
+            buildReqs.requestedHeapMb || 0,
+          );
           const estimateMb = warmDaemonProbe.warm ? 0 : coldEstimateMb;
           if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
             ramCheck = checkUnifiedRamAdmission(state, host, estimateMb, now, {

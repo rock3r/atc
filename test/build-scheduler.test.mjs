@@ -2287,6 +2287,43 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
       wsDir,
     );
     assert.ok(builtinCdReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
+
+    // gradle.properties org.gradle.jvmargs compares all daemon-affecting JVM args (including -D properties)
+    fs.writeFileSync(
+      path.join(subAppDir, "gradle.properties"),
+      "org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n",
+    );
+    const subAppGradleReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
+    assert.equal(subAppGradleReqs.requestedHeapMb, 2048);
+    const mismatchedSysPropProbe = probeWarmBuildDaemons(subAppGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdkHome },
+      runner: () => ({
+        stdout: `5001 ${path.join(canonicalMockJdkHome, "bin", "java")} -Xmx2g -Dfile.encoding=US-ASCII org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(mismatchedSysPropProbe.warm, false);
+    const matchingSysPropProbe = probeWarmBuildDaemons(subAppGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdkHome },
+      runner: () => ({
+        stdout: `5001 ${path.join(canonicalMockJdkHome, "bin", "java")} -Xmx2g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(matchingSysPropProbe.warm, true);
+
+    // Bazel server-changing startup options (--host_jvm_args=-Xmx8g) mark invocation cold and record requestedHeapMb
+    const bazelHostJvmReqs = resolveBuildResources(
+      "bazel",
+      ["--host_jvm_args=-Xmx8g", "build", "//..."],
+      subAppDir,
+    );
+    assert.equal(bazelHostJvmReqs.disablesDaemon, true);
+    assert.equal(bazelHostJvmReqs.requestedHeapMb, 8192);
+    const bazelHostJvmProbe = probeWarmBuildDaemons(bazelHostJvmReqs, {
+      runner: () => ({
+        stdout: `9005 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n`,
+      }),
+    });
+    assert.equal(bazelHostJvmProbe.warm, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
