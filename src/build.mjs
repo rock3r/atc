@@ -233,11 +233,18 @@ export function splitShellScriptParts(script) {
       cur = "";
       continue;
     }
-    if (ch === "&" && s[i + 1] === "&") {
-      parts.push(cur, "&&");
-      cur = "";
-      i++;
-      continue;
+    if (ch === "&") {
+      if (s[i + 1] === "&") {
+        parts.push(cur, "&&");
+        cur = "";
+        i++;
+        continue;
+      }
+      if (s[i + 1] !== ">" && (i === 0 || s[i - 1] !== ">")) {
+        parts.push(cur, "&");
+        cur = "";
+        continue;
+      }
     }
     if (ch === "|") {
       if (s[i + 1] === "|") {
@@ -358,7 +365,12 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           break;
         }
         if ((a === "-C" || a === "--chdir") && i + 1 < curArgs.length) {
-          relCwd = relCwd ? path.join(relCwd, curArgs[i + 1]) : curArgs[i + 1];
+          const nextDir = curArgs[i + 1];
+          relCwd = path.isAbsolute(nextDir)
+            ? nextDir
+            : relCwd
+              ? path.join(relCwd, nextDir)
+              : nextDir;
           i += 2;
           continue;
         }
@@ -453,15 +465,21 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             ? curArgs.slice(cIdx + 1).join(" ")
             : String(curArgs[cIdx + 1] || "");
         const script = rawScriptArg.trim();
-        const clauses = splitShellScriptParts(script)
-          .filter((_, idx) => idx % 2 === 0)
-          .map((s) => s.trim())
-          .filter(Boolean);
+        const rawParts = splitShellScriptParts(script);
+        const clauses = [];
+        for (let pIdx = 0; pIdx < rawParts.length; pIdx += 2) {
+          const text = rawParts[pIdx].trim();
+          const sepAfter = pIdx + 1 < rawParts.length ? rawParts[pIdx + 1] : null;
+          if (text) {
+            clauses.push({ text, backgrounded: sepAfter === "&" });
+          }
+        }
         const matchedClauses = [];
         let curShellRelCwd = relCwd;
         let pushdStack = [];
         const cwdStack = [];
-        for (const clause of clauses) {
+        for (const clauseObj of clauses) {
+          const clause = clauseObj.text;
           const { strippedClause, openedSubshells, closedSubshells } =
             splitShellClauseRedirAndGroup(clause);
           for (let s = 0; s < openedSubshells; s++) {
@@ -500,7 +518,11 @@ export function peelBuildWrapperTokens(cmd, args = []) {
                 if (headTok === "pushd") {
                   pushdStack.push(curShellRelCwd);
                 }
-                curShellRelCwd = curShellRelCwd ? path.join(curShellRelCwd, targetDir) : targetDir;
+                curShellRelCwd = path.isAbsolute(targetDir)
+                  ? targetDir
+                  : curShellRelCwd
+                    ? path.join(curShellRelCwd, targetDir)
+                    : targetDir;
               }
             }
             popSubshells();
@@ -508,15 +530,19 @@ export function peelBuildWrapperTokens(cmd, args = []) {
           }
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1));
           if (normalizeBuildToolName(peeled.cmd)) {
-            const effectiveRelCwd =
-              peeled.relCwd && curShellRelCwd
-                ? path.join(curShellRelCwd, peeled.relCwd)
-                : peeled.relCwd || curShellRelCwd || null;
+            const effectiveRelCwd = peeled.relCwd
+              ? path.isAbsolute(peeled.relCwd)
+                ? peeled.relCwd
+                : curShellRelCwd
+                  ? path.join(curShellRelCwd, peeled.relCwd)
+                  : peeled.relCwd
+              : curShellRelCwd || null;
             matchedClauses.push({
               cmd: peeled.cmd,
               args: peeled.args,
               relCwd: effectiveRelCwd,
               envVars: { ...envVars, ...(peeled.envVars || {}) },
+              backgrounded: Boolean(clauseObj.backgrounded || peeled.backgrounded),
             });
           }
           popSubshells();
@@ -527,6 +553,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
             args: matchedClauses[0].args,
             relCwd: matchedClauses[0].relCwd || null,
             envVars: matchedClauses[0].envVars || { ...envVars },
+            backgrounded: matchedClauses.some((c) => c.backgrounded),
             allBuildClauses: matchedClauses,
           };
         }
@@ -535,7 +562,7 @@ export function peelBuildWrapperTokens(cmd, args = []) {
     break;
   }
 
-  return { cmd: curCmd, args: curArgs, relCwd, envVars, allBuildClauses: null };
+  return { cmd: curCmd, args: curArgs, relCwd, envVars, backgrounded: false, allBuildClauses: null };
 }
 
 export function normalizeBuildToolName(cmd) {
@@ -692,7 +719,20 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = []) {
 }
 
 export function classifyBuildCommand(rawCmd, rawArgs = []) {
-  const { cmd, args, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const { cmd, args, backgrounded, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  if (backgrounded) {
+    return {
+      kind: "reject_long_running",
+      tool: normalizeBuildToolName(cmd) || "multi",
+      targetPlatform: null,
+      requiresDevice: false,
+      requiresHeavySlot: false,
+      requiresWorkspaceLock: false,
+      backgrounded: true,
+      reason:
+        "Backgrounded build commands (`&`) cannot be coordinated by atc exec because the shell exits before the build finishes.",
+    };
+  }
   if (allBuildClauses && allBuildClauses.length > 1) {
     const clauseResults = allBuildClauses.map((c) => classifyBuildCommand(c.cmd, c.args));
     const deny = clauseResults.find((r) => r.kind === "deny_lifecycle");
@@ -1086,7 +1126,25 @@ export function resolveBuildResources(
   cwd = process.cwd(),
   { forceBuild = false, inheritedEnvVars = null } = {},
 ) {
-  const { cmd, args, relCwd, envVars, allBuildClauses } = peelBuildWrapperTokens(rawCmd, rawArgs);
+  const { cmd, args, relCwd, envVars, backgrounded, allBuildClauses } = peelBuildWrapperTokens(
+    rawCmd,
+    rawArgs,
+  );
+  if (backgrounded) {
+    return {
+      kind: "reject_long_running",
+      tool: normalizeBuildToolName(cmd) || "multi",
+      targetPlatform: null,
+      requiresDevice: false,
+      requiresHeavySlot: false,
+      requiresWorkspaceLock: false,
+      backgrounded: true,
+      workspaceRoot: null,
+      resourceKeys: [],
+      reason:
+        "Backgrounded build commands (`&`) cannot be coordinated by atc exec because the shell exits before the build finishes.",
+    };
+  }
   const effectiveEnvVars = { ...(inheritedEnvVars || {}), ...(envVars || {}) };
   const outerCwd = path.resolve(cwd || process.cwd());
   if (allBuildClauses && allBuildClauses.length > 1) {

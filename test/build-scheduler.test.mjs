@@ -1395,8 +1395,101 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       bazelShellOutBaseInv.args[1],
       "bazel --output_base build build --jobs=4 --local_ram_resources=3072 //app",
     );
+
+    // Background & separator splits before echo and marks backgrounded builds as reject_long_running
+    const bgInv = buildChildInvocation(
+      "sh",
+      ["-c", "./gradlew build & echo done"],
+      null,
+      "sess-round12",
+      process.env,
+      buildLease,
+    );
+    assert.equal(bgInv.args[1], "./gradlew build -Dorg.gradle.workers.max=4 & echo done");
+    const bgReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew build & echo done"],
+      spacedAppDir,
+    );
+    assert.equal(bgReqs.kind, "reject_long_running");
+
+    // Absolute cd path replaces prior relative cd path
+    const absCdReqs = resolveBuildResources(
+      "sh",
+      ["-c", `cd fake-sub && cd ${JSON.stringify(spacedAppDir)} && ./gradlew assembleDebug`],
+      tmpRoot,
+    );
+    assert.deepEqual(absCdReqs.resourceKeys, [`gradle:${canonicalSpacedApp}`]);
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("cmdExec enforces matching-platform lease for device builds and keeps device commands from bypassing leases via --build", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-plat-guard-"));
+  const fakeInventory = {
+    hostResources: {
+      totalMemMb: 32768,
+      freeMemMb: 16384,
+      availableMemMb: 16384,
+      cpus: 8,
+      sampledAtMs: Date.now(),
+    },
+    running: [
+      {
+        deviceKey: "Pixel_7_API_35",
+        serial: "emulator-5554",
+        avd: "Pixel_7_API_35",
+        platform: "android",
+        kind: "emulator",
+        profile: { deviceType: "phone", apiLevel: 35, playStore: true },
+        state: "online",
+      },
+    ],
+    offline: [],
+    creatable: [],
+  };
+  try {
+    // 1. atc exec --build -- adb install app.apk must still require a device lease
+    const noLeaseAdbBuild = await cmdExec(
+      stateDir,
+      ["adb", "install", "app.apk"],
+      { build: true, session: "sess-no-lease" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "sess-no-lease" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.equal(noLeaseAdbBuild.exitCode, 3);
+    assert.match(noLeaseAdbBuild.error, /holds no active android device lease/);
+
+    // 2. Holding only an Android lease must not allow xcodebuild test to proceed without an iOS lease
+    const claimRes = cmdClaim(
+      stateDir,
+      { session: "sess-android-only" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "sess-android-only" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.equal(claimRes.exitCode, 0);
+
+    const wrongPlatBuild = await cmdExec(
+      stateDir,
+      ["xcodebuild", "test", "-scheme", "App"],
+      { session: "sess-android-only" },
+      {
+        inventory: fakeInventory,
+        env: { ...process.env, ATC_SESSION_ID: "sess-android-only" },
+        livenessCheck: () => true,
+      },
+    );
+    assert.equal(wrongPlatBuild.exitCode, 3);
+    assert.match(wrongPlatBuild.error, /holds no active ios device lease/);
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });
 

@@ -5192,13 +5192,39 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   if (buildReqs.kind === "deny_lifecycle") {
     return { exitCode: 3, error: buildReqs.reason };
   }
-  if (buildReqs.kind === "reject_long_running" && (isBuildFlag || isClaimFlag)) {
+  if (buildReqs.kind === "reject_long_running" && (isBuildFlag || isClaimFlag || buildReqs.backgrounded)) {
     return { exitCode: 3, error: buildReqs.reason };
+  }
+
+  const rawCmdStrForDeviceCheck = commandArgs
+    .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+    .join(" ");
+  const cmdDeviceClass = classifySegment(rawCmdStrForDeviceCheck);
+  if (cmdDeviceClass.kind === "deny_lifecycle") {
+    return { exitCode: 3, error: cmdDeviceClass.reason };
+  }
+
+  const requiredDevicePlatform =
+    (buildReqs.requiresDevice && buildReqs.targetPlatform) ||
+    (cmdDeviceClass.kind === "device_action" && cmdDeviceClass.targetPlatform) ||
+    null;
+  if (requiredDevicePlatform === "ios" || requiredDevicePlatform === "android") {
+    if (platFilter && platFilter !== requiredDevicePlatform) {
+      return {
+        exitCode: 3,
+        error: `Command targets ${requiredDevicePlatform}, which conflicts with explicit --${platFilter} selector.`,
+      };
+    }
+    platFilter = requiredDevicePlatform;
   }
 
   const needsBuildCoordination = Boolean(buildReqs.requiresWorkspaceLock);
   const needsDeviceLease =
-    isClaimFlag || Boolean(selectorSerial) || Boolean(buildReqs.requiresDevice) || !isBuildFlag;
+    isClaimFlag ||
+    Boolean(selectorSerial) ||
+    Boolean(buildReqs.requiresDevice) ||
+    cmdDeviceClass.kind === "device_action" ||
+    !isBuildFlag;
 
   const rawWait = flags.wait ?? flags.waitSec;
   if (rawWait !== undefined && rawWait !== null) {
