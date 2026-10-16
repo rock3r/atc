@@ -35,7 +35,7 @@ Guides: `workflow` · `profiles` · `snapshots` · `multi-agent` · `traps` (thi
 | `2` | `EBUSY` | All matching devices or slots are busy (`--wait 0`). |
 | `3` | `ENOTFOUND / EFORBIDDEN` | No active (online) lease for this session, lease belongs to another session, or a policy refused the op. Claim a device first (`atc claim`). |
 | `4` | `ETIMEDOUT` | Queue wait (`--wait`) or emulator/simulator boot (`bootTimeoutSec`) timed out. Check `atc status`. |
-| `5` | `ERESOURCE_EXCEEDED` | Host available RAM or free disk space is below the safety reserve (`minFreeRamMb` / `minFreeDiskMb`). Free idle devices (`atc free --stop`) or ask the user before passing `--force`. |
+| `5` | `ERESOURCE_EXCEEDED` | Host available RAM or free disk space is below the safety reserve (`minFreeRamMb` / `minFreeDiskMb`). Free idle devices (`atc free --stop`). For device boots and snapshot saves only, ask the user before passing `--force` to `atc claim` / `atc snapshot`; builds are never forced past RAM admission. |
 | `6` | `EPHYSICAL_FORBIDDEN` | Physical device claim rejected by policy (`allowPhysicalDevices`). Use an emulator/simulator or update `atc config`. |
 | `7` | `EINVALID_OP` | Request rejected by validation; nothing ran. Read the listed problems and hints. |
 | `124` | `ETIMEOUT_OP` | The op's `timeoutSec` elapsed and `atc` stopped it. |

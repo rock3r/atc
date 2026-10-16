@@ -375,7 +375,7 @@ Run `atc guide [workflow|profiles|snapshots|multi-agent|traps]` at any time to r
 | `2` | `EBUSY` | All matching devices or slots busy (`--wait 0`). |
 | `3` | `ENOTFOUND / EFORBIDDEN` | Caller session holds no matching online lease, the lease belongs to another session, or a policy refused the op. |
 | `4` | `ETIMEDOUT` | Queue wait (`--wait`) or device boot (`bootTimeoutSec`) timed out. |
-| `5` | `ERESOURCE_EXCEEDED` | Host available RAM or free disk space is below safety reserves (ask user before `--force`). |
+| `5` | `ERESOURCE_EXCEEDED` | Host available RAM or free disk space is below safety reserves. Free idle devices; only device boots and snapshot saves can be forced (ask the user first), never build RAM admission. |
 | `6` | `EPHYSICAL_FORBIDDEN` | Physical device claim rejected by `allowPhysicalDevices` policy. |
 | `7` | `EINVALID_OP` | Request rejected by validation (unsupported op, param or value); nothing ran. Read the listed problems and hints. |
 | `124` | `ETIMEOUT_OP` | An op's `timeoutSec` elapsed and `atc` stopped it. |

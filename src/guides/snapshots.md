@@ -54,4 +54,4 @@ atc free --snapshot-load default_boot
 | iOS Simulators (`maxRunningSimulators`) | `4` | `atc` checks the target volume with `statfsSync`. Free disk must cover the snapshot or clone plus `minFreeDiskMb (2048 MB)`. |
 | Heavy builds (`maxConcurrentBuilds`) | `"auto"` (1-4 by CPU/RAM, `+1` burst) | One build per workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) plus a RAM check (`buildRamEstimateMb = 3072 MB` for cold daemons + `minFreeRamMb`). |
 
-If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Stop idle virtual devices with `atc free --stop` first. Use `--force` only with user approval to bypass host resource limits.
+If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Stop idle virtual devices with `atc free --stop` first. For emulator/simulator boots and snapshot saves, use `--force` on `atc claim` / `atc snapshot` only with user approval to bypass host resource limits. Build RAM admission is never bypassed: `--force` on a build op only overrides value patterns, so free resources or wait for running builds instead.

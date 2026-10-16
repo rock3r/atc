@@ -78,7 +78,7 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
 | Split compile and device phases | Holding a device while compiling starves other agents. `atc` prints a notice when a request mixes them. | Batch: assemble step (no claim) → device step (`claim`) |
 | Opt in to physical phones explicitly | Default claims set `--kind emulator` so charging USB phones are never touched. | `atc claim --serial <id>` or `atc claim --ios --udid <id>` |
 | Treat `--force` as taking responsibility | It only overrides build-value patterns, needs `--reason`, and is recorded; later failures point back to it. | `atc exec gradle tasks odd+task --force --reason "vendor plugin task"` |
-| Respect exit code `5` (`ERESOURCE_EXCEEDED`) | Starting an emulator or saving a snapshot below the RAM/disk reserve risks host OOM or disk exhaustion. | Run `atc free --stop` on idle devices before asking to pass `--force`. |
+| Respect exit code `5` (`ERESOURCE_EXCEEDED`) | Starting an emulator or saving a snapshot below the RAM/disk reserve risks host OOM or disk exhaustion; builds below the RAM floor wait or fail. | Run `atc free --stop` on idle devices. Only device boots/snapshot saves can be forced (with user approval); builds cannot. |
 | Ask for missing operations | Unsupported operations are refused with the closest alternative. | Request it at https://github.com/rock3r/atc/issues |
 
 ## 4. Done checklist
