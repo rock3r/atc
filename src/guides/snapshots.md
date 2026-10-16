@@ -8,7 +8,7 @@ Pass reset flags to `atc claim` when a test requires a known starting state:
 
 | Flag | Android emulator action | iOS Simulator action |
 |---|---|---|
-| `--snapshot-load <name>` | `atc` restores QEMU snapshot `<name>` with `adb emu avd snapshot load` before activating the lease. | While the simulator is shut down, `atc` restores APFS copy-on-write (`cp -cR`) snapshot `<name>` from `~/.atc-snapshots/<udid>/<name>`. It then boots the simulator. |
+| `--snapshot-load <name>` | `atc` restores QEMU snapshot `<name>` with `adb emu avd snapshot load` before activating the lease. | `atc` shuts down the simulator if running, restores APFS copy-on-write (`cp -cR`) snapshot `<name>` from `<stateDir>/ios-snapshots/<udid>/<name>`, and boots the simulator. |
 | `--snapshot-save-on-free <name>` | `atc free` saves QEMU snapshot `<name>` before releasing the lease. | `atc free` saves APFS snapshot `<name>` before releasing the lease. |
 | `--wipe-data` | `atc` stops a running emulator, deletes `userdata-qemu.img*` / `cache.img*`, and boots it with clean data. | `atc` shuts down the simulator, runs `xcrun simctl erase <udid>`, and boots it with clean data. |
 | `--cold` | `atc` boots with `-no-snapshot-load` to skip quickboot state. | `atc` shuts down and cold-boots the simulator. |
@@ -24,7 +24,7 @@ atc claim --ios --type phone --os ">=18.0" --reset-app com.example.iosApp
 
 ## 2. Save and restore snapshots during an active lease
 
-Use `atc snapshot` with an active emulator or simulator lease:
+Use `atc snapshot` (or `atc exec snapshot …`) with an active emulator or simulator lease:
 
 ```bash
 atc snapshot list                  # list snapshots on the leased device
@@ -51,7 +51,7 @@ atc free --snapshot-load default_boot
 | Pool | Default slot cap | Pre-flight admission rule |
 |---|---|---|
 | Android QEMU (`maxRunningEmulators`) | `2` | Projected available RAM must cover `ramSizeMb + qemuOverheadRamMb (1024 MB) + minFreeRamMb (2048 MB)`, plus unaccounted builds that started in the last 30 s. The target volume must have `dataDiskMb + minFreeDiskMb (2048 MB)` free disk. |
-| iOS Simulators (`maxRunningSimulators`) | `4` | `atc` checks the target volume with `statfsSync`. Free disk must cover the snapshot or clone plus `minFreeDiskMb (2048 MB)`. |
-| Heavy builds (`maxConcurrentBuilds`) | `"auto"` (1-4 by CPU/RAM, `+1` burst) | One build per workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) plus a RAM check (`buildRamEstimateMb = 3072 MB` for cold daemons + `minFreeRamMb`). |
+| iOS Simulators (`maxRunningSimulators`) | `4` | Projected available RAM must cover `simOverheadRamMb (1280 MB) + minFreeRamMb (2048 MB)`, and free disk on the target volume (`statfsSync`) must cover the boot or snapshot clone plus `minFreeDiskMb (2048 MB)`. |
+| Heavy builds (`maxConcurrentBuilds`) | `"auto"` (1-4 by CPU/RAM, `+1` burst) | One build per workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, `xcode:dd:<derivedData>`) plus a RAM check (`buildRamEstimateMb = 3072 MB` for cold daemons + `minFreeRamMb`). |
 
 If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Stop idle virtual devices with `atc free --stop` first. For emulator/simulator boots and snapshot saves, use `--force` on `atc claim` / `atc snapshot` only with user approval to bypass host resource limits. Build RAM admission is never bypassed: `--force` on a build op only overrides value patterns, so free resources or wait for running builds instead.

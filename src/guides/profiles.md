@@ -19,7 +19,7 @@ Pass the constraints the task requires. Fewer constraints let `atc` reuse more r
 
 | Flag | Examples | Meaning |
 |---|---|---|
-| `--android` / `--ios` / `--platform <p>` | `--ios`, `--android` | Select Android or iOS. On macOS, `atc` also selects iOS automatically in directories with `.xcodeproj`, `.xcworkspace`, or `Package.swift` and no `build.gradle*`. |
+| `--android` / `--ios` / `--platform <p>` | `--ios`, `--android` | Select Android or iOS. On macOS, `atc` also selects iOS automatically in directories with `.xcodeproj`, `.xcworkspace`, `Package.swift`, or `Podfile` and no Android Gradle/Manifest markers. |
 | `--type <type>` | `phone`, `tablet`, `foldable`, `desktop`, `watch` (alias `wear`), `xr`, `tv`, `automotive`, `resizable` | Select a form factor on Android or iOS. `watch` and `wear` match Wear OS and watchOS. A `resizable` AVD satisfies `phone`, `foldable`, `tablet`, or `desktop`. |
 | `--api <spec>` / `--os <spec>` | `36`, `>=34`, `18.4`, `>=18.0`, `17.0..18.4` | Select an Android SDK API level with `--api`. Select an iOS/watchOS/tvOS/visionOS version with `--os`. |
 | `--play` / `--no-play` | `--play` | Require or exclude Google Play Store images (Android). |
@@ -49,7 +49,7 @@ atc claim --ios --type watch --os ">=11.0"
 # Physical Android phone by adb serial (from `atc status`)
 atc claim --serial adb-2A191FDH3007B7-SAhkP3._adb-tls-connect._tcp
 
-# Physical iPhone/iPad by hardware UDID (from `atc status --ios`)
+# Physical iPhone/iPad by hardware UDID (from `atc status --ios`; ios.* and xcode.test ops are simulator-only)
 atc claim --ios --kind physical --udid 00008120-000464CE2E44C01E
 
 # Block all physical device claims on this machine (exits with code 6)

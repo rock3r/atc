@@ -10,9 +10,9 @@ Each agent tool call runs in a fresh subshell whose PID exits right away. `atc` 
 
 | Priority | Source | What `atc` inspects |
 |---|---|---|
-| `1` | Explicit flag or env | `--session <id>`, `ATC_SESSION_ID`, or `--lease <lease_id>` |
+| `1` | Explicit flag or env | `--session <id>`, `ATC_SESSION_ID`, `--lease <lease_id>`, or `ATC_LEASE_ID` |
 | `2` | MCP session injection | `session` added to `atc_*` MCP tool arguments by the `PreToolUse` hook |
-| `3` | Host runtime env vars | `CODEX_SESSION_ID`, `PI_SESSION_ID`, `CURSOR_TRACE_ID`, `CURSOR_SESSION_ID`, `ANTIGRAVITY_CONVERSATION_ID`, `GEMINI_SESSION_ID`, `CLAUDE_SESSION_ID` |
+| `3` | Host runtime env vars | `CODEX_SESSION_ID`, `PI_SESSION_ID`, `CURSOR_TRACE_ID`, `CURSOR_SESSION_ID`, `ANTIGRAVITY_CONVERSATION_ID`, `GEMINI_SESSION_ID`, `CLAUDE_SESSION_ID`, `COPILOT_SESSION_ID`, `GITHUB_COPILOT_SESSION_ID`, `CONVERSATION_ID` |
 | `4` | Hook PID breadcrumb map | `state.hookSessions` (recorded by the hook on tool calls, without reading the command) matched by `process.ppid`, ancestor PID chain, or unique `cwd` |
 | `5` | Stdio MCP server | `mcp-<pid>` persisted for the lifetime of `atc mcp` |
 | `6` | Parent process fallback | `TMUX_PANE`, `TERM_SESSION_ID`, or `ppid-<stableParentPid>` |
@@ -35,15 +35,15 @@ Build ops (`gradle.tasks`, `bazel.*`, `xcode.*`) go through `state.buildLeases` 
 | Tier | Caller profile | Slot ceiling | Co-scheduling guarantee |
 |---|---|---|---|
 | `Tier 0` | Starved build ticket waiting `>= 120 s` (`buildReorderWindowSec`) | Base + Burst | Bounds maximum queue wait so pure builds never starve indefinitely. |
-| `Tier 1` | Device-coupled build under your lease, or `--claim` for the run | Base + Burst (`maxConcurrentBuilds = "auto"` `[1..4]` + `1` burst) | Jumps ahead of `< 120 s` pure builds so leased devices never sit idle waiting to compile. Cold-boot `--claim` runs reserve a `"preparing_device"` build slot before booting. |
-| `Tier 2` | Pure build | Base | Builds on the same workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) are serialized; aborted builds enter a `5 s` `"draining"` cooldown. Nested builds inherit `ATC_BUILD_OP_ID` without deadlocking. |
+| `Tier 1` | Device-coupled build under your lease, or `--claim` for the run | Base + Burst (`maxConcurrentBuilds = "auto"` `[1..4]` + `1` burst) | Jumps ahead of `< 120 s` pure builds so leased devices never sit idle waiting to compile. Cold-boot `--claim` runs reserve a build lease (`preparingDevice: true`) before booting. |
+| `Tier 2` | Pure build | Base | Builds on the same workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, `xcode:dd:<derivedData>`) are serialized; aborted builds enter a `5 s` `"draining"` cooldown. Nested builds inherit `ATC_BUILD_OP_ID` without deadlocking. |
 
 ### Split phases so devices are held only when needed
 
 `atc` never splits a request for you; it prints a notice instead. Plan the phases yourself, ideally in one `atc batch`:
 - **Gradle:** `gradle.tasks [assembleDebug, assembleDebugAndroidTest]` (no claim) → `gradle.tasks [connectedDebugAndroidTest]` (claim).
 - **Xcode:** `xcode.buildForTesting` (no claim) → `xcode.testWithoutBuilding` (claim).
-- **Bazel:** `bazel.build //app:instrumented_tests` (no claim) → `bazel.test //app:instrumented_tests`.
+- **Build + install/launch:** `gradle.tasks [":app:assembleDebug"]` or `bazel.build ["//app:main"]` (no claim) → `android.install` (`claim`) → `android.launch` (`claim: { "reuse": "install" }`).
 
 Use `"claim": {"reuse": "<stepId>"}` to keep one device across several device steps; `atc` holds and renews it until the last consumer finishes.
 
@@ -63,7 +63,7 @@ Agents that prefer structured JSON-RPC tools can run `atc mcp` (or load `.mcp.js
 
 | Tool | Purpose |
 |---|---|
-| `atc_gradle`, `atc_bazel`, `atc_xcode`, `atc_android`, `atc_ios` | Run a typed op: `{operation, params, claim?, serial?, udid?, waitSec?, force?, reason?}`. Output is captured into the result. |
+| `atc_gradle`, `atc_bazel`, `atc_xcode`, `atc_android`, `atc_ios` | Run a typed op: `{operation, params, claim?, serial?, udid?, waitSec?, force?, reason?, session?}`. Output is captured into the result. |
 | `atc_batch` | Run or validate (`validate: true`) a batch plan. |
 | `atc_status` | Fleet capacity, devices, leases, builds, and queues. |
 | `atc_claim` | Claim an Android or iOS lease (`ios`, `android`, `type`, `api`, `os`, `udid`, `avd`, `serial`). |

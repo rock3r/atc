@@ -47,7 +47,7 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
    atc exec ios privacy --bundle-id com.example.App --service photos --action grant
    ```
    `atc` validates every value first and lists **all** problems at once (exit `7`, nothing ran). It injects the leased serial/UDID, shapes worker/RAM flags (`-Dorg.gradle.workers.max`, `--jobs`, `-jobs`), serializes builds on the same workspace, tracks the worker process group, and renews your lease while the op runs. Add `--json` for structured results and `--brief` on builds for a condensed summary with the full log on disk.
-3. **Use `atc batch` for anything with ceremony** (several steps, `cwd`, `env`, claims, timeouts). Validate first:
+3. **Use `atc batch` for multi-step workflows** (dependencies, per-step `cwd` or `env`, scoped claims, or timeouts). Validate first:
    ```bash
    atc batch --file plan.json --validate
    atc batch --file plan.json

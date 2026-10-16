@@ -16,7 +16,7 @@ The `atc` CLI coordinates builds, Android emulators, iOS Simulators, and physica
    - `atc: command not found`: ask the user, then install it as [references/install.md](references/install.md) says (`npm install -g @rock3r/atc`).
    - Check `Host Capacity` (`emu slots`, `sim slots`, `build slots`, available RAM, free disk), `Running` devices, `Offline` AVDs/Simulators, and active `Leases` / `Builds` / `Queue`.
 2. Run `atc guide` and follow it, and `atc exec --help` for the operation catalog.
-   - Read `atc guide profiles` when choosing `--ios`/`--android`, `--type` (`phone`, `tablet`, `foldable`, `desktop`, `watch`/`wear`, `xr`, `tv`), `--api`/`--os`, `--play`/`--no-play`, or claiming a physical phone (`--serial <id>`, `--udid <id>`, or `--kind physical`).
+   - Read `atc guide profiles` when choosing `--ios`/`--android`, `--type` (`phone`, `tablet`, `foldable`, `desktop`, `watch`/`wear`, `xr`, `tv`, `automotive`, `resizable`), `--api`/`--os`, `--play`/`--no-play`, or claiming a physical phone (`--serial <id>`, `--udid <id>`, or `--kind physical`).
    - Read `atc guide snapshots` before restoring/saving snapshots, wiping data (`--wipe-data`), resetting app state (`--reset-app`), or handling exit code `5` (`ERESOURCE_EXCEEDED`).
    - Read `atc guide multi-agent` for queueing, build/device co-scheduling, KMP dual leases, sessions, hooks, and `atc mcp`.
    - Read `atc guide traps` when a request is rejected (exit `7`) or when diagnosing device collisions and crashes.
@@ -40,7 +40,7 @@ The `atc` CLI coordinates builds, Android emulators, iOS Simulators, and physica
    atc exec android screenshot out/screen.png
    atc exec ios launch com.example.App
    ```
-   For anything with several steps, `cwd`/`env`, claims, or timeouts, write an `atc batch` plan and run `atc batch --file plan.json --validate` first. If a request is rejected (exit `7`), read every listed problem; `--force --reason "<why>"` only overrides build-value patterns and makes you responsible for the run. Missing operations can be requested at https://github.com/rock3r/atc/issues.
+   For multi-step flows, per-step `cwd`/`env`, scoped claims, or timeouts, write an `atc batch` plan and run `atc batch --file plan.json --validate` first. If a request is rejected (exit `7`), read every listed problem; `--force --reason "<why>"` only overrides build-value patterns and records you as responsible for the run. Request missing operations at https://github.com/rock3r/atc/issues.
 6. Free the lease as soon as your task finishes:
    ```bash
    atc free

@@ -82,4 +82,4 @@ Copy `.cursor/hooks.json` into your project's `.cursor/hooks.json` (or user Curs
 
 ### Pi
 
-Load `extensions/atc/index.ts`. The Pi extension handles `tool_call` and `session_shutdown` events in the host process and registers native `atc_*` tools.
+Load `extensions/atc/index.ts`. The Pi extension listens for `session_shutdown` and `session_end` events and runs `atc free` to release the session's leases when Pi exits.

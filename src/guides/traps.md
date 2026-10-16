@@ -19,12 +19,12 @@ Guides: `workflow` · `profiles` · `snapshots` · `multi-agent` · `traps` (thi
 | Windows path refused | `windows_unsafe_path` / `windows_unsafe_arg` | `gradlew.bat` runs through `cmd.exe`, which expands `%`, `!`, `^` even inside quotes. | Move the project to a path without those characters; keep build values to `[A-Za-z0-9_.:/\@+=,-]`. |
 | Offline AVD counts as a used slot (`emu slots: 1/2`) | `atc status --json` shows `"hasLockFiles": true` on an offline AVD. | A previous QEMU process crashed with a non-numeric lock or is still shutting down. | `atc` auto-cleans bare dead-PID locks; if a QEMU process is stuck, wait for shutdown or check `~/.android/avd/<Name>.avd/*.lock`. |
 | Stopping shared build daemons | There is no op for `./gradlew --stop` or `bazel shutdown`. | Stopping shared daemons crashes active compilations in other agent sessions. | Don't stop them on shared hosts; `atc` manages build slots and draining. |
-| Two builds in the same repo wait on each other | Second build queues even when `build slots` shows `1/2`. | Both builds share a workspace key (`gradle:<root>`, `bazel:ws:<root>`, or `xcode:dd:<path>`), or a prior aborted build is in its `5 s` `"draining"` cooldown. | Expected: same-workspace builds are serialized. Use separate checkouts (or an isolated `derivedDataPath`) for true parallelism. |
+| Two builds in the same repo wait on each other | Second build queues even when `build slots` shows `1/2`. | Both builds share a workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, or `xcode:dd:<derivedData>`), or a prior aborted build is in its `5 s` `"draining"` cooldown. | Expected: same-workspace builds are serialized. Use separate checkouts (or an isolated `derivedDataPath`) for true parallelism. |
 | An op ran too long | Exit `124`. | The op's `timeoutSec` elapsed and `atc` stopped it. | Raise `timeoutSec` (required on `bazel.run`; optional per batch step). |
 
 ## System audit logs (`atc-audit.jsonl`)
 
-`atc` writes structured JSONL audit events (`lease`, `build`, `queue`, `gc`, `forced_run`) to `~/Library/Logs/atc/atc-audit.jsonl` (macOS), `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` (Linux), or `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` (Windows). Attach recent lines from `atc-audit.jsonl`, `atc status --json`, and `atc status --forced` when reporting bugs or diagnosing multi-agent contention.
+`atc` writes structured JSONL audit events (`lease`, `build`, `queue`, `gc`, `forced_run`) to `~/Library/Logs/atc/atc-audit.jsonl` (macOS), `${XDG_STATE_HOME:-~/.local/state}/atc/logs/atc-audit.jsonl` (Linux), or `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` (Windows). Attach recent lines from `atc-audit.jsonl`, `atc status --json`, and `atc status --forced` when reporting bugs or diagnosing multi-agent contention.
 
 ## Exit codes reference
 

@@ -23,19 +23,19 @@ An agent claims exclusive access to an Android emulator (AVD), an iOS Simulator,
 
 ```mermaid
 flowchart LR
-    CLI["atc exec gradle tasks ...\n(argv tokens)"] --> Parse["parseOpArgv\nsrc/validate.mjs"]
+    CLI["atc exec gradle tasks ...<br/>(argv tokens)"] --> Parse["parseOpArgv<br/>src/validate.mjs"]
     MCP["atc_gradle {operation, params}"] --> Validate
-    Batch["atc batch plan.json"] --> BV["validateBatchPlan\n(structure, deps, cycles, claims)"] --> Validate
-    Parse --> Validate["validateOpParams\n(all errors at once)"]
-    Validate --> Plan["planOp src/exec.mjs\nwrapper/workspace resolution,\nhost OS, Windows contract,\nnotices, build requirements"]
-    Plan --> Admit["runOpInvocations src/cli.mjs\nbuild slot, workspace lock, RAM,\ndevice lease / co-claim\n(atc.lock < 20ms)"]
-    Admit --> Run["spawnWithHeartbeat src/spawn.mjs\nliteral argv + lease env,\nheartbeat, timeout"]
+    Batch["atc batch plan.json"] --> BV["validateBatchPlan<br/>(structure, deps, cycles, claims)"] --> Validate
+    Parse --> Validate["validateOpParams<br/>(all errors at once)"]
+    Validate --> Plan["planOp src/exec.mjs<br/>wrapper/workspace resolution,<br/>host OS, Windows contract,<br/>notices, build requirements"]
+    Plan --> Admit["runOpInvocations src/cli.mjs<br/>build slot, workspace lock, RAM,<br/>device lease / co-claim<br/>(atc.lock < 20ms)"]
+    Admit --> Run["spawnWithHeartbeat src/spawn.mjs<br/>literal argv + lease env,<br/>heartbeat, timeout"]
 ```
 
 1. **Parse.** `parseOpArgv` maps `atc exec <system> <verb> …` to an op name and typed params. Raw commands (`-- <cmd>`), `--cwd` and `--env` are refused with the supported alternative.
 2. **Validate.** `validateOpParams` checks unknown fields, types, closed enums, ranges and value patterns (`src/ops/patterns.mjs`), collecting every problem as `{path, code, message, hint}`. `--force --reason` overrides only forceable build-value patterns, and never a leading `-`.
 3. **Plan.** `planOp` resolves the build executable (Gradle wrapper walking up from `workspace`/cwd; `./bazelw` → `bazelisk` → `bazel`; `xcodebuild`), checks the host OS and the Windows batch contract, collects efficiency notices, and derives build requirements (`src/ops/requirements.mjs`: workspace resource keys, Gradle heap/daemon properties, Bazel output base) by calling `resolveBuildResources` on the generated argv.
-4. **Admit.** `runOpInvocations` (the salvaged build/device admission engine) reserves a build slot and workspace lock, checks RAM, finds or co-allocates the device lease, and queues when busy, all in short `withStateTransaction` critical sections.
+4. **Admit.** `runOpInvocations` reserves a build slot and workspace lock, checks RAM, finds or co-allocates the device lease, and queues when busy, all in short `withStateTransaction` critical sections.
 5. **Run.** Invocations are generated against the admitted lease (`adb -s <serial>`, `xcrun simctl <verb> <udid>`, `-destination id=<udid>`), resource caps are appended (`-Dorg.gradle.workers.max`, `--jobs`/`--local_ram_resources`, `-jobs`), and each invocation is spawned in order with lease/session env vars, a heartbeat, optional `timeoutSec`, and stop-at-first-failure. Build leases enter a short `"draining"` cooldown when aborted.
 
 `atc batch` runs the same pipeline per step, sequentially in topological order, with per-step `cwd`/`env`, claims that are held for downstream `claim: {reuse}` consumers and renewed while held, and dependents skipped on failure.
@@ -49,7 +49,7 @@ Android ops that need a remote shell (`launch`, `clear-data`, `permission`, `pro
 `cmdClaim`, `cmdFree`, `cmdSnapshot`, and `runOpInvocations` split every operation into lock-free subprocess probes and `<20 ms` in-memory state transactions.
 
 1. **Resolve platform and session identity:** `resolveTargetPlatform()` picks `"android"` or `"ios"` from flags or project markers. `resolveSessionIdentity()` resolves `{ sessionId, anchorPid }` via the 6-step ladder.
-2. **Probe fleet outside `atc.lock`:** `discoverTargetFleet()` runs `android emulator list --long`, `adb devices -l`, `xcrun simctl list --json`, and `xcrun devicectl list devices --json-output`, then reads `.avd/config.ini`, snapshots, and host RAM/disk.
+2. **Probe fleet outside `atc.lock`:** `discoverTargetFleet()` runs `android emulator list --long`, `adb devices`, `xcrun simctl list --json`, and `xcrun devicectl list devices --json-output`, then reads `.avd/config.ini`, snapshots, and host RAM/disk.
 3. **Select candidate under `atc.lock` (`<20 ms`):** GC prunes expired or dead-PID leases and evaluates `Tier 0` (idempotent re-claim, crash recovery, warm idle match), `Tier 1` (offline boot under slot/resource caps), `Tier 2` (idle eviction), and `Tier 3` (`--create-if-missing`).
 4. **Run slow transitions outside `atc.lock`:** a worker heartbeat extends the lease while `atc` boots, loads snapshots, clears app state, or runs builds and device ops.
 5. **Activate or roll back under `atc.lock`:** `"starting" -> "active"`, or the record is deleted on failure so the slot reopens immediately.
@@ -79,7 +79,7 @@ Android ops that need a remote shell (`launch`, `clear-data`, `permission`, `pro
 | `<stateDir>/atc.lock/owner.json` | `src/lock.mjs` | Lock holder `{ pid, createdAtMs, nonce }`. |
 | `<stateDir>/logs/<op>-<time>-<pid>.log` | `src/exec.mjs` | Full output of `--brief` build runs. |
 | `~/.android/avd/<Name>.avd/snapshots/<snap>/` | QEMU / `adb` | QEMU snapshots. |
-| `~/.atc-snapshots/<udid>/<snap>/data/` | `src/ios.mjs` | APFS copy-on-write clones of simulator data. |
+| `<stateDir>/ios-snapshots/<udid>/<snap>/data/` | `src/ios.mjs` | APFS copy-on-write clones of simulator data (plus `meta.json`). |
 
 ## Verification commands
 
