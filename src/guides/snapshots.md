@@ -50,7 +50,8 @@ Android QEMU emulators and iOS Simulators use separate concurrency pools and pre
 
 | Pool | Default slot cap | Pre-flight admission rule |
 |---|---|---|
-| Android QEMU (`maxRunningEmulators`) | `2` | Projected available RAM must cover `ramSizeMb + qemuOverheadRamMb (1024 MB) + minFreeRamMb (2048 MB)`, and target volume must have `dataDiskMb + minFreeDiskMb (2048 MB)` free disk. |
+| Android QEMU (`maxRunningEmulators`) | `2` | Projected available RAM must cover `ramSizeMb + qemuOverheadRamMb (1024 MB) + minFreeRamMb (2048 MB)` plus unaccounted `<30 s` starting builds, and target volume must have `dataDiskMb + minFreeDiskMb (2048 MB)` free disk. |
 | iOS Simulators (`maxRunningSimulators`) | `4` | Target volume (`statfsSync`) must have required snapshot/clone disk plus `minFreeDiskMb (2048 MB)` free disk. |
+| Heavy builds (`maxConcurrentBuilds`) | `"auto"` (1-4 by CPU/RAM, `+1` burst) | Per-workspace lock (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<dir>`) plus RAM check (`buildRamEstimateMb = 3072 MB` for cold daemons + `minFreeRamMb`). |
 
 If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Free idle virtual devices with `atc free --stop` first; only pass `--force` if the user approves bypassing host resource limits.

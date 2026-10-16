@@ -245,7 +245,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 
   if (!inventory && options.runningCount === undefined) {
     const unscopedSegments = splitShellSegments(norm.command)
-      .map((seg) => classifySegment(seg))
+      .map((seg) => classifySegment(seg, {}, 0, { cwd, env: options.env || process.env }))
       .filter((c) => c.kind === "device_action" && !c.targetSerial);
     const runner = options.runner || runCommandSync;
     if (
@@ -289,7 +289,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 
   const evalResult = withStateTransaction(
     stateDir,
-    (state, { now }) => {
+    (state, { now, auditEvents }) => {
       const hookEntry = recordHookSession(state, {
         anchorPid: norm.anchorPid,
         sessionId: norm.sessionId,
@@ -344,26 +344,74 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
           }
         : options.runningCountByPlatform;
 
+      const coordinateBuilds =
+        options.coordinateBuilds !== undefined
+          ? Boolean(options.coordinateBuilds)
+          : Boolean(state.config?.coordinateBuilds);
+
       const guardRes = evaluateCommandGuard(norm.command, {
         sessionId: norm.sessionId,
         anchorPid: norm.anchorPid,
         activeLeases,
         runningCount,
         runningCountByPlatform,
+        coordinateBuilds,
         platform: options.platform,
+        cwd,
+        env: options.env || process.env,
       });
 
-      if (guardRes.allowed && norm.hostFormat === "cursor" && guardRes.hasDirectDeviceAction) {
+      if (
+        guardRes.allowed &&
+        norm.hostFormat === "cursor" &&
+        (guardRes.hasDirectDeviceAction || guardRes.hasDirectBuildAction)
+      ) {
+        const isDeviceAction = Boolean(guardRes.hasDirectDeviceAction);
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "guard_deny",
+            sessionId: norm.sessionId,
+            hostFormat: norm.hostFormat,
+            command: norm.command,
+            reason: isDeviceAction
+              ? "cursor_cannot_rewrite_device_action"
+              : "cursor_cannot_rewrite_build_action",
+          });
+        }
         return {
           mutated: true,
           value: {
             allowed: false,
-            reason:
-              `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to attach a lease heartbeat.\n` +
-              `  Run device commands via: atc exec -- ${norm.command}`,
+            reason: isDeviceAction
+              ? `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to attach a lease heartbeat.\n` +
+                `  Run device commands via: atc exec -- ${norm.command}`
+              : `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to coordinate build resources.\n` +
+                `  Run build commands via: atc exec --build -- ${norm.command}`,
             rewrittenCommand: null,
           },
         };
+      }
+
+      if (!guardRes.allowed) {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "guard_deny",
+            sessionId: norm.sessionId,
+            hostFormat: norm.hostFormat,
+            command: norm.command,
+            reason: guardRes.reason,
+          });
+        }
+      } else if (guardRes.rewrittenCommand && norm.hostFormat !== "cursor") {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "guard_rewrite",
+            sessionId: norm.sessionId,
+            hostFormat: norm.hostFormat,
+            command: norm.command,
+            rewrittenCommand: guardRes.rewrittenCommand,
+          });
+        }
       }
 
       if (guardRes.allowed && guardRes.renewLease) {

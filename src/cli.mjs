@@ -15,6 +15,18 @@ import {
   resolveAvdHome,
   wipeAvdUserData,
 } from "./android.mjs";
+import {
+  checkUnifiedRamAdmission,
+  computeBuildPoolSnapshot,
+  computeColdBuildRamDemandMb,
+  computeEffectiveMaxBuilds,
+  evaluateNestedBuildAdmission,
+  hasValidPinnedDeviceLease,
+  probeWarmBuildDaemons,
+  pruneAndSelectNextBuildTicket,
+  reconcileBuildLease,
+  resolveBuildResources,
+} from "./build.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
@@ -43,6 +55,7 @@ import {
   sleepSync,
   withLock,
 } from "./lock.mjs";
+import { resolveAuditLogPath } from "./logger.mjs";
 import { startMcpServer } from "./mcp.mjs";
 import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
@@ -56,6 +69,9 @@ import {
   computeEffectiveMaxSimulators,
   computeUsedEmulatorSlots,
   computeUsedSimulatorSlots,
+  findConflictingLeaseSelector,
+  getAncestorPids,
+  getAncestorProcessChain,
   getKnownPosixPgidStartToken,
   getKnownWindowsTreePids,
   getPosixProcessStartToken,
@@ -166,6 +182,8 @@ const BOOLEAN_FLAG_KEYS = new Set([
   "play",
   "ios",
   "android",
+  "build",
+  "claim",
 ]);
 
 const COMMON_ALLOWED_FLAGS = new Set([
@@ -249,13 +267,25 @@ const SNAPSHOT_ALLOWED_FLAGS = new Set([
 ]);
 
 const EXEC_ALLOWED_FLAGS = new Set([
-  ...COMMON_ALLOWED_FLAGS,
-  "platform",
-  "ios",
-  "android",
-  "serial",
-  "udid",
+  ...CLAIM_ALLOWED_FLAGS,
+  "build",
+  "claim",
+  "workspace",
+  "phase",
+  "ramMb",
+  "ram-mb",
 ]);
+
+const BATCH_ALLOWED_FLAGS = new Set([
+  ...COMMON_ALLOWED_FLAGS,
+  "file",
+  "spec",
+  "workspace",
+  "wait",
+  "waitSec",
+]);
+
+const VALID_EXEC_PHASES = new Set(["pure-build", "device-build", "device-test", "read-only"]);
 
 const STATUS_ALLOWED_FLAGS = new Set([
   ...COMMON_ALLOWED_FLAGS,
@@ -294,6 +324,10 @@ function validateCommandFlags(flags, allowedSet, subcommand) {
     "snapshotLoad",
     "snapshotSaveOnFree",
     "resetApp",
+    "workspace",
+    "phase",
+    "ramMb",
+    "ram-mb",
   ]);
   for (const [key, val] of Object.entries(flags)) {
     if (val === undefined) continue;
@@ -310,6 +344,38 @@ function validateCommandFlags(flags, allowedSet, subcommand) {
     }
   }
   return null;
+}
+
+function tokenizeClaimSelectorString(raw) {
+  const tokens = [];
+  let cur = "";
+  let quote = null;
+  const s = String(raw || "").trim();
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else if (ch === "\\" && quote === '"' && i + 1 < s.length) {
+        cur += s[++i];
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (cur.length > 0) {
+        tokens.push(cur);
+        cur = "";
+      }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.length > 0) {
+    tokens.push(cur);
+  }
+  return tokens;
 }
 
 export function parseCliArgs(argv) {
@@ -339,10 +405,22 @@ export function parseCliArgs(argv) {
       flags.play = false;
       continue;
     }
+    if (tok === "--claim") {
+      flags.claim = true;
+      if (i + 1 < mainArgs.length) {
+        const nextTok = String(mainArgs[i + 1]);
+        if (/\s/.test(nextTok)) {
+          const extraTokens = tokenizeClaimSelectorString(mainArgs[++i]);
+          mainArgs.splice(i + 1, 0, ...extraTokens);
+        }
+      }
+      continue;
+    }
     if (
       [
         "--ios",
         "--android",
+        "--build",
         "--create-if-missing",
         "--wipe-data",
         "--cold",
@@ -368,6 +446,17 @@ export function parseCliArgs(argv) {
         .replace(/^-+/, "")
         .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       const rawVal = tok.slice(eqIdx + 1);
+      if (
+        key === "claim" &&
+        !["true", "false", "1", "0", "yes", "no", "on", "off", ""].includes(
+          rawVal.trim().toLowerCase(),
+        )
+      ) {
+        flags.claim = true;
+        const extraTokens = tokenizeClaimSelectorString(rawVal);
+        mainArgs.splice(i + 1, 0, ...extraTokens);
+        continue;
+      }
       flags[key] = BOOLEAN_FLAG_KEYS.has(key) ? parseBoolFlag(rawVal) : rawVal;
       continue;
     }
@@ -455,7 +544,7 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
   const livenessCheck = options.livenessCheck || isPidAlive;
   const check = withStateTransaction(
     stateDir,
-    (state, { now }) => {
+    (state, { now, auditEvents }) => {
       const { key: resolvedKey, lease: cur } = findLeaseEntry(state, deviceKey, leaseId);
       if (
         !cur ||
@@ -466,7 +555,7 @@ function finishLeaseWorker(stateDir, deviceKey, leaseId, ttlMs, options = {}, on
         return { mutated: false, value: { lease: null, deferredFree: false } };
       }
       if (onBeforeRelease) {
-        onBeforeRelease(cur, state, now);
+        onBeforeRelease(cur, state, now, auditEvents);
       }
       const otherWorkers = removeLeaseWorker(cur, process.pid, livenessCheck);
       const needsRelease =
@@ -1418,7 +1507,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
     try {
       txOutcome = withStateTransaction(
         stateDir,
-        (state, { now }) => {
+        (state, { now, auditEvents }) => {
           const invEpoch = inventory.fleetEpoch ?? inventoryEpoch;
           const stoppedMap = state.stoppedDevices || {};
           const bootedMap = state.bootedDevices || {};
@@ -2081,6 +2170,19 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             };
             state.leases[dev.deviceKey] = lease;
             state.queue = state.queue.filter((t) => t.sessionId !== identity.sessionId);
+            if (Array.isArray(auditEvents)) {
+              auditEvents.push({
+                event: "device_claim",
+                sessionId: identity.sessionId,
+                leaseId: lease.leaseId,
+                deviceKey: lease.deviceKey,
+                platform: lease.platform,
+                kind: lease.kind,
+                serial: lease.serial,
+                avd: lease.avd,
+                udid: lease.udid,
+              });
+            }
             return {
               mutated: true,
               value: {
@@ -3396,7 +3498,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
       lease.leaseId,
       ttlMs,
       execOptions,
-      (current, state, now) => {
+      (current, state, now, auditEvents) => {
         if (current.isRecovery && now >= (current.expiresAtMs || 0)) {
           throw new Error(`Lease ${lease.leaseId} expired during crash recovery.`);
         }
@@ -3453,6 +3555,20 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         }
         current.firstSeenOfflineAtMs = null;
         current.deadlineMs = null;
+        if (!releasedDuringBoot && Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: "device_claim",
+            sessionId: current.sessionId,
+            leaseId: current.leaseId,
+            deviceKey: current.deviceKey,
+            platform: current.platform,
+            kind: current.kind,
+            serial: current.serial,
+            avd: current.avd,
+            udid: current.udid,
+            booted: Boolean(bootedNewEmulator),
+          });
+        }
       },
     );
     if (!activeLease) {
@@ -3954,7 +4070,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   try {
     outcome = withStateTransaction(
       stateDir,
-      (state, { now }) => {
+      (state, { now, auditEvents }) => {
         const identity = resolveSessionIdentity({
           flags,
           env: options.env || process.env,
@@ -4094,6 +4210,15 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           // Non-executable offline reservation (§5.4): release immediately without external adb/simctl calls
           if (lease.firstSeenOfflineAtMs !== null && lease.firstSeenOfflineAtMs !== undefined) {
             freedImmediate.push(lease.leaseId);
+            if (Array.isArray(auditEvents)) {
+              auditEvents.push({
+                event: "device_free",
+                sessionId: lease.sessionId,
+                leaseId: lease.leaseId,
+                deviceKey: lease.deviceKey,
+                serial: lease.serial,
+              });
+            }
             delete state.leases[lease.deviceKey];
             continue;
           }
@@ -4147,6 +4272,15 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             });
           } else {
             freedImmediate.push(lease.leaseId);
+            if (Array.isArray(auditEvents)) {
+              auditEvents.push({
+                event: "device_free",
+                sessionId: lease.sessionId,
+                leaseId: lease.leaseId,
+                deviceKey: lease.deviceKey,
+                serial: lease.serial,
+              });
+            }
             delete state.leases[lease.deviceKey];
           }
         }
@@ -4406,7 +4540,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       heartbeats.get(lease.leaseId)?.stop();
       withStateTransaction(
         stateDir,
-        (state, { now }) => {
+        (state, { now, auditEvents }) => {
           const { key: resolvedKey, lease: cur } = findLeaseEntry(
             state,
             lease.deviceKey,
@@ -4442,6 +4576,16 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
             } else {
               if (doStop) {
                 recordDeviceStoppedInState(state, cur, now);
+              }
+              if (Array.isArray(auditEvents)) {
+                auditEvents.push({
+                  event: "device_free",
+                  sessionId: cur.sessionId,
+                  leaseId: cur.leaseId,
+                  deviceKey: cur.deviceKey,
+                  serial: cur.serial,
+                  stopped: Boolean(doStop),
+                });
               }
               delete state.leases[resolvedKey];
             }
@@ -5035,6 +5179,16 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
 }
 
 export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
+  if (
+    typeof flags?.claim === "string" &&
+    flags.claim.trim() &&
+    !["true", "false", "1", "0", "yes", "no", "on", "off"].includes(
+      flags.claim.trim().toLowerCase(),
+    )
+  ) {
+    const parsedSelector = parseCliArgs(["exec", ...tokenizeClaimSelectorString(flags.claim)]);
+    flags = { ...parsedSelector.flags, ...flags, claim: true };
+  }
   const unknownFlagErr = validateCommandFlags(flags, EXEC_ALLOWED_FLAGS, "exec");
   if (unknownFlagErr) {
     return { exitCode: 1, error: unknownFlagErr };
@@ -5049,192 +5203,1710 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     return { exitCode: 1, error: "Usage: atc exec [--serial <serial>] -- <command> [args...]" };
   }
 
-  const check = withStateTransaction(stateDir, (state, { now }) => {
-    const identity = resolveSessionIdentity({
-      flags,
-      env: options.env || process.env,
-      state,
-      cwd: options.cwd || process.cwd(),
-      ppid: options.ppid ?? process.ppid,
-      ancestorPids: options.ancestorPids,
-      processChain: options.processChain,
-    });
-    const selectorSerial = flags.serial || flags.udid || null;
-    let owned = Object.values(state.leases).filter(
+  const [cmd, ...args] = commandArgs;
+  const cwd = options.cwd || process.cwd();
+  const callerEnv = options.env || process.env;
+  let explicitWorkspace = null;
+  if (flags.workspace !== undefined && flags.workspace !== null) {
+    if (typeof flags.workspace === "boolean" || !String(flags.workspace).trim()) {
+      return { exitCode: 1, error: 'Option "--workspace" requires a directory path.' };
+    }
+    const candidateWs = path.resolve(cwd, String(flags.workspace).trim());
+    try {
+      if (!fs.existsSync(candidateWs) || !fs.statSync(candidateWs).isDirectory()) {
+        return { exitCode: 1, error: `Workspace directory does not exist: ${candidateWs}` };
+      }
+      explicitWorkspace = fs.realpathSync(candidateWs);
+    } catch {
+      return { exitCode: 1, error: `Workspace directory is not accessible: ${candidateWs}` };
+    }
+  }
+
+  const rawRamMb = flags.ramMb ?? flags["ram-mb"];
+  let explicitRamMb = 0;
+  if (rawRamMb !== undefined && rawRamMb !== null) {
+    const parsedRam =
+      typeof rawRamMb === "boolean" || (typeof rawRamMb === "string" && !rawRamMb.trim())
+        ? Number.NaN
+        : Number(rawRamMb);
+    if (!Number.isInteger(parsedRam) || parsedRam < 1 || parsedRam > 1_048_576) {
+      return {
+        exitCode: 1,
+        error: `Invalid --ram-mb "${rawRamMb}". Expected an integer between 1 and 1048576.`,
+      };
+    }
+    explicitRamMb = parsedRam;
+  }
+
+  let explicitPhase = null;
+  if (flags.phase !== undefined && flags.phase !== null) {
+    const p = typeof flags.phase === "boolean" ? "" : String(flags.phase).trim().toLowerCase();
+    if (!VALID_EXEC_PHASES.has(p)) {
+      return {
+        exitCode: 1,
+        error: `Invalid --phase "${flags.phase}". Expected one of: pure-build, device-build, device-test, read-only.`,
+      };
+    }
+    explicitPhase = p;
+  }
+
+  const isBuildFlag =
+    parseBoolFlag(flags.build) ||
+    explicitPhase === "pure-build" ||
+    explicitPhase === "device-build";
+  const isClaimFlag = parseBoolFlag(flags.claim);
+  const selectorSerial = flags.serial || flags.udid || null;
+
+  const buildReqs = resolveBuildResources(cmd, args, cwd, {
+    forceBuild: isBuildFlag,
+    env: callerEnv,
+    workspace: explicitWorkspace,
+  });
+  if (explicitRamMb > 0) {
+    buildReqs.requestedHeapMb = Math.max(buildReqs.requestedHeapMb || 0, explicitRamMb);
+  }
+  if (buildReqs.kind === "deny_lifecycle") {
+    return { exitCode: 3, error: buildReqs.reason };
+  }
+  if (buildReqs.kind === "reject_long_running") {
+    return { exitCode: 3, error: buildReqs.reason };
+  }
+
+  const rawCmdStrForDeviceCheck = commandArgs
+    .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+    .join(" ");
+  const cmdDeviceClass = classifySegment(rawCmdStrForDeviceCheck, {}, 0, {
+    cwd,
+    env: callerEnv,
+  });
+  if (cmdDeviceClass.kind === "deny_lifecycle") {
+    return { exitCode: 3, error: cmdDeviceClass.reason };
+  }
+  if (cmdDeviceClass.buildClass === "reject_long_running") {
+    return {
+      exitCode: 3,
+      error:
+        cmdDeviceClass.rejectReason ||
+        "Continuous/watch build commands cannot be coordinated by atc exec because they hold build slots indefinitely.",
+    };
+  }
+
+  if (explicitPhase) {
+    if (
+      (explicitPhase === "pure-build" || explicitPhase === "read-only") &&
+      (isClaimFlag || Boolean(selectorSerial))
+    ) {
+      return {
+        exitCode: 3,
+        error: `Conflicting flags: --phase=${explicitPhase} cannot be combined with --claim or --serial/--udid.`,
+      };
+    }
+    if (explicitPhase === "read-only") {
+      if (
+        buildReqs.requiresHeavySlot ||
+        buildReqs.requiresWorkspaceLock ||
+        buildReqs.requiresDevice ||
+        cmdDeviceClass.kind === "device_action" ||
+        (cmdDeviceClass.isBuildTool &&
+          cmdDeviceClass.buildClass &&
+          cmdDeviceClass.buildClass !== "read_only")
+      ) {
+        const conflictKind =
+          buildReqs.kind && buildReqs.kind !== "not_build_tool"
+            ? buildReqs.kind
+            : cmdDeviceClass.buildClass || cmdDeviceClass.kind;
+        return {
+          exitCode: 3,
+          error: `Phase conflict: command requires build/workspace/device locks (${conflictKind}), which violates --phase=read-only.`,
+        };
+      }
+      buildReqs.kind = "read_only";
+      buildReqs.requiresWorkspaceLock = false;
+      buildReqs.requiresHeavySlot = false;
+      buildReqs.requiresDevice = false;
+    } else if (explicitPhase === "pure-build") {
+      if (buildReqs.requiresDevice || cmdDeviceClass.kind === "device_action") {
+        return {
+          exitCode: 3,
+          error: `Phase conflict: command interacts with a device (${buildReqs.kind}), which violates --phase=pure-build. Use --phase=device-build or split build and test phases.`,
+        };
+      }
+      buildReqs.kind = "pure_build";
+      buildReqs.requiresWorkspaceLock = true;
+      buildReqs.requiresHeavySlot = true;
+      buildReqs.requiresDevice = false;
+    } else if (explicitPhase === "device-build") {
+      buildReqs.kind = "device_coupled_build";
+      buildReqs.requiresWorkspaceLock = true;
+      buildReqs.requiresHeavySlot = true;
+      buildReqs.requiresDevice = true;
+    } else if (explicitPhase === "device-test") {
+      if (
+        (buildReqs.requiresHeavySlot && !buildReqs.requiresDevice) ||
+        (cmdDeviceClass.isBuildTool && cmdDeviceClass.buildClass === "pure_build")
+      ) {
+        const conflictKind =
+          buildReqs.kind && buildReqs.kind !== "not_build_tool"
+            ? buildReqs.kind
+            : cmdDeviceClass.buildClass;
+        return {
+          exitCode: 3,
+          error: `Phase conflict: command is a pure compilation (${conflictKind}) that does not target a device, which violates --phase=device-test. Use --phase=pure-build or --phase=device-build.`,
+        };
+      }
+      buildReqs.requiresDevice = true;
+    }
+  }
+
+  const requiredDevicePlatform =
+    (buildReqs.requiresDevice && buildReqs.targetPlatform) ||
+    (cmdDeviceClass.kind === "device_action" && cmdDeviceClass.targetPlatform) ||
+    null;
+  if (requiredDevicePlatform === "ios" || requiredDevicePlatform === "android") {
+    if (platFilter && platFilter !== requiredDevicePlatform) {
+      return {
+        exitCode: 3,
+        error: `Command targets ${requiredDevicePlatform}, which conflicts with explicit --${platFilter} selector.`,
+      };
+    }
+    platFilter = requiredDevicePlatform;
+  }
+
+  const needsBuildCoordination = Boolean(buildReqs.requiresWorkspaceLock);
+  const needsDeviceLease =
+    explicitPhase === "pure-build" || explicitPhase === "read-only"
+      ? false
+      : isClaimFlag ||
+        Boolean(selectorSerial) ||
+        Boolean(buildReqs.requiresDevice) ||
+        cmdDeviceClass.kind === "device_action" ||
+        !isBuildFlag;
+
+  const rawWait = flags.wait ?? flags.waitSec;
+  if (rawWait !== undefined && rawWait !== null) {
+    const parsedWait =
+      typeof rawWait === "boolean" || (typeof rawWait === "string" && !rawWait.trim())
+        ? Number.NaN
+        : Number(rawWait);
+    if (!Number.isFinite(parsedWait) || parsedWait < 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --wait duration "${rawWait}". Expected a non-negative number of seconds.`,
+      };
+    }
+  }
+
+  const claimFlags = Object.fromEntries(
+    Object.entries(flags).filter(
+      ([k]) =>
+        k !== "build" &&
+        k !== "claim" &&
+        k !== "workspace" &&
+        k !== "phase" &&
+        k !== "ramMb" &&
+        k !== "ram-mb",
+    ),
+  );
+  if (!claimFlags.platform && !claimFlags.ios && !claimFlags.android && requiredDevicePlatform) {
+    claimFlags.platform = requiredDevicePlatform;
+  }
+  if (buildReqs.targetSerial && requiredDevicePlatform === "ios") {
+    for (const part of String(buildReqs.targetSerial)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)) {
+      if (part.startsWith("ios_simulator_version=")) {
+        if (!claimFlags.os && !claimFlags.api) {
+          claimFlags.os = part.slice("ios_simulator_version=".length).trim();
+        }
+      } else if (
+        !claimFlags.avd &&
+        !claimFlags.udid &&
+        !claimFlags.serial &&
+        part.toLowerCase() !== "booted"
+      ) {
+        claimFlags.avd = part.startsWith("ios_simulator_device=")
+          ? part.slice("ios_simulator_device=".length).trim()
+          : part;
+      }
+    }
+  }
+
+  // If --claim is requested without build coordination, claim the device first via cmdClaim
+  let coAllocatedLeaseId = null;
+  let coAllocatedDeviceKey = null;
+  if (isClaimFlag && !needsBuildCoordination) {
+    const claimRes = cmdClaim(stateDir, claimFlags, options);
+    if (claimRes.exitCode !== 0) {
+      return claimRes;
+    }
+    if (!claimRes.idempotent && claimRes.lease?.leaseId) {
+      coAllocatedLeaseId = claimRes.lease.leaseId;
+      coAllocatedDeviceKey = claimRes.lease.deviceKey || null;
+    }
+  }
+  const cleanupCoAllocatedLeaseOnEarlyError = () => {
+    if (!coAllocatedLeaseId) return;
+    try {
+      withStateTransaction(
+        stateDir,
+        (state, { auditEvents }) => {
+          const { key, lease: cur } = findLeaseEntry(
+            state,
+            coAllocatedDeviceKey,
+            coAllocatedLeaseId,
+          );
+          if (!cur || cur.leaseId !== coAllocatedLeaseId) {
+            return { mutated: false };
+          }
+          delete state.leases[key];
+          if (Array.isArray(auditEvents)) {
+            auditEvents.push({
+              event: "device_free",
+              sessionId: cur.sessionId,
+              leaseId: cur.leaseId,
+              deviceKey: key,
+              platform: cur.platform,
+              kind: cur.kind,
+              serial: cur.serial,
+              reason: "exec_claim_abort",
+            });
+          }
+          return { mutated: true };
+        },
+        options,
+      );
+    } catch {
+      // Best-effort cleanup on pre-spawn error
+    }
+  };
+
+  const runner = options.runner || runCommandSync;
+  const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
+  const rawPpid = options.ppid ?? process.ppid;
+  const ancestorPids = options.ancestorPids || Array.from(getAncestorPids(rawPpid));
+  const processChain =
+    options.processChain ||
+    (needsBuildCoordination ? getAncestorProcessChain(rawPpid) : []);
+  const inheritedOpId = callerEnv.ATC_BUILD_OP_ID
+    ? String(callerEnv.ATC_BUILD_OP_ID).trim()
+    : null;
+  const inheritedNonce = callerEnv.ATC_BUILD_OP_NONCE
+    ? String(callerEnv.ATC_BUILD_OP_NONCE).trim()
+    : null;
+
+  let resolvedClaimPlatform = "android";
+  let coClaimReq = null;
+  if (isClaimFlag && needsBuildCoordination) {
+    try {
+      resolvedClaimPlatform = resolveTargetPlatform(claimFlags, cwd);
+    } catch (err) {
+      cleanupCoAllocatedLeaseOnEarlyError();
+      return { exitCode: 1, error: err.message };
+    }
+    if (
+      resolvedClaimPlatform === "android" &&
+      !claimFlags.android &&
+      !claimFlags.platform &&
+      buildReqs.targetPlatform === "ios"
+    ) {
+      resolvedClaimPlatform = "ios";
+    }
+    const targetPlatform = resolvedClaimPlatform === "all" ? "any" : resolvedClaimPlatform;
+    coClaimReq = {
+      platform: targetPlatform,
+      kind:
+        claimFlags.kind ||
+        (claimFlags.udid ||
+        (claimFlags.serial && !String(claimFlags.serial).startsWith("emulator-"))
+          ? "any"
+          : "emulator"),
+      avd: claimFlags.avd || null,
+      udid: claimFlags.udid || null,
+      serial: claimFlags.serial || null,
+      deviceType: claimFlags.type ? normalizeDeviceType(claimFlags.type) : null,
+      apiSpec: claimFlags.api ? String(claimFlags.api) : null,
+      osSpec: claimFlags.os ? String(claimFlags.os) : null,
+      services: claimFlags.services || null,
+      play:
+        claimFlags.play === undefined || claimFlags.play === null
+          ? null
+          : parseBoolFlag(claimFlags.play),
+      abi: claimFlags.abi || null,
+      createIfMissing: parseBoolFlag(claimFlags.createIfMissing),
+      snapshotLoad: claimFlags.snapshotLoad || null,
+      snapshotSaveOnFree: claimFlags.snapshotSaveOnFree || null,
+      wipeData: parseBoolFlag(claimFlags.wipeData),
+      coldBoot: parseBoolFlag(claimFlags.cold),
+      resetApp: claimFlags.resetApp || null,
+      headless: parseBoolFlag(claimFlags.headless),
+      force: parseBoolFlag(claimFlags.force),
+      reason: claimFlags.reason || null,
+    };
+  }
+
+  const startWaitMs = Date.now();
+  let retainedBuildTicket = null;
+  let coClaimInventory = options.inventory || null;
+
+  const getMatchingOwnedLeases = (leasesMap, sessionId) => {
+    let owned = Object.values(leasesMap || {}).filter(
       (l) =>
+        l &&
         l.state === "active" &&
-        l.sessionId === identity.sessionId &&
+        l.sessionId === sessionId &&
         (!platFilter || (l.platform || "android") === platFilter) &&
         (!selectorSerial ||
           l.serial === selectorSerial ||
           l.udid === selectorSerial ||
-          l.coreDeviceId === selectorSerial),
+          l.coreDeviceId === selectorSerial) &&
+        (!coClaimReq ||
+          (matchesProfile(l, {
+            ...coClaimReq,
+            kind: claimFlags.kind ? coClaimReq.kind : "any",
+            snapshotLoad: null,
+          }) &&
+            !coClaimReq.wipeData &&
+            !coClaimReq.coldBoot)),
     );
-    if (owned.length === 0) {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error: `Session "${identity.sessionId}" holds no active${platFilter ? ` ${platFilter}` : ""} device lease. Run "atc claim" first.`,
-        },
-      };
-    }
     if (owned.length > 1 && !selectorSerial) {
       const rawCmdStr = commandArgs
         .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
         .join(" ");
-      const cmdClass = classifySegment(rawCmdStr);
-      if (cmdClass.targetPlatform === "ios" || cmdClass.targetPlatform === "android") {
+      const cmdClass = classifySegment(rawCmdStr, {}, 0, { cwd, env: callerEnv });
+      const preferredPlat = cmdClass.targetPlatform || buildReqs.targetPlatform;
+      if (preferredPlat === "ios" || preferredPlat === "android") {
         const platformMatched = owned.filter(
-          (l) => (l.platform || "android") === cmdClass.targetPlatform,
+          (l) => (l.platform || "android") === preferredPlat,
         );
         if (platformMatched.length === 1) {
           owned = platformMatched;
         }
       }
     }
-    if (owned.length > 1 && !selectorSerial) {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error: `Session "${identity.sessionId}" holds multiple active leases; pass --serial <serial> or --android/--ios.`,
-        },
-      };
-    }
-    const lease = owned[0];
-    if (lease.firstSeenOfflineAtMs !== null && lease.firstSeenOfflineAtMs !== undefined) {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error:
-            lease.kind === "physical"
-              ? `Physical device "${lease.serial || lease.deviceKey}" is currently disconnected. Wait for it to reconnect or run "atc claim" to release the lease.`
-              : `Virtual device "${lease.avd || lease.serial || lease.deviceKey}" crashed or went offline; run "atc claim" within the recovery window to restart it in-place.`,
-        },
-      };
-    }
-    if (!lease.serial) {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error: `Lease ${lease.leaseId} (${lease.avd || lease.deviceKey}) has no active adb serial because its last restart failed; run "atc claim" to restart it.`,
-        },
-      };
-    }
-    const [cmd, ...args] = commandArgs;
-    const leasePlat = lease.platform || "android";
-    const wrappedClass = classifySegment(
-      [cmd, ...args]
-        .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
-        .join(" "),
-      lease.serial
-        ? leasePlat === "ios"
-          ? {
-              SIMULATOR_UDID: lease.serial,
-              ATC_DEVICE_SERIAL: lease.serial,
-              ATC_PLATFORM: "ios",
-            }
-          : {
-              ANDROID_SERIAL: lease.serial,
-              ATC_DEVICE_SERIAL: lease.serial,
-              ATC_PLATFORM: "android",
-            }
-        : {},
-    );
-    if (wrappedClass.kind === "deny_lifecycle") {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error: wrappedClass.reason,
-        },
-      };
-    }
-    const isRewritableBooted =
-      leasePlat === "ios" &&
-      lease.kind === "emulator" &&
-      String(wrappedClass.targetSerial || "").toLowerCase() === "booted";
-    if (
-      wrappedClass.targetSerial &&
-      !isRewritableBooted &&
-      lease.serial &&
-      wrappedClass.targetSerial !== lease.serial
-    ) {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error: `Conflicting device selector "${wrappedClass.targetSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-        },
-      };
-    }
-    try {
-      buildChildInvocation(cmd, args, lease, identity.sessionId, options.env);
-    } catch (err) {
-      return {
-        mutated: false,
-        value: {
-          exitCode: 3,
-          error: err.message,
-        },
-      };
-    }
-    const ttlMs = (state.config.defaultTtlSec || 600) * 1000;
-    addLeaseWorker(lease, process.pid, options.livenessCheck || isPidAlive);
-    if (wrappedClass.kind !== "read_only") {
-      lease.loadedSnapshot = null;
-    }
-    lease.renewedAtMs = now;
-    lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
-    return {
-      mutated: true,
-      value: {
-        exitCode: 0,
-        lease,
-        sessionId: identity.sessionId,
-        ttlMs,
-      },
-    };
-  }, options);
+    return owned;
+  };
 
-  if (check.exitCode !== 0) {
-    return check;
+  const refreshHostAndInventory = () => {
+    const curState = readState(stateDir);
+    const curCfg = curState.config || DEFAULT_CONFIG;
+    let freshlyDiscoveredInventory = false;
+    if (isClaimFlag && needsBuildCoordination && !options.inventory) {
+      const preIdentity = resolveSessionIdentity({
+        flags,
+        env: callerEnv,
+        state: curState,
+        cwd,
+        ppid: rawPpid,
+        ancestorPids,
+        processChain,
+      });
+      const matchingOwned = getMatchingOwnedLeases(curState.leases, preIdentity.sessionId);
+      const hasOwnedActive =
+        matchingOwned.length === 1 &&
+        Boolean(matchingOwned[0].serial) &&
+        matchingOwned[0].firstSeenOfflineAtMs == null &&
+        (!coClaimReq ||
+          (!coClaimReq.resetApp &&
+            (!coClaimReq.snapshotLoad ||
+              (matchingOwned[0].kind === "emulator" &&
+                matchingOwned[0].loadedSnapshot === coClaimReq.snapshotLoad))));
+      const nowPre = Date.now();
+      const cacheStale =
+        !coClaimInventory ||
+        (curState.fleetEpoch || 0) !== coClaimInventory.fleetEpoch ||
+        nowPre - (coClaimInventory.discoveredAtMs || 0) >= 1500;
+      if (!hasOwnedActive && cacheStale) {
+        const discStart = Date.now();
+        const rawInv = discoverTargetFleet({
+          targetPlatform: resolvedClaimPlatform,
+          stateDir,
+          runner,
+          avdHome,
+          cfg: curCfg,
+          platform: options.platform,
+          env: callerEnv,
+        });
+        coClaimInventory = {
+          ...rawInv,
+          discoveredAtMs: rawInv.discoveredAtMs ?? discStart,
+          fleetEpoch: rawInv.fleetEpoch ?? (curState.fleetEpoch || 0),
+        };
+        freshlyDiscoveredInventory = true;
+      }
+    }
+    const host =
+      options.host ||
+      options.inventory?.host ||
+      (freshlyDiscoveredInventory && coClaimInventory?.host ? coClaimInventory.host : null) ||
+      (needsBuildCoordination ? readHostResources(avdHome) : coClaimInventory?.host || null);
+    const probedGradleBuildIds = new Set(
+      Object.values(options.activeBuildLeases || curState.buildLeases || {})
+        .filter(
+          (b) =>
+            b &&
+            (b.tool === "gradle" ||
+              (Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0) ||
+              Number(b.claimedGradleCount) > 0) &&
+            b.requiresHeavySlot !== false &&
+            (b.state === "active" || b.state === "draining") &&
+            !b.preparingDevice &&
+            b.buildId,
+        )
+        .map((b) => b.buildId),
+    );
+    const warmDaemonProbe =
+      needsBuildCoordination && buildReqs.requiresHeavySlot
+        ? probeWarmBuildDaemons(buildReqs, {
+            ...options,
+            activeBuildLeases: options.activeBuildLeases ?? curState.buildLeases,
+          })
+        : { warm: false, daemonPids: [] };
+    return { host, inventory: coClaimInventory, warmDaemonProbe, probedGradleBuildIds };
+  };
+
+  let check;
+  while (true) {
+    const { host, inventory, warmDaemonProbe, probedGradleBuildIds } = refreshHostAndInventory();
+    let txRes;
+    try {
+      txRes = withStateTransaction(
+        stateDir,
+        (state, { now, auditEvents }) => {
+          const livenessCheck = options.livenessCheck || isPidAlive;
+          const identity = resolveSessionIdentity({
+            flags,
+            env: callerEnv,
+            state,
+            cwd,
+            ppid: rawPpid,
+            ancestorPids,
+            processChain,
+          });
+          const ttlSec = clampTtlSec(flags.ttl ?? flags.ttlSec, state.config);
+          const ttlMs = ttlSec * 1000;
+
+          let lease = null;
+          let coClaimCandidate = null;
+          let coClaimNeedsColdOrPrep = false;
+          let coClaimDeviceAvailable = false;
+          let effectiveInventory = inventory;
+
+          if (needsDeviceLease) {
+            const owned = getMatchingOwnedLeases(state.leases, identity.sessionId);
+            if (owned.length > 1 && !selectorSerial) {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  exitCode: 3,
+                  error: `Session "${identity.sessionId}" holds multiple active leases; pass --serial <serial> or --android/--ios.`,
+                },
+              };
+            }
+            if (owned.length === 1) {
+              const matchedLease = owned[0];
+              const needsIdempotentPrep = Boolean(
+                coClaimReq &&
+                  (coClaimReq.resetApp ||
+                    (coClaimReq.snapshotLoad &&
+                      (matchedLease.kind !== "emulator" ||
+                        matchedLease.loadedSnapshot !== coClaimReq.snapshotLoad))),
+              );
+              if (
+                matchedLease.firstSeenOfflineAtMs !== null &&
+                matchedLease.firstSeenOfflineAtMs !== undefined
+              ) {
+                if (isClaimFlag) {
+                  coClaimNeedsColdOrPrep = true;
+                  coClaimDeviceAvailable = true;
+                } else {
+                  return {
+                    mutated: false,
+                    value: {
+                      status: "error",
+                      exitCode: 3,
+                      error:
+                        matchedLease.kind === "physical"
+                          ? `Physical device "${matchedLease.serial || matchedLease.deviceKey}" is currently disconnected. Wait for it to reconnect or run "atc claim" to release the lease.`
+                          : `Virtual device "${matchedLease.avd || matchedLease.serial || matchedLease.deviceKey}" crashed or went offline; run "atc claim" within the recovery window to restart it in-place.`,
+                    },
+                  };
+                }
+              } else if (!matchedLease.serial) {
+                if (isClaimFlag) {
+                  coClaimNeedsColdOrPrep = true;
+                  coClaimDeviceAvailable = true;
+                } else {
+                  return {
+                    mutated: false,
+                    value: {
+                      status: "error",
+                      exitCode: 3,
+                      error: `Lease ${matchedLease.leaseId} (${matchedLease.avd || matchedLease.deviceKey}) has no active adb serial because its last restart failed; run "atc claim" to restart it.`,
+                    },
+                  };
+                }
+              } else if (needsIdempotentPrep) {
+                coClaimNeedsColdOrPrep = true;
+                coClaimDeviceAvailable = true;
+              } else {
+                lease = matchedLease;
+                coClaimDeviceAvailable = true;
+              }
+            } else if (!isClaimFlag) {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  exitCode: 3,
+                  error: `Session "${identity.sessionId}" holds no active${platFilter ? ` ${platFilter}` : ""} device lease. Run "atc claim" first.`,
+                },
+              };
+            } else if (coClaimReq && inventory) {
+              const invEpoch = inventory.fleetEpoch ?? (state.fleetEpoch || 0);
+              const stoppedMap = state.stoppedDevices || {};
+              const bootedMap = state.bootedDevices || {};
+              const isStoppedSinceInventory = (d) => {
+                if (!d || d.kind === "physical") return false;
+                const byKey = d.deviceKey ? stoppedMap[d.deviceKey] : null;
+                const byAvd = d.avd ? stoppedMap[`avd:${d.avd}`] : null;
+                const bySerial = d.serial ? stoppedMap[`serial:${d.serial}`] : null;
+                return Boolean(
+                  (byKey && byKey.epoch > invEpoch) ||
+                    (byAvd && byAvd.epoch > invEpoch) ||
+                    (bySerial && bySerial.epoch > invEpoch),
+                );
+              };
+              const staleRunning = (inventory.running || []).filter(isStoppedSinceInventory);
+              const staleBootedByKey = new Map();
+              for (const entry of Object.values(bootedMap)) {
+                if (!entry || !(entry.epoch > invEpoch)) continue;
+                if (isStoppedSinceInventory(entry)) continue;
+                const alreadyRunning = (inventory.running || []).some(
+                  (d) =>
+                    d.kind === "emulator" &&
+                    (!entry.serial || d.serial === entry.serial) &&
+                    ((entry.deviceKey && d.deviceKey === entry.deviceKey) ||
+                      (entry.avd && d.avd === entry.avd) ||
+                      (entry.serial && d.serial === entry.serial)),
+                );
+                if (alreadyRunning) continue;
+                const dedupKey =
+                  entry.avd ? `avd:${entry.avd}` : entry.deviceKey || `serial:${entry.serial}`;
+                const prev = staleBootedByKey.get(dedupKey);
+                if (!prev || entry.epoch > prev.epoch) {
+                  staleBootedByKey.set(dedupKey, entry);
+                }
+              }
+              const staleBooted = Array.from(staleBootedByKey.values());
+              const staleStopping = Object.values(state.leases || {}).some(
+                (l) =>
+                  l &&
+                  l.state === "stopping" &&
+                  l.awaitOfflineReconcile &&
+                  (l.stoppingEpoch || 0) > invEpoch,
+              );
+              const epochAdvanced = (state.fleetEpoch || 0) > invEpoch;
+              if (
+                (epochAdvanced ||
+                  staleRunning.length > 0 ||
+                  staleBooted.length > 0 ||
+                  staleStopping) &&
+                !options.inventory
+              ) {
+                return {
+                  mutated: false,
+                  value: { status: "stale_inventory" },
+                };
+              }
+              if (staleRunning.length > 0 || staleBooted.length > 0) {
+                let nextRunning = (inventory.running || []).filter(
+                  (d) => !isStoppedSinceInventory(d),
+                );
+                let nextOffline = [...(inventory.offline || [])];
+                for (const d of staleRunning) {
+                  if (
+                    (d.avd || d.udid) &&
+                    !nextOffline.some(
+                      (o) => o.deviceKey === d.deviceKey || (d.avd && o.avd === d.avd),
+                    )
+                  ) {
+                    nextOffline.push({
+                      ...d,
+                      deviceKey:
+                        d.platform === "ios"
+                          ? `sim:${d.udid || d.serial}`
+                          : `avd:${d.avd}`,
+                      serial: d.platform === "ios" ? d.udid || d.serial : null,
+                      online: false,
+                    });
+                  }
+                }
+                for (const b of staleBooted) {
+                  const runningMatch = nextRunning.find(
+                    (r) =>
+                      (b.avd && r.avd === b.avd) ||
+                      (b.deviceKey && r.deviceKey === b.deviceKey) ||
+                      (b.serial && r.serial === b.serial),
+                  );
+                  nextRunning = nextRunning.filter(
+                    (r) =>
+                      !(
+                        (b.avd && r.avd === b.avd) ||
+                        (b.deviceKey && r.deviceKey === b.deviceKey) ||
+                        (b.serial && r.serial === b.serial)
+                      ),
+                  );
+                  const offlineMatch = nextOffline.find(
+                    (o) =>
+                      (b.avd && o.avd === b.avd) ||
+                      (b.deviceKey && o.deviceKey === b.deviceKey),
+                  );
+                  nextOffline = nextOffline.filter(
+                    (o) =>
+                      !(
+                        (b.avd && o.avd === b.avd) ||
+                        (b.deviceKey && o.deviceKey === b.deviceKey)
+                      ),
+                  );
+                  const baseMatch = offlineMatch || runningMatch || {};
+                  nextRunning.push({
+                    ...baseMatch,
+                    platform: b.platform || baseMatch.platform || "android",
+                    deviceKey:
+                      b.deviceKey ||
+                      baseMatch.deviceKey ||
+                      (b.avd ? `avd:${b.avd}` : `serial:${b.serial}`),
+                    kind: "emulator",
+                    avd: b.avd || baseMatch.avd || null,
+                    udid: b.udid || baseMatch.udid || null,
+                    serial: b.serial || null,
+                    online: true,
+                    profile: b.profile || baseMatch.profile || {},
+                    ramSizeMb: b.ramSizeMb || baseMatch.ramSizeMb || 2048,
+                    requiredRamMb:
+                      b.requiredRamMb ||
+                      baseMatch.requiredRamMb ||
+                      2048 + (state.config?.qemuOverheadRamMb ?? 1024),
+                  });
+                }
+                effectiveInventory = {
+                  ...inventory,
+                  running: nextRunning,
+                  offline: nextOffline,
+                };
+              }
+              reconcileOfflineLeases(
+                state,
+                effectiveInventory,
+                identity.sessionId,
+                now,
+                livenessCheck,
+                avdHome,
+              );
+              const selection = selectCandidateUnderLock(
+                state,
+                effectiveInventory,
+                coClaimReq,
+                null,
+                now,
+                identity.sessionId,
+                livenessCheck,
+                { suppressResourceError: true },
+              );
+              if (selection.priority === 1 && !selection.needsWarmPrep) {
+                coClaimCandidate = selection.candidate;
+                coClaimDeviceAvailable = true;
+              } else if (selection.priority !== null) {
+                coClaimNeedsColdOrPrep = true;
+                coClaimDeviceAvailable = true;
+              } else {
+                const anyWarmMatchInFleet = (effectiveInventory.running || []).some((d) =>
+                  matchesProfile(d, coClaimReq),
+                );
+                const anyOfflineMatchInFleet = (effectiveInventory.offline || []).some((d) =>
+                  matchesProfile(d, coClaimReq),
+                );
+                if (!anyWarmMatchInFleet && !anyOfflineMatchInFleet) {
+                  coClaimNeedsColdOrPrep = true;
+                  coClaimDeviceAvailable = true;
+                } else {
+                  coClaimDeviceAvailable = false;
+                }
+              }
+            }
+          }
+
+          const effectiveDeviceForCheck = lease || coClaimCandidate;
+          if (effectiveDeviceForCheck) {
+            const leasePlat = effectiveDeviceForCheck.platform || "android";
+            const devSerial = effectiveDeviceForCheck.serial || effectiveDeviceForCheck.udid;
+            const wrappedClass = classifySegment(
+              [cmd, ...args]
+                .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+                .join(" "),
+              devSerial
+                ? leasePlat === "ios"
+                  ? {
+                      SIMULATOR_UDID: devSerial,
+                      ATC_DEVICE_SERIAL: devSerial,
+                      ATC_PLATFORM: "ios",
+                    }
+                  : {
+                      ANDROID_SERIAL: devSerial,
+                      ATC_DEVICE_SERIAL: devSerial,
+                      ATC_PLATFORM: "android",
+                    }
+                : {},
+              0,
+              { cwd, env: callerEnv },
+            );
+            if (wrappedClass.kind === "deny_lifecycle") {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  exitCode: 3,
+                  error: wrappedClass.reason,
+                },
+              };
+            }
+            const candidateTargetSerials = [
+              wrappedClass.targetSerial,
+              buildReqs.targetSerial,
+            ].filter(Boolean);
+            for (const ts of candidateTargetSerials) {
+              const conflictSel = devSerial
+                ? findConflictingLeaseSelector(effectiveDeviceForCheck, ts, {
+                    allowRewritableBooted: true,
+                  })
+                : null;
+              if (conflictSel) {
+                return {
+                  mutated: false,
+                  value: {
+                    status: "error",
+                    exitCode: 3,
+                    error: `Conflicting device selector "${conflictSel}" in atc exec; lease ${effectiveDeviceForCheck.leaseId || effectiveDeviceForCheck.deviceKey} is bound to "${devSerial}".`,
+                  },
+                };
+              }
+            }
+            try {
+              buildChildInvocation(
+                cmd,
+                args,
+                effectiveDeviceForCheck,
+                identity.sessionId,
+                callerEnv,
+                null,
+                { cwd },
+              );
+            } catch (err) {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  exitCode: 3,
+                  error: err.message,
+                },
+              };
+            }
+            if (!needsBuildCoordination && lease) {
+              addLeaseWorker(lease, process.pid, livenessCheck);
+              if (wrappedClass.kind !== "read_only") {
+                lease.loadedSnapshot = null;
+              }
+              lease.renewedAtMs = now;
+              lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+              return {
+                mutated: true,
+                value: {
+                  status: "admitted",
+                  exitCode: 0,
+                  lease,
+                  buildLease: null,
+                  coAllocatedDevice: Boolean(
+                    coAllocatedLeaseId && lease.leaseId === coAllocatedLeaseId,
+                  ),
+                  sessionId: identity.sessionId,
+                  ttlMs,
+                },
+              };
+            }
+          } else if (!needsDeviceLease) {
+            try {
+              buildChildInvocation(cmd, args, null, identity.sessionId, callerEnv, null, {
+                cwd,
+              });
+            } catch (err) {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  exitCode: 3,
+                  error: err.message,
+                },
+              };
+            }
+            if (!needsBuildCoordination) {
+              return {
+                mutated: false,
+                value: {
+                  status: "admitted",
+                  exitCode: 0,
+                  lease: null,
+                  buildLease: null,
+                  sessionId: identity.sessionId,
+                  ttlMs,
+                },
+              };
+            }
+          }
+
+          // Nested / Re-entrant build check
+          const nested = evaluateNestedBuildAdmission(state, {
+            inheritedOpId,
+            inheritedNonce,
+            ancestorPids,
+            processChain,
+            requestedKeys: buildReqs.resourceKeys,
+            requiresHeavySlot: Boolean(buildReqs.requiresHeavySlot),
+            requiresDevice: Boolean(needsDeviceLease),
+            hasActiveDeviceLease: Boolean(lease),
+            livenessCheck,
+          });
+          if (nested.deadlockHazard) {
+            if (Array.isArray(auditEvents)) {
+              auditEvents.push({
+                event: "build_deadlock_reject",
+                sessionId: identity.sessionId,
+                workspaceRoot: buildReqs.workspaceRoot,
+                resourceKeys: buildReqs.resourceKeys,
+                reason: nested.reason,
+              });
+            }
+            return {
+              mutated: false,
+              value: {
+                status: "error",
+                exitCode: 3,
+                error: nested.reason,
+              },
+            };
+          }
+          if (nested.reentrant) {
+            if (Array.isArray(auditEvents)) {
+              auditEvents.push({
+                event: "build_reentrant",
+                sessionId: identity.sessionId,
+                parentBuildId: nested.buildLease.buildId,
+                opId: nested.buildLease.opId,
+                workspaceRoot: buildReqs.workspaceRoot,
+                tool: buildReqs.tool,
+                deltaKeys: nested.deltaKeys || [],
+              });
+            }
+            if (lease) {
+              addLeaseWorker(lease, process.pid, livenessCheck);
+              lease.loadedSnapshot = null;
+              lease.renewedAtMs = now;
+              lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
+            }
+            return {
+              mutated: Boolean(lease || (nested.deltaKeys && nested.deltaKeys.length > 0)),
+              value: {
+                status: "admitted",
+                exitCode: 0,
+                lease,
+                buildLease: nested.buildLease,
+                coAllocatedDevice: Boolean(
+                  coAllocatedLeaseId && lease && lease.leaseId === coAllocatedLeaseId,
+                ),
+                reentrant: true,
+                sessionId: identity.sessionId,
+                ttlMs,
+              },
+            };
+          }
+
+          // Build Queue + Co-Scheduling Admission
+          const waitSec =
+            rawWait !== undefined
+              ? Number(rawWait)
+              : (state.config?.defaultBuildWaitSec ?? DEFAULT_CONFIG.defaultBuildWaitSec ?? 600);
+          const waitExpiresAtMs = startWaitMs + waitSec * 1000;
+          const reorderWindowMs =
+            (flags.reorderWindow !== undefined || flags.reorderWindowSec !== undefined
+              ? Number(flags.reorderWindow ?? flags.reorderWindowSec)
+              : (state.config?.buildReorderWindowSec ??
+                DEFAULT_CONFIG.buildReorderWindowSec ??
+                120)) * 1000;
+          const hbTimeoutSec =
+            state.config?.queueHeartbeatTimeoutSec ?? DEFAULT_CONFIG.queueHeartbeatTimeoutSec ?? 10;
+          const hbTimeoutMs = hbTimeoutSec * 1000;
+
+          if (!Array.isArray(state.buildQueue)) {
+            state.buildQueue = [];
+          }
+          let ticket =
+            (retainedBuildTicket?.ticketId &&
+              state.buildQueue.find((t) => t.ticketId === retainedBuildTicket.ticketId)) ||
+            state.buildQueue.find(
+              (t) => t.sessionId === identity.sessionId && t.waiterPid === process.pid,
+            ) ||
+            null;
+          const wasAlreadyQueued = Boolean(ticket || retainedBuildTicket);
+          const coAllocResourceKey =
+            isClaimFlag && !lease
+              ? `device:${coClaimReq?.platform || "android"}:${coClaimReq?.serial || coClaimReq?.avd || coClaimReq?.udid || coClaimReq?.deviceType || "any"}`
+              : null;
+          if (!ticket) {
+            const enqueuedAtMs = retainedBuildTicket ? retainedBuildTicket.enqueuedAtMs : now;
+            const starvationDeadlineMs = retainedBuildTicket
+              ? retainedBuildTicket.starvationDeadlineMs
+              : enqueuedAtMs + reorderWindowMs;
+            const seq =
+              retainedBuildTicket?.seq ??
+              ((state.nextBuildQueueSeq = (state.nextBuildQueueSeq || 0) + 1));
+            const ticketId =
+              retainedBuildTicket?.ticketId || `bq_${randomNonce().slice(0, 12)}`;
+            ticket = {
+              ticketId,
+              seq,
+              sessionId: identity.sessionId,
+              waiterPid: process.pid,
+              resourceKeys: buildReqs.resourceKeys,
+              workspaceRoot: buildReqs.workspaceRoot,
+              requiresHeavySlot: Boolean(buildReqs.requiresHeavySlot),
+              requiresWorkspaceLock: Boolean(buildReqs.requiresWorkspaceLock),
+              buildClass: buildReqs.kind,
+              tool: buildReqs.tool,
+              pinnedDeviceLeaseId: lease?.leaseId || null,
+              pinnedDeviceKey: lease?.deviceKey || null,
+              requiresDeviceCoAlloc: Boolean(isClaimFlag && !lease),
+              coAllocResourceKey,
+              coAllocReq: isClaimFlag && !lease ? coClaimReq : null,
+              deviceAvailableForCoAlloc: coClaimDeviceAvailable,
+              enqueuedAtMs,
+              starvationDeadlineMs,
+              lastHeartbeatAtMs: now,
+              waitExpiresAtMs,
+            };
+            state.buildQueue.push(ticket);
+          } else {
+            ticket.lastHeartbeatAtMs = now;
+            ticket.waiterPid = process.pid;
+            ticket.pinnedDeviceLeaseId = lease?.leaseId || null;
+            ticket.pinnedDeviceKey = lease?.deviceKey || null;
+            ticket.requiresDeviceCoAlloc = Boolean(isClaimFlag && !lease);
+            ticket.coAllocResourceKey = coAllocResourceKey;
+            ticket.coAllocReq = isClaimFlag && !lease ? coClaimReq : null;
+            ticket.deviceAvailableForCoAlloc = coClaimDeviceAvailable;
+          }
+
+          const pool = computeBuildPoolSnapshot(state, host);
+          const { chosenIdx } = pruneAndSelectNextBuildTicket(
+            state.buildQueue,
+            {
+              activeWorkspaces: pool.activeWorkspaces,
+              activeHeavyBuilds: pool.activeHeavyBuilds,
+              maxHostBuilds: pool.effectiveMaxBuilds,
+              burstBuilds: pool.burstBuilds,
+              leases: state.leases,
+              isDeviceAvailableForTicket: (t) => {
+                if (!t.requiresDeviceCoAlloc) return true;
+                if (t.ticketId === ticket.ticketId) {
+                  return coClaimDeviceAvailable;
+                }
+                if (t.coAllocReq && effectiveInventory) {
+                  const reqPlat = t.coAllocReq.platform || "android";
+                  const queriedPlats = effectiveInventory.queriedPlatforms || [resolvedClaimPlatform];
+                  if (queriedPlats.includes(reqPlat)) {
+                    const sel = selectCandidateUnderLock(
+                      state,
+                      effectiveInventory,
+                      t.coAllocReq,
+                      null,
+                      now,
+                      t.sessionId,
+                      livenessCheck,
+                      { suppressResourceError: true },
+                    );
+                    if (sel.priority !== null) return true;
+                    const anyWarm = (effectiveInventory.running || []).some((d) =>
+                      matchesProfile(d, t.coAllocReq),
+                    );
+                    const anyOff = (effectiveInventory.offline || []).some((d) =>
+                      matchesProfile(d, t.coAllocReq),
+                    );
+                    return !anyWarm && !anyOff;
+                  }
+                }
+                return typeof t.deviceAvailableForCoAlloc === "boolean"
+                  ? t.deviceAvailableForCoAlloc
+                  : true;
+              },
+            },
+            now,
+            {
+              reorderWindowMs,
+              hbTimeoutMs,
+              livenessCheck,
+              currentTicketId: wasAlreadyQueued ? null : ticket.ticketId,
+            },
+          );
+          const chosenTicket = chosenIdx >= 0 ? state.buildQueue[chosenIdx] : null;
+          let canAdmit = Boolean(chosenTicket && chosenTicket.ticketId === ticket.ticketId);
+          let ramCheck = null;
+
+          let effectiveWarmDaemon = Boolean(warmDaemonProbe.warm);
+          let invalidatedWarmAfterProbe = false;
+          const effectiveDaemonPids = Array.isArray(warmDaemonProbe.daemonPids)
+            ? [...warmDaemonProbe.daemonPids]
+            : [];
+          const effectiveClaimedDaemonPids = Array.isArray(warmDaemonProbe.claimedDaemonPids)
+            ? [...warmDaemonProbe.claimedDaemonPids]
+            : effectiveWarmDaemon && effectiveDaemonPids.length > 0
+              ? [effectiveDaemonPids[0]]
+              : [];
+          const hasGradleClause =
+            buildReqs.tool === "gradle" ||
+            (Array.isArray(buildReqs.clauseBuildReqs) &&
+              buildReqs.clauseBuildReqs.some((r) => r?.tool === "gradle"));
+          if ((effectiveWarmDaemon || warmDaemonProbe.anyWarm) && hasGradleClause) {
+            const newlyActiveGradle = Object.values(state.buildLeases || {}).filter(
+              (b) =>
+                b &&
+                (b.tool === "gradle" ||
+                  (Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0) ||
+                  Number(b.claimedGradleCount) > 0) &&
+                b.requiresHeavySlot !== false &&
+                (b.state === "active" || b.state === "draining") &&
+                !b.preparingDevice &&
+                (!b.buildId || !probedGradleBuildIds?.has(b.buildId)),
+            );
+            if (newlyActiveGradle.length > 0) {
+              for (const b of newlyActiveGradle) {
+                const claimedList =
+                  Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0
+                    ? b.claimedDaemonPids.map(Number).filter(Boolean)
+                    : Number(b.claimedDaemonPid)
+                      ? [Number(b.claimedDaemonPid)]
+                      : [];
+                if (claimedList.length > 0) {
+                  for (const claimedPid of claimedList) {
+                    const idx = effectiveDaemonPids.indexOf(claimedPid);
+                    if (idx >= 0) {
+                      effectiveDaemonPids.splice(idx, 1);
+                    }
+                    const cIdx = effectiveClaimedDaemonPids.indexOf(claimedPid);
+                    if (cIdx >= 0) {
+                      effectiveClaimedDaemonPids.splice(cIdx, 1);
+                    }
+                    if (
+                      idx < 0 &&
+                      (!Array.isArray(warmDaemonProbe.daemonPids) ||
+                        warmDaemonProbe.daemonPids.length === 0)
+                    ) {
+                      effectiveWarmDaemon = false;
+                      invalidatedWarmAfterProbe = true;
+                    }
+                  }
+                } else {
+                  const anonCount = Math.max(1, Number(b.claimedGradleCount) || 1);
+                  for (let k = 0; k < anonCount; k++) {
+                    if (effectiveDaemonPids.length > 0) {
+                      const removed = effectiveDaemonPids.shift();
+                      const cIdx = effectiveClaimedDaemonPids.indexOf(removed);
+                      if (cIdx >= 0) effectiveClaimedDaemonPids.splice(cIdx, 1);
+                    } else {
+                      effectiveWarmDaemon = false;
+                      invalidatedWarmAfterProbe = true;
+                    }
+                  }
+                }
+              }
+              const requiredDaemons = Math.max(1, Number(warmDaemonProbe.claimedGradleCount) || 1);
+              if (
+                Array.isArray(warmDaemonProbe.daemonPids) &&
+                warmDaemonProbe.daemonPids.length > 0 &&
+                effectiveDaemonPids.length < requiredDaemons
+              ) {
+                effectiveWarmDaemon = false;
+                invalidatedWarmAfterProbe = true;
+              }
+            }
+          }
+          const coldEstimateMb = Math.max(
+            computeColdBuildRamDemandMb(buildReqs, state.config?.buildRamEstimateMb ?? 3072),
+            explicitRamMb || 0,
+          );
+          const partialWarmColdMb =
+            warmDaemonProbe.anyWarm &&
+            typeof warmDaemonProbe.coldRamMb === "number" &&
+            warmDaemonProbe.coldRamMb > 0 &&
+            !invalidatedWarmAfterProbe
+              ? Math.max(warmDaemonProbe.coldRamMb, explicitRamMb || 0)
+              : coldEstimateMb;
+          const estimateMb = effectiveWarmDaemon
+            ? Math.max(0, explicitRamMb || 0)
+            : partialWarmColdMb;
+          if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
+            ramCheck = checkUnifiedRamAdmission(state, host, estimateMb, now, {
+              hysteresisMb: wasAlreadyQueued ? 0 : undefined,
+            });
+            if (!ramCheck.allowed) {
+              canAdmit = false;
+            }
+          }
+
+          if (canAdmit) {
+            state.buildQueue.splice(chosenIdx, 1);
+            let coAllocatedDevice = false;
+            if (!lease && coClaimCandidate) {
+              const dev = coClaimCandidate;
+              const newLeaseId = `lease_${randomNonce().slice(0, 12)}`;
+              lease = {
+                leaseId: newLeaseId,
+                deviceKey: dev.deviceKey,
+                platform: dev.platform || "android",
+                kind: dev.kind,
+                avd: dev.avd || null,
+                udid: dev.udid || null,
+                coreDeviceId: dev.coreDeviceId || null,
+                serial: dev.serial,
+                profile: dev.profile,
+                dataPath: dev.dataPath || null,
+                sessionId: identity.sessionId,
+                anchorPid: identity.anchorPid,
+                parentPid: resolveStableParentPid(rawPpid, processChain),
+                state: "active",
+                isRecovery: false,
+                workerPid: null,
+                replacingAvd: null,
+                requiredRamMb: dev.requiredRamMb || 0,
+                requiredDiskMb: 0,
+                fsDev: dev.fsDev ?? host?.fsDev ?? null,
+                avdPath: dev.avdPath || null,
+                loadedSnapshot: coClaimReq?.snapshotLoad || null,
+                saveSnapshotOnFree: coClaimReq?.snapshotSaveOnFree || null,
+                claimedAtMs: now,
+                activatedAtMs: now,
+                activatedEpoch: state.fleetEpoch || 0,
+                renewedAtMs: now,
+                expiresAtMs: now + ttlMs,
+                deadlineMs: null,
+                firstSeenOfflineAtMs: null,
+                reason: coClaimReq?.reason || null,
+              };
+              state.leases[dev.deviceKey] = lease;
+              state.queue = (state.queue || []).filter((t) => t.sessionId !== identity.sessionId);
+              coAllocatedDevice = true;
+            }
+            if (lease) {
+              addLeaseWorker(lease, process.pid, livenessCheck);
+              lease.loadedSnapshot = null;
+              lease.renewedAtMs = now;
+              lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
+            }
+
+            const buildId = `build_${randomNonce().slice(0, 12)}`;
+            const reserveWindowMs = (state.config?.buildRamReservationWindowSec ?? 30) * 1000;
+            const isColdPrep = Boolean(!lease && coClaimNeedsColdOrPrep);
+            const prepBudgetMs = isColdPrep
+              ? ((state.config?.bootTimeoutSec || 180) + (state.config?.stopTimeoutSec || 60)) *
+                  1000 +
+                Math.max(0, (waitExpiresAtMs || now) - now)
+              : 0;
+            const buildLease = {
+              buildId,
+              opId: `op_${randomNonce().slice(0, 12)}`,
+              opNonce: randomNonce().slice(0, 16),
+              sessionId: identity.sessionId,
+              anchorPid: identity.anchorPid,
+              workerPid: process.pid,
+              execWrapperPid: process.pid,
+              workerPids: [process.pid],
+              workerPgids: [],
+              resourceKeys: buildReqs.resourceKeys,
+              workspaceRoot: buildReqs.workspaceRoot,
+              buildClass: buildReqs.kind,
+              tool: buildReqs.tool,
+              requiresHeavySlot: Boolean(buildReqs.requiresHeavySlot),
+              requiresWorkspaceLock: Boolean(buildReqs.requiresWorkspaceLock),
+              isBurstSlot: Boolean(
+                buildReqs.requiresHeavySlot && pool.activeHeavyBuilds >= pool.effectiveMaxBuilds,
+              ),
+              maxConcurrentBuilds: pool.effectiveMaxBuilds,
+              state: "active",
+              preparingDevice: isColdPrep,
+              pinnedDeviceLeaseId: lease?.leaseId || null,
+              pinnedDeviceKey: lease?.deviceKey || null,
+              claimedDaemonPid:
+                (effectiveWarmDaemon || (warmDaemonProbe.anyWarm && !invalidatedWarmAfterProbe)) &&
+                (effectiveClaimedDaemonPids.length > 0 || effectiveDaemonPids.length > 0)
+                  ? effectiveClaimedDaemonPids[0] || effectiveDaemonPids[0]
+                  : null,
+              claimedDaemonPids:
+                effectiveWarmDaemon || (warmDaemonProbe.anyWarm && !invalidatedWarmAfterProbe)
+                  ? effectiveClaimedDaemonPids.length > 0
+                    ? effectiveClaimedDaemonPids
+                    : effectiveDaemonPids.slice(
+                        0,
+                        Math.max(1, Number(warmDaemonProbe.claimedGradleCount) || 1),
+                      )
+                  : [],
+              claimedGradleCount:
+                effectiveWarmDaemon || (warmDaemonProbe.anyWarm && !invalidatedWarmAfterProbe)
+                  ? Math.max(1, Number(warmDaemonProbe.claimedGradleCount) || 1)
+                  : 0,
+              daemonPids: effectiveDaemonPids,
+              reservedRamMb: buildReqs.requiresHeavySlot ? estimateMb : 0,
+              ramReservationUntilMs:
+                buildReqs.requiresHeavySlot && estimateMb > 0
+                  ? now + Math.max(reserveWindowMs, prepBudgetMs)
+                  : 0,
+              createdAtMs: now,
+              renewedAtMs: now,
+              expiresAtMs: now + Math.max(ttlMs, prepBudgetMs),
+              commandPreview: [cmd, ...args].join(" ").slice(0, 200),
+            };
+            state.buildLeases[buildId] = buildLease;
+
+            if (!lease && coClaimNeedsColdOrPrep) {
+              retainedBuildTicket = {
+                ticketId: ticket.ticketId,
+                seq: ticket.seq,
+                enqueuedAtMs: ticket.enqueuedAtMs,
+                starvationDeadlineMs: ticket.starvationDeadlineMs,
+              };
+              return {
+                mutated: true,
+                value: {
+                  status: "needs_cold_claim",
+                  buildLease,
+                  sessionId: identity.sessionId,
+                  ttlMs,
+                  waitSec,
+                  waitExpiresAtMs,
+                  waitedMs: Math.max(0, now - ticket.enqueuedAtMs),
+                },
+              };
+            }
+
+            if (Array.isArray(auditEvents)) {
+              if (coAllocatedDevice && lease) {
+                auditEvents.push({
+                  event: "device_claim",
+                  sessionId: identity.sessionId,
+                  leaseId: lease.leaseId,
+                  deviceKey: lease.deviceKey,
+                  platform: lease.platform,
+                  kind: lease.kind,
+                  serial: lease.serial,
+                  avd: lease.avd,
+                  udid: lease.udid,
+                  coAllocatedWithBuildId: buildId,
+                });
+              }
+              auditEvents.push({
+                event: coAllocatedDevice ? "build_co_alloc_admit" : "build_admit",
+                sessionId: identity.sessionId,
+                buildId,
+                opId: buildLease.opId,
+                tool: buildReqs.tool,
+                buildClass: buildReqs.kind,
+                workspaceRoot: buildReqs.workspaceRoot,
+                resourceKeys: buildReqs.resourceKeys,
+                pinnedDeviceLeaseId: lease?.leaseId || null,
+                pinnedDeviceSerial: lease?.serial || null,
+                waitedMs: Math.max(0, now - ticket.enqueuedAtMs),
+              });
+            }
+
+            return {
+              mutated: true,
+              value: {
+                status: "admitted",
+                exitCode: 0,
+                lease,
+                buildLease,
+                coAllocatedDevice: Boolean(
+                  coAllocatedDevice ||
+                    (coAllocatedLeaseId && lease && lease.leaseId === coAllocatedLeaseId),
+                ),
+                reentrant: false,
+                sessionId: identity.sessionId,
+                ttlMs,
+              },
+            };
+          }
+
+          // Cannot admit right now
+          const hasActiveVirtualDeviceLease = Object.values(state.leases || {}).some(
+            (l) => l && l.kind === "emulator",
+          );
+          const noRecoverableWorkload =
+            ramCheck &&
+            !ramCheck.allowed &&
+            pool.activeHeavyBuilds === 0 &&
+            !hasActiveVirtualDeviceLease;
+          if (noRecoverableWorkload) {
+            state.buildQueue = state.buildQueue.filter((t) => t.ticketId !== ticket.ticketId);
+            return {
+              mutated: wasAlreadyQueued,
+              value: {
+                status: "error",
+                exitCode: 5,
+                error: `Insufficient host RAM to admit build (${ramCheck.effectiveFreeMb} MB projected free < ${ramCheck.requiredFloorMb} MB required floor). Pass --force to override.`,
+              },
+            };
+          }
+          if (waitSec <= 0 || now >= waitExpiresAtMs) {
+            state.buildQueue = state.buildQueue.filter((t) => t.ticketId !== ticket.ticketId);
+            return {
+              mutated: wasAlreadyQueued,
+              value: {
+                status: "error",
+                exitCode: 2,
+                error: `Build slot or workspace lock (${buildReqs.resourceKeys.join(", ")}) is currently busy (wait timeout reached).`,
+              },
+            };
+          }
+
+          retainedBuildTicket = {
+            ticketId: ticket.ticketId,
+            seq: ticket.seq,
+            enqueuedAtMs: ticket.enqueuedAtMs,
+            starvationDeadlineMs: ticket.starvationDeadlineMs,
+          };
+
+          // Coupled heartbeat: keep pinned device lease alive while waiting in buildQueue
+          if (lease) {
+            lease.renewedAtMs = now;
+            lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
+          }
+
+          if (!wasAlreadyQueued && Array.isArray(auditEvents)) {
+            auditEvents.push({
+              event: "build_queue_enter",
+              sessionId: identity.sessionId,
+              ticketId: ticket.ticketId,
+              tool: buildReqs.tool,
+              buildClass: buildReqs.kind,
+              workspaceRoot: buildReqs.workspaceRoot,
+              resourceKeys: buildReqs.resourceKeys,
+              pinnedDeviceLeaseId: lease?.leaseId || null,
+              requiresDeviceCoAlloc: Boolean(isClaimFlag && !lease),
+            });
+          }
+
+          return {
+            mutated: true,
+            value: {
+              status: "queued",
+              ticket,
+              hbTimeoutSec,
+              lease,
+              ttlMs,
+            },
+          };
+        },
+        options,
+      );
+    } catch (err) {
+      cleanupCoAllocatedLeaseOnEarlyError();
+      return { exitCode: 1, error: err.message };
+    }
+
+    if (txRes.status === "stale_inventory") {
+      coClaimInventory = null;
+      continue;
+    }
+
+    if (txRes.status === "needs_cold_claim") {
+      const effectiveClaimFlags = {
+        ...claimFlags,
+        ...(claimFlags.platform || claimFlags.ios || claimFlags.android
+          ? {}
+          : { platform: resolvedClaimPlatform }),
+        wait: 0,
+      };
+      let claimRes;
+      try {
+        claimRes = cmdClaim(
+          stateDir,
+          effectiveClaimFlags,
+          options,
+        );
+      } catch (err) {
+        claimRes = { exitCode: 1, error: err.message };
+      }
+      if (!claimRes || claimRes.exitCode !== 0 || !claimRes.lease) {
+        if (txRes.buildLease?.buildId) {
+          try {
+            withStateTransaction(
+              stateDir,
+              (state) => {
+                if (state.buildLeases?.[txRes.buildLease.buildId]) {
+                  delete state.buildLeases[txRes.buildLease.buildId];
+                  return { mutated: true };
+                }
+                return { mutated: false };
+              },
+              options,
+            );
+          } catch {
+            // Best-effort rollback of reserved build lease
+          }
+        }
+        if (
+          claimRes?.exitCode === 2 &&
+          (txRes.waitSec ?? 0) > 0 &&
+          Date.now() < (txRes.waitExpiresAtMs ?? startWaitMs)
+        ) {
+          coClaimInventory = null;
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
+        return claimRes || { exitCode: 1, error: "Device claim failed during co-allocation." };
+      }
+      retainedBuildTicket = null;
+      const claimedLease = claimRes.lease;
+      const coldCreatedNewLease = Boolean(!claimRes.idempotent);
+      if (coldCreatedNewLease && claimedLease?.leaseId) {
+        coAllocatedLeaseId = claimedLease.leaseId;
+        coAllocatedDeviceKey = claimedLease.deviceKey || null;
+      }
+      let postClaimValidationError = null;
+      const leasePlat = claimedLease.platform || "android";
+      const devSerial = claimedLease.serial || claimedLease.udid;
+      const wrappedClass = classifySegment(
+        [cmd, ...args]
+          .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+          .join(" "),
+        devSerial
+          ? leasePlat === "ios"
+            ? {
+                SIMULATOR_UDID: devSerial,
+                ATC_DEVICE_SERIAL: devSerial,
+                ATC_PLATFORM: "ios",
+              }
+            : {
+                ANDROID_SERIAL: devSerial,
+                ATC_DEVICE_SERIAL: devSerial,
+                ATC_PLATFORM: "android",
+              }
+          : {},
+        0,
+        { cwd, env: callerEnv },
+      );
+      if (wrappedClass.kind === "deny_lifecycle") {
+        postClaimValidationError = wrappedClass.reason;
+      } else {
+        const candidateTargetSerials = [
+          wrappedClass.targetSerial,
+          buildReqs.targetSerial,
+        ].filter(Boolean);
+        let conflictSel = null;
+        if (devSerial) {
+          for (const ts of candidateTargetSerials) {
+            conflictSel = findConflictingLeaseSelector(claimedLease, ts, {
+              allowRewritableBooted: true,
+            });
+            if (conflictSel) break;
+          }
+        }
+        if (conflictSel) {
+          postClaimValidationError = `Conflicting device selector "${conflictSel}" in atc exec; lease ${claimedLease.leaseId || claimedLease.deviceKey} is bound to "${devSerial}".`;
+        } else {
+          try {
+            buildChildInvocation(
+              cmd,
+              args,
+              claimedLease,
+              txRes.sessionId,
+              callerEnv,
+              txRes.buildLease || null,
+              { cwd },
+            );
+          } catch (err) {
+            postClaimValidationError = err.message;
+          }
+        }
+      }
+      if (postClaimValidationError) {
+        try {
+          withStateTransaction(
+            stateDir,
+            (state) => {
+              let mutated = false;
+              if (txRes.buildLease?.buildId && state.buildLeases?.[txRes.buildLease.buildId]) {
+                delete state.buildLeases[txRes.buildLease.buildId];
+                mutated = true;
+              }
+              if (coldCreatedNewLease) {
+                const { key, lease: cur } = findLeaseEntry(
+                  state,
+                  claimedLease.deviceKey,
+                  claimedLease.leaseId,
+                );
+                if (cur && cur.leaseId === claimedLease.leaseId) {
+                  delete state.leases[key];
+                  mutated = true;
+                }
+              }
+              return { mutated };
+            },
+            options,
+          );
+        } catch {
+          // Best-effort rollback of reserved build and device leases
+        }
+        return { exitCode: 3, error: postClaimValidationError };
+      }
+
+      const postClaimTx = withStateTransaction(
+        stateDir,
+        (state, { now, auditEvents }) => {
+          const livenessCheck = options.livenessCheck || isPidAlive;
+          const curBuild = state.buildLeases?.[txRes.buildLease.buildId];
+          const { lease: curDev } = findLeaseEntry(
+            state,
+            claimedLease.deviceKey,
+            claimedLease.leaseId,
+          );
+          const deviceGone = Boolean(
+            !curDev ||
+              curDev.state !== "active" ||
+              curDev.sessionId !== txRes.sessionId,
+          );
+          if (!curBuild || curBuild.state !== "active" || deviceGone) {
+            if (curBuild) {
+              delete state.buildLeases[txRes.buildLease.buildId];
+            }
+            return {
+              mutated: Boolean(curBuild),
+              value: { ok: false, deviceGone },
+            };
+          }
+          addLeaseWorker(curDev, process.pid, livenessCheck);
+          curDev.loadedSnapshot = null;
+          curDev.renewedAtMs = now;
+          curDev.expiresAtMs = Math.max(curDev.expiresAtMs || 0, now + txRes.ttlMs);
+          const reserveWindowMs = (state.config?.buildRamReservationWindowSec ?? 30) * 1000;
+          curBuild.preparingDevice = false;
+          curBuild.pinnedDeviceLeaseId = claimedLease.leaseId;
+          curBuild.pinnedDeviceKey = claimedLease.deviceKey;
+          curBuild.createdAtMs = now;
+          curBuild.renewedAtMs = now;
+          curBuild.expiresAtMs = now + txRes.ttlMs;
+          curBuild.ramReservationUntilMs = curBuild.requiresHeavySlot
+            ? now + reserveWindowMs
+            : 0;
+          if (Array.isArray(auditEvents)) {
+            auditEvents.push({
+              event: "build_co_alloc_admit",
+              sessionId: txRes.sessionId,
+              buildId: txRes.buildLease.buildId,
+              opId: txRes.buildLease.opId,
+              tool: buildReqs.tool,
+              buildClass: buildReqs.kind,
+              workspaceRoot: buildReqs.workspaceRoot,
+              resourceKeys: buildReqs.resourceKeys,
+              pinnedDeviceLeaseId: claimedLease.leaseId,
+              pinnedDeviceSerial: claimedLease.serial || null,
+              waitedMs: txRes.waitedMs || 0,
+            });
+          }
+          return {
+            mutated: true,
+            value: { ok: true, buildLease: { ...curBuild } },
+          };
+        },
+        options,
+      );
+      if (!postClaimTx?.ok) {
+        if (postClaimTx?.deviceGone) {
+          coAllocatedLeaseId = null;
+          coAllocatedDeviceKey = null;
+        }
+        // Build reservation or device lease was lost during cold device prep; re-enter admission loop
+        continue;
+      }
+      check = {
+        status: "admitted",
+        exitCode: 0,
+        lease: claimedLease,
+        buildLease: postClaimTx.buildLease,
+        coAllocatedDevice: coldCreatedNewLease,
+        reentrant: false,
+        sessionId: txRes.sessionId,
+        ttlMs: txRes.ttlMs,
+      };
+      break;
+    }
+
+    if (txRes.status === "error") {
+      cleanupCoAllocatedLeaseOnEarlyError();
+      return { exitCode: txRes.exitCode, error: txRes.error };
+    }
+
+    if (txRes.status === "admitted") {
+      check = txRes;
+      break;
+    }
+
+    // Queued in buildQueue: sleep with jitter and heartbeat both build ticket and pinned device lease
+    const pollSleepCapMs = Math.max(100, Math.floor(((txRes.hbTimeoutSec || 10) * 1000) / 4));
+    const sleepMs = Math.min(250 + Math.floor(Math.random() * 150), pollSleepCapMs);
+    sleepSync(sleepMs);
   }
 
-  const [cmd, ...args] = commandArgs;
   const heartbeatIntervalMs = Math.min(60_000, Math.max(1000, Math.floor(check.ttlMs / 3)));
   const onHeartbeat = () => {
     withStateTransaction(stateDir, (state, { now }) => {
-      const { lease: cur } = findLeaseEntry(
-        state,
-        check.lease.deviceKey,
-        check.lease.leaseId,
-      );
-      if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
-        const killCommittedAgeMs =
-          typeof cur.gcKillCommittedAtMs === "number" &&
-          Number.isFinite(cur.gcKillCommittedAtMs)
-            ? now - cur.gcKillCommittedAtMs
-            : -1;
-        if (killCommittedAgeMs >= 0 && killCommittedAgeMs < 30_000) {
-          return { mutated: false };
+      let mutated = false;
+      if (check.lease) {
+        const { lease: cur } = findLeaseEntry(
+          state,
+          check.lease.deviceKey,
+          check.lease.leaseId,
+        );
+        if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+          const killCommittedAgeMs =
+            typeof cur.gcKillCommittedAtMs === "number" &&
+            Number.isFinite(cur.gcKillCommittedAtMs)
+              ? now - cur.gcKillCommittedAtMs
+              : -1;
+          if (!(killCommittedAgeMs >= 0 && killCommittedAgeMs < 30_000)) {
+            delete cur.gcReapingAtMs;
+            delete cur.gcKillCommittedAtMs;
+            syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+            cur.renewedAtMs = now;
+            cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
+            mutated = true;
+          }
         }
-        delete cur.gcReapingAtMs;
-        delete cur.gcKillCommittedAtMs;
-        syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
-        cur.renewedAtMs = now;
-        cur.expiresAtMs = Math.max(cur.expiresAtMs || 0, now + check.ttlMs);
-        return { mutated: true };
       }
-      return { mutated: false };
+      if (check.buildLease && !check.reentrant) {
+        const curBuild = state.buildLeases?.[check.buildLease.buildId];
+        if (curBuild && curBuild.state === "active") {
+          syncLeaseWorkers(curBuild, options.livenessCheck || isPidAlive);
+          curBuild.renewedAtMs = now;
+          curBuild.expiresAtMs = Math.max(curBuild.expiresAtMs || 0, now + check.ttlMs);
+          mutated = true;
+        }
+      }
+      return { mutated };
     }, options);
   };
 
   let spawnedChildPid = null;
   let spawnedChildStartToken = null;
+  let childExitInfo = { exitCode: 0, signal: null, aborted: false };
   const onChildSpawn = (
     childPid,
     { isProcessGroup, freshGeneration, archivedGeneration, startToken } = {},
@@ -5262,24 +6934,43 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       withStateTransaction(
         stateDir,
         (state) => {
-          const { lease: cur } = findLeaseEntry(
-            state,
-            check.lease.deviceKey,
-            check.lease.leaseId,
-          );
-          if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
-            addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
-              isProcessGroup: Boolean(isProcessGroup),
-              freshGeneration: Boolean(freshGeneration ?? true),
-              archivedGeneration: alreadyArchivedInMemory,
-              startToken: spawnedChildStartToken,
-              platform: effectivePlatform,
-              spawnSyncFn: options.spawnSyncFn || options.runner,
-              allowSubprocess: false,
-            });
-            return { mutated: true };
+          let mutated = false;
+          if (check.lease) {
+            const { lease: cur } = findLeaseEntry(
+              state,
+              check.lease.deviceKey,
+              check.lease.leaseId,
+            );
+            if (cur && cur.leaseId === check.lease.leaseId && cur.sessionId === check.sessionId) {
+              addLeaseWorker(cur, childPid, options.livenessCheck || isPidAlive, {
+                isProcessGroup: Boolean(isProcessGroup),
+                freshGeneration: Boolean(freshGeneration ?? true),
+                archivedGeneration: alreadyArchivedInMemory,
+                startToken: spawnedChildStartToken,
+                platform: effectivePlatform,
+                spawnSyncFn: options.spawnSyncFn || options.runner,
+                allowSubprocess: false,
+              });
+              mutated = true;
+            }
           }
-          return { mutated: false };
+          if (check.buildLease && !check.reentrant) {
+            const curBuild = state.buildLeases?.[check.buildLease.buildId];
+            if (curBuild && curBuild.state === "active") {
+              curBuild.workerPid = childPid;
+              addLeaseWorker(curBuild, childPid, options.livenessCheck || isPidAlive, {
+                isProcessGroup: Boolean(isProcessGroup),
+                freshGeneration: Boolean(freshGeneration ?? true),
+                archivedGeneration: alreadyArchivedInMemory,
+                startToken: spawnedChildStartToken,
+                platform: effectivePlatform,
+                spawnSyncFn: options.spawnSyncFn || options.runner,
+                allowSubprocess: false,
+              });
+              mutated = true;
+            }
+          }
+          return { mutated };
         },
         {
           ...options,
@@ -5310,8 +7001,13 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       onHeartbeat,
       {
         ...options,
+        buildLease: check.buildLease,
+        buildMode: Boolean(check.buildLease),
         heartbeatIntervalMs,
         onChildSpawn,
+        onChildExit: (info) => {
+          childExitInfo = info;
+        },
       },
     );
     return { exitCode };
@@ -5322,6 +7018,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         try {
           keepSpawnedChildGroup = hasAliveProcessInGroup(spawnedChildPid, {
             allowSubprocess: true,
+            triState: true,
             spawnSyncFn: options.spawnSyncFn,
             platform: options.platform,
             expectedStartToken: spawnedChildStartToken,
@@ -5330,22 +7027,119 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           keepSpawnedChildGroup = false;
         }
       }
-      finishLeaseWorker(
-        stateDir,
-        check.lease.deviceKey,
-        check.lease.leaseId,
-        check.ttlMs,
-        options,
-        (cur) => {
-          if (spawnedChildPid) {
-            if (keepSpawnedChildGroup) {
-              syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+      if (check.buildLease && !check.reentrant) {
+        withStateTransaction(
+          stateDir,
+          (state, { now, auditEvents }) => {
+            const curBuild = state.buildLeases?.[check.buildLease.buildId];
+            if (!curBuild) return { mutated: false };
+            const abortedOrTimedOut = Boolean(
+              childExitInfo.aborted ||
+                childExitInfo.signal ||
+                childExitInfo.exitCode === 130 ||
+                childExitInfo.exitCode === 137 ||
+                childExitInfo.exitCode === 143,
+            );
+            const abortCooldownMs = (state.config?.buildAbortCooldownSec ?? 5) * 1000;
+            const maxDrainingMs = (state.config?.maxBuildDrainingSec ?? 30) * 1000;
+            const rec = reconcileBuildLease(curBuild, now, {
+              clientGroupAlive: keepSpawnedChildGroup,
+              abortedOrTimedOut,
+              abortCooldownMs,
+              maxDrainingMs,
+            });
+            if (rec.action === "mark_draining" && rec.lease) {
+              state.buildLeases[check.buildLease.buildId] = rec.lease;
+              if (Array.isArray(auditEvents)) {
+                auditEvents.push({
+                  event: "build_draining",
+                  sessionId: check.sessionId,
+                  buildId: check.buildLease.buildId,
+                  workspaceRoot: check.buildLease.workspaceRoot,
+                  resourceKeys: check.buildLease.resourceKeys,
+                  exitCode: childExitInfo.exitCode,
+                  signal: childExitInfo.signal,
+                  drainingCooldownUntilMs: rec.lease.drainingCooldownUntilMs,
+                  drainingDeadlineMs: rec.lease.drainingDeadlineMs,
+                });
+              }
             } else {
-              removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+              delete state.buildLeases[check.buildLease.buildId];
+              if (Array.isArray(auditEvents)) {
+                auditEvents.push({
+                  event: "build_release",
+                  sessionId: check.sessionId,
+                  buildId: check.buildLease.buildId,
+                  workspaceRoot: check.buildLease.workspaceRoot,
+                  resourceKeys: check.buildLease.resourceKeys,
+                  durationMs: Math.max(0, now - (check.buildLease.createdAtMs || now)),
+                  exitCode: childExitInfo.exitCode,
+                });
+              }
             }
-          }
-        },
-      );
+            return { mutated: true };
+          },
+          options,
+        );
+      }
+      if (check.lease) {
+        if (check.coAllocatedDevice) {
+          withStateTransaction(
+            stateDir,
+            (state, { auditEvents }) => {
+              const { key, lease: cur } = findLeaseEntry(
+                state,
+                check.lease.deviceKey,
+                check.lease.leaseId,
+              );
+              if (!cur || cur.leaseId !== check.lease.leaseId) {
+                return { mutated: false };
+              }
+              if (spawnedChildPid) {
+                removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+              }
+              removeLeaseWorker(cur, process.pid, options.livenessCheck || isPidAlive);
+              if (keepSpawnedChildGroup) {
+                cur.releaseOnWorkerExit = true;
+                syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+                return { mutated: true };
+              }
+              delete state.leases[key];
+              if (Array.isArray(auditEvents)) {
+                auditEvents.push({
+                  event: "device_free",
+                  sessionId: check.sessionId,
+                  leaseId: cur.leaseId,
+                  deviceKey: key,
+                  platform: cur.platform,
+                  kind: cur.kind,
+                  serial: cur.serial,
+                  reason: "exec_claim_exit",
+                });
+              }
+              return { mutated: true };
+            },
+            options,
+          );
+        } else {
+          finishLeaseWorker(
+            stateDir,
+            check.lease.deviceKey,
+            check.lease.leaseId,
+            check.ttlMs,
+            options,
+            (cur) => {
+              if (spawnedChildPid) {
+                if (keepSpawnedChildGroup && !check.buildLease) {
+                  syncLeaseWorkers(cur, options.livenessCheck || isPidAlive);
+                } else {
+                  removeLeaseWorker(cur, spawnedChildPid, options.livenessCheck || isPidAlive);
+                }
+              }
+            },
+          );
+        }
+      }
     } catch {
       // Best-effort workerPid cleanup
     }
@@ -5441,6 +7235,7 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
       const usedSlots = computeUsedEmulatorSlots(state, inventory);
       const effectiveMaxSimulators = computeEffectiveMaxSimulators(state.config, inventory.host);
       const usedSimulatorSlots = computeUsedSimulatorSlots(state, inventory);
+      const buildCapacity = computeBuildPoolSnapshot(state, inventory.host, now);
       const running = (inventory.running || []).filter((d) => matchesProfile(d, req));
       const offline = (inventory.offline || []).filter((d) => matchesProfile(d, req));
       const creatable = (inventory.creatable || []).filter((d) =>
@@ -5457,8 +7252,21 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
             effectiveMaxEmulators,
             usedSimulatorSlots,
             effectiveMaxSimulators,
+            usedBuildSlots: buildCapacity.usedBuildSlots,
+            effectiveMaxBuilds: buildCapacity.effectiveMaxBuilds,
+            burstBuildSlots: buildCapacity.burstSlots,
+            totalBuildCapacity: buildCapacity.totalCapacity,
             minFreeRamMb: state.config.minFreeRamMb,
             minFreeDiskMb: state.config.minFreeDiskMb,
+          },
+          buildCapacity: {
+            activeHeavyBuilds: buildCapacity.activeHeavyBuilds,
+            activeTotalBuilds: buildCapacity.activeTotalBuilds,
+            usedBuildSlots: buildCapacity.usedBuildSlots,
+            effectiveMaxBuilds: buildCapacity.effectiveMaxBuilds,
+            burstBuilds: buildCapacity.burstBuilds,
+            totalCapacity: buildCapacity.totalCapacity,
+            activeWorkspaces: Array.from(buildCapacity.activeWorkspaces),
           },
           fleet: {
             running,
@@ -5467,6 +7275,9 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
           },
           leases: state.leases,
           queue: state.queue,
+          buildLeases: state.buildLeases,
+          buildQueue: state.buildQueue,
+          logPath: resolveAuditLogPath(stateDir, options.env || process.env),
           config: state.config,
         },
       };
@@ -5500,7 +7311,11 @@ export function cmdConfig(stateDir, action, key = null, val = null) {
         };
       }
       let parsedVal = val;
-      if (key === "maxRunningEmulators" || key === "maxRunningSimulators") {
+      if (
+        key === "maxRunningEmulators" ||
+        key === "maxRunningSimulators" ||
+        key === "maxConcurrentBuilds"
+      ) {
         if (val === "auto") {
           parsedVal = "auto";
         } else if (/^\d+$/.test(String(val)) && Number(val) >= 1) {
@@ -5816,7 +7631,12 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
 
   if (!inventory && options.runningCount === undefined) {
     const unscopedSegments = splitShellSegments(commandStr)
-      .map((seg) => classifySegment(seg))
+      .map((seg) =>
+        classifySegment(seg, {}, 0, {
+          cwd: options.cwd || process.cwd(),
+          env: options.env || process.env,
+        }),
+      )
       .filter((c) => c.kind === "device_action" && !c.targetSerial);
     const runner = options.runner || runCommandSync;
     if (
@@ -5858,7 +7678,7 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
     probedRunningCount = options.runningCount;
   }
 
-  const evalRes = withStateTransaction(stateDir, (state, { now }) => {
+  const evalRes = withStateTransaction(stateDir, (state, { now, auditEvents }) => {
     const identity = resolveSessionIdentity({
       flags,
       env: options.env || process.env,
@@ -5895,7 +7715,32 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       runningCount,
       runningCountByPlatform,
       platform: options.platform,
+      cwd: options.cwd || process.cwd(),
+      env: options.env || process.env,
+      coordinateBuilds:
+        options.coordinateBuilds !== undefined
+          ? Boolean(options.coordinateBuilds)
+          : Boolean(state.config?.coordinateBuilds),
     });
+    if (!guard.allowed) {
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "guard_deny",
+          sessionId: identity.sessionId,
+          command: commandStr,
+          reason: guard.reason,
+        });
+      }
+    } else if (guard.rewrittenCommand) {
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "guard_rewrite",
+          sessionId: identity.sessionId,
+          command: commandStr,
+          rewrittenCommand: guard.rewrittenCommand,
+        });
+      }
+    }
     let mutated = false;
     if (guard.allowed && guard.renewLease && activeLeases.length > 0) {
       const ttlMs = (state.config?.defaultTtlSec ?? DEFAULT_CONFIG.defaultTtlSec ?? 600) * 1000;
@@ -5925,6 +7770,688 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
   return {
     exitCode: evalRes.allowed ? 0 : 2,
     ...evalRes,
+  };
+}
+
+export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {}) {
+  const subcmdName = options.subcommand || "batch";
+  const unknownFlagErr = validateCommandFlags(flags, BATCH_ALLOWED_FLAGS, subcmdName);
+  if (unknownFlagErr) {
+    return { exitCode: 1, error: unknownFlagErr };
+  }
+
+  if (flags.file !== undefined && flags.file !== null) {
+    if (typeof flags.file === "boolean" || !String(flags.file).trim()) {
+      return { exitCode: 1, error: 'Option "--file" requires a file path.' };
+    }
+  }
+  if (flags.spec !== undefined && flags.spec !== null) {
+    if (typeof flags.spec === "boolean" || (typeof flags.spec === "string" && !flags.spec.trim())) {
+      return { exitCode: 1, error: 'Option "--spec" requires a JSON specification.' };
+    }
+  }
+  if (
+    flags.file !== undefined &&
+    flags.file !== null &&
+    flags.spec !== undefined &&
+    flags.spec !== null
+  ) {
+    return { exitCode: 1, error: 'Cannot combine "--file" with "--spec".' };
+  }
+
+  let defaultBatchWorkspace = null;
+  if (flags.workspace !== undefined && flags.workspace !== null) {
+    if (typeof flags.workspace === "boolean" || !String(flags.workspace).trim()) {
+      return { exitCode: 1, error: 'Option "--workspace" requires a directory path.' };
+    }
+    const candWs = path.resolve(options.cwd || process.cwd(), String(flags.workspace).trim());
+    try {
+      if (!fs.existsSync(candWs) || !fs.statSync(candWs).isDirectory()) {
+        return { exitCode: 1, error: `Workspace directory does not exist: ${candWs}` };
+      }
+      defaultBatchWorkspace = fs.realpathSync(candWs);
+    } catch {
+      return { exitCode: 1, error: `Workspace directory is not accessible: ${candWs}` };
+    }
+  }
+  const rawBatchWait = flags.wait ?? flags.waitSec;
+  let defaultBatchWait = undefined;
+  if (rawBatchWait !== undefined && rawBatchWait !== null) {
+    const parsedWait =
+      typeof rawBatchWait === "boolean" || (typeof rawBatchWait === "string" && !rawBatchWait.trim())
+        ? Number.NaN
+        : Number(rawBatchWait);
+    if (!Number.isFinite(parsedWait) || parsedWait < 0) {
+      return {
+        exitCode: 1,
+        error: `Invalid --wait duration "${rawBatchWait}". Expected a non-negative number of seconds.`,
+      };
+    }
+    defaultBatchWait = parsedWait;
+  }
+
+  let spec = null;
+  let effectiveSpecInput = null;
+  if (rawSpecInput !== undefined && rawSpecInput !== null) {
+    effectiveSpecInput = rawSpecInput;
+  } else if (flags.spec !== undefined && flags.spec !== null) {
+    effectiveSpecInput = flags.spec;
+  } else if (
+    flags.file !== undefined &&
+    flags.file !== null &&
+    String(flags.file).trim() !== "-"
+  ) {
+    const fileArg = String(flags.file).trim();
+    try {
+      effectiveSpecInput = fs.readFileSync(
+        path.resolve(options.cwd || process.cwd(), fileArg),
+        "utf8",
+      );
+    } catch (err) {
+      return {
+        exitCode: 1,
+        error: `Failed to read batch file "${fileArg}": ${err.message}`,
+      };
+    }
+  } else {
+    const readStdin =
+      typeof options.readStdinFn === "function" ? options.readStdinFn : readStdinSync;
+    effectiveSpecInput = readStdin();
+  }
+  if (
+    effectiveSpecInput &&
+    typeof effectiveSpecInput === "object" &&
+    !Array.isArray(effectiveSpecInput)
+  ) {
+    spec = effectiveSpecInput;
+  } else {
+    const rawStr = typeof effectiveSpecInput === "string" ? effectiveSpecInput.trim() : "";
+    if (!rawStr) {
+      return {
+        exitCode: 1,
+        error: 'Usage: atc batch [--file <path.json>|--spec <json>] [--json] (or pass JSON spec via stdin)',
+      };
+    }
+    try {
+      spec = JSON.parse(rawStr);
+    } catch (err) {
+      return {
+        exitCode: 1,
+        error: `Invalid JSON batch specification: ${err.message}`,
+      };
+    }
+  }
+
+  if (!spec || typeof spec !== "object" || !Array.isArray(spec.steps) || spec.steps.length === 0) {
+    return {
+      exitCode: 1,
+      error: 'Batch specification must contain a non-empty "steps" array.',
+    };
+  }
+
+  const baseCwd = options.cwd || process.cwd();
+  const baseEnv = options.env || process.env;
+  const stepsById = new Map();
+  const preparedSteps = [];
+
+  for (let i = 0; i < spec.steps.length; i++) {
+    const rawStep = spec.steps[i];
+    if (!rawStep || typeof rawStep !== "object" || Array.isArray(rawStep)) {
+      return { exitCode: 1, error: `Batch step at index ${i} must be an object.` };
+    }
+    const id = typeof rawStep.id === "string" ? rawStep.id.trim() : "";
+    if (!id) {
+      return {
+        exitCode: 1,
+        error: `Batch step at index ${i} is missing a non-empty string "id".`,
+      };
+    }
+    if (stepsById.has(id)) {
+      return {
+        exitCode: 1,
+        error: `Duplicate step id "${id}" in batch specification.`,
+      };
+    }
+    const command = typeof rawStep.command === "string" ? rawStep.command.trim() : "";
+    if (!command || command.includes("\0")) {
+      return {
+        exitCode: 1,
+        error: `Batch step "${id}" has an empty or invalid "command".`,
+      };
+    }
+    let stepArgs = [];
+    if (rawStep.args !== undefined && rawStep.args !== null) {
+      if (!Array.isArray(rawStep.args)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "args" must be an array of strings.`,
+        };
+      }
+      stepArgs = rawStep.args.map((a) => String(a));
+      if (stepArgs.some((a) => a.includes("\0"))) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "args" entries must not contain NUL bytes.`,
+        };
+      }
+    }
+
+    let dependsOn = [];
+    if (rawStep.dependsOn !== undefined && rawStep.dependsOn !== null) {
+      if (!Array.isArray(rawStep.dependsOn)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "dependsOn" must be an array of step IDs.`,
+        };
+      }
+      for (const dep of rawStep.dependsOn) {
+        const depId = typeof dep === "string" ? dep.trim() : "";
+        if (!depId) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": "dependsOn" entries must be non-empty strings.`,
+          };
+        }
+        if (depId === id) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}" cannot depend on itself.`,
+          };
+        }
+        if (!dependsOn.includes(depId)) {
+          dependsOn.push(depId);
+        }
+      }
+    }
+
+    let stepCwd = baseCwd;
+    if (rawStep.cwd !== undefined && rawStep.cwd !== null) {
+      if (typeof rawStep.cwd !== "string" || !rawStep.cwd.trim()) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "cwd" must be a non-empty directory path.`,
+        };
+      }
+      const candCwd = path.resolve(baseCwd, rawStep.cwd.trim());
+      try {
+        if (!fs.existsSync(candCwd) || !fs.statSync(candCwd).isDirectory()) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": cwd directory does not exist: ${candCwd}`,
+          };
+        }
+        stepCwd = fs.realpathSync(candCwd);
+      } catch {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": cwd directory is not accessible: ${candCwd}`,
+        };
+      }
+    }
+
+    let stepWorkspace = defaultBatchWorkspace;
+    if (rawStep.workspace !== undefined && rawStep.workspace !== null) {
+      if (typeof rawStep.workspace !== "string" || !rawStep.workspace.trim()) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "workspace" must be a non-empty directory path.`,
+        };
+      }
+      const candWs = path.resolve(stepCwd, rawStep.workspace.trim());
+      try {
+        if (!fs.existsSync(candWs) || !fs.statSync(candWs).isDirectory()) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": workspace directory does not exist: ${candWs}`,
+          };
+        }
+        stepWorkspace = fs.realpathSync(candWs);
+      } catch {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": workspace directory is not accessible: ${candWs}`,
+        };
+      }
+    }
+
+    let stepPhase = null;
+    if (rawStep.phase !== undefined && rawStep.phase !== null) {
+      const p = typeof rawStep.phase === "string" ? rawStep.phase.trim().toLowerCase() : "";
+      if (!VALID_EXEC_PHASES.has(p)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": invalid phase "${rawStep.phase}". Expected one of: pure-build, device-build, device-test, read-only.`,
+        };
+      }
+      stepPhase = p;
+    }
+
+    const rawStepRam = rawStep.ramMb ?? rawStep["ram-mb"];
+    let stepRamMb = undefined;
+    if (rawStepRam !== undefined && rawStepRam !== null) {
+      const parsedRam =
+        typeof rawStepRam === "boolean" || (typeof rawStepRam === "string" && !rawStepRam.trim())
+          ? Number.NaN
+          : Number(rawStepRam);
+      if (!Number.isInteger(parsedRam) || parsedRam < 1 || parsedRam > 1_048_576) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": invalid ramMb "${rawStepRam}". Expected an integer between 1 and 1048576.`,
+        };
+      }
+      stepRamMb = parsedRam;
+    }
+
+    const rawStepWait = rawStep.wait ?? rawStep.waitSec;
+    let stepWait = defaultBatchWait;
+    if (rawStepWait !== undefined && rawStepWait !== null) {
+      const parsedWait =
+        typeof rawStepWait === "boolean" || (typeof rawStepWait === "string" && !rawStepWait.trim())
+          ? Number.NaN
+          : Number(rawStepWait);
+      if (!Number.isFinite(parsedWait) || parsedWait < 0) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": invalid wait "${rawStepWait}". Expected a non-negative number of seconds.`,
+        };
+      }
+      stepWait = parsedWait;
+    }
+
+    let stepEnv = { ...baseEnv };
+    if (rawStep.env !== undefined && rawStep.env !== null) {
+      if (typeof rawStep.env !== "object" || Array.isArray(rawStep.env)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "env" must be an object of key-value pairs.`,
+        };
+      }
+      for (const [k, v] of Object.entries(rawStep.env)) {
+        if (!k || k.includes("\0") || k.includes("=")) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": invalid environment variable name ${JSON.stringify(k)}.`,
+          };
+        }
+        if (v === undefined || v === null) {
+          delete stepEnv[k];
+        } else {
+          const strVal = String(v);
+          if (strVal.includes("\0")) {
+            return {
+              exitCode: 1,
+              error: `Batch step "${id}": environment variable "${k}" must not contain NUL bytes.`,
+            };
+          }
+          stepEnv[k] = strVal;
+        }
+      }
+    }
+
+    const stepFlags = {};
+    if (flags.session !== undefined) stepFlags.session = flags.session;
+    if (flags.role !== undefined) stepFlags.role = flags.role;
+    if (flags.anchorPid !== undefined) stepFlags.anchorPid = flags.anchorPid;
+    if (stepPhase) stepFlags.phase = stepPhase;
+    if (stepWorkspace) stepFlags.workspace = stepWorkspace;
+    if (stepRamMb !== undefined) stepFlags.ramMb = stepRamMb;
+    if (stepWait !== undefined) stepFlags.wait = stepWait;
+    if (rawStep.build !== undefined) stepFlags.build = parseBoolFlag(rawStep.build);
+    if (rawStep.serial !== undefined) stepFlags.serial = String(rawStep.serial);
+    if (rawStep.udid !== undefined) stepFlags.udid = String(rawStep.udid);
+
+    if (rawStep.claim !== undefined && rawStep.claim !== null && rawStep.claim !== false) {
+      if (rawStep.claim === true) {
+        stepFlags.claim = true;
+      } else if (typeof rawStep.claim === "string") {
+        const parsedSel = parseCliArgs(["exec", ...tokenizeClaimSelectorString(rawStep.claim)]);
+        if (parsedSel.positionals.length > 0) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": unexpected argument "${parsedSel.positionals[0]}" in claim selector.`,
+          };
+        }
+        Object.assign(stepFlags, parsedSel.flags);
+        stepFlags.claim = true;
+      } else if (typeof rawStep.claim === "object" && !Array.isArray(rawStep.claim)) {
+        const claimErr = validateCommandFlags(rawStep.claim, CLAIM_ALLOWED_FLAGS, "claim");
+        if (claimErr) {
+          return {
+            exitCode: 1,
+            error: `Batch step "${id}": ${claimErr}`,
+          };
+        }
+        Object.assign(stepFlags, rawStep.claim);
+        stepFlags.claim = true;
+      } else {
+        return {
+          exitCode: 1,
+          error: `Batch step "${id}": "claim" must be a boolean, selector string, or claim options object.`,
+        };
+      }
+    }
+
+    const execFlagErr = validateCommandFlags(stepFlags, EXEC_ALLOWED_FLAGS, "exec");
+    if (execFlagErr) {
+      return { exitCode: 1, error: `Batch step "${id}": ${execFlagErr}` };
+    }
+
+    try {
+      resolveExplicitPlatformFilter(stepFlags);
+      if (parseBoolFlag(stepFlags.claim)) {
+        resolveTargetPlatform(stepFlags, stepCwd);
+      }
+    } catch (err) {
+      return { exitCode: 1, error: `Batch step "${id}": ${err.message}` };
+    }
+
+    const isStepBuild =
+      parseBoolFlag(stepFlags.build) ||
+      stepPhase === "pure-build" ||
+      stepPhase === "device-build";
+    const isStepClaim = parseBoolFlag(stepFlags.claim);
+    const stepSelectorSerial = stepFlags.serial || stepFlags.udid || null;
+
+    const preflightBuildReqs = resolveBuildResources(command, stepArgs, stepCwd, {
+      forceBuild: isStepBuild,
+      env: stepEnv,
+      workspace: stepWorkspace,
+    });
+    if (preflightBuildReqs.kind === "deny_lifecycle") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightBuildReqs.reason}`,
+      };
+    }
+    if (preflightBuildReqs.kind === "reject_long_running") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightBuildReqs.reason}`,
+      };
+    }
+    const rawStepCmdStr = [command, ...stepArgs]
+      .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
+      .join(" ");
+    const preflightDevClass = classifySegment(rawStepCmdStr, {}, 0, {
+      cwd: stepCwd,
+      env: stepEnv,
+    });
+    if (preflightDevClass.kind === "deny_lifecycle") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightDevClass.reason}`,
+      };
+    }
+    if (preflightDevClass.buildClass === "reject_long_running") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightDevClass.rejectReason || "Continuous/watch build commands cannot be coordinated by atc batch because they hold build slots indefinitely."}`,
+      };
+    }
+    if (stepPhase) {
+      if (
+        (stepPhase === "pure-build" || stepPhase === "read-only") &&
+        (isStepClaim || Boolean(stepSelectorSerial))
+      ) {
+        return {
+          exitCode: 3,
+          error: `Batch pre-flight failed on step "${id}": Conflicting flags: --phase=${stepPhase} cannot be combined with --claim or --serial/--udid.`,
+        };
+      }
+      if (stepPhase === "read-only") {
+        if (
+          preflightBuildReqs.requiresHeavySlot ||
+          preflightBuildReqs.requiresWorkspaceLock ||
+          preflightBuildReqs.requiresDevice ||
+          preflightDevClass.kind === "device_action" ||
+          (preflightDevClass.isBuildTool &&
+            preflightDevClass.buildClass &&
+            preflightDevClass.buildClass !== "read_only")
+        ) {
+          const conflictKind =
+            preflightBuildReqs.kind && preflightBuildReqs.kind !== "not_build_tool"
+              ? preflightBuildReqs.kind
+              : preflightDevClass.buildClass || preflightDevClass.kind;
+          return {
+            exitCode: 3,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command requires build/workspace/device locks (${conflictKind}), which violates --phase=read-only.`,
+          };
+        }
+      } else if (stepPhase === "pure-build") {
+        if (preflightBuildReqs.requiresDevice || preflightDevClass.kind === "device_action") {
+          return {
+            exitCode: 3,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command interacts with a device (${preflightBuildReqs.kind}), which violates --phase=pure-build.`,
+          };
+        }
+      } else if (stepPhase === "device-test") {
+        if (
+          (preflightBuildReqs.requiresHeavySlot && !preflightBuildReqs.requiresDevice) ||
+          (preflightDevClass.isBuildTool && preflightDevClass.buildClass === "pure_build")
+        ) {
+          const conflictKind =
+            preflightBuildReqs.kind && preflightBuildReqs.kind !== "not_build_tool"
+              ? preflightBuildReqs.kind
+              : preflightDevClass.buildClass;
+          return {
+            exitCode: 3,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command is a pure compilation (${conflictKind}) that does not target a device, which violates --phase=device-test.`,
+          };
+        }
+      }
+    }
+
+    const stepObj = {
+      id,
+      index: i,
+      command,
+      args: stepArgs,
+      dependsOn,
+      phase: stepPhase,
+      cwd: stepCwd,
+      workspace: stepWorkspace,
+      env: stepEnv,
+      flags: stepFlags,
+    };
+    stepsById.set(id, stepObj);
+    preparedSteps.push(stepObj);
+  }
+
+  // Validate dependency references and perform Kahn's topological sort
+  const inDegree = new Map();
+  const dependents = new Map();
+  for (const s of preparedSteps) {
+    inDegree.set(s.id, 0);
+    dependents.set(s.id, []);
+  }
+  for (const s of preparedSteps) {
+    for (const depId of s.dependsOn) {
+      if (!stepsById.has(depId)) {
+        return {
+          exitCode: 1,
+          error: `Batch step "${s.id}" depends on unknown step "${depId}".`,
+        };
+      }
+      inDegree.set(s.id, (inDegree.get(s.id) || 0) + 1);
+      dependents.get(depId).push(s.id);
+    }
+  }
+
+  const readyQueue = preparedSteps.filter((s) => inDegree.get(s.id) === 0).map((s) => s.id);
+  const topoOrder = [];
+  while (readyQueue.length > 0) {
+    const curId = readyQueue.shift();
+    topoOrder.push(stepsById.get(curId));
+    for (const nextId of dependents.get(curId) || []) {
+      const nextDeg = (inDegree.get(nextId) || 0) - 1;
+      inDegree.set(nextId, nextDeg);
+      if (nextDeg === 0) {
+        readyQueue.push(nextId);
+      }
+    }
+  }
+
+  if (topoOrder.length !== preparedSteps.length) {
+    const cycleIds = preparedSteps
+      .filter((s) => (inDegree.get(s.id) || 0) > 0)
+      .map((s) => s.id);
+    return {
+      exitCode: 1,
+      error: `Dependency cycle detected in batch specification involving step(s): ${cycleIds.join(", ")}.`,
+    };
+  }
+
+  const batchId = `batch_${randomNonce().slice(0, 12)}`;
+  const batchStartMs = Date.now();
+  let sessionId = null;
+  withStateTransaction(
+    stateDir,
+    (state, { auditEvents }) => {
+      const identity = resolveSessionIdentity({
+        flags,
+        env: baseEnv,
+        state,
+        cwd: baseCwd,
+        ppid: options.ppid ?? process.ppid,
+        ancestorPids: options.ancestorPids,
+        processChain: options.processChain,
+      });
+      sessionId = identity.sessionId;
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "batch_start",
+          sessionId: identity.sessionId,
+          batchId,
+          stepCount: topoOrder.length,
+          stepOrder: topoOrder.map((s) => s.id),
+        });
+      }
+      return { mutated: false };
+    },
+    options,
+  );
+
+  const stepResults = [];
+  const jsonOutputMode = parseBoolFlag(flags.json);
+
+  for (const step of topoOrder) {
+    const stepStartMs = Date.now();
+    let execRes;
+    try {
+      execRes = await cmdExec(
+        stateDir,
+        [step.command, ...step.args],
+        step.flags,
+        {
+          ...options,
+          cwd: step.cwd,
+          env: step.env,
+          ...(jsonOutputMode && !options.stdio
+            ? {
+                stdio: ["ignore", "pipe", "pipe"],
+                redirectStdoutToStderr: true,
+              }
+            : {}),
+        },
+      );
+    } catch (err) {
+      execRes = {
+        exitCode: 1,
+        error: err && err.message ? err.message : String(err),
+      };
+    }
+    const durationMs = Math.max(0, Date.now() - stepStartMs);
+    const exitCode = typeof execRes?.exitCode === "number" ? execRes.exitCode : 1;
+    const stepRecord = {
+      id: step.id,
+      phase: step.phase,
+      exitCode,
+      durationMs,
+      ...(execRes?.error ? { error: execRes.error } : {}),
+    };
+    stepResults.push(stepRecord);
+
+    withStateTransaction(
+      stateDir,
+      (state, { auditEvents }) => {
+        if (Array.isArray(auditEvents)) {
+          auditEvents.push({
+            event: exitCode === 0 ? "batch_step_done" : "batch_step_failed",
+            sessionId,
+            batchId,
+            stepId: step.id,
+            phase: step.phase,
+            exitCode,
+            durationMs,
+            ...(execRes?.error ? { error: execRes.error } : {}),
+          });
+        }
+        return { mutated: false };
+      },
+      options,
+    );
+
+    if (exitCode !== 0) {
+      const totalDurationMs = Math.max(0, Date.now() - batchStartMs);
+      withStateTransaction(
+        stateDir,
+        (state, { auditEvents }) => {
+          if (Array.isArray(auditEvents)) {
+            auditEvents.push({
+              event: "batch_complete",
+              sessionId,
+              batchId,
+              status: "failed",
+              failedStepId: step.id,
+              exitCode,
+              completedSteps: stepResults.length,
+              totalSteps: topoOrder.length,
+              durationMs: totalDurationMs,
+            });
+          }
+          return { mutated: false };
+        },
+        options,
+      );
+      return {
+        exitCode,
+        batchId,
+        status: "failed",
+        failedStepId: step.id,
+        steps: stepResults,
+        durationMs: totalDurationMs,
+        error: execRes?.error || `Batch step "${step.id}" failed with exit code ${exitCode}.`,
+      };
+    }
+  }
+
+  const totalDurationMs = Math.max(0, Date.now() - batchStartMs);
+  withStateTransaction(
+    stateDir,
+    (state, { auditEvents }) => {
+      if (Array.isArray(auditEvents)) {
+        auditEvents.push({
+          event: "batch_complete",
+          sessionId,
+          batchId,
+          status: "completed",
+          exitCode: 0,
+          completedSteps: stepResults.length,
+          totalSteps: topoOrder.length,
+          durationMs: totalDurationMs,
+        });
+      }
+      return { mutated: false };
+    },
+    options,
+  );
+
+  return {
+    exitCode: 0,
+    batchId,
+    status: "completed",
+    steps: stepResults,
+    durationMs: totalDurationMs,
   };
 }
 
@@ -5964,7 +8491,8 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
         `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
         `  atc renew [<target>] [--ttl <sec>]\n` +
         `  atc snapshot <list|save|load|delete> [<name>]\n` +
-        `  atc exec -- <command> [args...]\n` +
+        `  atc exec [--build] [--claim] [--workspace <dir>] [--phase <phase>] [--ram-mb <mb>] -- <command> [args...]\n` +
+        `  atc batch [--file <path.json>] [--json]\n` +
         `  atc status [--ios|--android] [--type <type>] [--api|--os <spec>] [--json]\n` +
         `  atc config <get|set> [key] [val]\n` +
         `  atc gc\n` +
@@ -6120,6 +8648,41 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
       return res.exitCode;
     }
 
+    case "batch":
+    case "plan": {
+      if (
+        parsed.positionals.length > 1 ||
+        (parsed.positionals.length > 0 && parsed.flags.file !== undefined) ||
+        (parsed.positionals.length > 0 && parsed.flags.spec !== undefined)
+      ) {
+        const extra =
+          parsed.positionals.length > 1 ? parsed.positionals[1] : parsed.positionals[0];
+        process.stderr.write(
+          `[atc] Unexpected argument "${extra}" for "atc ${parsed.subcommand}".\n`,
+        );
+        return 1;
+      }
+      const batchFlags =
+        parsed.positionals.length > 0
+          ? { ...parsed.flags, file: parsed.positionals[0] }
+          : parsed.flags;
+      const res = await cmdBatch(stateDir, null, batchFlags, {
+        env,
+        ...options,
+        subcommand: parsed.subcommand,
+      });
+      if (parsed.flags.json) {
+        process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+      } else if (res.error) {
+        process.stderr.write(`[atc] ${res.error}\n`);
+      } else {
+        process.stdout.write(
+          `✓ Completed batch ${res.batchId} (${res.steps.length} step${res.steps.length === 1 ? "" : "s"} in ${res.durationMs}ms)\n`,
+        );
+      }
+      return res.exitCode;
+    }
+
     case "status": {
       if (parsed.positionals.length > 0) {
         process.stderr.write(
@@ -6137,12 +8700,14 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
       } else {
         const hc = res.hostCapacity;
         process.stdout.write(
-          `Host Capacity: ${hc.availableRamMb} MB RAM avail · ${hc.freeDiskMb} MB disk free · emu slots: ${hc.usedSlots}/${hc.effectiveMaxEmulators} · sim slots: ${hc.usedSimulatorSlots ?? 0}/${hc.effectiveMaxSimulators ?? 4}\n`,
+          `Host Capacity: ${hc.availableRamMb} MB RAM avail · ${hc.freeDiskMb} MB disk free · emu slots: ${hc.usedSlots}/${hc.effectiveMaxEmulators} · sim slots: ${hc.usedSimulatorSlots ?? 0}/${hc.effectiveMaxSimulators ?? 4} · build slots: ${hc.usedBuildSlots ?? 0}/${hc.effectiveMaxBuilds ?? 1}\n`,
         );
         process.stdout.write(`  Running (${res.fleet.running.length}): ${res.fleet.running.map((d) => `${d.avd || d.serial} (${d.serial})`).join(", ") || "none"}\n`);
         process.stdout.write(`  Offline (${res.fleet.offline.length}): ${res.fleet.offline.map((d) => d.avd || d.udid).join(", ") || "none"}\n`);
         process.stdout.write(`  Leases  (${Object.keys(res.leases).length}): ${Object.keys(res.leases).join(", ") || "none"}\n`);
         process.stdout.write(`  Queue   (${res.queue.length}): ${res.queue.map((q) => q.ticketId).join(", ") || "none"}\n`);
+        process.stdout.write(`  Builds  (${Object.keys(res.buildLeases || {}).length}): ${Object.keys(res.buildLeases || {}).join(", ") || "none"}\n`);
+        process.stdout.write(`  BQueue  (${(res.buildQueue || []).length}): ${(res.buildQueue || []).map((q) => q.ticketId).join(", ") || "none"}\n`);
       }
       return 0;
     }

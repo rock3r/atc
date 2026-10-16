@@ -1,11 +1,13 @@
 import path from "node:path";
+import { classifyBuildCommand, resolveBuildResources } from "./build.mjs";
+import { matchesLeaseTarget } from "./state.mjs";
 
 const FAST_PATH_REGEX =
-  /(?:^|(?<![A-Za-z0-9]))(android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)(?=$|(?![A-Za-z0-9]))/i;
+  /(?:^|(?<![A-Za-z0-9]))(android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild|atc)(?=$|(?![A-Za-z0-9]))/i;
 const GUARDED_TOOL_NAMES_RE_SRC =
-  "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild)";
+  "(?:android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild)";
 const TOOL_NAMES_RE_SRC =
-  "(?:android|adb|emulator|gradlew|gradle|xcrun|simctl|devicectl|xcodebuild|atc)";
+  "(?:android|adb|emulator|gradlew|gradle|bazel|bazelisk|bazelw|xcrun|simctl|devicectl|xcodebuild|atc)";
 const TOOL_EXEC_EXT_RE_SRC = "[A-Za-z0-9_+~%@-]+(?:\\.[A-Za-z0-9_+~%@-]+)*";
 const TOOL_EXEC_EXT_STRIP_RE = new RegExp(`(?<=.)\\.${TOOL_EXEC_EXT_RE_SRC}$`, "i");
 const TOOL_WRAPPER_AFFIX_RE = new RegExp(
@@ -112,8 +114,11 @@ const WRAPPER_VALUE_FLAGS = new Set([
   "-R",
   "-T",
   "-k",
+  "--kill-after",
   "-s",
+  "--signal",
   "-n",
+  "--adjustment",
   "-o",
   "+o",
   "--rcfile",
@@ -244,6 +249,7 @@ const PASSIVE_NON_EXEC_COMMANDS = new Set([
   "id",
   "hostname",
   "jq",
+  "pioneer",
   "true",
   "false",
   "which",
@@ -318,6 +324,9 @@ const TOOL_NAMES = [
   "emulator",
   "gradlew",
   "gradle",
+  "bazel",
+  "bazelisk",
+  "bazelw",
   "xcrun",
   "simctl",
   "devicectl",
@@ -1290,6 +1299,7 @@ export function splitShellSegments(command, { allowHashComments = true } = {}) {
         segments.push(stage);
       }
       for (const arg of parsedStage.args) {
+        if (arg === "--") continue;
         if (
           !/^-[A-Za-z0-9]+$/.test(arg) ||
           matchesAndroidOrAtcText(arg, parsedStage.envVars, FAST_PATH_REGEX, {
@@ -1310,7 +1320,8 @@ export function tokenizeSegment(
 ) {
   const tokens = [];
   const str = stripLineContinuations(String(segment || ""), { allowHashComments });
-  const isWinPathLike = (s) => /^(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
+  const isWinPathLike = (s) =>
+    /^(?:-[^=\s]*=|[A-Za-z_][A-Za-z0-9_]*=)?(?:[A-Za-z]:\\|\.\\|\.\.\\|\\\\)/.test(s);
   let i = 0;
   while (i < str.length) {
     while (i < str.length && /\s/.test(str[i])) i++;
@@ -1688,6 +1699,30 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
+  let ignoreEnvironment = Boolean(inheritedVars.__atc_ignore_env);
+  let preservedEnvKeys = inheritedVars.__atc_preserved_env
+    ? new Set(String(inheritedVars.__atc_preserved_env).split(",").filter(Boolean))
+    : null;
+  const unsetEnvKeys = new Set();
+  const shellUnsetKeys = new Set();
+  for (const [k, v] of Object.entries(inheritedVars || {})) {
+    if (k.startsWith("__atc_unset_") && v === "1") {
+      const origKey = k.slice("__atc_unset_".length);
+      if (origKey) {
+        unsetEnvKeys.add(origKey);
+        delete baseVars[origKey];
+      }
+    }
+  }
+  let relCwd = inheritedVars.__atc_rel_cwd ? String(inheritedVars.__atc_rel_cwd) : null;
+  const combineRelCwd = (baseRel, nextDir) => {
+    const d = String(nextDir || "");
+    if (!d) return baseRel;
+    if (path.isAbsolute(d) || /^[a-zA-Z]:[\\/]/.test(d) || d.startsWith("\\\\")) {
+      return d;
+    }
+    return baseRel ? path.join(baseRel, d) : d;
+  };
   let isPackageExec = false;
   let idx = 0;
 
@@ -1712,6 +1747,11 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           const k = arg.split("=")[0];
           delete baseVars[k];
           delete envVars[k];
+          if (k) {
+            unsetEnvKeys.add(k);
+            shellUnsetKeys.add(k);
+            envVars[`__atc_unset_${k}`] = "1";
+          }
           if (k === "ANDROID_SERIAL") {
             stripsAndroidSerial = true;
             envVars.__atc_stripped_android_serial = "1";
@@ -1746,6 +1786,11 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
         const k = tokens[idx++];
         delete baseVars[k];
         delete envVars[k];
+        if (k) {
+          unsetEnvKeys.add(k);
+          shellUnsetKeys.add(k);
+          envVars[`__atc_unset_${k}`] = "1";
+        }
         if (k === "ANDROID_SERIAL") {
           stripsAndroidSerial = true;
           envVars.__atc_stripped_android_serial = "1";
@@ -1761,6 +1806,13 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
         ? "__atc_cmd_sub__"
         : expandVariables(rawVal, { ...baseVars, ...envVars });
       envVars[k] = expandedVal;
+      unsetEnvKeys.delete(k);
+      shellUnsetKeys.delete(k);
+      delete baseVars[`__atc_unset_${k}`];
+      envVars[`__atc_unset_${k}`] = "";
+      if (preservedEnvKeys) {
+        preservedEnvKeys.add(k);
+      }
       if (k === "ANDROID_SERIAL") {
         if (expandedVal) {
           stripsAndroidSerial = false;
@@ -1783,6 +1835,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
     if (TRANSPARENT_WRAPPERS.has(base)) {
       idx++;
       if (base === "env") {
+        const envEntryCwd = relCwd;
         while (idx < tokens.length && (tokens[idx] === "-" || tokens[idx].startsWith("-"))) {
           const flag = tokens[idx];
           idx++;
@@ -1792,21 +1845,30 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           if (flag === "-" || flag === "-i" || flag === "--ignore-environment") {
             baseVars = {};
             for (const k of Object.keys(envVars)) {
-              delete envVars[k];
+              if (!k.startsWith("__atc_rel_cwd")) {
+                delete envVars[k];
+              }
             }
+            ignoreEnvironment = true;
+            preservedEnvKeys = null;
+            unsetEnvKeys.clear();
             stripsAndroidSerial = true;
           } else if (flag === "-u" || flag === "--unset") {
             const unsetKey = tokens[idx] || "";
             if (idx < tokens.length) idx++;
             delete baseVars[unsetKey];
             delete envVars[unsetKey];
+            if (unsetKey) unsetEnvKeys.add(unsetKey);
             if (unsetKey === "ANDROID_SERIAL") {
               stripsAndroidSerial = true;
             }
           } else if (flag.startsWith("--unset=") || (flag.startsWith("-u") && flag.length > 2)) {
-            const unsetKey = flag.startsWith("--unset=") ? flag.slice("--unset=".length) : flag.slice(2);
+            const unsetKey = flag.startsWith("--unset=")
+              ? flag.slice("--unset=".length)
+              : flag.slice(2);
             delete baseVars[unsetKey];
             delete envVars[unsetKey];
+            if (unsetKey) unsetEnvKeys.add(unsetKey);
             if (unsetKey === "ANDROID_SERIAL") {
               stripsAndroidSerial = true;
             }
@@ -1816,10 +1878,22 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
               tokens.splice(idx, 1, ...tokenizeSegment(splitStr));
             }
           } else if (flag.startsWith("--split-string=") || (flag.startsWith("-S") && flag.length > 2)) {
-            const splitStr = flag.startsWith("--split-string=") ? flag.slice("--split-string=".length) : flag.slice(2);
+            const splitStr = flag.startsWith("--split-string=")
+              ? flag.slice("--split-string=".length)
+              : flag.slice(2);
             tokens.splice(idx, 0, ...tokenizeSegment(splitStr));
           } else if ((flag === "-C" || flag === "--chdir") && idx < tokens.length) {
-            idx++;
+            const nextDir = tokens[idx++];
+            if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
+              relCwd = combineRelCwd(envEntryCwd, nextDir);
+            }
+          } else if (flag.startsWith("--chdir=") || (flag.startsWith("-C") && flag.length > 2)) {
+            const nextDir = flag.startsWith("--chdir=")
+              ? flag.slice("--chdir=".length)
+              : flag.slice(2);
+            if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
+              relCwd = combineRelCwd(envEntryCwd, nextDir);
+            }
           }
         }
       } else if (base === "command") {
@@ -1830,7 +1904,10 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx++];
           if (flag === "--") break;
-          if ((flag === "-k" || flag === "-s") && idx < tokens.length) {
+          if (
+            (flag === "-k" || flag === "--kill-after" || flag === "-s" || flag === "--signal") &&
+            idx < tokens.length
+          ) {
             idx++;
           }
         }
@@ -1838,7 +1915,9 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           idx++;
         }
       } else if (base === "sudo") {
-        let sudoPreservesSerial = false;
+        const sudoEntryCwd = relCwd;
+        let sudoPreservesAll = false;
+        const sudoPreservedList = [];
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx];
           idx++;
@@ -1848,34 +1927,65 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
             flag === "--preserve-env" ||
             (flag.startsWith("-") && !flag.startsWith("--") && flag.slice(1).includes("E"))
           ) {
-            sudoPreservesSerial = true;
-          } else if (
-            flag.startsWith("--preserve-env=") &&
-            flag
+            sudoPreservesAll = true;
+          } else if (flag.startsWith("--preserve-env=")) {
+            for (const k of flag
               .slice("--preserve-env=".length)
               .split(",")
               .map((s) => s.trim())
-              .includes("ANDROID_SERIAL")
-          ) {
-            sudoPreservesSerial = true;
+              .filter(Boolean)) {
+              sudoPreservedList.push(k);
+            }
+          } else if (flag.startsWith("--chdir=")) {
+            const nextDir = flag.slice("--chdir=".length);
+            if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
+              relCwd = combineRelCwd(sudoEntryCwd, nextDir);
+            }
           }
           if (
             (flag === "-u" ||
               flag === "-g" ||
               flag === "-C" ||
               flag === "-D" ||
+              flag === "--chdir" ||
               flag === "-R" ||
               flag === "-T") &&
             idx < tokens.length
           ) {
-            idx++;
+            const val = tokens[idx++];
+            if ((flag === "-D" || flag === "--chdir") && val && !val.includes("__atc_cmd_sub__")) {
+              relCwd = combineRelCwd(sudoEntryCwd, val);
+            }
+          }
+        }
+        const sudoPreservesSerial =
+          sudoPreservesAll || sudoPreservedList.includes("ANDROID_SERIAL");
+        if (!sudoPreservesAll) {
+          if (sudoPreservedList.length > 0) {
+            const keep = new Set(sudoPreservedList);
+            for (const k of Object.keys(baseVars)) {
+              if (!keep.has(k)) delete baseVars[k];
+            }
+            for (const k of Object.keys(envVars)) {
+              if (!keep.has(k)) delete envVars[k];
+            }
+            ignoreEnvironment = true;
+            preservedEnvKeys = keep;
+          } else {
+            baseVars = {};
+            for (const k of Object.keys(envVars)) {
+              if (!k.startsWith("__atc_rel_cwd")) {
+                delete envVars[k];
+              }
+            }
+            ignoreEnvironment = true;
+            preservedEnvKeys = null;
+            unsetEnvKeys.clear();
           }
         }
         if (!sudoPreservesSerial) {
-          baseVars = {};
-          for (const k of Object.keys(envVars)) {
-            delete envVars[k];
-          }
+          delete baseVars.ANDROID_SERIAL;
+          delete envVars.ANDROID_SERIAL;
           stripsAndroidSerial = true;
         }
       } else if (base === "nice") {
@@ -1883,7 +1993,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           const flag = tokens[idx];
           idx++;
           if (flag === "--") break;
-          if (flag === "-n" && idx < tokens.length) {
+          if ((flag === "-n" || flag === "--adjustment") && idx < tokens.length) {
             idx++;
           }
         }
@@ -2041,14 +2151,60 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
     extractExecutableBase(cmd, { allowPackageSpec: isPackageExec, allowWrapperAffix: true }) ||
     (cmd.split(/[\\/]/).pop() || cmd).toLowerCase();
   const args = remaining.slice(1);
+  if (baseCmd === "cd") {
+    let cdIdx = 0;
+    while (cdIdx < args.length && String(args[cdIdx]).startsWith("-")) {
+      const f = String(args[cdIdx]);
+      if (f === "-") break;
+      cdIdx++;
+      if (f === "--") break;
+    }
+    const cdTarget = args[cdIdx];
+    if (cdTarget && cdTarget !== "-" && !String(cdTarget).includes("__atc_cmd_sub__")) {
+      allVars.__atc_rel_cwd = combineRelCwd(relCwd, cdTarget);
+    }
+  }
   return {
     raw: expandVariables(segment, allVars),
     envVars: allVars,
+    unsetEnvKeys: Array.from(unsetEnvKeys),
+    shellUnsetKeys: Array.from(shellUnsetKeys),
+    ignoreEnvironment,
+    preservedEnvKeys: preservedEnvKeys ? Array.from(preservedEnvKeys) : null,
+    relCwd,
     stripsAndroidSerial,
     cmd,
     baseCmd,
     args,
   };
+}
+
+function propagateSegmentEnvMutations(targetVars, parsed) {
+  if (!parsed) return;
+  Object.assign(targetVars, parsed.envVars || {});
+  if (Array.isArray(parsed.shellUnsetKeys)) {
+    for (const uk of parsed.shellUnsetKeys) {
+      delete targetVars[uk];
+    }
+  }
+}
+
+function buildWrappedInheritedVars(parsed) {
+  const vars = { ...(parsed?.envVars || {}) };
+  if (parsed?.ignoreEnvironment) {
+    vars.__atc_ignore_env = "1";
+    if (Array.isArray(parsed.preservedEnvKeys) && parsed.preservedEnvKeys.length > 0) {
+      vars.__atc_preserved_env = parsed.preservedEnvKeys.join(",");
+    } else {
+      delete vars.__atc_preserved_env;
+    }
+  }
+  if (Array.isArray(parsed?.unsetEnvKeys)) {
+    for (const uk of parsed.unsetEnvKeys) {
+      vars[`__atc_unset_${uk}`] = "1";
+    }
+  }
+  return vars;
 }
 
 const UUID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
@@ -2123,6 +2279,79 @@ export function extractTargetSerial(parsed) {
     }
     return parsed.envVars.SIMULATOR_UDID || parsed.envVars.ATC_DEVICE_SERIAL || null;
   }
+  if (baseCmd === "bazel" || baseCmd === "bazelisk" || baseCmd === "bazelw") {
+    const selectors = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = String(args[i]);
+      if (a === "--") continue;
+      if (a.startsWith("--device=")) {
+        selectors.push(a.slice("--device=".length));
+      } else if (a === "--device" && i + 1 < args.length) {
+        selectors.push(String(args[i + 1]));
+        i += 1;
+      } else if (a.startsWith("--test_arg=--device=")) {
+        selectors.push(a.slice("--test_arg=--device=".length));
+      } else if (a === "--test_arg=--device" && i + 1 < args.length) {
+        const nextArg = String(args[i + 1]);
+        if (nextArg.startsWith("--test_arg=")) {
+          selectors.push(nextArg.slice("--test_arg=".length));
+          i += 1;
+        } else if (nextArg === "--test_arg" && i + 2 < args.length) {
+          selectors.push(String(args[i + 2]));
+          i += 2;
+        }
+      } else if (a === "--test_arg" && i + 1 < args.length) {
+        const testArgVal = String(args[i + 1]);
+        if (testArgVal.startsWith("--device=")) {
+          selectors.push(testArgVal.slice("--device=".length));
+          i += 1;
+        } else if (testArgVal === "--device" && i + 2 < args.length) {
+          const nextPair = String(args[i + 2]);
+          if (nextPair === "--test_arg" && i + 3 < args.length) {
+            selectors.push(String(args[i + 3]));
+            i += 3;
+          } else if (nextPair.startsWith("--test_arg=")) {
+            selectors.push(nextPair.slice("--test_arg=".length));
+            i += 2;
+          }
+        }
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_device=/.test(a)
+      ) {
+        const val = a.slice(a.indexOf("=") + 1).trim();
+        if (val) selectors.push(val);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_device$/.test(a) &&
+        i + 1 < args.length
+      ) {
+        const val = String(args[i + 1]).trim();
+        if (val) selectors.push(val);
+        i += 1;
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_version=/.test(a)
+      ) {
+        const val = a.slice(a.indexOf("=") + 1).trim();
+        if (val) selectors.push(`ios_simulator_version=${val}`);
+      } else if (
+        /^--(?:@[A-Za-z0-9_.-]*\/\/[^:=]+:|\/\/[^:=]+:)?ios_simulator_version$/.test(a) &&
+        i + 1 < args.length
+      ) {
+        const val = String(args[i + 1]).trim();
+        if (val) selectors.push(`ios_simulator_version=${val}`);
+        i += 1;
+      }
+    }
+    if (selectors.length > 0) {
+      const unique = Array.from(new Set(selectors));
+      return unique.length === 1 ? unique[0] : unique.join(",");
+    }
+    return (
+      parsed.envVars.ANDROID_SERIAL ||
+      parsed.envVars.SIMULATOR_UDID ||
+      parsed.envVars.ATC_DEVICE_SERIAL ||
+      null
+    );
+  }
   if (baseCmd === "adb") {
     const selectors = [];
     let subIdx = 0;
@@ -2187,9 +2416,11 @@ export function classifySegment(
   segment,
   inheritedVars = {},
   depth = 0,
-  { allowHashComments = true } = {},
+  { allowHashComments = true, cwd = process.cwd(), env = process.env } = {},
 ) {
   const parsed = parseSegment(segment, inheritedVars, { allowHashComments });
+  const baseCwd = cwd || process.cwd();
+  const effectiveCwd = parsed.relCwd ? path.resolve(baseCwd, parsed.relCwd) : baseCwd;
   if (depth > 8) {
     return {
       kind: "device_action",
@@ -2249,6 +2480,7 @@ export function classifySegment(
     if (subcommand === "exec") {
       const dashDashIdx = args.indexOf("--", subIdx + 1);
       let wrappedTokens = [];
+      let atcWorkspaceFlag = null;
       let i = subIdx + 1;
       const scanEnd = dashDashIdx !== -1 ? dashDashIdx : args.length;
       while (i < scanEnd) {
@@ -2264,10 +2496,43 @@ export function classifySegment(
             a === "--role" ||
             a === "--anchor-pid" ||
             a === "--lease" ||
-            a === "--state-dir") &&
+            a === "--state-dir" ||
+            a === "--type" ||
+            a === "--api" ||
+            a === "--os" ||
+            a === "--kind" ||
+            a === "--avd" ||
+            a === "--udid" ||
+            a === "--platform" ||
+            a === "--wait" ||
+            a === "--wait-sec" ||
+            a === "--ttl" ||
+            a === "--ttl-sec" ||
+            a === "--reason" ||
+            a === "--snapshot-load" ||
+            a === "--snapshot-save-on-free" ||
+            a === "--reset-app" ||
+            a === "--abi" ||
+            a === "--services" ||
+            a === "--reorder-window" ||
+            a === "--reorder-window-sec" ||
+            a === "--workspace" ||
+            a === "--phase" ||
+            a === "--ram-mb") &&
           i + 1 < scanEnd
         ) {
+          if (a === "--udid") {
+            atcSerialFlag = args[i + 1];
+          } else if (a === "--workspace") {
+            atcWorkspaceFlag = args[i + 1];
+          }
           i += 2;
+        } else if (a.startsWith("--udid=")) {
+          atcSerialFlag = a.slice("--udid=".length);
+          i += 1;
+        } else if (a.startsWith("--workspace=")) {
+          atcWorkspaceFlag = a.slice("--workspace=".length);
+          i += 1;
         } else if (a.startsWith("--")) {
           i += 1;
         } else {
@@ -2283,7 +2548,7 @@ export function classifySegment(
         const wrappedSeg = wrappedTokens
           .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        const execInheritedVars = { ...parsed.envVars };
+        const execInheritedVars = buildWrappedInheritedVars(parsed);
         if (atcSerialFlag) {
           execInheritedVars.ANDROID_SERIAL = atcSerialFlag;
           execInheritedVars.SIMULATOR_UDID = atcSerialFlag;
@@ -2297,7 +2562,14 @@ export function classifySegment(
           execInheritedVars.SIMULATOR_UDID = "__ATC_EXEC_INJECTED_SERIAL__";
           execInheritedVars.ATC_DEVICE_SERIAL = "__ATC_EXEC_INJECTED_SERIAL__";
         }
-        const innerClass = classifySegment(wrappedSeg, execInheritedVars, depth + 1);
+        const execCwd = atcWorkspaceFlag
+          ? path.resolve(effectiveCwd, String(atcWorkspaceFlag))
+          : effectiveCwd;
+        const innerClass = classifySegment(wrappedSeg, execInheritedVars, depth + 1, {
+          allowHashComments,
+          cwd: execCwd,
+          env,
+        });
         if (innerClass.kind === "deny_lifecycle") {
           return innerClass;
         }
@@ -2397,65 +2669,34 @@ export function classifySegment(
   }
 
   if (baseCmd === "xcodebuild") {
-    const valueFlags = new Set([
-      "-project",
-      "-workspace",
-      "-scheme",
-      "-target",
-      "-configuration",
-      "-sdk",
-      "-destination",
-      "-destination-timeout",
-      "-derivedDataPath",
-      "-resultBundlePath",
-      "-xcconfig",
-      "-archivePath",
-      "-exportPath",
-      "-exportOptionsPlist",
-      "-only-testing",
-      "-skip-testing",
-      "-testPlan",
-    ]);
-    const buildActions = [];
-    const destinations = [];
-    for (let i = 0; i < args.length; i++) {
-      const a = String(args[i]);
-      if (a === "-destination" && i + 1 < args.length) {
-        destinations.push(String(args[i + 1]));
-        i += 1;
-        continue;
-      }
-      if (a.startsWith("-destination=")) {
-        destinations.push(a.slice("-destination=".length));
-        continue;
-      }
-      if (valueFlags.has(a) && i + 1 < args.length) {
-        i += 1;
-        continue;
-      }
-      if (a.startsWith("-") || a.includes("=")) {
-        continue;
-      }
-      buildActions.push(a.toLowerCase());
+    const buildInfo = classifyBuildCommand(baseCmd, args);
+    if (buildInfo.kind === "deny_lifecycle") {
+      return { kind: "deny_lifecycle", reason: buildInfo.reason, parsed };
     }
-    const hasTestAction = buildActions.some(
-      (act) => act === "test" || act === "test-without-building",
-    );
-    if (!hasTestAction) {
-      return { kind: "ignore", parsed };
+    if (buildInfo.kind === "device_coupled_build") {
+      return {
+        kind: "device_action",
+        isBuildTool: true,
+        buildClass: buildInfo.kind,
+        targetPlatform: buildInfo.targetPlatform || "ios",
+        targetSerial: extractTargetSerial(parsed),
+        parsed,
+      };
     }
-    if (
-      destinations.length > 0 &&
-      destinations.every(
-        (d) => /\bplatform=macOS\b/i.test(d) || /\bgeneric\/platform=/i.test(d),
-      )
-    ) {
-      return { kind: "ignore", parsed };
+    if (buildInfo.kind === "read_only") {
+      return {
+        kind: "read_only",
+        isBuildTool: true,
+        buildClass: buildInfo.kind,
+        targetPlatform: "ios",
+        parsed,
+      };
     }
     return {
-      kind: "device_action",
-      targetPlatform: "ios",
-      targetSerial: extractTargetSerial(parsed),
+      kind: "ignore",
+      isBuildTool: true,
+      buildClass: buildInfo.kind,
+      rejectReason: buildInfo.reason || null,
       parsed,
     };
   }
@@ -2711,34 +2952,84 @@ export function classifySegment(
     };
   }
 
-  // Precedence 4: Gradle connectedAndroidTest and install/uninstall tasks
-  if (baseCmd === "gradlew" || baseCmd === "gradle") {
-    const hasDeviceTask = args.some((a) => {
-      if (!a || a.startsWith("-")) return false;
-      const taskName = a.split(":").pop() || "";
-      if (/^(connected.*androidtest|connectedcheck|devicecheck)$/i.test(taskName)) {
-        return true;
+  // Precedence 4: Gradle and Bazel build/test/install tasks and daemon lifecycle guardrails
+  if (
+    baseCmd === "gradlew" ||
+    baseCmd === "gradle" ||
+    baseCmd === "bazel" ||
+    baseCmd === "bazelisk" ||
+    baseCmd === "bazelw"
+  ) {
+    let buildInfo = classifyBuildCommand(baseCmd, args);
+    if (
+      (baseCmd === "bazel" || baseCmd === "bazelisk" || baseCmd === "bazelw") &&
+      buildInfo.kind !== "deny_lifecycle" &&
+      buildInfo.kind !== "read_only"
+    ) {
+      const baseCallerEnv = env || process.env;
+      const envForBazel = {};
+      if (!parsed.ignoreEnvironment) {
+        for (const [k, v] of Object.entries(baseCallerEnv)) {
+          if (v !== undefined) envForBazel[k] = v;
+        }
+      } else if (Array.isArray(parsed.preservedEnvKeys)) {
+        for (const k of parsed.preservedEnvKeys) {
+          if (baseCallerEnv[k] !== undefined) envForBazel[k] = baseCallerEnv[k];
+        }
       }
-      if (/^uninstall([A-Z0-9_].*)?$/i.test(taskName)) {
-        return true;
+      if (Array.isArray(parsed.unsetEnvKeys)) {
+        for (const k of parsed.unsetEnvKeys) {
+          delete envForBazel[k];
+        }
       }
-      if (
-        /^install([A-Z0-9_].*)?$/i.test(taskName) &&
-        !/^install(Dist|BootDist|ShadowDist|Maven|ToMavenLocal)$/i.test(taskName)
-      ) {
-        return true;
+      for (const [k, v] of Object.entries(parsed.envVars || {})) {
+        if (k.startsWith("__atc_")) continue;
+        if (v === "__atc_cmd_sub__" || (typeof v === "string" && v.includes("__atc_cmd_sub__"))) {
+          envForBazel[k] = "__UNRESOLVED_DYNAMIC_ENV__";
+        } else {
+          envForBazel[k] = v;
+        }
       }
-      return false;
-    });
-    if (hasDeviceTask) {
+      const resolvedBazel = resolveBuildResources(
+        parsed.cmd || baseCmd,
+        args,
+        effectiveCwd,
+        { env: envForBazel },
+      );
+      if (resolvedBazel && resolvedBazel.kind && resolvedBazel.kind !== "not_build_tool") {
+        buildInfo = resolvedBazel;
+      }
+    }
+    if (buildInfo.kind === "deny_lifecycle") {
       return {
-        kind: "device_action",
-        targetPlatform: "android",
-        targetSerial: extractTargetSerial(parsed),
+        kind: "deny_lifecycle",
+        reason: buildInfo.reason,
         parsed,
       };
     }
-    return { kind: "ignore", parsed };
+    if (buildInfo.kind === "device_coupled_build") {
+      const effectiveParsed = Array.isArray(buildInfo.effectiveBazelArgs)
+        ? { ...parsed, args: buildInfo.effectiveBazelArgs }
+        : parsed;
+      return {
+        kind: "device_action",
+        isBuildTool: true,
+        buildClass: buildInfo.kind,
+        targetPlatform: buildInfo.targetPlatform || "android",
+        targetSerial: buildInfo.targetSerial || extractTargetSerial(effectiveParsed),
+        parsed,
+      };
+    }
+    if (buildInfo.kind === "read_only") {
+      return { kind: "read_only", isBuildTool: true, buildClass: buildInfo.kind, parsed };
+    }
+    return {
+      kind: "ignore",
+      isBuildTool: true,
+      buildClass: buildInfo.kind,
+      rejectReason: buildInfo.reason || null,
+      parsed,
+    };
   }
 
   // Shell wrappers (e.g., `bash -c "adb shell ..."`, `sh -lc "emulator -avd ..."`, `eval adb shell ...`)
@@ -2777,7 +3068,7 @@ export function classifySegment(
         handledCWrapper = true;
         const rawScript = String(args[scriptIdx]);
         const posArgs = args.slice(scriptIdx + 1).map((a) => String(a));
-        const wrapperVars = { ...parsed.envVars };
+        const wrapperVars = buildWrappedInheritedVars(parsed);
         for (let i = 0; i < posArgs.length; i++) {
           wrapperVars[String(i)] = posArgs[i];
         }
@@ -2804,24 +3095,30 @@ export function classifySegment(
             allowHashComments: innerAllowHash,
           })
         ) {
-          innerEntries.push({ script: a, vars: { ...parsed.envVars } });
+          innerEntries.push({ script: a, vars: buildWrappedInheritedVars(parsed) });
         }
       }
       if (nonFlagArgs.length > 1) {
-        innerEntries.push({ script: nonFlagArgs.join(" "), vars: { ...parsed.envVars } });
+        innerEntries.push({
+          script: nonFlagArgs.join(" "),
+          vars: buildWrappedInheritedVars(parsed),
+        });
       }
     }
     if (innerEntries.length > 0) {
       let chosen = { kind: "ignore", parsed };
       const rank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
+      const buildRank = { workspace_only: 1, pure_build: 2, reject_long_running: 3 };
       for (const { script: inner, vars: baseInnerVars } of innerEntries) {
         const innerVars = { ...baseInnerVars };
         for (const subSeg of splitShellSegments(inner, { allowHashComments: innerAllowHash })) {
           if (subSeg.trim() === effectiveSegment.trim()) continue;
           const subClass = classifySegment(subSeg, innerVars, depth + 1, {
             allowHashComments: innerAllowHash,
+            cwd: effectiveCwd,
+            env,
           });
-          Object.assign(innerVars, subClass.parsed?.envVars || {});
+          propagateSegmentEnvMutations(innerVars, subClass.parsed);
           if (subClass.parsed?.stripsAndroidSerial) {
             delete innerVars.ANDROID_SERIAL;
             innerVars.__atc_stripped_android_serial = "1";
@@ -2829,6 +3126,12 @@ export function classifySegment(
             delete innerVars.__atc_stripped_android_serial;
           }
           if ((rank[subClass.kind] || 0) > (rank[chosen.kind] || 0)) {
+            chosen = subClass;
+          } else if (
+            (subClass.kind === "read_only" || subClass.kind === "ignore") &&
+            subClass.kind === chosen.kind &&
+            (buildRank[subClass.buildClass] || 0) > (buildRank[chosen.buildClass] || 0)
+          ) {
             chosen = subClass;
           } else if (subClass.kind === "device_action" && chosen.kind === "device_action") {
             if (subClass.targetSerial === "<stripped-ANDROID_SERIAL>") {
@@ -2848,7 +3151,7 @@ export function classifySegment(
           }
         }
       }
-      if (chosen.kind !== "ignore") {
+      if (chosen.kind !== "ignore" || chosen.buildClass) {
         return chosen;
       }
       if (handledCWrapper) {
@@ -3066,6 +3369,9 @@ export function classifySegment(
                 "android",
                 "gradlew",
                 "gradle",
+                "bazel",
+                "bazelisk",
+                "bazelw",
                 "xcrun",
                 "simctl",
                 "devicectl",
@@ -3082,15 +3388,91 @@ export function classifySegment(
           ? startSearchIdx + nestedRelIdx
           : -1;
     let peeledClass = null;
-    if (peelIdx !== -1) {
+    if (baseCmd === "find" && execFlagIdx !== -1) {
+      const findRank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
+      const findBuildRank = { workspace_only: 1, pure_build: 2, reject_long_running: 3 };
+      const findActions = [];
+      let actStart = -1;
+      for (let fi = 0; fi < args.length; fi++) {
+        const fa = String(args[fi]);
+        if (actStart === -1) {
+          if (fa === "-exec" || fa === "-execdir" || fa === "-ok" || fa === "-okdir") {
+            actStart = fi + 1;
+          }
+          continue;
+        }
+        if (fa === ";" || fa === "\\;" || fa === "+" || fa === "\\+") {
+          if (fi > actStart) findActions.push(args.slice(actStart, fi));
+          actStart = -1;
+        }
+      }
+      if (actStart !== -1 && actStart < args.length) findActions.push(args.slice(actStart));
+      for (const actTokens of findActions) {
+        const actSegment = actTokens
+          .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
+          .join(" ");
+        const actClass = classifySegment(actSegment, buildWrappedInheritedVars(parsed), depth + 1, {
+          allowHashComments,
+          cwd: effectiveCwd,
+          env,
+        });
+        if (actClass.kind === "deny_lifecycle") {
+          return actClass;
+        }
+        if (
+          !peeledClass ||
+          (findRank[actClass.kind] || 0) > (findRank[peeledClass.kind] || 0) ||
+          ((actClass.kind === "read_only" || actClass.kind === "ignore") &&
+            actClass.kind === peeledClass.kind &&
+            (findBuildRank[actClass.buildClass] || 0) > (findBuildRank[peeledClass.buildClass] || 0))
+        ) {
+          peeledClass = actClass;
+        }
+      }
+    } else if (peelIdx !== -1) {
       const cleanedArgs = args
         .slice(peelIdx)
-        .filter((a) => a !== ";" && a !== "\\;" && a !== "+");
+        .filter((a) => a !== ";" && a !== "\\;" && a !== "+" && a !== "\\+");
+      if (baseCmd === "xargs" || baseCmd === "parallel") {
+        const wrapperOpts = args.slice(startSearchIdx, peelIdx);
+        let fanout = baseCmd === "parallel";
+        for (let wi = 0; wi < wrapperOpts.length; wi++) {
+          const w = String(wrapperOpts[wi]);
+          let procsVal = null;
+          if (
+            (w === "-P" || w === "--max-procs" || (baseCmd === "parallel" && (w === "-j" || w === "--jobs"))) &&
+            wi + 1 < wrapperOpts.length
+          ) {
+            procsVal = wrapperOpts[wi + 1];
+          } else if (/^-[Pj]\d+$/.test(w)) {
+            procsVal = w.slice(2);
+          } else if (w.startsWith("--max-procs=") || w.startsWith("--jobs=")) {
+            procsVal = w.slice(w.indexOf("=") + 1);
+          }
+          if (procsVal !== null) fanout = Number(procsVal) !== 1;
+        }
+        const hasStaticParallelArgs =
+          baseCmd === "parallel" &&
+          cleanedArgs.some((a) => a === ":::" || a === ":::+") &&
+          !cleanedArgs.some((a) => a === "::::" || a === "::::+");
+        for (let ci = cleanedArgs.length - 1; ci >= 1; ci--) {
+          if (baseCmd === "parallel" && /^:{3,4}\+?$/.test(cleanedArgs[ci])) {
+            cleanedArgs.splice(ci, 1);
+          }
+        }
+        if (!hasStaticParallelArgs) cleanedArgs.push("__xargs_stdin__");
+        if (fanout) cleanedArgs.push("__xargs_parallel__");
+      }
       if (cleanedArgs.length > 0) {
         const nestedSegment = cleanedArgs
           .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        peeledClass = classifySegment(nestedSegment, parsed.envVars, depth + 1);
+        peeledClass = classifySegment(
+          nestedSegment,
+          buildWrappedInheritedVars(parsed),
+          depth + 1,
+          { allowHashComments, cwd: effectiveCwd, env },
+        );
         if (peeledClass.kind === "deny_lifecycle") {
           return peeledClass;
         }
@@ -3109,14 +3491,18 @@ export function classifySegment(
     if (embeddedCandidates.length > 0) {
       const embeddedSerials = new Set();
       let sawEmbeddedDeviceAction = false;
-      const baseEmbeddedVars = { ...parsed.envVars };
+      const baseEmbeddedVars = buildWrappedInheritedVars(parsed);
       delete baseEmbeddedVars.ANDROID_SERIAL;
       for (const candidate of embeddedCandidates) {
         const innerVars = { ...baseEmbeddedVars };
         for (const subSeg of splitShellSegments(candidate)) {
           if (subSeg.trim() === effectiveSegment.trim()) continue;
-          const subClass = classifySegment(subSeg, innerVars, depth + 1);
-          Object.assign(innerVars, subClass.parsed?.envVars || {});
+          const subClass = classifySegment(subSeg, innerVars, depth + 1, {
+            allowHashComments,
+            cwd: effectiveCwd,
+            env,
+          });
+          propagateSegmentEnvMutations(innerVars, subClass.parsed);
           if (subClass.kind === "deny_lifecycle") {
             return subClass;
           }
@@ -4775,12 +5161,24 @@ function rewriteCompoundCommand(
     anchorPid,
     execSerial,
     execSerialByPlatform = null,
+    coordinateBuilds = false,
     platform = "win32",
+    cwd = process.cwd(),
+    env = process.env,
     inheritedShellVars = null,
     inheritedLoopDepth = 0,
   },
 ) {
-  const rewriteOpts = { sessionId, anchorPid, execSerial, execSerialByPlatform, platform };
+  const rewriteOpts = {
+    sessionId,
+    anchorPid,
+    execSerial,
+    execSerialByPlatform,
+    coordinateBuilds,
+    platform,
+    cwd,
+    env,
+  };
   const isWin = platform === "win32";
   const sessionFlag = sessionId
     ? anchorPid
@@ -5126,8 +5524,8 @@ function rewriteCompoundCommand(
           classifyInput = `${stageForClassify} ${pipeUpstreamArgs.join(" ")}`;
         }
       }
-      const c = classifySegment(classifyInput, shellVars);
-      Object.assign(shellVars, c.parsed?.envVars || {});
+      const c = classifySegment(classifyInput, shellVars, 0, { cwd, env });
+      propagateSegmentEnvMutations(shellVars, c.parsed);
       for (const uv of maybeUnsetVars) {
         if (Object.prototype.hasOwnProperty.call(shellVars, uv)) {
           shellVars[uv] = "__atc_cmd_sub__";
@@ -5142,6 +5540,7 @@ function rewriteCompoundCommand(
         }
       }
       for (const arg of parsedStage.args) {
+        if (arg === "--") continue;
         if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
           pipeUpstreamArgs.push(arg);
         }
@@ -5152,16 +5551,26 @@ function rewriteCompoundCommand(
           loopDepth = Math.max(0, loopDepth - doneMatches.length);
         }
       };
+      const isCoordinatedBuildStage =
+        Boolean(coordinateBuilds) &&
+        (c.kind === "read_only" || c.kind === "ignore") &&
+        (c.buildClass === "pure_build" || c.buildClass === "workspace_only");
       if (subRewrite.changed) {
         trimmed = subRewrite.rewrittenStage;
-        if (c.kind !== "device_action" && c.kind !== "atc") {
+        if (c.kind !== "device_action" && c.kind !== "atc" && !isCoordinatedBuildStage) {
           finishLoopDepth();
           return trimmed;
         }
       }
       const stageExecSerial =
         (c.targetPlatform && execSerialByPlatform?.[c.targetPlatform]) || execSerial;
-      if (c.kind === "device_action" && stageExecSerial) {
+      const stageExecFlag =
+        c.kind === "device_action" && stageExecSerial
+          ? `--serial ${stageExecSerial}`
+          : isCoordinatedBuildStage
+            ? "--build"
+            : null;
+      if (stageExecFlag) {
         let prefix = "";
         let cmdBody = trimmed;
         const ctrlMatch = trimmed.match(LEADING_CONTROL_PREFIX_RE);
@@ -5186,12 +5595,12 @@ function rewriteCompoundCommand(
         }
         finishLoopDepth();
         if (isWin) {
-          return `${prefix}atc exec${sessionFlag} --serial ${stageExecSerial} -- ${cmdBody}${suffix}`;
+          return `${prefix}atc exec${sessionFlag} ${stageExecFlag} -- ${cmdBody}${suffix}`;
         }
         const isSimpleStage =
           !/[<>|&;`()\r\n]/.test(cmdBody) && !requiresShellExecution(cmdBody);
         if (isSimpleStage) {
-          return `${prefix}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${cmdBody}${suffix}`;
+          return `${prefix}${posixEnvPrefix}atc exec ${stageExecFlag} -- ${cmdBody}${suffix}`;
         }
         const specialBashRefs = extractReferencedBashSpecialVars(cmdBody);
         const dynamicVarNames = new Set(
@@ -5812,7 +6221,7 @@ function rewriteCompoundCommand(
             (hasPositionalParams ? ' "$@"' : "");
           const bashExec = usesExtglob ? "bash -O extglob" : "bash";
           const zeroArg = hasZeroParam ? '"$0"' : "bash";
-          return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
+          return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec ${stageExecFlag} -- ${bashExec} -c ${escaped} ${zeroArg} ${trailingArrays}${suffix}`;
         }
         const needsOuterNoglob =
           hasUnquotedAlias ||
@@ -5837,7 +6246,7 @@ function rewriteCompoundCommand(
           : hasZeroParam
             ? ' "$0"'
             : "";
-        return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec --serial ${stageExecSerial} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
+        return `${prefix}${statusEnv}${arrayEnvAssigns}${flagsEnv}${shoptsEnv}${specialVarEnv}${shIfsEnv}${dynamicEnvAssigns}${posixEnvPrefix}atc exec ${stageExecFlag} -- ${shellExec} -c ${escaped}${trailingAtArgs}${suffix}`;
       }
       if (c.kind === "atc" && c.subcommand && sessionFlags) {
         const hasSession =
@@ -5884,25 +6293,6 @@ function rewriteCompoundCommand(
     .join("");
 }
 
-function matchesLeaseSerial(leaseSerial, targetSerial) {
-  if (!leaseSerial || !targetSerial) return false;
-  if (leaseSerial === targetSerial) return true;
-  if (UUID_RE.test(targetSerial) && UUID_RE.test(leaseSerial)) {
-    return leaseSerial.toLowerCase() === targetSerial.toLowerCase();
-  }
-  return false;
-}
-
-function matchesLeaseTarget(lease, targetSerial) {
-  if (!lease || !targetSerial) return false;
-  return (
-    matchesLeaseSerial(lease.serial, targetSerial) ||
-    matchesLeaseSerial(lease.udid, targetSerial) ||
-    matchesLeaseSerial(lease.coreDeviceId, targetSerial) ||
-    matchesLeaseSerial(lease.profile?.coreDeviceId, targetSerial)
-  );
-}
-
 export function evaluateCommandGuard(
   command,
   {
@@ -5912,7 +6302,10 @@ export function evaluateCommandGuard(
     offlineLeases = [],
     runningCount = 0,
     runningCountByPlatform = null,
+    coordinateBuilds = false,
     platform = process.platform,
+    cwd = process.cwd(),
+    env = process.env,
   } = {},
 ) {
   if (!hasAndroidOrAtcTokens(command)) {
@@ -5932,6 +6325,7 @@ export function evaluateCommandGuard(
   const segments = splitShellSegments(command);
   let needsAtcRewrite = false;
   let hasDeviceAction = false;
+  let hasBuildAction = false;
   let hasUnscopedDeviceAction = false;
   const targetSerials = new Set();
   const unscopedPlatformSerials = new Set();
@@ -5941,8 +6335,8 @@ export function evaluateCommandGuard(
     for (const lv of extractStageLoopVariables(seg)) {
       shellVars[lv] = "__atc_cmd_sub__";
     }
-    const c = classifySegment(seg, shellVars);
-    Object.assign(shellVars, c.parsed?.envVars || {});
+    const c = classifySegment(seg, shellVars, 0, { cwd, env });
+    propagateSegmentEnvMutations(shellVars, c.parsed);
     for (const lv of extractStageLoopVariables(seg)) {
       shellVars[lv] = "__atc_cmd_sub__";
     }
@@ -5953,6 +6347,21 @@ export function evaluateCommandGuard(
       delete shellVars.__atc_stripped_android_serial;
     }
     if (c.kind === "ignore" || c.kind === "read_only") {
+      if (coordinateBuilds && c.buildClass === "reject_long_running") {
+        return {
+          allowed: false,
+          reason:
+            c.rejectReason ||
+            `Blocked by ATC build guardrail: "${seg}" is a continuous/watch build command that would pin a build slot indefinitely. Run one-shot builds under ATC or bypass build coordination for watch mode.`,
+          rewrittenCommand: null,
+        };
+      }
+      if (
+        coordinateBuilds &&
+        (c.buildClass === "pure_build" || c.buildClass === "workspace_only")
+      ) {
+        hasBuildAction = true;
+      }
       continue;
     }
 
@@ -6039,21 +6448,29 @@ export function evaluateCommandGuard(
           };
         }
         if (segPlatform === "ios") {
+          const coAllocHint = c.isBuildTool
+            ? `\n  Or claim & build atomically: atc exec --claim --ios --type phone -- ${seg}`
+            : "";
           return {
             allowed: false,
             reason:
               `Blocked by ATC guardrail: command "${seg}" interacts with an iOS device/simulator, but session "${sessionId || "current"}" holds no active device lease.\n` +
               `  1. Claim a device first:  atc claim --ios --type phone\n` +
-              `  2. Run your command via:  atc exec -- ${seg}`,
+              `  2. Run your command via:  atc exec -- ${seg}` +
+              coAllocHint,
             rewrittenCommand: null,
           };
         }
+        const coAllocHint = c.isBuildTool
+          ? `\n  Or claim & build atomically: atc exec --claim --type phone --api 36 -- ${seg}`
+          : "";
         return {
           allowed: false,
           reason:
             `Blocked by ATC guardrail: command "${seg}" interacts with an Android device, but session "${sessionId || "current"}" holds no active device lease.\n` +
             `  1. Claim a device first:  atc claim --type phone --api 36\n` +
-            `  2. Run your command via:  atc exec -- ${seg}`,
+            `  2. Run your command via:  atc exec -- ${seg}` +
+            coAllocHint,
           rewrittenCommand: null,
         };
       }
@@ -6147,7 +6564,10 @@ export function evaluateCommandGuard(
         anchorPid,
         execSerial,
         execSerialByPlatform,
+        coordinateBuilds,
         platform: "win32",
+        cwd,
+        env,
       });
     } else {
       const envPrefix = sessionId
@@ -6163,7 +6583,10 @@ export function evaluateCommandGuard(
           anchorPid,
           execSerial,
           execSerialByPlatform,
+          coordinateBuilds,
           platform,
+          cwd,
+          env,
         });
       } else {
         const usesExtglob = stageUsesExtglob(command);
@@ -6182,6 +6605,57 @@ export function evaluateCommandGuard(
         rewrittenCommand = `${flagsEnv}${envPrefix}atc exec --serial ${execSerial} -- ${shellExec} -c ${escaped}`;
       }
     }
+  } else if (hasBuildAction && coordinateBuilds) {
+    const isSimpleSingleCommand =
+      segments.length === 1 &&
+      !needsAtcRewrite &&
+      !/[<>|&;`()\r\n]/.test(command) &&
+      !requiresShellExecution(command);
+    if (isWin) {
+      rewrittenCommand = rewriteCompoundCommand(command, {
+        sessionId,
+        anchorPid,
+        execSerial: null,
+        coordinateBuilds: true,
+        platform: "win32",
+        cwd,
+        env,
+      });
+    } else {
+      const envPrefix = sessionId
+        ? anchorPid
+          ? `ATC_SESSION_ID=${sessionId} ATC_ANCHOR_PID=${anchorPid} `
+          : `ATC_SESSION_ID=${sessionId} `
+        : "";
+      if (isSimpleSingleCommand) {
+        rewrittenCommand = `${envPrefix}atc exec --build -- ${command}`;
+      } else if (segments.length > 1) {
+        rewrittenCommand = rewriteCompoundCommand(command, {
+          sessionId,
+          anchorPid,
+          execSerial: null,
+          coordinateBuilds: true,
+          platform,
+          cwd,
+          env,
+        });
+      } else {
+        const usesExtglob = stageUsesExtglob(command);
+        const needsOuterNoglob = usesExtglob || stageContainsUnquotedGlob(command);
+        const needsOuterNounset = stageContainsUnboundVarOrParam(command);
+        const flagsEnv = needsOuterNoglob || needsOuterNounset ? '__atc_flags="$-" ' : "";
+        const noglobPrelude = needsOuterNoglob
+          ? "case $__atc_flags in *f*) set -f;; esac; "
+          : "";
+        const nounsetPrelude = needsOuterNounset
+          ? "case $__atc_flags in *u*) set -u;; esac; "
+          : "";
+        const targetShell = usesExtglob || stageRequiresBashShell(command) ? "bash" : "sh";
+        const shellExec = usesExtglob ? "bash -O extglob" : targetShell;
+        const escaped = `'${String(noglobPrelude + nounsetPrelude + command).replace(/'/g, `'\\''`)}'`;
+        rewrittenCommand = `${flagsEnv}${envPrefix}atc exec --build -- ${shellExec} -c ${escaped}`;
+      }
+    }
   } else if (needsAtcRewrite && sessionId) {
     if (isWin) {
       rewrittenCommand = rewriteCompoundCommand(command, {
@@ -6189,6 +6663,8 @@ export function evaluateCommandGuard(
         anchorPid,
         execSerial: null,
         platform: "win32",
+        cwd,
+        env,
       });
     } else if (segments.length > 1) {
       const exportVars = anchorPid
@@ -6208,6 +6684,7 @@ export function evaluateCommandGuard(
     fastPath: false,
     rewrittenCommand,
     hasDirectDeviceAction: hasDeviceAction,
+    hasDirectBuildAction: Boolean(hasBuildAction && coordinateBuilds),
     renewLease: hasDeviceAction && onlineLeases.length > 0,
     targetSerial: serialList && serialList.length === 1 ? serialList[0] : null,
     targetSerials: serialList,

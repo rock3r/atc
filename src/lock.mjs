@@ -827,15 +827,18 @@ export function isProcessGroupAlive(
       return activePgidLivenessSnapshot.get(pgidKey);
     }
     if (allowSubprocess) {
-      return Boolean(
-        queryWindowsProcessGroups([pgidKey], spawnSyncFn, {
-          knownDescendants: effectiveKnown,
-          pgidStartTokens:
-            options.pgidStartTokens || lease?.workerPgidStartTokens || null,
-          expectedStartToken: options.expectedStartToken || null,
-          lease,
-        }).get(pgidKey),
-      );
+      const qRes = queryWindowsProcessGroups([pgidKey], spawnSyncFn, {
+        triState: Boolean(options.triState),
+        knownDescendants: effectiveKnown,
+        pgidStartTokens:
+          options.pgidStartTokens || lease?.workerPgidStartTokens || null,
+        expectedStartToken: options.expectedStartToken || null,
+        lease,
+      });
+      const qVal = qRes.get(pgidKey);
+      if (qVal !== null && qVal !== undefined) {
+        return Boolean(qVal);
+      }
     }
     const knownMap = winKnownTreeDescendants.get(pgidKey);
     const rootMeta = knownMap?.get(pgid);

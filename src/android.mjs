@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { computeUnaccountedBuildRamMb } from "./build.mjs";
 import { runCommandSync } from "./spawn.mjs";
 import { DEFAULT_CONFIG, avdHasRuntimeLockFiles, normalizeApiLevel } from "./state.mjs";
 
@@ -505,6 +506,7 @@ export function readHostResources(avdHome = resolveAvdHome()) {
     freeDiskMb: diskInfo.freeDiskMb,
     fsDev: diskInfo.fsDev,
     cpuCores: os.availableParallelism(),
+    sampledAtMs: Date.now(),
   };
 }
 
@@ -606,6 +608,7 @@ export function checkResourceAdmission(
         ? replacingAvd.ramSizeMb + replacingOverheadMb
         : replacingAvd.requiredRamMb || 2048 + replacingOverheadMb
     : 0;
+  unaccountedRamMb += computeUnaccountedBuildRamMb(state, host?.sampledAtMs, now);
   const projectedAvailableRamMb =
     (host.availableRamMb ?? 4096) + replacingCreditMb - unaccountedRamMb;
 

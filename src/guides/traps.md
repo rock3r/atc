@@ -15,6 +15,12 @@ Guides: `workflow` · `profiles` · `snapshots` · `multi-agent` · `traps` (thi
 | Shell loop or `$VAR` breaks across rewrite | `for apk in *.apk; do adb install "$apk"; done` loses `$apk` if split naively. | Subshells inside `atc exec` cannot see unexported variables assigned in a separate process. | Run `atc exec -- sh -c 'for apk in *.apk; do adb install "$apk"; done'` or let `atc hook pre-tool-use` rewrite the loop body in place. |
 | Cursor hook blocks raw `adb`/`simctl` even with a lease | `Cursor hooks cannot rewrite commands to attach a lease heartbeat.` | Cursor's `beforeShellExecution` hook protocol only supports allow/deny, not command rewriting. | Prefix device commands explicitly with `atc exec -- <cmd>` when running in Cursor. |
 | Offline AVD counts as a used slot (`emu slots: 1/2`) | `atc status --json` shows `"hasLockFiles": true` on an offline AVD. | A previous QEMU process crashed with a non-numeric lock or is still shutting down. | `atc` auto-cleans bare dead-PID locks; if a QEMU process is stuck, wait for shutdown or check `~/.android/avd/<Name>.avd/*.lock`. |
+| `./gradlew --stop` or `bazel shutdown` blocked (`exit 2`) | Guard blocks stopping Gradle or Bazel daemons. | Stopping shared build daemons crashes active compilations in other agent sessions. | Never run `--stop`, `shutdown`, or `clean --expunge` on shared hosts; let `atc exec --build` manage build slots and daemon draining. |
+| Two builds in the same repo wait on each other | Second `atc exec --build` queues even when `build slots` shows `1/2`. | Both builds share a workspace key (`gradle:<root>`, `bazel:ws:<root>`, or `xcode:dd:<path>`) or a prior aborted/lingering build is in its `5 s` `"draining"` cooldown. | Let `atc` serialize same-workspace builds automatically, or pass an isolated `-derivedDataPath` / `--output_base` when supported. |
+
+## System audit logs (`atc-audit.jsonl`)
+
+`atc` writes structured JSONL audit events (`lease`, `build`, `queue`, `guard`, `gc`) to `~/Library/Logs/atc/atc-audit.jsonl` (macOS), `$XDG_STATE_HOME/atc/logs/atc-audit.jsonl` (Linux), or `%LOCALAPPDATA%\atc\logs\atc-audit.jsonl` (Windows). Attach recent lines from `atc-audit.jsonl` and `atc status --json` when reporting bugs or diagnosing multi-agent contention.
 
 ## Exit codes reference
 
