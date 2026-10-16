@@ -101,6 +101,20 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
     // Model the declared claim so guaranteed device-policy refusals (e.g. prop.set on a
     // physical device) are caught before any device is claimed.
     let placeholder = null;
+    if (p.errors.length === 0 && p.op.kind === "snapshot") {
+      // Snapshots are virtual-only: refuse a declared or existing physical lease up front.
+      const claim = step.claim?.reuse !== undefined ? stepById.get(step.claim.reuse)?.claim : step.claim;
+      const sessionLease = !claim && deps.sessionLease ? deps.sessionLease(claim?.platform || null) : null;
+      const kind = claim ? claim.kind : sessionLease?.kind;
+      if (kind === "physical") {
+        planErrors.push({
+          path: `/steps/${idx}/claim`,
+          code: "virtual_only",
+          message: `${step.op} only works on emulators and simulators, but this step would run on a physical device.`,
+          hint: 'Claim a virtual device ("kind": "emulator").',
+        });
+      }
+    }
     if (p.errors.length === 0 && p.op.kind !== "snapshot" && (p.op.kind !== "build" || p.buildReqs.requiresDevice)) {
       const claim = step.claim?.reuse !== undefined ? stepById.get(step.claim.reuse)?.claim : step.claim;
       const opPlatform = p.op.platform || p.op.devicePlatform;
@@ -242,20 +256,39 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
           claimError = { code: "claim_failed", message: res.error || "Device claim failed." };
         } else {
           const lastIdx = lastConsumerIndex(order, stepById, id);
-          const ttlMs = Math.max(30_000, Number(res.lease.expiresAtMs || 0) - Date.now());
-          const timer =
-            lastIdx > i && deps.cmdRenew
-              ? setInterval(() => {
-                  try {
-                    deps.cmdRenew(stateDir, res.lease.leaseId, { session: sessionId }, { env, cwd });
-                  } catch {
-                    // best-effort heartbeat
-                  }
-                }, Math.max(5_000, Math.floor(ttlMs / 3)))
-              : null;
-          if (timer && typeof timer.unref === "function") timer.unref();
-          heldClaims.set(id, { lease: res.lease, created: !res.idempotent, timer, lastIdx });
-          flags.serial = res.lease.serial;
+          // An idempotent claim can return a lease another producer in this batch already holds.
+          // Share ownership: extend the owner's lifetime instead of holding an independent alias.
+          const owner = [...heldClaims.values()].find((h) => h.lease?.leaseId && h.lease.leaseId === res.lease.leaseId && !h.aliasOf);
+          if (owner) {
+            owner.lastIdx = Math.max(owner.lastIdx, lastIdx);
+            if (!owner.timer && owner.lastIdx > i && deps.cmdRenew) {
+              owner.timer = setInterval(() => {
+                try {
+                  deps.cmdRenew(stateDir, owner.lease.leaseId, { session: sessionId }, { env, cwd });
+                } catch {
+                  // best-effort heartbeat
+                }
+              }, 60_000);
+              if (typeof owner.timer.unref === "function") owner.timer.unref();
+            }
+            heldClaims.set(id, { lease: res.lease, created: false, timer: null, lastIdx, aliasOf: true });
+            flags.serial = res.lease.serial;
+          } else {
+            const ttlMs = Math.max(30_000, Number(res.lease.expiresAtMs || 0) - Date.now());
+            const timer =
+              lastIdx > i && deps.cmdRenew
+                ? setInterval(() => {
+                    try {
+                      deps.cmdRenew(stateDir, res.lease.leaseId, { session: sessionId }, { env, cwd });
+                    } catch {
+                      // best-effort heartbeat
+                    }
+                  }, Math.max(5_000, Math.floor(ttlMs / 3)))
+                : null;
+            if (timer && typeof timer.unref === "function") timer.unref();
+            heldClaims.set(id, { lease: res.lease, created: !res.idempotent, timer, lastIdx });
+            flags.serial = res.lease.serial;
+          }
         }
       }
       let r;

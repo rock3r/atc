@@ -340,3 +340,63 @@ test("batch: planning models an existing physical session lease when the step ha
     s.cleanup();
   }
 });
+
+test("batch: snapshot steps refuse a physical claim before anything runs", async () => {
+  const s = setup();
+  try {
+    const res = await s.run(
+      { version: 1, steps: [{ id: "snap", op: "snapshot.save", name: "clean", claim: { platform: "android", kind: "physical" } }] },
+      { validate: true },
+    );
+    assert.equal(res.exitCode, 7, JSON.stringify(res));
+    assert.equal(res.errors[0].code, "virtual_only");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: two producers that receive the same idempotent lease share ownership", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const { runBatch } = await import("../src/batch.mjs");
+    const { execDeps, cmdClaim } = await import("../src/cli.mjs");
+    const events = [];
+    let claimCount = 0;
+    const deps = {
+      ...execDeps(s.stateDir, {}),
+      cmdClaim: (dir, flags, opts) => {
+        claimCount++;
+        const res = cmdClaim(dir, flags, { ...opts, inventory: mockInventory });
+        return claimCount === 1 ? res : { ...res, idempotent: true };
+      },
+      cmdFree: (dir, leaseId) => {
+        const launches = s.calls().filter((l) => l === "adb shell").length;
+        events.push(`free:${leaseId ? "lease" : "none"}:after-${launches}-launches`);
+        return { exitCode: 0, freed: [leaseId] };
+      },
+      cmdRenew: () => ({ exitCode: 0 }),
+      sessionHasLease: () => false,
+      resolveSessionId: () => "sess-batch",
+    };
+    script(path.join(s.root, "bin", "adb"), `echo "adb $3" >> ${s.log}; exit 0`);
+    const res = await runBatch(
+      s.stateDir,
+      {
+        version: 1,
+        steps: [
+          { id: "p1", op: "android.install", apk: "a.apk", claim: { platform: "android" } },
+          { id: "p2", op: "android.install", apk: "b.apk", dependsOn: ["p1"], claim: { platform: "android" } },
+          { id: "c1", op: "android.launch", package: "com.ex.app", activity: ".Main", dependsOn: ["p1", "p2"], claim: { reuse: "p1" } },
+          { id: "c2", op: "android.launch", package: "com.ex.app", activity: ".Main", dependsOn: ["c1", "p2"], claim: { reuse: "p2" } },
+        ],
+      },
+      deps,
+      { env: s.env, cwd: s.proj, json: true, inventory: mockInventory, host: HOST, session: "sess-batch" },
+    );
+    assert.equal(res.exitCode, 0, JSON.stringify(res.steps));
+    assert.deepEqual(res.steps.map((x) => x.status), ["ok", "ok", "ok", "ok"]);
+    assert.deepEqual(events, ["free:lease:after-2-launches"], "the shared lease is freed exactly once, after the last consumer");
+  } finally {
+    s.cleanup();
+  }
+});
