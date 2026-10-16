@@ -4545,11 +4545,10 @@ export function resolveBuildResources(
       parseBazelVersionRange(dotBazelversionRaw);
 
     const rawBazelMajor =
-      bazelMajorVersion !== null && bazelMajorVersion !== undefined && bazelMajorVersion !== ""
-        ? parseBazelVersionRange(bazelMajorVersion)?.major ?? Number(bazelMajorVersion)
-        : bazelVersion !== null && bazelVersion !== undefined && bazelVersion !== ""
-          ? parseBazelVersionRange(bazelVersion)?.major ?? null
-          : null;
+      bazelVersionRange?.major ??
+      (bazelMajorVersion !== null && bazelMajorVersion !== undefined && bazelMajorVersion !== ""
+        ? Number(bazelMajorVersion)
+        : null);
     const effectiveBazelMajor =
       rawBazelMajor !== null && Number.isFinite(rawBazelMajor) && rawBazelMajor > 0
         ? rawBazelMajor
@@ -4977,10 +4976,11 @@ export function resolveBuildResources(
         if (!resourceKeys.includes(key)) resourceKeys.push(key);
       }
     }
+    const resolvedBazelMajorVersion = effectiveBazelMajor ?? bazelMajorVersion;
     const bazelEnvMeta = {
       baseCwd,
       platform: platform || process.platform,
-      bazelMajorVersion,
+      bazelMajorVersion: resolvedBazelMajorVersion,
       envBazelTestTmpdir: effectiveEnvVars.TEST_TMPDIR,
       envBazelUser: effectiveEnvVars.USER,
       envBazelUsername: effectiveEnvVars.USERNAME,
@@ -4998,7 +4998,7 @@ export function resolveBuildResources(
         buildReqs: bazelEnvMeta,
         env: baseEnv,
         platform: platform || process.platform,
-        bazelMajorVersion,
+        bazelMajorVersion: resolvedBazelMajorVersion,
       }),
       workspaceRoot: canonicalRoot,
       resourceKeys: Array.from(new Set(resourceKeys)),
@@ -5895,7 +5895,40 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
   const env = options.env || process.env;
   const platform = options.platform || buildReqs?.platform || process.platform;
   const baseCwd = buildReqs?.baseCwd || process.cwd();
-  const rawMajor = options.bazelMajorVersion ?? buildReqs?.bazelMajorVersion ?? null;
+  let rawMajor = options.bazelMajorVersion ?? buildReqs?.bazelMajorVersion ?? null;
+  if (rawMajor === null || rawMajor === undefined || rawMajor === "") {
+    const rawVerStr =
+      options.bazelVersion ||
+      buildReqs?.bazelVersion ||
+      (env?.USE_BAZEL_VERSION && env.USE_BAZEL_VERSION !== "__UNRESOLVED_DYNAMIC_ENV__"
+        ? String(env.USE_BAZEL_VERSION)
+        : null) ||
+      (() => {
+        try {
+          const bvPath = path.join(String(wsRoot), ".bazelversion");
+          if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
+            return (
+              fs
+                .readFileSync(bvPath, "utf8")
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .find((l) => Boolean(l) && !l.startsWith("#")) || null
+            );
+          }
+        } catch {
+          // Ignore unreadable .bazelversion
+        }
+        return null;
+      })();
+    if (rawVerStr) {
+      const m = String(rawVerStr)
+        .trim()
+        .match(
+          /^(?:[A-Za-z0-9_.-]+\/)?v?(\d+)(?:\.(?:\d+|x|\*))?(?:\.(?:\d+|x|\*))?(?:[-+][A-Za-z0-9_.-]+)?$/i,
+        );
+      if (m) rawMajor = Number(m[1]);
+    }
+  }
   const bazelMajor =
     rawMajor !== null && rawMajor !== undefined && rawMajor !== ""
       ? Number(rawMajor)
@@ -6133,12 +6166,65 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
   ) {
     return { warm: false, daemonPids: [] };
   }
+  const filterIdleGradleDaemons = (
+    candidatePids,
+    candidateCount = candidatePids.length,
+    psClientCount = 0,
+  ) => {
+    if (buildReqs.tool !== "gradle") {
+      return { warm: candidateCount > 0, daemonPids: candidatePids };
+    }
+    const rawLeases = options.activeBuildLeases || options.state?.buildLeases || null;
+    const leaseList = Array.isArray(rawLeases)
+      ? rawLeases
+      : rawLeases && typeof rawLeases === "object"
+        ? Object.values(rawLeases)
+        : [];
+    const activeGradleLeases = leaseList.filter(
+      (b) =>
+        b &&
+        b.tool === "gradle" &&
+        b.requiresHeavySlot !== false &&
+        (b.state === "active" || b.state === "draining") &&
+        !b.preparingDevice,
+    );
+    const busySet = new Set(
+      Array.isArray(options.busyDaemonPids)
+        ? options.busyDaemonPids.map((p) => Number(p)).filter(Boolean)
+        : [],
+    );
+    let unassignedBusyCount = 0;
+    for (const b of activeGradleLeases) {
+      const claimedPid =
+        Number(b.claimedDaemonPid) ||
+        (Array.isArray(b.daemonPids) && b.daemonPids.length === 1 ? Number(b.daemonPids[0]) : 0);
+      if (claimedPid && candidatePids.includes(claimedPid) && !busySet.has(claimedPid)) {
+        busySet.add(claimedPid);
+      } else {
+        unassignedBusyCount++;
+      }
+    }
+    const extraPsBusy = Math.max(0, psClientCount - activeGradleLeases.length);
+    const remainingPids = candidatePids.filter((pid) => !busySet.has(pid));
+    const totalDeductions = unassignedBusyCount + extraPsBusy;
+    if (remainingPids.length > 0) {
+      const idlePids = remainingPids.slice(totalDeductions);
+      return { warm: idlePids.length > 0, daemonPids: idlePids };
+    }
+    const remainingAnon = Math.max(0, candidateCount - busySet.size - totalDeductions);
+    return { warm: remainingAnon > 0, daemonPids: [] };
+  };
   if (typeof options.warmBuildDaemon === "boolean") {
-    return { warm: options.warmBuildDaemon, daemonPids: [] };
+    return options.warmBuildDaemon
+      ? filterIdleGradleDaemons([], 1, 0)
+      : { warm: false, daemonPids: [] };
   }
   if (Array.isArray(options.inventory?.warmBuildDaemons)) {
     const matched = options.inventory.warmBuildDaemons.filter((d) => {
       if (!d) return false;
+      if (typeof d === "object" && (d.busy === true || d.idle === false || d.state === "busy")) {
+        return false;
+      }
       if (typeof d === "string") return d === buildReqs.tool || d === buildReqs.workspaceRoot;
       if (d.tool && d.tool !== buildReqs.tool) return false;
       if (d.workspaceRoot && buildReqs.workspaceRoot && d.workspaceRoot !== buildReqs.workspaceRoot) {
@@ -6146,10 +6232,10 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
       }
       return true;
     });
-    return {
-      warm: matched.length > 0,
-      daemonPids: matched.map((d) => d.pid).filter(Boolean),
-    };
+    const matchedPids = matched
+      .map((d) => (typeof d === "object" ? Number(d.pid) : 0))
+      .filter(Boolean);
+    return filterIdleGradleDaemons(matchedPids, matched.length, 0);
   }
   if (options.inventory && !options.runner && !options.spawnSyncFn) {
     return { warm: false, daemonPids: [] };
@@ -6419,6 +6505,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     const outKeys = (buildReqs.resourceKeys || [])
       .filter((k) => String(k).startsWith("bazel:out:"))
       .map((k) => String(k).slice("bazel:out:".length));
+    let psGradleClientCount = 0;
     for (const rawLine of stdout.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (!line) continue;
@@ -6427,6 +6514,15 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
       const pid = Number(m[1]);
       const cmdLine = m[2];
       if (buildReqs.tool === "gradle") {
+        if (
+          !/GradleDaemon\b/.test(cmdLine) &&
+          /\b(?:org\.gradle\.wrapper\.GradleWrapperMain|org\.gradle\.launcher\.GradleMain|org\.gradle\.cli\.GradleCliMain)\b/.test(
+            cmdLine,
+          )
+        ) {
+          psGradleClientCount++;
+          continue;
+        }
         if (/GradleDaemon\b/.test(cmdLine)) {
           const verMatch = cmdLine.match(/GradleDaemon\s+([0-9][0-9A-Za-z.-]*)/);
           const daemonVer = verMatch?.[1] || null;
@@ -6514,7 +6610,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
         }
       }
     }
-    return { warm: daemonPids.length > 0, daemonPids };
+    return filterIdleGradleDaemons(daemonPids, daemonPids.length, psGradleClientCount);
   } catch {
     return { warm: false, daemonPids: [] };
   }

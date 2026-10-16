@@ -5636,16 +5636,32 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       options.inventory?.host ||
       (freshlyDiscoveredInventory && coClaimInventory?.host ? coClaimInventory.host : null) ||
       (needsBuildCoordination ? readHostResources(avdHome) : coClaimInventory?.host || null);
+    const probedGradleBuildIds = new Set(
+      Object.values(options.activeBuildLeases || curState.buildLeases || {})
+        .filter(
+          (b) =>
+            b &&
+            b.tool === "gradle" &&
+            b.requiresHeavySlot !== false &&
+            (b.state === "active" || b.state === "draining") &&
+            !b.preparingDevice &&
+            b.buildId,
+        )
+        .map((b) => b.buildId),
+    );
     const warmDaemonProbe =
       needsBuildCoordination && buildReqs.requiresHeavySlot
-        ? probeWarmBuildDaemons(buildReqs, options)
+        ? probeWarmBuildDaemons(buildReqs, {
+            ...options,
+            activeBuildLeases: options.activeBuildLeases ?? curState.buildLeases,
+          })
         : { warm: false, daemonPids: [] };
-    return { host, inventory: coClaimInventory, warmDaemonProbe };
+    return { host, inventory: coClaimInventory, warmDaemonProbe, probedGradleBuildIds };
   };
 
   let check;
   while (true) {
-    const { host, inventory, warmDaemonProbe } = refreshHostAndInventory();
+    const { host, inventory, warmDaemonProbe, probedGradleBuildIds } = refreshHostAndInventory();
     let txRes;
     try {
       txRes = withStateTransaction(
@@ -6237,12 +6253,47 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           let canAdmit = Boolean(chosenTicket && chosenTicket.ticketId === ticket.ticketId);
           let ramCheck = null;
 
+          let effectiveWarmDaemon = Boolean(warmDaemonProbe.warm);
+          const effectiveDaemonPids = Array.isArray(warmDaemonProbe.daemonPids)
+            ? [...warmDaemonProbe.daemonPids]
+            : [];
+          if (effectiveWarmDaemon && buildReqs.tool === "gradle") {
+            const newlyActiveGradle = Object.values(state.buildLeases || {}).filter(
+              (b) =>
+                b &&
+                b.tool === "gradle" &&
+                b.requiresHeavySlot !== false &&
+                (b.state === "active" || b.state === "draining") &&
+                !b.preparingDevice &&
+                (!b.buildId || !probedGradleBuildIds?.has(b.buildId)),
+            );
+            if (newlyActiveGradle.length > 0) {
+              for (const b of newlyActiveGradle) {
+                const claimedPid = Number(b.claimedDaemonPid) || 0;
+                const idx = claimedPid ? effectiveDaemonPids.indexOf(claimedPid) : -1;
+                if (idx >= 0) {
+                  effectiveDaemonPids.splice(idx, 1);
+                } else if (effectiveDaemonPids.length > 0) {
+                  effectiveDaemonPids.shift();
+                } else {
+                  effectiveWarmDaemon = false;
+                }
+              }
+              if (
+                Array.isArray(warmDaemonProbe.daemonPids) &&
+                warmDaemonProbe.daemonPids.length > 0 &&
+                effectiveDaemonPids.length === 0
+              ) {
+                effectiveWarmDaemon = false;
+              }
+            }
+          }
           const coldEstimateMb = Math.max(
             state.config?.buildRamEstimateMb ?? 3072,
             buildReqs.requestedHeapMb || 0,
             explicitRamMb || 0,
           );
-          const estimateMb = warmDaemonProbe.warm
+          const estimateMb = effectiveWarmDaemon
             ? Math.max(0, explicitRamMb || 0)
             : coldEstimateMb;
           if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
@@ -6336,6 +6387,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               preparingDevice: isColdPrep,
               pinnedDeviceLeaseId: lease?.leaseId || null,
               pinnedDeviceKey: lease?.deviceKey || null,
+              claimedDaemonPid:
+                effectiveWarmDaemon && effectiveDaemonPids.length > 0
+                  ? effectiveDaemonPids[0]
+                  : null,
+              daemonPids: effectiveDaemonPids,
               reservedRamMb: buildReqs.requiresHeavySlot ? estimateMb : 0,
               ramReservationUntilMs:
                 buildReqs.requiresHeavySlot && estimateMb > 0

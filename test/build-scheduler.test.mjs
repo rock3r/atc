@@ -3703,6 +3703,89 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     );
     assert.equal(readOnlyHereStringBatch.exitCode, 3);
     assert.match(readOnlyHereStringBatch.error, /Phase conflict:.*violates --phase=read-only/);
+
+    // 14. Round 51: .bazelversion major version propagation for macOS warm daemon probing + busy Gradle daemon exclusion
+    const bvDir = path.join(wsDir, "bazel9-ws");
+    fs.mkdirSync(bvDir, { recursive: true });
+    fs.writeFileSync(path.join(bvDir, "MODULE.bazel"), 'module(name = "b9")\n');
+    fs.writeFileSync(path.join(bvDir, ".bazelversion"), "9.0.0\n");
+    const canonicalBvDir = (fs.realpathSync.native || fs.realpathSync)(bvDir);
+
+    const bvDarwinReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bvDir,
+      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
+    );
+    assert.equal(bvDarwinReqs.bazelMajorVersion, 9);
+    assert.ok(
+      bvDarwinReqs.defaultBazelOutputBases.some((p) =>
+        p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/"),
+      ),
+    );
+    const bvDarwinWarmProbe = probeWarmBuildDaemons(bvDarwinReqs, {
+      platform: "darwin",
+      env: { USER: "alice", HOME: "/Users/alice" },
+      runner: () => ({
+        stdout: `9601 bazel(b9) -XX:+HeapDumpOnOutOfMemoryError --output_base=${bvDarwinReqs.defaultBazelOutputBases[0]} --workspace_directory=${canonicalBvDir}\n`,
+      }),
+    });
+    assert.equal(bvDarwinWarmProbe.warm, true);
+    assert.deepEqual(bvDarwinWarmProbe.daemonPids, [9601]);
+
+    // Busy Gradle daemon is not double-counted as warm for a concurrent Gradle build
+    const busyGradleProbeSingle = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      activeBuildLeases: {
+        build_other_gradle: {
+          buildId: "build_other_gradle",
+          tool: "gradle",
+          requiresHeavySlot: true,
+          state: "active",
+          preparingDevice: false,
+          claimedDaemonPid: 7020,
+        },
+      },
+      runner: () => ({
+        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(busyGradleProbeSingle.warm, false);
+    assert.deepEqual(busyGradleProbeSingle.daemonPids, []);
+
+    const busyGradleProbeTwoDaemons = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      activeBuildLeases: {
+        build_other_gradle: {
+          buildId: "build_other_gradle",
+          tool: "gradle",
+          requiresHeavySlot: true,
+          state: "active",
+          preparingDevice: false,
+          claimedDaemonPid: 7020,
+        },
+      },
+      runner: () => ({
+        stdout: [
+          `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
+          `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
+        ].join("\n"),
+      }),
+    });
+    assert.equal(busyGradleProbeTwoDaemons.warm, true);
+    assert.deepEqual(busyGradleProbeTwoDaemons.daemonPids, [7021]);
+
+    const busyGradleClientPsProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: [
+          `7019 ${path.join(canonicalMockJdk, "bin", "java")} org.gradle.wrapper.GradleWrapperMain assembleDebug`,
+          `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
+        ].join("\n"),
+      }),
+    });
+    assert.equal(busyGradleClientPsProbe.warm, false);
+    assert.deepEqual(busyGradleClientPsProbe.daemonPids, []);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
