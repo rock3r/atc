@@ -1,20 +1,20 @@
 # atc architecture
 
-How the `atc` CLI, the lock-serialized state file, the 3-tier Android and iOS fleet discovery, the warm-affinity queue, and the multi-agent hooks fit together.
+The `atc` CLI uses a shared state file to coordinate device discovery, leases, queued requests, and agent hooks.
 
 Status: `v2.1.0` · Updated `2026-10-12` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 
-An agent claims exclusive access to an Android emulator (AVD), an iOS Simulator, or a physical USB/Wi-Fi device, runs commands under `atc exec -- <cmd>`, and frees the lease when done. All coordination runs through a user-private `state.json` file guarded by an atomic directory lock (`atc.lock`) with no daemon and zero npm dependencies.
+An agent claims an Android emulator (AVD), an iOS Simulator, or a physical USB/Wi-Fi device. It runs commands through `atc exec -- <cmd>` and releases the lease after use. `atc` coordinates access through a user-private `state.json` file protected by an atomic directory lock (`atc.lock`). It has no background daemon or npm dependencies.
 
-The CLI carries its own documentation (`atc guide`), enforces lease boundaries (`atc guard` and `atc hook pre-tool-use`), and frees leases when a turn ends (`atc hook stop`) or when an agent PID dies. An optional stdio MCP server (`atc mcp`) exposes the same operations over JSON-RPC 2.0.
+`atc guide` supplies the CLI documentation. `atc guard` and `atc hook pre-tool-use` check lease ownership before agent commands run. `atc hook stop` handles turn-end cleanup; later commands reclaim leases whose agent process has died. The optional Model Context Protocol (MCP) server (`atc mcp`) exposes operations over stdio JSON-RPC 2.0.
 
 | Invariant | Guarantee | Where enforced |
 |---|---|---|
 | Zero subprocesses under `atc.lock` | Fleet discovery runs before acquiring `atc.lock`; boot, wipe, snapshot, and stop run after releasing `atc.lock` under `"starting"` or `"stopping"` states. Lock hold time stays under `20 ms`. | `src/cli.mjs`, `src/lock.mjs` |
-| No personal-phone hijack | Default claims set `--kind emulator`. Physical Android and iOS devices require `--serial`, `--udid`, or `--kind physical\|any` and use `0` virtual slots. | `src/cli.mjs`, `src/state.mjs` |
-| Warm-affinity fairness ceiling | Warm `Tier 0` matches can jump ahead of cold-boot tickets within `reorderWindowSec` (`120 s`). At `120 s`, waiting tickets freeze at Priority #0. | `src/state.mjs` (`canJumpAhead`) |
+| Physical claims require a request | Default claims set `--kind emulator`. Physical Android and iOS devices require `--serial`, `--udid`, or `--kind physical\|any` and use `0` virtual slots. | `src/cli.mjs`, `src/state.mjs` |
+| Queue protection starts after 120 seconds | Warm `Tier 0` matches can precede cold-boot tickets within `reorderWindowSec` (`120 s`). After that window, `atc` reserves competing resources for earlier tickets. Unrelated claims can proceed. | `src/state.mjs` (`canJumpAhead`) |
 | Virtual crash recovery vs. physical fail-fast | Crashed virtual devices hold a `45 s` reservation for in-place reboot (`expiresAtMs` preserved). Disconnected physical devices fail fast after `15 s` with a tombstone. | `src/state.mjs` (`reconcileOfflineLeases`), `src/cli.mjs` |
 
 ## Every critical section under `atc.lock` finishes in under 20 ms
@@ -35,15 +35,22 @@ The CLI carries its own documentation (`atc guide`), enforces lease boundaries (
   + loadIosSimulatorSnapshot(udid, name, runner)      @ src/ios.mjs:746
 ```
 
-1. **Resolve platform and session identity:** `resolveTargetPlatform()` (`src/ios.mjs:62`) picks `"android"` or `"ios"` from flags (`--ios`, `--android`, `--udid`, `--os`) or project markers (`.xcodeproj`, `.xcworkspace`, `Package.swift`). `resolveSessionIdentity()` (`src/state.mjs:2079`) resolves `{ sessionId, anchorPid }` via the 6-step ladder.
-2. **Probe fleet outside `atc.lock`:** `discoverTargetFleet()` (`src/cli.mjs:276`) runs `android emulator list --long`, `adb devices -l`, `xcrun simctl list --json`, and `xcrun devicectl list devices --json-output`, then reads `.avd/config.ini`, snapshots, and host RAM/disk.
-3. **Select candidate under `atc.lock` (`<20 ms`):** `runGarbageCollection()` and `reconcileOfflineLeases()` prune expired or dead-PID leases, mark offline virtual leases (`45 s` recovery window), and record `disconnectedPhysicalLeases` tombstones (`15 s` grace). `cmdClaim` then evaluates `Tier 0` (idempotent re-claim, in-place virtual crash recovery, or warm idle match), `Tier 1` (offline boot under slot/resource caps), `Tier 2` (idle eviction), and `Tier 3` (`--create-if-missing`).
-4. **Run slow transitions outside `atc.lock`:** A 15-second worker heartbeat (`startWorkerHeartbeat()`) extends `lease.deadlineMs` while `atc` boots the AVD or iOS Simulator, loads a QEMU or APFS (`cp -cR`) snapshot, or clears app state.
-5. **Activate or roll back under `atc.lock`:** `cmdClaim` transitions `"starting" -> "active"` with the bound `serial` / `udid` and `expiresAtMs`, or deletes the `"starting"` record on failure so the slot reopens immediately.
+1. `resolveTargetPlatform()` (`src/ios.mjs:62`) selects `"android"` or `"ios"` from flags (`--ios`, `--android`, `--udid`, `--os`) or project markers (`.xcodeproj`, `.xcworkspace`, `Package.swift`).
+   `resolveSessionIdentity()` (`src/state.mjs:2079`) resolves `{ sessionId, anchorPid }` through six ordered sources.
+2. `discoverTargetFleet()` (`src/cli.mjs:276`) runs `android emulator list --long`, `adb devices -l`, `xcrun simctl list --json`, and `xcrun devicectl list devices --json-output` outside `atc.lock`.
+   It reads `.avd/config.ini`, snapshots, and host RAM and disk capacity.
+3. Under `atc.lock`, `runGarbageCollection()` removes expired leases and leases whose owner processes have died.
+   `reconcileOfflineLeases()` reserves offline virtual devices for recovery (`45 s`) and records physical disconnects in `disconnectedPhysicalLeases` (`15 s` grace).
+   `cmdClaim` checks Tier 0 for an existing session lease, recovery, or a running idle match.
+   It then checks Tier 1 for offline boot, Tier 2 for idle eviction, and Tier 3 for `--create-if-missing`.
+4. Outside the lock, `atc` boots devices, loads QEMU or APFS (`cp -cR`) snapshots, or clears app state.
+   `startWorkerHeartbeat()` extends `lease.deadlineMs` every 15 seconds during the operation.
+5. Under the lock, `cmdClaim` activates the `"starting"` lease with its `serial` / `udid` and `expiresAtMs`.
+   On failure, it deletes the starting record and releases the slot.
 
 ## `atc exec` and `atc guard` route Android, iOS, and dual-lease KMP commands
 
-When a session holds one Android lease and one iOS lease (Kotlin Multiplatform / KMP), `cmdExec` (`src/cli.mjs:4973`) and `evaluateCommandGuard` (`src/guard.mjs:1309`) match each command segment to its target platform automatically.
+Kotlin Multiplatform (KMP) sessions can hold one Android lease and one iOS lease. `cmdExec` (`src/cli.mjs:4973`) and `evaluateCommandGuard` (`src/guard.mjs:1309`) select a platform lease for each command segment.
 
 | Command family | Target platform | Environment & argument injection in `buildChildInvocation` (`src/spawn.mjs:96`) |
 |---|---|---|
@@ -55,7 +62,7 @@ When a session holds one Android lease and one iOS lease (Kotlin Multiplatform /
 | `xcodebuild test ...` | `ios` | Sets `ATC_IOS_UDID=<udid>` and validates `-destination id=<udid>,name=<name>`. |
 | Generic (`sh -c ...`) in KMP session | `android` + `ios` | Exports both `ANDROID_SERIAL` and `ATC_IOS_UDID` into the child environment. |
 
-`evaluateCommandGuard()` fast-paths commands that do not mention `adb`, `emulator`, `android`, `gradlew`, `simctl`, `devicectl`, or `xcodebuild` in under `2 ms` without reading `state.json`. Direct lifecycle commands (`emulator -avd`, `adb emu kill`, `xcrun simctl boot|shutdown|erase|delete`) are blocked with exit code `2`. Compound commands (`adb ... && xcrun simctl ...`) are rewritten segment by segment using `execSerialByPlatform`.
+`evaluateCommandGuard()` checks commands for `adb`, `emulator`, `android`, `gradlew`, `simctl`, `devicectl`, and `xcodebuild`. Commands without these tools pass in under `2 ms` without a `state.json` read. The guard blocks direct lifecycle commands (`emulator -avd`, `adb emu kill`, `xcrun simctl boot|shutdown|erase|delete`) with exit code `2`. It rewrites compound commands (`adb ... && xcrun simctl ...`) segment by segment using `execSerialByPlatform`.
 
 ## Code map and on-disk state
 
@@ -83,6 +90,6 @@ When a session holds one Android lease and one iOS lease (Kotlin Multiplatform /
 
 | Command | Coverage |
 |---|---|
-| `npm test` (`node --test test/*.test.mjs`) | 18 integration suites covering lock serialization, corruption quarantine, dead-PID GC, `45 s` virtual crash recovery, `15 s` physical disconnect fail-fast, warm-affinity scheduling, RAM/disk admission, shell guard rewriting, hooks, Android & iOS `atc exec` injection, APFS snapshots, KMP dual-lease routing, `atc guide`, and `atc mcp`. |
+| `npm test` (`node --test test/*.test.mjs`) | Tests cover lock serialization, corrupt-state handling, dead-PID GC, `45 s` virtual recovery, and `15 s` physical disconnect handling. They also cover scheduling, RAM/disk checks, guards, hooks, command targets, APFS snapshots, KMP leases, guides, and MCP. |
 | `npm run check` | Syntax check (`node --check`) across all `.mjs` files plus the full integration test suite. |
 | `npm run release:verify` | Version parity check across `package.json`, `plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/atc/SKILL.md`, and `skills/atc/skill-source.json`. |

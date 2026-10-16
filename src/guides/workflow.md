@@ -1,16 +1,16 @@
 # atc workflow guide
 
-Guides: `workflow` (this page) · `profiles` · `snapshots` · `multi-agent` · `traps` (`atc guide <topic>`).
+Run `atc guide <topic>` to read `workflow`, `profiles`, `snapshots`, `multi-agent`, or `traps`.
 
 ## 1. Check fleet capacity before claiming a device
 
-Run `atc status` to inspect available RAM, free disk, used Android emulator slots (`emu slots`), used iOS Simulator slots (`sim slots`), running devices, offline AVDs/Simulators, and active leases.
+Run `atc status` to check available RAM, free disk, and used slots (`emu slots` and `sim slots`). It also lists running devices, offline Android Virtual Devices (AVDs) and Simulators, and active leases.
 
 Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`, `xcrun simctl boot`, `xcrun simctl shutdown`, or `xcrun simctl erase`. `atc` owns the virtual device lifecycle.
 
 ## 2. Claim, run under `atc exec`, snapshot, and free
 
-1. **Claim a device** matching the platform and profile your task needs:
+1. Claim a device with the platform and profile the task requires:
    ```bash
    # Android emulator (default outside iOS-only directories)
    atc claim --type phone --api ">=35" --play --wait 300
@@ -19,7 +19,7 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
    atc claim --ios --type phone --os ">=18.0" --wait 300
    ```
    If your agent host does not export a session ID, pass `--session <id>` or set `ATC_SESSION_ID=<id>`.
-2. **Run every device command through `atc exec`**:
+2. Run every device command through `atc exec`:
    ```bash
    # Android commands
    atc exec -- adb shell getprop ro.product.model
@@ -30,25 +30,25 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
    atc exec -- xcrun simctl launch booted com.example.app
    atc exec -- xcrun devicectl device info details
    ```
-   `atc exec` injects `ANDROID_SERIAL` and `--device` on Android, or `ATC_IOS_UDID`, `booted` -> `<udid>` (`simctl`), and `--device` (`devicectl`) on iOS. It tracks the worker process group and renews the lease every 15 seconds.
+   On Android, `atc exec` sets `ANDROID_SERIAL` and adds `--device`. On iOS, it sets `ATC_IOS_UDID`, replaces `simctl`'s `booted` target with `<udid>`, and adds `devicectl`'s `--device`. It tracks the worker process group and renews the lease every 15 seconds.
 
-3. **Use dual leases for Kotlin Multiplatform (KMP) tasks**:
-   One session can hold **1 Android lease + 1 iOS lease** at once. `atc exec` routes `adb`/`android`/`gradlew` to the Android lease and `xcrun simctl`/`devicectl`/`xcodebuild` to the iOS lease automatically. Pass `--android` or `--ios` to target one leg in `atc renew`, `atc snapshot`, or `atc free`.
-4. **Reset state with snapshots** when a test mutates device storage:
+3. Use dual leases for Kotlin Multiplatform (KMP) tasks.
+   One session can hold one Android lease and one iOS lease. `atc exec` selects Android for `adb`/`android`/`gradlew` and iOS for `xcrun simctl`/`devicectl`/`xcodebuild`. Select a platform with `--android` or `--ios` in `atc renew`, `atc snapshot`, or `atc free`.
+4. Reset state with snapshots when a test changes device storage:
    ```bash
    atc snapshot save clean_login
    # run destructive test steps...
    atc snapshot load clean_login
    ```
-5. **Renew during long interactive pauses** when no `atc exec` worker is running:
+5. Renew during long interactive pauses when no `atc exec` worker is running:
    ```bash
    atc renew --ttl 600
    ```
-6. **Free the lease when your task finishes**:
+6. Free the lease when the task finishes:
    ```bash
    atc free
    ```
-   Leaving the virtual device warm lets the next queued agent claim it in under 20 ms (`Tier 0`). Pass `atc free --stop` only when shutting down a specialized device (such as `xr` or `watch`) that other tasks will not reuse.
+   A running idle device lets the next queued agent claim it in under 20 ms (`Tier 0`). Use `atc free --stop` only for specialized devices, such as `xr` or `watch`, that other tasks will not reuse.
 
 ## 3. Rules that keep concurrent agents safe
 
@@ -62,6 +62,6 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
 ## 4. Done checklist
 
 - [ ] Every test or UI check ran under `atc exec --`.
-- [ ] Temporary app state was cleaned up or restored from a snapshot.
+- [ ] The agent cleared temporary app state or restored a snapshot.
 - [ ] `atc free` released all held leases.
 - [ ] `atc status` shows zero active leases or queue tickets for your session.
