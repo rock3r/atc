@@ -3984,6 +3984,21 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     );
     assert.equal(hookPayloadCwdDeny.exitCode, 2);
     assert.match(hookPayloadCwdDeny.stderr, /bazel clean --expunge/);
+
+    // Round 55: absolute `cd /abs/path` after relative `cd sub` replaces tracked cwd, and repeated `env -C a -C b` resolves each relative chdir against wrapper entry cwd
+    const absCdDeny = evaluateCommandGuard(
+      `cd sub && cd ${JSON.stringify(guardRcWs)} && bazel --nosystem_rc --nohome_rc clean`,
+      { cwd: wsDir },
+    );
+    assert.equal(absCdDeny.allowed, false);
+    assert.match(absCdDeny.reason, /bazel clean --expunge/);
+
+    const multiEnvChdirDeny = evaluateCommandGuard(
+      "env -C fake-bazelisk-bin -C guard-rc-ws bazel --nosystem_rc --nohome_rc clean",
+      { cwd: wsDir },
+    );
+    assert.equal(multiEnvChdirDeny.allowed, false);
+    assert.match(multiEnvChdirDeny.reason, /bazel clean --expunge/);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

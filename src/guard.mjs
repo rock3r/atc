@@ -1714,6 +1714,14 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
     }
   }
   let relCwd = inheritedVars.__atc_rel_cwd ? String(inheritedVars.__atc_rel_cwd) : null;
+  const combineRelCwd = (baseRel, nextDir) => {
+    const d = String(nextDir || "");
+    if (!d) return baseRel;
+    if (path.isAbsolute(d) || /^[a-zA-Z]:[\\/]/.test(d) || d.startsWith("\\\\")) {
+      return d;
+    }
+    return baseRel ? path.join(baseRel, d) : d;
+  };
   let isPackageExec = false;
   let idx = 0;
 
@@ -1826,6 +1834,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
     if (TRANSPARENT_WRAPPERS.has(base)) {
       idx++;
       if (base === "env") {
+        const envEntryCwd = relCwd;
         while (idx < tokens.length && (tokens[idx] === "-" || tokens[idx].startsWith("-"))) {
           const flag = tokens[idx];
           idx++;
@@ -1875,14 +1884,14 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           } else if ((flag === "-C" || flag === "--chdir") && idx < tokens.length) {
             const nextDir = tokens[idx++];
             if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
-              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+              relCwd = combineRelCwd(envEntryCwd, nextDir);
             }
           } else if (flag.startsWith("--chdir=") || (flag.startsWith("-C") && flag.length > 2)) {
             const nextDir = flag.startsWith("--chdir=")
               ? flag.slice("--chdir=".length)
               : flag.slice(2);
             if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
-              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+              relCwd = combineRelCwd(envEntryCwd, nextDir);
             }
           }
         }
@@ -1905,6 +1914,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           idx++;
         }
       } else if (base === "sudo") {
+        const sudoEntryCwd = relCwd;
         let sudoPreservesAll = false;
         const sudoPreservedList = [];
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
@@ -1928,7 +1938,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           } else if (flag.startsWith("--chdir=")) {
             const nextDir = flag.slice("--chdir=".length);
             if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
-              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+              relCwd = combineRelCwd(sudoEntryCwd, nextDir);
             }
           }
           if (
@@ -1943,7 +1953,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           ) {
             const val = tokens[idx++];
             if ((flag === "-D" || flag === "--chdir") && val && !val.includes("__atc_cmd_sub__")) {
-              relCwd = relCwd ? path.join(relCwd, val) : val;
+              relCwd = combineRelCwd(sudoEntryCwd, val);
             }
           }
         }
@@ -2150,7 +2160,7 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
     }
     const cdTarget = args[cdIdx];
     if (cdTarget && cdTarget !== "-" && !String(cdTarget).includes("__atc_cmd_sub__")) {
-      allVars.__atc_rel_cwd = relCwd ? path.join(relCwd, String(cdTarget)) : String(cdTarget);
+      allVars.__atc_rel_cwd = combineRelCwd(relCwd, cdTarget);
     }
   }
   return {
