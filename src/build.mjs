@@ -303,6 +303,7 @@ export function scanExecutableSubstitutions(text, { ignoreOuterSingleQuotes = fa
           openStart: i,
           bodyStart: i + 2,
           kind: "paren",
+          isProcSub: true,
           stackDepth: stack.length + 1,
         };
       }
@@ -343,6 +344,7 @@ export function scanExecutableSubstitutions(text, { ignoreOuterSingleQuotes = fa
               closeEnd: i + 1,
               body: s.slice(topSub.bodyStart, i),
               kind: "paren",
+              isProcSub: Boolean(topSub.isProcSub),
             });
             topSub = null;
           }
@@ -1189,6 +1191,101 @@ export function expandShellBuildClausePaths(cmd, args = [], envMap = process.env
   };
 }
 
+function combineConcurrencySeq(nodes) {
+  const flat = [];
+  for (const n of nodes || []) {
+    if (!n) continue;
+    if (n.type === "seq") {
+      flat.push(...(n.children || []));
+    } else {
+      flat.push(n);
+    }
+  }
+  if (flat.length === 0) return null;
+  if (flat.length === 1) return flat[0];
+  return { type: "seq", children: flat };
+}
+
+function combineConcurrencyPar(nodes) {
+  const flat = [];
+  for (const n of nodes || []) {
+    if (!n) continue;
+    if (n.type === "par") {
+      flat.push(...(n.children || []));
+    } else {
+      flat.push(n);
+    }
+  }
+  if (flat.length === 0) return null;
+  if (flat.length === 1) return flat[0];
+  return { type: "par", children: flat };
+}
+
+function offsetConcurrencyTree(node, offset, clauseCount = 0) {
+  if (!node) {
+    if (clauseCount <= 0) return null;
+    const leaves = Array.from({ length: clauseCount }, (_, i) => ({
+      type: "leaf",
+      clauseIdx: offset + i,
+    }));
+    return combineConcurrencySeq(leaves);
+  }
+  if (node.type === "leaf") {
+    return { type: "leaf", clauseIdx: node.clauseIdx + offset };
+  }
+  if (node.type === "seq" || node.type === "par") {
+    return {
+      type: node.type,
+      children: (node.children || [])
+        .map((c) => offsetConcurrencyTree(c, offset, 0))
+        .filter(Boolean),
+    };
+  }
+  return null;
+}
+
+export function evaluateConcurrencyTree(node, getLeafValue) {
+  if (!node || typeof node !== "object") return 0;
+  if (node.type === "leaf") {
+    return Math.max(0, Number(getLeafValue(node.clauseIdx)) || 0);
+  }
+  if (node.type === "par") {
+    let sum = 0;
+    for (const child of node.children || []) {
+      sum += evaluateConcurrencyTree(child, getLeafValue);
+    }
+    return sum;
+  }
+  if (node.type === "seq") {
+    let max = 0;
+    for (const child of node.children || []) {
+      max = Math.max(max, evaluateConcurrencyTree(child, getLeafValue));
+    }
+    return max;
+  }
+  return 0;
+}
+
+export function computeColdBuildRamDemandMb(buildReqs, defaultBuildRamMb = 3072) {
+  const baseDefaultMb = Math.max(0, Number(defaultBuildRamMb) || 3072);
+  if (
+    buildReqs?.concurrencyTree &&
+    Array.isArray(buildReqs.clauseResults) &&
+    buildReqs.clauseResults.length > 1
+  ) {
+    const treeDemandMb = evaluateConcurrencyTree(buildReqs.concurrencyTree, (idx) => {
+      const clause = buildReqs.clauseResults[idx];
+      if (!clause) return 0;
+      if (clause.requiresHeavySlot) {
+        return Math.max(baseDefaultMb, clause.requestedHeapMb || 0);
+      }
+      return clause.requestedHeapMb || 0;
+    });
+    return Math.max(baseDefaultMb, treeDemandMb, buildReqs.requestedHeapMb || 0);
+  }
+  return Math.max(baseDefaultMb, buildReqs?.requestedHeapMb || 0);
+}
+
 export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
   let curCmd = String(cmd || "");
   let curArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
@@ -1760,10 +1857,37 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             }
           }
 
+          const concStack = [{ kind: "root", seqItems: [], pipeStages: [] }];
+          const flushConcPipe = (frame = concStack[concStack.length - 1]) => {
+            if (!frame || frame.pipeStages.length === 0) return;
+            const pipeNode = combineConcurrencyPar(frame.pipeStages);
+            if (pipeNode) frame.seqItems.push(pipeNode);
+            frame.pipeStages = [];
+          };
+          const finalizeConcFrame = (frame) => {
+            flushConcPipe(frame);
+            return combineConcurrencySeq(frame.seqItems);
+          };
+          const popConcFrame = (targetKinds) => {
+            for (let i = concStack.length - 1; i >= 1; i--) {
+              if (targetKinds.includes(concStack[i].kind)) {
+                while (concStack.length > i) {
+                  const popped = concStack.pop();
+                  const node = finalizeConcFrame(popped);
+                  if (node) concStack[concStack.length - 1].pipeStages.push(node);
+                }
+                return;
+              }
+            }
+          };
+
           for (let cIdx = 0; cIdx < clauses.length; cIdx++) {
             const clauseObj = clauses[cIdx];
             const { sepBefore, sepAfter } = clauseObj;
             currentClauseBackgrounded = Boolean(clauseObj.backgrounded);
+            if (sepBefore && sepBefore !== "|") {
+              flushConcPipe();
+            }
             if (
               sepBefore === ";" ||
               sepBefore === ";;" ||
@@ -1825,7 +1949,18 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               hasCasePattern,
             } = splitInfo;
             const isFunctionDecl = Array.isArray(functionNames) && functionNames.length > 0;
+            const clauseCmdSubNodes = [];
+            const clauseProcSubNodes = [];
+            let clauseMainNode = null;
+            if (
+              Array.isArray(leadingKeywords) &&
+              leadingKeywords.length > 0 &&
+              ["then", "elif", "else", "do"].includes(leadingKeywords[0])
+            ) {
+              flushConcPipe();
+            }
             for (let s = 0; s < openedSubshells; s++) {
+              concStack.push({ kind: "subshell", seqItems: [], pipeStages: [] });
               cwdStack.push({
                 cwd: curShellRelCwd,
                 unresolvedCwd: curShellUnresolvedCwd,
@@ -1852,15 +1987,32 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               });
               resetChainState();
             }
+            for (let b = 0; b < (openedBraces || 0); b++) {
+              concStack.push({ kind: "brace", seqItems: [], pipeStages: [] });
+            }
             braceDepth += openedBraces || 0;
             const popSubshells = (
               cBraces = isFunctionDecl ? 0 : closedBraces,
               cSubshells = isFunctionDecl ? 0 : closedSubshells,
             ) => {
+              const stageNode = combineConcurrencySeq([
+                ...clauseCmdSubNodes,
+                combineConcurrencyPar([clauseMainNode, ...clauseProcSubNodes]),
+              ]);
+              if (stageNode) {
+                concStack[concStack.length - 1].pipeStages.push(stageNode);
+              }
+              clauseCmdSubNodes.length = 0;
+              clauseProcSubNodes.length = 0;
+              clauseMainNode = null;
               if (cBraces > 0) {
                 braceDepth = Math.max(0, braceDepth - cBraces);
+                for (let b = 0; b < cBraces; b++) {
+                  popConcFrame(["brace", "subshell"]);
+                }
               }
               for (let s = 0; s < cSubshells; s++) {
+                popConcFrame(["subshell", "brace"]);
                 if (cwdStack.length > 0) {
                   const frame = cwdStack.pop();
                   curShellRelCwd = frame.cwd;
@@ -1921,6 +2073,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                   break;
                 }
               } else if (kw === "if") {
+              concStack.push({ kind: "if", seqItems: [], pipeStages: [] });
               controlStack.push({
                 type: "if",
                 phase: "cond",
@@ -1939,12 +2092,14 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               });
               resetChainState();
             } else if (kw === "then") {
+              flushConcPipe();
               const found = findTopControlFrame(["if"]);
               if (found) {
                 found.frame.phase = "then";
               }
               resetChainState();
             } else if (kw === "elif" || kw === "else") {
+              flushConcPipe();
               const found = findTopControlFrame(["if"]);
               if (found) {
                 for (const fd of fnDefs.values()) {
@@ -1969,6 +2124,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               }
               resetChainState();
             } else if (kw === "fi") {
+              popConcFrame(["if"]);
               const found = findTopControlFrame(["if"]);
               if (found) {
                 for (const fd of fnDefs.values()) {
@@ -1991,6 +2147,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               }
               resetChainState();
             } else if (kw === "while" || kw === "until" || kw === "for") {
+              concStack.push({ kind: "loop", seqItems: [], pipeStages: [] });
               const loopMutatedEnv = new Set(forLoopVars || []);
               for (const fv of loopMutatedEnv) {
                 taintedEnvVars.add(fv);
@@ -2013,12 +2170,14 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               });
               resetChainState();
             } else if (kw === "do") {
+              flushConcPipe();
               const found = findTopControlFrame(["loop"]);
               if (found) {
                 found.frame.phase = "body";
               }
               resetChainState();
             } else if (kw === "done") {
+              popConcFrame(["loop"]);
               const found = findTopControlFrame(["loop"]);
               if (found) {
                 for (const fd of fnDefs.values()) {
@@ -2037,6 +2196,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               }
               resetChainState();
             } else if (kw === "case") {
+              concStack.push({ kind: "case", seqItems: [], pipeStages: [] });
               controlStack.push({
                 type: "case",
                 phase: "arm",
@@ -2055,6 +2215,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               });
               resetChainState();
             } else if (kw === "esac") {
+              popConcFrame(["case"]);
               const found = findTopControlFrame(["case"]);
               if (found) {
                 for (const fd of fnDefs.values()) {
@@ -2080,6 +2241,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           }
 
           if (hasCasePattern) {
+            flushConcPipe();
             const topCase = findTopControlFrame(["case"])?.frame;
             if (topCase) {
               for (const fd of fnDefs.values()) {
@@ -2128,6 +2290,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 candidateBuildToolEnv,
               });
               if (Array.isArray(subPeeled.allBuildClauses) && subPeeled.allBuildClauses.length > 0) {
+                const subOffset = matchedClauses.length;
                 for (const subC of subPeeled.allBuildClauses) {
                   const subUnresolvedCwd = Boolean(
                     subC.unresolvedDynamicCwd ||
@@ -2155,6 +2318,18 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                     ),
                     unresolvedDynamicCwd: subUnresolvedCwd,
                   });
+                }
+                const subNode = offsetConcurrencyTree(
+                  subPeeled.concurrencyTree,
+                  subOffset,
+                  subPeeled.allBuildClauses.length,
+                );
+                if (subNode) {
+                  if (subExec.isProcSub) {
+                    clauseProcSubNodes.push(subNode);
+                  } else {
+                    clauseCmdSubNodes.push(subNode);
+                  }
                 }
               } else if (
                 subPeeled.unparseableShellReason ||
@@ -2251,6 +2426,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 hasCasePattern,
               });
             } else {
+              const fnCallNodes = [];
               if (fnIsTainted) {
                 curShellUnresolvedCwd = true;
                 recordCwdMutation({ isAbsoluteTarget: false, hasCasePattern, dirVerified: false });
@@ -2260,7 +2436,8 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                   hasCasePattern,
                 });
                 for (const pd of fnDef.prevDefs || []) {
-                  runShellScript(pd.bodyScript, { inheritedCond: true });
+                  const pdNode = runShellScript(pd.bodyScript, { inheritedCond: true });
+                  if (pdNode) fnCallNodes.push(pdNode);
                 }
               }
               const callArgs = rawTokens.slice(fnTokIdx + 1);
@@ -2336,9 +2513,11 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               const clausesBeforeCall = matchedClauses.length;
               fnCallStack.push({ localVars: new Set(), savedState: new Map() });
               activeFnCalls.add(candidateFnName);
-              runShellScript(fnDef.bodyScript, {
+              const fnBodyNode = runShellScript(fnDef.bodyScript, {
                 inheritedCond: chainHasCondition || outerChainConditional || fnIsTainted,
               });
+              if (fnBodyNode) fnCallNodes.push(fnBodyNode);
+              clauseMainNode = combineConcurrencySeq(fnCallNodes);
               activeFnCalls.delete(candidateFnName);
               const poppedFnCall = fnCallStack.pop();
               if (poppedFnCall && !needsSubshell) {
@@ -2418,13 +2597,15 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             continue;
           }
           if (headLower === "source" || headTok === "." || headLower === "eval") {
+            const evalNodes = [];
             const evalHeredocs = scriptHeredocs.filter(
               (h) =>
                 h.kind === "shell" &&
                 (h.consumerPartIdx !== -1 ? h.consumerPartIdx : h.opPartIdx) === clauseObj.partIdx,
             );
             for (const hd of evalHeredocs) {
-              runShellScript(hd.effectiveBodyText, { inheritedCond: true });
+              const hdNode = runShellScript(hd.effectiveBodyText, { inheritedCond: true });
+              if (hdNode) evalNodes.push(hdNode);
             }
             curShellUnresolvedCwd = true;
             recordCwdMutation({ isAbsoluteTarget: false, hasCasePattern, dirVerified: false });
@@ -2436,10 +2617,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             for (const fd of fnDefs.values()) {
               if (!activeFnCalls.has(fd.name)) {
                 activeFnCalls.add(fd.name);
-                runShellScript(fd.bodyScript, { inheritedCond: true });
+                const fdNode = runShellScript(fd.bodyScript, { inheritedCond: true });
+                if (fdNode) evalNodes.push(fdNode);
                 activeFnCalls.delete(fd.name);
               }
             }
+            clauseMainNode = combineConcurrencySeq(evalNodes);
             popSubshells();
             continue;
           }
@@ -2760,6 +2943,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             candidateBuildToolEnv,
           });
           if (Array.isArray(peeled.allBuildClauses) && peeled.allBuildClauses.length > 0) {
+            const subOffset = matchedClauses.length;
             for (const subC of peeled.allBuildClauses) {
               const subUnresolvedCwd = Boolean(
                 subC.unresolvedDynamicCwd ||
@@ -2782,6 +2966,11 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 unresolvedDynamicCwd: subUnresolvedCwd,
               });
             }
+            clauseMainNode = offsetConcurrencyTree(
+              peeled.concurrencyTree,
+              subOffset,
+              peeled.allBuildClauses.length,
+            );
             popSubshells();
             continue;
           }
@@ -2858,6 +3047,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                   ? path.join(curShellRelCwd, peeled.relCwd)
                   : peeled.relCwd
               : curShellRelCwd || null;
+            const hdNodes = [];
             for (const hd of shellClauseHeredocs) {
               const hdPeeled = peelBuildWrapperTokens(
                 effectiveHdShell,
@@ -2874,6 +3064,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 },
               );
               if (Array.isArray(hdPeeled.allBuildClauses) && hdPeeled.allBuildClauses.length > 0) {
+                const subOffset = matchedClauses.length;
                 for (const subC of hdPeeled.allBuildClauses) {
                   const subUnresolvedCwd = Boolean(
                     subC.unresolvedDynamicCwd ||
@@ -2907,6 +3098,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                     unresolvedDynamicCwd: subUnresolvedCwd,
                   });
                 }
+                const hdNode = offsetConcurrencyTree(
+                  hdPeeled.concurrencyTree,
+                  subOffset,
+                  hdPeeled.allBuildClauses.length,
+                );
+                if (hdNode) hdNodes.push(hdNode);
               } else if (
                 hdPeeled.unparseableShellReason ||
                 hdPeeled.hasUnresolvedCmd ||
@@ -2916,6 +3113,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 curShellUnresolvedCwd = true;
               }
             }
+            clauseMainNode = combineConcurrencySeq(hdNodes);
             popSubshells();
             continue;
           }
@@ -2987,6 +3185,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
                 mergedClauseEnvVars[locKey] = "__UNRESOLVED_DYNAMIC_ENV__";
               }
             }
+            const leafIdx = matchedClauses.length;
             matchedClauses.push({
               cmd: matchedToolCmd,
               args: expandedClause.args,
@@ -2995,13 +3194,20 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               backgrounded: Boolean(clauseObj.backgrounded || peeled.backgrounded),
               unresolvedDynamicCwd: clauseUnresolvedCwd,
             });
+            clauseMainNode = { type: "leaf", clauseIdx: leafIdx };
           }
           popSubshells();
           }
           outerChainConditional = prevOuterCond;
+          while (concStack.length > 1) {
+            const popped = concStack.pop();
+            const node = finalizeConcFrame(popped);
+            if (node) concStack[concStack.length - 1].pipeStages.push(node);
+          }
+          return finalizeConcFrame(concStack[0]);
         };
 
-        runShellScript(script);
+        const scriptConcurrencyTree = runShellScript(script);
 
         const unparseableCheck = detectUnparseableShellConstructs(script, shellType);
         const scriptWithoutHeredoc = stripOpaqueHeredocsForCheck(script);
@@ -3022,6 +3228,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             unparseableShellReason: unparseableCheck.reason,
             hasUnresolvedCmd: true,
             allBuildClauses: matchedClauses.length > 0 ? matchedClauses : null,
+            concurrencyTree: matchedClauses.length > 0 ? scriptConcurrencyTree : null,
           };
         }
 
@@ -3036,6 +3243,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               hasUnresolvedCmd || matchedClauses.some((c) => c.unresolvedDynamicCwd),
             hasUnresolvedCmd,
             allBuildClauses: matchedClauses,
+            concurrencyTree: scriptConcurrencyTree,
           };
         }
         if (hasUnresolvedCmd) {
@@ -3048,6 +3256,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             unresolvedDynamicCwd,
             hasUnresolvedCmd: true,
             allBuildClauses: null,
+            concurrencyTree: null,
           };
         }
       }
@@ -3063,6 +3272,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
     backgrounded: false,
     unresolvedDynamicCwd,
     allBuildClauses: null,
+    concurrencyTree: null,
   };
 }
 
@@ -3983,6 +4193,7 @@ export function resolveBuildResources(
     unparseableShellReason,
     hasUnresolvedCmd,
     allBuildClauses,
+    concurrencyTree,
   } = peelBuildWrapperTokens(rawCmd, rawArgs, { env: baseEnv, cwd });
   if (backgrounded) {
     return {
@@ -4029,6 +4240,7 @@ export function resolveBuildResources(
         platform,
         bazelMajorVersion,
         bazelVersion,
+        isBazelisk,
       });
     });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
@@ -4066,6 +4278,9 @@ export function resolveBuildResources(
         : requiresWorkspaceLock
           ? "workspace_only"
           : "not_build_tool";
+    const resolvedHeapMb = concurrencyTree
+      ? evaluateConcurrencyTree(concurrencyTree, (idx) => clauseRes[idx]?.requestedHeapMb || 0)
+      : Math.max(0, ...clauseRes.map((r) => r.requestedHeapMb || 0));
     return {
       ...clauseRes[0],
       kind,
@@ -4088,10 +4303,12 @@ export function resolveBuildResources(
       requiresHeavySlot,
       requiresWorkspaceLock,
       disablesDaemon: clauseRes.some((r) => r.disablesDaemon),
-      requestedHeapMb: Math.max(0, ...clauseRes.map((r) => r.requestedHeapMb || 0)),
+      requestedHeapMb: resolvedHeapMb,
       workspaceRoot: clauseRes.find((r) => r.workspaceRoot)?.workspaceRoot || null,
       resourceKeys: Array.from(new Set(clauseRes.flatMap((r) => r.resourceKeys || []))),
       clauseBuildReqs: clauseRes.filter((r) => r.requiresHeavySlot),
+      clauseResults: clauseRes,
+      concurrencyTree,
     };
   }
   let classified = classifyBuildCommand(cmd, args);
@@ -6349,6 +6566,162 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
 }
 
 export function probeWarmBuildDaemons(buildReqs, options = {}) {
+  if (
+    buildReqs?.concurrencyTree &&
+    Array.isArray(buildReqs.clauseResults) &&
+    buildReqs.clauseResults.length > 0
+  ) {
+    const defaultColdMb = Math.max(
+      0,
+      Number(options.state?.config?.buildRamEstimateMb ?? options.defaultBuildRamMb ?? 3072) ||
+        3072,
+    );
+    const probeNode = (node, busyPids, anonUsed) => {
+      if (!node || typeof node !== "object") {
+        return {
+          warm: true,
+          anyWarm: false,
+          daemonPids: [],
+          claimedPids: [],
+          usedAnon: 0,
+          coldRamMb: 0,
+        };
+      }
+      if (node.type === "leaf") {
+        const sub = buildReqs.clauseResults[node.clauseIdx];
+        if (!sub || !sub.requiresHeavySlot) {
+          return {
+            warm: true,
+            anyWarm: false,
+            daemonPids: [],
+            claimedPids: [],
+            usedAnon: 0,
+            coldRamMb: sub?.requestedHeapMb || 0,
+          };
+        }
+        const mergedBusy = Array.from(
+          new Set([
+            ...(Array.isArray(options.busyDaemonPids)
+              ? options.busyDaemonPids.map(Number).filter(Boolean)
+              : []),
+            ...busyPids,
+          ]),
+        );
+        const res = probeWarmBuildDaemons(
+          { ...sub, clauseBuildReqs: null, concurrencyTree: null, clauseResults: null },
+          {
+            ...options,
+            busyDaemonPids: mergedBusy,
+            _extraBusyGradleCount: (Number(options._extraBusyGradleCount) || 0) + anonUsed,
+          },
+        );
+        if (res.warm) {
+          const isGradle = sub.tool === "gradle";
+          const claimedPids =
+            isGradle && Array.isArray(res.daemonPids) && res.daemonPids.length > 0
+              ? [res.daemonPids[0]]
+              : [];
+          const usedAnon =
+            isGradle &&
+            claimedPids.length === 0 &&
+            typeof options.warmBuildDaemon !== "boolean"
+              ? 1
+              : 0;
+          return {
+            warm: true,
+            anyWarm: true,
+            daemonPids: res.daemonPids || [],
+            claimedPids,
+            usedAnon,
+            coldRamMb: 0,
+          };
+        }
+        return {
+          warm: false,
+          anyWarm: false,
+          daemonPids: [],
+          claimedPids: [],
+          usedAnon: 0,
+          coldRamMb: Math.max(defaultColdMb, sub.requestedHeapMb || 0),
+        };
+      }
+      if (node.type === "par") {
+        const curBusy = new Set(busyPids);
+        let curAnon = anonUsed;
+        let allWarm = true;
+        let anyWarm = false;
+        const allDaemonPids = [];
+        const allClaimedPids = [];
+        let totalColdRamMb = 0;
+        for (const child of node.children || []) {
+          const cRes = probeNode(child, curBusy, curAnon);
+          if (!cRes.warm) allWarm = false;
+          if (cRes.anyWarm) anyWarm = true;
+          for (const pid of cRes.daemonPids) allDaemonPids.push(pid);
+          for (const pid of cRes.claimedPids) {
+            curBusy.add(pid);
+            allClaimedPids.push(pid);
+          }
+          curAnon += cRes.usedAnon;
+          totalColdRamMb += cRes.coldRamMb;
+        }
+        return {
+          warm: allWarm,
+          anyWarm,
+          daemonPids: Array.from(new Set(allDaemonPids)),
+          claimedPids: Array.from(new Set(allClaimedPids)),
+          usedAnon: curAnon - anonUsed,
+          coldRamMb: totalColdRamMb,
+        };
+      }
+      if (node.type === "seq") {
+        let allWarm = true;
+        let anyWarm = false;
+        const allDaemonPids = [];
+        const allClaimedPids = [];
+        let maxAnon = 0;
+        let maxColdRamMb = 0;
+        for (const child of node.children || []) {
+          const cRes = probeNode(child, busyPids, anonUsed);
+          if (!cRes.warm) allWarm = false;
+          if (cRes.anyWarm) anyWarm = true;
+          for (const pid of cRes.daemonPids) allDaemonPids.push(pid);
+          for (const pid of cRes.claimedPids) allClaimedPids.push(pid);
+          maxAnon = Math.max(maxAnon, cRes.usedAnon);
+          maxColdRamMb = Math.max(maxColdRamMb, cRes.coldRamMb);
+        }
+        return {
+          warm: allWarm,
+          anyWarm,
+          daemonPids: Array.from(new Set(allDaemonPids)),
+          claimedPids: Array.from(new Set(allClaimedPids)),
+          usedAnon: maxAnon,
+          coldRamMb: maxColdRamMb,
+        };
+      }
+      return {
+        warm: false,
+        anyWarm: false,
+        daemonPids: [],
+        claimedPids: [],
+        usedAnon: 0,
+        coldRamMb: 0,
+      };
+    };
+    const hasHeavy = buildReqs.clauseResults.some((r) => r?.requiresHeavySlot);
+    if (!hasHeavy) {
+      return { warm: false, daemonPids: [] };
+    }
+    const treeRes = probeNode(buildReqs.concurrencyTree, new Set(), 0);
+    return {
+      warm: treeRes.warm,
+      anyWarm: treeRes.anyWarm,
+      coldRamMb: treeRes.coldRamMb,
+      claimedGradleCount: Math.max(treeRes.claimedPids.length, treeRes.usedAnon),
+      claimedDaemonPids: treeRes.claimedPids,
+      daemonPids: treeRes.daemonPids,
+    };
+  }
   if (Array.isArray(buildReqs?.clauseBuildReqs) && buildReqs.clauseBuildReqs.length > 0) {
     const subProbes = buildReqs.clauseBuildReqs.map((sub) =>
       probeWarmBuildDaemons({ ...sub, clauseBuildReqs: null }, options),
@@ -6382,7 +6755,9 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     const activeGradleLeases = leaseList.filter(
       (b) =>
         b &&
-        b.tool === "gradle" &&
+        (b.tool === "gradle" ||
+          (Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0) ||
+          Number(b.claimedGradleCount) > 0) &&
         b.requiresHeavySlot !== false &&
         (b.state === "active" || b.state === "draining") &&
         !b.preparingDevice,
@@ -6395,20 +6770,27 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     let matchedBusyCount = 0;
     let unassignedBusyCount = 0;
     for (const b of activeGradleLeases) {
-      const claimedPid =
-        Number(b.claimedDaemonPid) ||
-        (Array.isArray(b.daemonPids) && b.daemonPids.length === 1 ? Number(b.daemonPids[0]) : 0);
-      if (claimedPid) {
-        if (candidatePids.length === 0) {
-          unassignedBusyCount++;
-          matchedBusyCount++;
-        } else if (candidatePids.includes(claimedPid)) {
-          if (!busySet.has(claimedPid)) {
-            busySet.add(claimedPid);
-          } else {
+      const claimedList =
+        Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0
+          ? b.claimedDaemonPids.map(Number).filter(Boolean)
+          : Number(b.claimedDaemonPid)
+            ? [Number(b.claimedDaemonPid)]
+            : Array.isArray(b.daemonPids) && b.daemonPids.length === 1 && Number(b.daemonPids[0])
+              ? [Number(b.daemonPids[0])]
+              : [];
+      if (claimedList.length > 0) {
+        for (const claimedPid of claimedList) {
+          if (candidatePids.length === 0) {
             unassignedBusyCount++;
+            matchedBusyCount++;
+          } else if (candidatePids.includes(claimedPid)) {
+            if (!busySet.has(claimedPid)) {
+              busySet.add(claimedPid);
+            } else {
+              unassignedBusyCount++;
+            }
+            matchedBusyCount++;
           }
-          matchedBusyCount++;
         }
       } else if (
         candidatePids.length > 0 &&
@@ -6418,19 +6800,25 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
       ) {
         // Active lease has a known disjoint compatible daemon pool
       } else {
-        unassignedBusyCount++;
-        matchedBusyCount++;
+        const anonCount = Math.max(1, Number(b.claimedGradleCount) || 1);
+        unassignedBusyCount += anonCount;
+        matchedBusyCount += anonCount;
       }
     }
     const extraPsBusy = Math.max(0, psClientCount - matchedBusyCount);
     const remainingPids = candidatePids.filter((pid) => !busySet.has(pid));
-    const totalDeductions = unassignedBusyCount + extraPsBusy;
+    const totalDeductions =
+      unassignedBusyCount + extraPsBusy + Math.max(0, Number(options._extraBusyGradleCount) || 0);
     if (remainingPids.length > 0) {
       const idlePids = remainingPids.slice(totalDeductions);
-      return { warm: idlePids.length > 0, daemonPids: idlePids };
+      return {
+        warm: idlePids.length > 0,
+        claimedDaemonPids: idlePids.length > 0 ? [idlePids[0]] : [],
+        daemonPids: idlePids,
+      };
     }
     const remainingAnon = Math.max(0, candidateCount - busySet.size - totalDeductions);
-    return { warm: remainingAnon > 0, daemonPids: [] };
+    return { warm: remainingAnon > 0, claimedDaemonPids: [], daemonPids: [] };
   };
   if (typeof options.warmBuildDaemon === "boolean") {
     return options.warmBuildDaemon

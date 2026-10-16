@@ -17,6 +17,7 @@ import {
   evaluateNestedBuildAdmission,
   computeDefaultBazelOutputBases,
   probeWarmBuildDaemons,
+  computeColdBuildRamDemandMb,
 } from "../src/build.mjs";
 import {
   resolveAuditLogPath,
@@ -3999,6 +4000,81 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     );
     assert.equal(multiEnvChdirDeny.allowed, false);
     assert.match(multiEnvChdirDeny.reason, /bazel clean --expunge/);
+
+    // Round 56: concurrently piped build clauses sum RAM demand while sequential chains take max, and warm daemon probing does not double-claim a single daemon across piped stages
+    const pipedHeapReqs = resolveBuildResources(
+      "sh",
+      [
+        "-c",
+        "./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g assembleDebug | ./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g testDebugUnitTest",
+      ],
+      dirB,
+      { env: { GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(pipedHeapReqs.requestedHeapMb, 8192);
+    assert.equal(computeColdBuildRamDemandMb(pipedHeapReqs, 3072), 8192);
+
+    const seqHeapReqs = resolveBuildResources(
+      "sh",
+      [
+        "-c",
+        "./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g assembleDebug && ./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g testDebugUnitTest",
+      ],
+      dirB,
+      { env: { GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(seqHeapReqs.requestedHeapMb, 4096);
+    assert.equal(computeColdBuildRamDemandMb(seqHeapReqs, 3072), 4096);
+
+    const pipedDefaultColdReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew --no-daemon assembleDebug | ./gradlew --no-daemon testDebugUnitTest"],
+      dirB,
+      { env: { GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(computeColdBuildRamDemandMb(pipedDefaultColdReqs, 3072), 6144);
+
+    const mixedSeqParHeapReqs = resolveBuildResources(
+      "sh",
+      [
+        "-c",
+        "(./gradlew -Dorg.gradle.jvmargs=-Xmx2g assembleDebug && ./gradlew -Dorg.gradle.jvmargs=-Xmx3g lintDebug) | ./gradlew -Dorg.gradle.jvmargs=-Xmx4g testDebugUnitTest",
+      ],
+      dirB,
+      { env: { GRADLE_USER_HOME: fakeUserHome } },
+    );
+    assert.equal(mixedSeqParHeapReqs.requestedHeapMb, 7168);
+    assert.equal(computeColdBuildRamDemandMb(mixedSeqParHeapReqs, 3072), 7168);
+
+    const pipedWarmGradleReqs = resolveBuildResources(
+      "sh",
+      ["-c", "./gradlew assembleDebug | ./gradlew testDebugUnitTest"],
+      dirB,
+      { env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome } },
+    );
+    const pipedSingleDaemonProbe = probeWarmBuildDaemons(pipedWarmGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(pipedSingleDaemonProbe.warm, false);
+    assert.equal(pipedSingleDaemonProbe.anyWarm, true);
+    assert.equal(pipedSingleDaemonProbe.coldRamMb, 3072);
+    assert.deepEqual(pipedSingleDaemonProbe.claimedDaemonPids, [7020]);
+
+    const pipedTwoDaemonsProbe = probeWarmBuildDaemons(pipedWarmGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: [
+          `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
+          `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
+        ].join("\n"),
+      }),
+    });
+    assert.equal(pipedTwoDaemonsProbe.warm, true);
+    assert.equal(pipedTwoDaemonsProbe.coldRamMb, 0);
+    assert.deepEqual(pipedTwoDaemonsProbe.claimedDaemonPids, [7020, 7021]);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

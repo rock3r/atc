@@ -18,6 +18,7 @@ import {
 import {
   checkUnifiedRamAdmission,
   computeBuildPoolSnapshot,
+  computeColdBuildRamDemandMb,
   computeEffectiveMaxBuilds,
   evaluateNestedBuildAdmission,
   hasValidPinnedDeviceLease,
@@ -5644,7 +5645,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         .filter(
           (b) =>
             b &&
-            b.tool === "gradle" &&
+            (b.tool === "gradle" ||
+              (Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0) ||
+              Number(b.claimedGradleCount) > 0) &&
             b.requiresHeavySlot !== false &&
             (b.state === "active" || b.state === "draining") &&
             !b.preparingDevice &&
@@ -6259,14 +6262,26 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
           let ramCheck = null;
 
           let effectiveWarmDaemon = Boolean(warmDaemonProbe.warm);
+          let invalidatedWarmAfterProbe = false;
           const effectiveDaemonPids = Array.isArray(warmDaemonProbe.daemonPids)
             ? [...warmDaemonProbe.daemonPids]
             : [];
-          if (effectiveWarmDaemon && buildReqs.tool === "gradle") {
+          const effectiveClaimedDaemonPids = Array.isArray(warmDaemonProbe.claimedDaemonPids)
+            ? [...warmDaemonProbe.claimedDaemonPids]
+            : effectiveWarmDaemon && effectiveDaemonPids.length > 0
+              ? [effectiveDaemonPids[0]]
+              : [];
+          const hasGradleClause =
+            buildReqs.tool === "gradle" ||
+            (Array.isArray(buildReqs.clauseBuildReqs) &&
+              buildReqs.clauseBuildReqs.some((r) => r?.tool === "gradle"));
+          if ((effectiveWarmDaemon || warmDaemonProbe.anyWarm) && hasGradleClause) {
             const newlyActiveGradle = Object.values(state.buildLeases || {}).filter(
               (b) =>
                 b &&
-                b.tool === "gradle" &&
+                (b.tool === "gradle" ||
+                  (Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0) ||
+                  Number(b.claimedGradleCount) > 0) &&
                 b.requiresHeavySlot !== false &&
                 (b.state === "active" || b.state === "draining") &&
                 !b.preparingDevice &&
@@ -6274,40 +6289,70 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             );
             if (newlyActiveGradle.length > 0) {
               for (const b of newlyActiveGradle) {
-                const claimedPid = Number(b.claimedDaemonPid) || 0;
-                if (claimedPid) {
-                  const idx = effectiveDaemonPids.indexOf(claimedPid);
-                  if (idx >= 0) {
-                    effectiveDaemonPids.splice(idx, 1);
-                  } else if (
-                    !Array.isArray(warmDaemonProbe.daemonPids) ||
-                    warmDaemonProbe.daemonPids.length === 0
-                  ) {
-                    effectiveWarmDaemon = false;
+                const claimedList =
+                  Array.isArray(b.claimedDaemonPids) && b.claimedDaemonPids.length > 0
+                    ? b.claimedDaemonPids.map(Number).filter(Boolean)
+                    : Number(b.claimedDaemonPid)
+                      ? [Number(b.claimedDaemonPid)]
+                      : [];
+                if (claimedList.length > 0) {
+                  for (const claimedPid of claimedList) {
+                    const idx = effectiveDaemonPids.indexOf(claimedPid);
+                    if (idx >= 0) {
+                      effectiveDaemonPids.splice(idx, 1);
+                    }
+                    const cIdx = effectiveClaimedDaemonPids.indexOf(claimedPid);
+                    if (cIdx >= 0) {
+                      effectiveClaimedDaemonPids.splice(cIdx, 1);
+                    }
+                    if (
+                      idx < 0 &&
+                      (!Array.isArray(warmDaemonProbe.daemonPids) ||
+                        warmDaemonProbe.daemonPids.length === 0)
+                    ) {
+                      effectiveWarmDaemon = false;
+                      invalidatedWarmAfterProbe = true;
+                    }
                   }
-                } else if (effectiveDaemonPids.length > 0) {
-                  effectiveDaemonPids.shift();
                 } else {
-                  effectiveWarmDaemon = false;
+                  const anonCount = Math.max(1, Number(b.claimedGradleCount) || 1);
+                  for (let k = 0; k < anonCount; k++) {
+                    if (effectiveDaemonPids.length > 0) {
+                      const removed = effectiveDaemonPids.shift();
+                      const cIdx = effectiveClaimedDaemonPids.indexOf(removed);
+                      if (cIdx >= 0) effectiveClaimedDaemonPids.splice(cIdx, 1);
+                    } else {
+                      effectiveWarmDaemon = false;
+                      invalidatedWarmAfterProbe = true;
+                    }
+                  }
                 }
               }
+              const requiredDaemons = Math.max(1, Number(warmDaemonProbe.claimedGradleCount) || 1);
               if (
                 Array.isArray(warmDaemonProbe.daemonPids) &&
                 warmDaemonProbe.daemonPids.length > 0 &&
-                effectiveDaemonPids.length === 0
+                effectiveDaemonPids.length < requiredDaemons
               ) {
                 effectiveWarmDaemon = false;
+                invalidatedWarmAfterProbe = true;
               }
             }
           }
           const coldEstimateMb = Math.max(
-            state.config?.buildRamEstimateMb ?? 3072,
-            buildReqs.requestedHeapMb || 0,
+            computeColdBuildRamDemandMb(buildReqs, state.config?.buildRamEstimateMb ?? 3072),
             explicitRamMb || 0,
           );
+          const partialWarmColdMb =
+            warmDaemonProbe.anyWarm &&
+            typeof warmDaemonProbe.coldRamMb === "number" &&
+            warmDaemonProbe.coldRamMb > 0 &&
+            !invalidatedWarmAfterProbe
+              ? Math.max(warmDaemonProbe.coldRamMb, explicitRamMb || 0)
+              : coldEstimateMb;
           const estimateMb = effectiveWarmDaemon
             ? Math.max(0, explicitRamMb || 0)
-            : coldEstimateMb;
+            : partialWarmColdMb;
           if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
             ramCheck = checkUnifiedRamAdmission(state, host, estimateMb, now, {
               hysteresisMb: wasAlreadyQueued ? 0 : undefined,
@@ -6400,9 +6445,23 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               pinnedDeviceLeaseId: lease?.leaseId || null,
               pinnedDeviceKey: lease?.deviceKey || null,
               claimedDaemonPid:
-                effectiveWarmDaemon && effectiveDaemonPids.length > 0
-                  ? effectiveDaemonPids[0]
+                (effectiveWarmDaemon || (warmDaemonProbe.anyWarm && !invalidatedWarmAfterProbe)) &&
+                (effectiveClaimedDaemonPids.length > 0 || effectiveDaemonPids.length > 0)
+                  ? effectiveClaimedDaemonPids[0] || effectiveDaemonPids[0]
                   : null,
+              claimedDaemonPids:
+                effectiveWarmDaemon || (warmDaemonProbe.anyWarm && !invalidatedWarmAfterProbe)
+                  ? effectiveClaimedDaemonPids.length > 0
+                    ? effectiveClaimedDaemonPids
+                    : effectiveDaemonPids.slice(
+                        0,
+                        Math.max(1, Number(warmDaemonProbe.claimedGradleCount) || 1),
+                      )
+                  : [],
+              claimedGradleCount:
+                effectiveWarmDaemon || (warmDaemonProbe.anyWarm && !invalidatedWarmAfterProbe)
+                  ? Math.max(1, Number(warmDaemonProbe.claimedGradleCount) || 1)
+                  : 0,
               daemonPids: effectiveDaemonPids,
               reservedRamMb: buildReqs.requiresHeavySlot ? estimateMb : 0,
               ramReservationUntilMs:
