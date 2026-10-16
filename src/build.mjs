@@ -4428,7 +4428,17 @@ export function resolveBuildResources(
       return -1;
     };
 
+    const rawBazelMajor =
+      bazelMajorVersion !== null && bazelMajorVersion !== undefined && bazelMajorVersion !== ""
+        ? Number(bazelMajorVersion)
+        : null;
+    const effectiveBazelMajor =
+      rawBazelMajor !== null && Number.isFinite(rawBazelMajor) && rawBazelMajor > 0
+        ? rawBazelMajor
+        : null;
+
     if (!ignoreAllRc) {
+      const seenTopLevelRcs = new Set();
       const parseBazelrcFile = (
         rcPath,
         { required = false, depth = 0, activeStack = new Set() } = {},
@@ -4438,13 +4448,14 @@ export function resolveBuildResources(
           hasCustomStartupOption = true;
           return;
         }
-        const resolvedRc = canonicalizeBuildPath(rcPath);
+        const resolvedRc = canonicalizeBuildPath(rcPath, { platform });
+        if (depth === 0 && seenTopLevelRcs.has(resolvedRc)) {
+          return;
+        }
         if (activeStack.has(resolvedRc)) {
           hasCustomStartupOption = true;
           return;
         }
-        const nextStack = new Set(activeStack);
-        nextStack.add(resolvedRc);
         let content;
         try {
           if (!fs.existsSync(resolvedRc)) {
@@ -4456,6 +4467,11 @@ export function resolveBuildResources(
           if (required) hasCustomStartupOption = true;
           return;
         }
+        if (depth === 0) {
+          seenTopLevelRcs.add(resolvedRc);
+        }
+        const nextStack = new Set(activeStack);
+        nextStack.add(resolvedRc);
         const rcDir = path.dirname(resolvedRc);
         for (const rawLine of joinBackslashContinuations(content)) {
           const line = rawLine.trim();
@@ -4553,17 +4569,22 @@ export function resolveBuildResources(
               ? String(baseEnv.BAZELRC)
               : null;
       let hitNullRcSentinel = false;
-      if (effectiveBazelrcEnv === "__UNRESOLVED_DYNAMIC_ENV__") {
-        hasCustomStartupOption = true;
-      } else if (effectiveBazelrcEnv) {
-        for (const rawEnvRc of effectiveBazelrcEnv.split(",")) {
-          if (!rawEnvRc) continue;
-          if (rawEnvRc === "/dev/null" || rawEnvRc.toUpperCase() === "NUL") {
-            hitNullRcSentinel = true;
-            break;
+      if (effectiveBazelMajor === null || effectiveBazelMajor >= 9) {
+        if (effectiveBazelrcEnv === "__UNRESOLVED_DYNAMIC_ENV__") {
+          hasCustomStartupOption = true;
+        } else if (effectiveBazelrcEnv) {
+          if (effectiveBazelMajor === null) {
+            hasCustomStartupOption = true;
           }
-          const expandedRc = String(rawEnvRc).replace(/%workspace%/g, canonicalRoot);
-          parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
+          for (const rawEnvRc of effectiveBazelrcEnv.split(",")) {
+            if (!rawEnvRc) continue;
+            if (rawEnvRc === "/dev/null" || rawEnvRc.toUpperCase() === "NUL") {
+              hitNullRcSentinel = true;
+              break;
+            }
+            const expandedRc = String(rawEnvRc).replace(/%workspace%/g, canonicalRoot);
+            parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
+          }
         }
       }
       if (!hitNullRcSentinel) {

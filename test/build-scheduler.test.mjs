@@ -3523,6 +3523,60 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
         ),
       /Conflicting device selector "iPhone 15"/,
     );
+
+    // 12. Round 49: BAZELRC version gating (Bazel <= 8 ignores BAZELRC, unknown version forces cold) and top-level rc deduplication
+    const dedupeRcX = path.join(wsDir, "dedupe-x.rc");
+    const dedupeRcY = path.join(wsDir, "dedupe-y.rc");
+    const dedupeOutX = path.join(wsDir, "dedupe-out-x");
+    const dedupeOutY = path.join(wsDir, "dedupe-out-y");
+    fs.writeFileSync(dedupeRcX, `startup --output_base=${dedupeOutX}\n`);
+    fs.writeFileSync(dedupeRcY, `startup --output_base=${dedupeOutY}\n`);
+
+    const bazel8IgnoresBazelrc = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      dirA,
+      { env: { BAZELRC: dedupeRcX }, bazelMajorVersion: 8 },
+    );
+    assert.equal(
+      bazel8IgnoresBazelrc.resourceKeys.some((k) => k.endsWith("dedupe-out-x")),
+      false,
+    );
+    assert.equal(bazel8IgnoresBazelrc.disablesDaemon, false);
+    const bazel8WrongOutWarmProbe = probeWarmBuildDaemons(bazel8IgnoresBazelrc, {
+      bazelMajorVersion: 8,
+      runner: () => ({
+        stdout: `9501 bazel(a) -XX:+HeapDumpOnOutOfMemoryError --output_base=${dedupeOutX} --workspace_directory=${canonicalDirA}\n`,
+      }),
+    });
+    assert.equal(bazel8WrongOutWarmProbe.warm, false);
+
+    const bazelUnknownVerWithBazelrc = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      dirA,
+      { env: { BAZELRC: dedupeRcX } },
+    );
+    assert.equal(bazelUnknownVerWithBazelrc.disablesDaemon, true);
+    const bazelUnknownVerWarmProbe = probeWarmBuildDaemons(bazelUnknownVerWithBazelrc, {
+      runner: () => ({
+        stdout: `9502 bazel(a) -XX:+HeapDumpOnOutOfMemoryError --output_base=${dedupeOutX} --workspace_directory=${canonicalDirA}\n`,
+      }),
+    });
+    assert.equal(bazelUnknownVerWarmProbe.warm, false);
+
+    const bazel9TopLevelDedupe = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      dirA,
+      { env: { BAZELRC: `${dedupeRcX},${dedupeRcY},${dedupeRcX}` }, bazelMajorVersion: 9 },
+    );
+    assert.ok(bazel9TopLevelDedupe.resourceKeys.some((k) => k.endsWith("dedupe-out-y")));
+    assert.equal(
+      bazel9TopLevelDedupe.resourceKeys.some((k) => k.endsWith("dedupe-out-x")),
+      false,
+    );
+    assert.equal(bazel9TopLevelDedupe.disablesDaemon, false);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
