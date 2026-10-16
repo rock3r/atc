@@ -1401,6 +1401,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           envVars.LOGNAME = null;
           envVars.USERNAME = null;
           envVars.BAZELRC = null;
+          envVars.LC_ALL = null;
+          envVars.LC_MESSAGES = null;
+          envVars.LANG = null;
         } else if (act.type === "chdir") {
           const rawNextDir = act.rawDir;
           const exp = inShell
@@ -2955,6 +2958,14 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             ) {
               mergedClauseEnvVars.GRADLE_USER_HOME = "__UNRESOLVED_DYNAMIC_ENV__";
             }
+            for (const locKey of ["LC_ALL", "LC_MESSAGES", "LANG"]) {
+              if (
+                (taintedEnvVars.has("*") || taintedEnvVars.has(locKey)) &&
+                !(peeled.envVars && locKey in peeled.envVars)
+              ) {
+                mergedClauseEnvVars[locKey] = "__UNRESOLVED_DYNAMIC_ENV__";
+              }
+            }
             matchedClauses.push({
               cmd: matchedToolCmd,
               args: expandedClause.args,
@@ -4059,6 +4070,12 @@ export function resolveBuildResources(
       effectiveEnvVars.GRADLE_USER_HOME === null || effectiveEnvVars.GRADLE_USER_HOME === "";
     const envGradleHomeUnset =
       effectiveEnvVars.GRADLE_HOME === null || effectiveEnvVars.GRADLE_HOME === "";
+    const envLcAllUnset =
+      effectiveEnvVars.LC_ALL === null || effectiveEnvVars.LC_ALL === "";
+    const envLcMessagesUnset =
+      effectiveEnvVars.LC_MESSAGES === null || effectiveEnvVars.LC_MESSAGES === "";
+    const envLangUnset =
+      effectiveEnvVars.LANG === null || effectiveEnvVars.LANG === "";
     let cliGradleUserHome = null;
     let hasCliGradleJvmArgs = false;
     let cliHeapMb = 0;
@@ -4197,6 +4214,12 @@ export function resolveBuildResources(
       envPathUnset,
       envGradleUserHome: envGradleUserHomeUnset ? "" : effectiveEnvVars.GRADLE_USER_HOME || null,
       envGradleUserHomeUnset,
+      envLcAll: envLcAllUnset ? "" : effectiveEnvVars.LC_ALL || null,
+      envLcAllUnset,
+      envLcMessages: envLcMessagesUnset ? "" : effectiveEnvVars.LC_MESSAGES || null,
+      envLcMessagesUnset,
+      envLang: envLangUnset ? "" : effectiveEnvVars.LANG || null,
+      envLangUnset,
       workspaceRoot: canonicalRoot,
       resourceKeys: [`gradle:${canonicalRoot}`],
     });
@@ -4856,14 +4879,17 @@ function normalizeGradleCompatJvmArgs(args) {
 
 function resolveDefaultGradleLocaleProps(env = null) {
   const effectiveEnv = env || process.env || {};
-  const rawLocale =
-    effectiveEnv.LC_ALL ||
-    effectiveEnv.LC_MESSAGES ||
-    effectiveEnv.LANG ||
-    process.env.LC_ALL ||
-    process.env.LC_MESSAGES ||
-    process.env.LANG ||
-    "";
+  const hasExplicitLocaleKeys =
+    env && ("LC_ALL" in env || "LC_MESSAGES" in env || "LANG" in env);
+  const rawLocale = hasExplicitLocaleKeys
+    ? effectiveEnv.LC_ALL || effectiveEnv.LC_MESSAGES || effectiveEnv.LANG || "C.UTF-8"
+    : effectiveEnv.LC_ALL ||
+      effectiveEnv.LC_MESSAGES ||
+      effectiveEnv.LANG ||
+      process.env.LC_ALL ||
+      process.env.LC_MESSAGES ||
+      process.env.LANG ||
+      "";
   const parsePosixLocale = (raw) => {
     const trimmed = String(raw || "").trim();
     if (!trimmed) return null;
@@ -5870,9 +5896,49 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
     const expectedGradleUserHome = buildReqs.envGradleUserHomeUnset
       ? null
       : buildReqs.envGradleUserHome || options.env?.GRADLE_USER_HOME || null;
-    if (expectedGradleUserHome === "__UNRESOLVED_DYNAMIC_ENV__") {
+    if (
+      expectedGradleUserHome === "__UNRESOLVED_DYNAMIC_ENV__" ||
+      buildReqs.envLcAll === "__UNRESOLVED_DYNAMIC_ENV__" ||
+      buildReqs.envLcMessages === "__UNRESOLVED_DYNAMIC_ENV__" ||
+      buildReqs.envLang === "__UNRESOLVED_DYNAMIC_ENV__"
+    ) {
       return { warm: false, daemonPids: [] };
     }
+    const baseProbeEnv = options.env || process.env || {};
+    const hasLocaleOverrideInReqs = Boolean(
+      buildReqs.envLcAll ||
+        buildReqs.envLcAllUnset ||
+        buildReqs.envLcMessages ||
+        buildReqs.envLcMessagesUnset ||
+        buildReqs.envLang ||
+        buildReqs.envLangUnset ||
+        (options.env &&
+          ("LC_ALL" in options.env || "LC_MESSAGES" in options.env || "LANG" in options.env)),
+    );
+    const effectiveProbeEnv = hasLocaleOverrideInReqs
+      ? {
+          ...baseProbeEnv,
+          LC_ALL: buildReqs.envLcAllUnset
+            ? ""
+            : buildReqs.envLcAll ||
+              (options.env && "LC_ALL" in options.env
+                ? options.env.LC_ALL
+                : process.env.LC_ALL) ||
+              "",
+          LC_MESSAGES: buildReqs.envLcMessagesUnset
+            ? ""
+            : buildReqs.envLcMessages ||
+              (options.env && "LC_MESSAGES" in options.env
+                ? options.env.LC_MESSAGES
+                : process.env.LC_MESSAGES) ||
+              "",
+          LANG: buildReqs.envLangUnset
+            ? ""
+            : buildReqs.envLang ||
+              (options.env && "LANG" in options.env ? options.env.LANG : process.env.LANG) ||
+              "",
+        }
+      : options.env;
     const matchesCmdPathBoundary = (cmdLine, targetPath, { allowSubpath = false } = {}) => {
       if (!cmdLine || !targetPath) return false;
       const cleanTarget = String(targetPath).replace(/[\\/]+$/, "");
@@ -6117,7 +6183,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const expectedCompatNorm = stripDefaultGradleDaemonJvmArgs(
             normalizeGradleCompatJvmArgs(expectedCompatJvmArgs),
             { keyed: new Map(), positional: [] },
-            options.env,
+            effectiveProbeEnv,
           );
           const daemonMainIdx = cmdLine.search(
             /\b(?:org\.gradle\.launcher\.daemon\.bootstrap\.)?GradleDaemon\b/,
@@ -6132,7 +6198,7 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           const daemonCompatNorm = stripDefaultGradleDaemonJvmArgs(
             normalizeGradleCompatJvmArgs(daemonCompatJvmArgs),
             normalizeGradleCompatJvmArgs(expectedCompatJvmArgs),
-            options.env,
+            effectiveProbeEnv,
           );
           const rawExpectedCompatNorm = normalizeGradleCompatJvmArgs(expectedCompatJvmArgs);
           const jvmArgsMatch =

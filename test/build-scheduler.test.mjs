@@ -3389,6 +3389,34 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     });
     assert.equal(frHostAcceptsFrDaemon.warm, true);
 
+    const wrappedFrGradleReqs = resolveBuildResources(
+      "env",
+      ["LANG=fr_FR.UTF-8", "./gradlew", "assembleDebug"],
+      dirB,
+      { env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "en_US.UTF-8" } },
+    );
+    const wrappedFrRejectsEnDaemon = probeWarmBuildDaemons(wrappedFrGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "en_US.UTF-8" },
+      runner: () => ({
+        stdout: `7024 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(wrappedFrRejectsEnDaemon.warm, false);
+
+    const wrappedUnsetLangReqs = resolveBuildResources(
+      "env",
+      ["-u", "LANG", "./gradlew", "assembleDebug"],
+      dirB,
+      { env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" } },
+    );
+    const wrappedUnsetRejectsFrDaemon = probeWarmBuildDaemons(wrappedUnsetLangReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" },
+      runner: () => ({
+        stdout: `7025 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(wrappedUnsetRejectsFrDaemon.warm, false);
+
     const iosMatchingLease = {
       leaseId: "lease_ios_16",
       sessionId: "sess-ios-match",
