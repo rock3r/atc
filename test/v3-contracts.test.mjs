@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { withLock } from "../src/lock.mjs";
 import { runCommandSync, spawnWithHeartbeat } from "../src/spawn.mjs";
 import { cmdBatch, cmdExec } from "../src/cli.mjs";
+const HOST = { totalRamMb: 65536, availableRamMb: 32768, freeDiskMb: 100000, cpuCores: 8 };
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel) => fs.readFileSync(path.join(repo, rel), "utf8");
@@ -78,12 +79,12 @@ test("lock boundary: exec and batch flows never spawn under atc.lock", { skip: !
     fs.writeFileSync(path.join(proj, "gradlew"), "#!/bin/sh\nexit 0\n");
     fs.chmodSync(path.join(proj, "gradlew"), 0o755);
     const env = { ...process.env };
-    const one = await cmdExec(stateDir, ["gradle", "tasks", "build", "--json"], { env, cwd: proj });
+    const one = await cmdExec(stateDir, ["gradle", "tasks", "build", "--json"], { env, cwd: proj, host: HOST });
     assert.equal(one.exitCode, 0, one.error);
     const batch = await cmdBatch(
       stateDir,
       { session: "lb", json: true },
-      { env, cwd: proj, plan: { version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["lint"] }, { id: "b", op: "gradle.tasks", tasks: ["test"], dependsOn: ["a"] }] } },
+      { env, cwd: proj, host: HOST, plan: { version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["lint"] }, { id: "b", op: "gradle.tasks", tasks: ["test"], dependsOn: ["a"] }] } },
     );
     assert.equal(batch.exitCode, 0, batch.error);
   } finally {

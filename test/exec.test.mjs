@@ -6,6 +6,7 @@ import path from "node:path";
 import { cmdClaim, cmdExec } from "../src/cli.mjs";
 import { checkWindowsContract, execHelp, planOp, summarizeBriefOutput } from "../src/exec.mjs";
 import { readState } from "../src/state.mjs";
+const HOST = { totalRamMb: 65536, availableRamMb: 32768, freeDiskMb: 100000, cpuCores: 8 };
 
 function tmp(prefix = "atc-exec-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -55,7 +56,7 @@ test("exec: gradle.tasks runs the wrapper with literal argv and resource caps", 
   const s = setup();
   try {
     script(path.join(s.proj, "gradlew"), 'echo "ARGS:$*"');
-    const res = await cmdExec(s.stateDir, ["gradle", "tasks", ":app:assembleDebug", "--offline", "--json"], { env: s.env, cwd: s.proj });
+    const res = await cmdExec(s.stateDir, ["gradle", "tasks", ":app:assembleDebug", "--offline", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 0, res.error);
     assert.equal(res.steps.length, 1);
     assert.equal(res.steps[0].args[0], ":app:assembleDebug");
@@ -74,7 +75,7 @@ test("exec: validation errors are collected and nothing runs", async () => {
   try {
     const marker = path.join(s.root, "ran");
     script(path.join(s.proj, "gradlew"), `touch ${marker}`);
-    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "a;b", "--bogus", "--cwd", "/x"], { env: s.env, cwd: s.proj });
+    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "a;b", "--bogus", "--cwd", "/x"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 7);
     assert.equal(res.errors.length, 3);
     assert.ok(!fs.existsSync(marker));
@@ -87,7 +88,8 @@ test("exec: --claim on a pure build is rejected as claim_unused", async () => {
   const s = setup();
   try {
     script(path.join(s.proj, "gradlew"), "exit 0");
-    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "assembleDebug", "--claim"], { env: s.env, cwd: s.proj });
+    fs.writeFileSync(path.join(s.proj, "gradlew.bat"), "@exit /b 0\r\n");
+    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "assembleDebug", "--claim"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 7);
     assert.equal(res.errors[0].code, "claim_unused");
   } finally {
@@ -99,13 +101,13 @@ test("exec: --force needs a reason, is recorded, and cannot unlock leading-dash 
   const s = setup();
   try {
     script(path.join(s.proj, "gradlew"), "exit 0");
-    const noReason = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force"], { env: s.env, cwd: s.proj });
+    const noReason = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(noReason.exitCode, 7);
     assert.equal(noReason.errors[0].code, "force_reason_required");
-    const dash = await cmdExec(s.stateDir, ["gradle", "tasks", "-x", "--force", "--reason", "please"], { env: s.env, cwd: s.proj });
+    const dash = await cmdExec(s.stateDir, ["gradle", "tasks", "-x", "--force", "--reason", "please"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(dash.exitCode, 7);
     assert.equal(dash.errors[0].forceable, false);
-    const ok = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force", "--reason", "vendor plugin task", "--json"], { env: s.env, cwd: s.proj });
+    const ok = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force", "--reason", "vendor plugin task", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(ok.exitCode, 0, ok.error);
     assert.ok(ok.forcedRunId);
     const st = readState(s.stateDir);
@@ -122,7 +124,7 @@ test("exec: --brief writes a full log and condenses failures", { skip: !posix },
   const s = setup();
   try {
     script(path.join(s.proj, "gradlew"), 'i=0; while [ $i -lt 100 ]; do echo "noise $i"; i=$((i+1)); done; echo "e: Unresolved reference: foo" >&2; exit 1');
-    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--brief", "--json"], { env: s.env, cwd: s.proj });
+    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--brief", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 1);
     assert.ok(fs.existsSync(res.logPath));
     assert.match(fs.readFileSync(res.logPath, "utf8"), /noise 0/);
@@ -144,7 +146,7 @@ test("exec: android ops run adb -s <serial> with the exact remote string under t
     const res = await cmdExec(
       s.stateDir,
       ["android", "launch", "--package", "com.example.app", "--activity", ".MainActivity", "--session", "sess-exec", "--json"],
-      { env: s.env, cwd: s.proj, inventory: mockInventory },
+      { env: s.env, cwd: s.proj, host: HOST, inventory: mockInventory },
     );
     assert.equal(res.exitCode, 0, res.error);
     assert.equal(fs.readFileSync(log, "utf8").trim(), "[-s][emulator-5554][shell][am start -n 'com.example.app/.MainActivity']");
@@ -159,7 +161,7 @@ test("exec: multi-invocation ops stop at the first failure", { skip: !posix }, a
     const log = path.join(s.root, "adb.log");
     script(path.join(s.bin, "adb"), `echo "$3" >> ${log}; [ "$3" = "pull" ] && exit 7; exit 0`);
     cmdClaim(s.stateDir, { session: "sess-shot", api: "35", type: "phone" }, { inventory: mockInventory, env: s.env });
-    const res = await cmdExec(s.stateDir, ["android", "screenshot", "out.png", "--session", "sess-shot", "--json"], { env: s.env, cwd: s.proj, inventory: mockInventory });
+    const res = await cmdExec(s.stateDir, ["android", "screenshot", "out.png", "--session", "sess-shot", "--json"], { env: s.env, cwd: s.proj, host: HOST, inventory: mockInventory });
     assert.equal(res.exitCode, 7);
     assert.equal(res.steps.length, 2);
     assert.deepEqual(fs.readFileSync(log, "utf8").trim().split("\n"), ["shell", "pull"]);
@@ -171,7 +173,7 @@ test("exec: multi-invocation ops stop at the first failure", { skip: !posix }, a
 test("exec: device ops without a lease fail clearly", async () => {
   const s = setup();
   try {
-    const res = await cmdExec(s.stateDir, ["android", "uninstall", "com.example.app", "--session", "nobody", "--wait", "0"], { env: s.env, cwd: s.proj, inventory: mockInventory });
+    const res = await cmdExec(s.stateDir, ["android", "uninstall", "com.example.app", "--session", "nobody", "--wait", "0"], { env: s.env, cwd: s.proj, host: HOST, inventory: mockInventory });
     assert.notEqual(res.exitCode, 0);
     assert.ok(res.error);
   } finally {
@@ -185,7 +187,7 @@ test("exec: bazel.run honours timeoutSec (exit 124)", { skip: !posix }, async ()
     fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
     script(path.join(s.proj, "bazelw"), "sleep 30");
     const started = Date.now();
-    const res = await cmdExec(s.stateDir, ["bazel", "run", "//tools:gen", "--timeout-sec", "1", "--json"], { env: s.env, cwd: s.proj });
+    const res = await cmdExec(s.stateDir, ["bazel", "run", "//tools:gen", "--timeout-sec", "1", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 124, res.error);
     assert.equal(res.steps[0].timedOut, true);
     assert.ok(Date.now() - started < 15000);
@@ -201,7 +203,7 @@ test("exec: bazel.clean --expunge is allowed and serialized like a build", { ski
   try {
     fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
     script(path.join(s.proj, "bazelw"), 'echo "ARGS:$*"');
-    const res = await cmdExec(s.stateDir, ["bazel", "clean", "--expunge", "--json"], { env: s.env, cwd: s.proj });
+    const res = await cmdExec(s.stateDir, ["bazel", "clean", "--expunge", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 0, res.error);
     assert.deepEqual(res.steps[0].args, ["clean", "--expunge"]);
   } finally {
@@ -268,8 +270,8 @@ test("exec: two in-process builds on one workspace serialize without blocking th
     const log = path.join(s.root, "order.log");
     script(path.join(s.proj, "gradlew"), `echo "start $1" >> ${log}; sleep 1; echo "end $1" >> ${log}`);
     const [a, b] = await Promise.all([
-      cmdExec(s.stateDir, ["gradle", "tasks", "one", "--json"], { env: s.env, cwd: s.proj }),
-      cmdExec(s.stateDir, ["gradle", "tasks", "two", "--json"], { env: s.env, cwd: s.proj }),
+      cmdExec(s.stateDir, ["gradle", "tasks", "one", "--json"], { env: s.env, cwd: s.proj, host: HOST }),
+      cmdExec(s.stateDir, ["gradle", "tasks", "two", "--json"], { env: s.env, cwd: s.proj, host: HOST }),
     ]);
     assert.equal(a.exitCode, 0, a.error);
     assert.equal(b.exitCode, 0, b.error);
@@ -310,9 +312,24 @@ test("exec: read-only op never runs against an opposite-platform lease", { skip:
     };
     const claim = cmdClaim(s.stateDir, { session: "sess-x", ios: true }, { inventory: iosInventory, env: s.env, platform: "darwin" });
     assert.equal(claim.exitCode, 0, claim.error);
-    const res = await cmdExec(s.stateDir, ["android", "logcat", "--session", "sess-x", "--wait", "0", "--json"], { env: s.env, cwd: s.proj, inventory: iosInventory });
+    const res = await cmdExec(s.stateDir, ["android", "logcat", "--session", "sess-x", "--wait", "0", "--json"], { env: s.env, cwd: s.proj, host: HOST, inventory: iosInventory });
     assert.notEqual(res.exitCode, 0);
     assert.ok(!fs.existsSync(log), "adb must not be invoked with an iOS UDID");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec: a missing build executable is a structured failure, not a crash", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    const env = { ...s.env, PATH: s.bin };
+    const res = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--json"], { env, cwd: s.proj, host: HOST });
+    assert.equal(res.exitCode, 127, res.error);
+    assert.equal(res.errorCode, "executable_not_found");
+    assert.equal(res.steps.length, 1);
+    assert.deepEqual(Object.keys(readState(s.stateDir).buildLeases || {}), [], "build lease released");
   } finally {
     s.cleanup();
   }

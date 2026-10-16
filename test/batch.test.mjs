@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { cmdBatch } from "../src/cli.mjs";
 import { readState } from "../src/state.mjs";
+const HOST = { totalRamMb: 65536, availableRamMb: 32768, freeDiskMb: 100000, cpuCores: 8 };
 
 const posix = process.platform !== "win32";
 
@@ -52,7 +53,7 @@ function setup() {
     log,
     env,
     calls: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : []),
-    run: (plan, flags = {}) => cmdBatch(stateDir, { session: "sess-batch", json: true, ...flags }, { env, cwd: proj, plan, inventory: mockInventory }),
+    run: (plan, flags = {}) => cmdBatch(stateDir, { session: "sess-batch", json: true, ...flags }, { env, cwd: proj, plan, inventory: mockInventory, host: HOST }),
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
   };
 }

@@ -198,7 +198,7 @@ export function validateOpParams(opName, params, { force = false, basePath = "" 
   if (op.system === "xcode" && params?.workspaceFile && params?.project) {
     errors.push(err(`${basePath}/project`, "conflict", "Pass either workspaceFile or project, not both."));
   }
-  if (op.deviceCoupled && params?.buildOnly && op.deviceCoupled(params || {})) {
+  if (errors.length === 0 && op.deviceCoupled && params?.buildOnly && op.deviceCoupled(params || {})) {
     errors.push(
       err(`${basePath}/buildOnly`, "build_only_device", "buildOnly was set, but these tasks need a device.", "Remove buildOnly, or split the device tasks into a separate step."),
     );
@@ -523,9 +523,11 @@ export function validateBatchPlan(plan, ctx = {}) {
     if (step.continueOnError !== undefined && typeof step.continueOnError !== "boolean") {
       errors.push(err(`${p}/continueOnError`, "type", "Expected true or false."));
     }
-    // Claims
-    const needsDevice = op.kind === "device" || op.kind === "snapshot" || (op.deviceCoupled && op.deviceCoupled(opParams));
-    const platform = op.platform || (op.deviceCoupled && op.deviceCoupled(opParams) ? op.devicePlatform : null);
+    // Claims (device classification only runs on type-valid params)
+    const paramsValid = res.errors.length === 0;
+    const coupled = paramsValid && Boolean(op.deviceCoupled && op.deviceCoupled(opParams));
+    const needsDevice = op.kind === "device" || op.kind === "snapshot" || coupled;
+    const platform = op.platform || (coupled ? op.devicePlatform : null);
     if (step.claim !== undefined) {
       if (!step.claim || typeof step.claim !== "object" || Array.isArray(step.claim)) {
         errors.push(err(`${p}/claim`, "type", 'Expected a claim profile object or { "reuse": "<stepId>" }.'));
@@ -548,7 +550,7 @@ export function validateBatchPlan(plan, ctx = {}) {
         if (platform && cp && cp !== platform) {
           errors.push(err(`${p}/claim/platform`, "platform_mismatch", `${step.op} needs a ${platform} device, but the claim is for ${cp}.`));
         }
-        if (!needsDevice) {
+        if (!needsDevice && paramsValid) {
           errors.push(err(`${p}/claim`, "claim_unused", `${step.op} does not use a device here; remove the claim.`));
         }
       }

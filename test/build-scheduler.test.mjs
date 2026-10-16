@@ -244,6 +244,7 @@ test("typed build ops derive device coupling, platform and workspace keys from t
     fs.mkdirSync(wsDir, { recursive: true });
     fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'demo'\n");
     script(path.join(wsDir, "gradlew"), "exit 0");
+    fs.writeFileSync(path.join(wsDir, "gradlew.bat"), "@exit /b 0\r\n");
     fs.writeFileSync(path.join(wsDir, "MODULE.bazel"), "");
     const canonicalWs = canonicalizeBuildPath(wsDir);
 

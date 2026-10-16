@@ -1861,17 +1861,20 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, null);
         }
 
-        // Re-claiming with --snapshot-load restores the snapshot again
-        snapCalls.length = 0;
-        const c2 = cmdClaim(
-          snapReloadDir,
-          { session: "snap-sess", api: "35", snapshotLoad: "clean-base" },
-          { inventory: snapInv, runner: snapRunner },
-        );
-        assert.equal(c2.exitCode, 0);
-        assert.equal(c2.idempotent, true);
-        assert.ok(snapCalls.includes("adb -s emulator-5554 emu avd snapshot load clean-base"));
-        assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-base");
+        // Re-claiming with --snapshot-load restores the snapshot again (only after the
+        // mutating op above invalidated it, which needs the POSIX fake adb)
+        if (process.platform !== "win32") {
+          snapCalls.length = 0;
+          const c2 = cmdClaim(
+            snapReloadDir,
+            { session: "snap-sess", api: "35", snapshotLoad: "clean-base" },
+            { inventory: snapInv, runner: snapRunner },
+          );
+          assert.equal(c2.exitCode, 0);
+          assert.equal(c2.idempotent, true);
+          assert.ok(snapCalls.includes("adb -s emulator-5554 emu avd snapshot load clean-base"));
+          assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-base");
+        }
       } finally {
         fs.rmSync(snapReloadDir, { recursive: true, force: true });
       }

@@ -179,7 +179,7 @@ export const OPS = Object.freeze({
       ...BUILD_COMMON,
     },
     devicePlatform: "android",
-    deviceCoupled: (p) => (p.tasks || []).some((t) => isGradleDeviceTaskName(String(t).split(":").pop())),
+    deviceCoupled: (p) => Array.isArray(p.tasks) && p.tasks.some((t) => isGradleDeviceTaskName(String(t).split(":").pop())),
     invocations(params, ctx) {
       const wrapper = resolveGradleWrapper(params, ctx);
       const args = [...params.tasks];
@@ -314,7 +314,7 @@ export const OPS = Object.freeze({
       ...XCODE_COMMON,
       actions: { type: "enum[]", values: XCODE_ACTIONS, required: true, minItems: 1, maxItems: 6 },
     },
-    deviceCoupled: (p) => p.testDestination !== "macos" && (p.actions || []).some((a) => XCODE_DEVICE_ACTIONS.has(a)),
+    deviceCoupled: (p) => p.testDestination !== "macos" && Array.isArray(p.actions) && p.actions.some((a) => XCODE_DEVICE_ACTIONS.has(a)),
     invocations(params, ctx) {
       return [{ cmd: "xcodebuild", args: [...xcodeBaseArgs(params, ctx), ...params.actions, ...xcodeDestinationArgs(params, ctx, params.actions)], cwd: buildBaseDir(params, ctx) }];
     },

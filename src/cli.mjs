@@ -6322,7 +6322,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
               value: {
                 status: "error",
                 exitCode: 5,
-                error: `Insufficient host RAM to admit build (${ramCheck.effectiveFreeMb} MB projected free < ${ramCheck.requiredFloorMb} MB required floor). Pass --force to override.`,
+                error: `Insufficient host RAM to admit build (${ramCheck.effectiveFreeMb} MB projected free < ${ramCheck.requiredFloorMb} MB required floor). Free idle devices or wait for running builds; --force does not override RAM admission.`,
               },
             };
           }
@@ -6689,7 +6689,9 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
       });
       const startedAt = Date.now();
       childExitInfo = { exitCode: 0, signal: null, aborted: false };
-      exitCode = await spawnWithHeartbeat(prepared.cmd, prepared.args, check.lease, check.sessionId, onHeartbeat, {
+      let spawnError = null;
+      try {
+        exitCode = await spawnWithHeartbeat(prepared.cmd, prepared.args, check.lease, check.sessionId, onHeartbeat, {
         ...options,
         prepared: { ...prepared, cwd: prepared.cwd || cwd },
         cwd: prepared.cwd || cwd,
@@ -6704,6 +6706,13 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
           childExitInfo = info;
         },
       });
+      } catch (err) {
+        // e.g. ENOENT when the resolved tool isn't installed: report as a failed step, not a crash
+        spawnError = err;
+        exitCode = err?.code === "ENOENT" ? 127 : 1;
+        // Nothing ran, so there is no daemon/client group to drain: release normally.
+        childExitInfo = { exitCode, signal: null, aborted: false };
+      }
       steps.push({
         cmd: prepared.cmd,
         args: prepared.args,
@@ -6711,7 +6720,21 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
         exitCode,
         timedOut: Boolean(childExitInfo.timedOut),
         durationMs: Date.now() - startedAt,
+        ...(spawnError ? { error: spawnError.message } : {}),
       });
+      if (spawnError) {
+        return {
+          exitCode,
+          steps,
+          lease: check.lease || null,
+          sessionId: check.sessionId,
+          error:
+            spawnError.code === "ENOENT"
+              ? `Could not start ${prepared.cmd}: not found. Install it or make it available on PATH.`
+              : `Could not start ${prepared.cmd}: ${spawnError.message}`,
+          errorCode: spawnError.code === "ENOENT" ? "executable_not_found" : "spawn_failed",
+        };
+      }
       if (exitCode !== 0) break;
     }
     return { exitCode, steps, lease: check.lease || null, sessionId: check.sessionId };

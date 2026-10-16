@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MCP_TOOLS, handleMcpRequest } from "../src/mcp.mjs";
+const HOST = { totalRamMb: 65536, availableRamMb: 32768, freeDiskMb: 100000, cpuCores: 8 };
 
 const posix = process.platform !== "win32";
 
@@ -35,7 +36,7 @@ test("mcp: op family tools and atc_batch are listed; no raw command tool exists"
 test("mcp: atc_gradle runs under the MCP session identity and captures output", { skip: !posix }, async () => {
   const s = setup();
   try {
-    const reply = await call(s.stateDir, "atc_gradle", { operation: "tasks", params: { tasks: ["assembleDebug"] } }, { sessionId: "agent-42", cwd: s.proj, env: { ...process.env } });
+    const reply = await call(s.stateDir, "atc_gradle", { operation: "tasks", params: { tasks: ["assembleDebug"] } }, { sessionId: "agent-42", cwd: s.proj, env: { ...process.env }, host: HOST });
     const res = JSON.parse(reply.result.content[0].text);
     assert.equal(reply.result.isError, false, res.error);
     assert.match(res.stdout, /^SESSION=agent-42 ARGS=assembleDebug -Dorg\.gradle\.workers\.max=\d+/);
@@ -47,11 +48,11 @@ test("mcp: atc_gradle runs under the MCP session identity and captures output", 
 test("mcp: invalid params come back as structured errors", async () => {
   const s = setup();
   try {
-    const reply = await call(s.stateDir, "atc_gradle", { operation: "tasks", params: { tasks: ["a;b"], shell: "rm -rf /" } }, { sessionId: "agent-1", cwd: s.proj });
+    const reply = await call(s.stateDir, "atc_gradle", { operation: "tasks", params: { tasks: ["a;b"], shell: "rm -rf /" } }, { sessionId: "agent-1", cwd: s.proj, host: HOST });
     assert.equal(reply.result.isError, true);
     const res = JSON.parse(reply.result.content[0].text);
     assert.deepEqual(res.errors.map((e) => e.code).sort(), ["pattern_mismatch", "unknown_field"]);
-    const unknownOp = await call(s.stateDir, "atc_gradle", { operation: "exec", params: {} }, { sessionId: "agent-1", cwd: s.proj });
+    const unknownOp = await call(s.stateDir, "atc_gradle", { operation: "exec", params: {} }, { sessionId: "agent-1", cwd: s.proj, host: HOST });
     assert.equal(JSON.parse(unknownOp.result.content[0].text).errors[0].code, "unknown_op");
   } finally {
     s.cleanup();
@@ -65,7 +66,7 @@ test("mcp: atc_batch validate returns exact invocations", { skip: !posix }, asyn
       s.stateDir,
       "atc_batch",
       { plan: { version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["lint"] }] }, validate: true },
-      { sessionId: "agent-7", cwd: s.proj },
+      { sessionId: "agent-7", cwd: s.proj, host: HOST },
     );
     const res = JSON.parse(reply.result.content[0].text);
     assert.equal(reply.result.isError, false, res.error);

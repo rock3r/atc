@@ -185,7 +185,7 @@ test("xcode: destination only for test actions on the leased simulator", () => {
   const op = OPS["xcode.test"];
   const ctx = { cwd: "/w", lease: iosLease };
   const [inv] = op.invocations({ scheme: "App", project: "App.xcodeproj" }, ctx);
-  assert.deepEqual(inv.args, ["-project", "/w/App.xcodeproj", "-scheme", "App", "test", "-destination", `id=${iosLease.serial}`]);
+  assert.deepEqual(inv.args, ["-project", path.resolve("/w", "App.xcodeproj"), "-scheme", "App", "test", "-destination", `id=${iosLease.serial}`]);
   assert.equal(op.deviceCoupled({ scheme: "App" }), true);
   assert.equal(op.deviceCoupled({ scheme: "App", testDestination: "macos" }), false);
   const [mac] = op.invocations({ scheme: "App", testDestination: "macos" }, { cwd: "/w" });
@@ -198,7 +198,7 @@ test("xcode: destination only for test actions on the leased simulator", () => {
 test("android ops: adb -s <serial> with single-quoted remote values", () => {
   const ctx = { cwd: "/w", lease: androidLease };
   assert.deepEqual(OPS["android.install"].invocations({ apk: "app.apk", replace: true }, ctx), [
-    { cmd: "adb", args: ["-s", "emulator-5554", "install", "-r", "/w/app.apk"] },
+    { cmd: "adb", args: ["-s", "emulator-5554", "install", "-r", path.resolve("/w", "app.apk")] },
   ]);
   assert.deepEqual(OPS["android.launch"].invocations({ package: "com.ex.app", activity: ".Main" }, ctx)[0].args, [
     "-s",
@@ -235,7 +235,7 @@ test("ios ops: xcrun simctl <verb> <udid>", () => {
     "camera",
     "com.ex.App",
   ]);
-  assert.deepEqual(OPS["ios.screenshot"].invocations({ output: "a.png" }, ctx)[0].args, ["simctl", "io", iosLease.serial, "screenshot", "/w/a.png"]);
+  assert.deepEqual(OPS["ios.screenshot"].invocations({ output: "a.png" }, ctx)[0].args, ["simctl", "io", iosLease.serial, "screenshot", path.resolve("/w", "a.png")]);
 });
 
 // ---------------------------------------------------------------- validateOpParams
@@ -509,8 +509,22 @@ test("parseOpArgv: --no-<flag> negates exec-level boolean selectors", () => {
 test("xcode ops run from and resolve paths against the workspace param", () => {
   const ctx = { cwd: "/repo", lease: null };
   const [inv] = OPS["xcode.build"].invocations({ scheme: "App", workspace: "ios", project: "App.xcodeproj", derivedDataPath: "dd" }, ctx);
-  assert.equal(inv.cwd, "/repo/ios");
-  assert.deepEqual(inv.args, ["-project", "/repo/ios/App.xcodeproj", "-scheme", "App", "-derivedDataPath", "/repo/ios/dd", "build"]);
+  assert.equal(inv.cwd, path.resolve("/repo", "ios"));
+  assert.deepEqual(inv.args, ["-project", path.resolve("/repo", "ios", "App.xcodeproj"), "-scheme", "App", "-derivedDataPath", path.resolve("/repo", "ios", "dd"), "build"]);
   const [plain] = OPS["xcode.actions"].invocations({ scheme: "App", actions: ["clean", "build"] }, ctx);
   assert.equal(plain.cwd, "/repo");
+});
+
+test("validateBatchPlan: wrong param types are reported, never thrown", () => {
+  const r = validateBatchPlan({
+    version: 1,
+    steps: [
+      { id: "a", op: "gradle.tasks", tasks: "assemble", claim: { platform: "android" } },
+      { id: "b", op: "xcode.actions", scheme: "App", actions: "test" },
+    ],
+  });
+  const codes = r.errors.map((e) => `${e.path}:${e.code}`);
+  assert.ok(codes.includes("/steps/0/tasks:type"), codes.join(", "));
+  assert.ok(codes.includes("/steps/1/actions:type"), codes.join(", "));
+  assert.ok(!codes.some((c) => c.includes("claim_unused")), "no spurious claim errors on invalid params");
 });
