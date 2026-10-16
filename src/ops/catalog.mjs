@@ -59,7 +59,19 @@ function findUp(startDir, fileNames) {
 }
 
 function buildBaseDir(params, ctx) {
-  return params.workspace ? path.resolve(ctx.cwd, params.workspace) : ctx.cwd;
+  if (!params.workspace) return ctx.cwd;
+  const dir = path.resolve(ctx.cwd, params.workspace);
+  let ok = false;
+  try {
+    ok = fs.statSync(dir).isDirectory();
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    // Never walk up from a misspelled workspace into a parent project.
+    throw new OpError("workspace_not_found", `Workspace directory ${dir} does not exist.`, "Pass an existing directory as workspace.");
+  }
+  return dir;
 }
 
 function resolveGradleWrapper(params, ctx) {

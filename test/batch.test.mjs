@@ -259,8 +259,56 @@ test("cli: `atc batch -` and `--file -` read the plan from stdin", async () => {
   try {
     const plan = JSON.stringify({ version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["lint"] }] });
     fs.writeFileSync(path.join(s.proj, "gradlew"), "#!/bin/sh\nexit 0\n");
+    fs.writeFileSync(path.join(s.proj, "gradlew.bat"), "@exit /b 0\r\n");
     const res = await cmdBatch(s.stateDir, { session: "stdin", json: true, validate: true, file: "-" }, { env: s.env, cwd: s.proj, readStdin: () => plan });
     assert.equal(res.exitCode, 0, res.error);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: validation models an explicit physical claim (prop.set policy caught before claiming)", async () => {
+  const s = setup();
+  try {
+    const plan = {
+      version: 1,
+      steps: [{ id: "p", op: "android.prop.set", key: "debug.x", value: "1", claim: { platform: "android", kind: "physical" } }],
+    };
+    for (const flags of [{ validate: true }, {}]) {
+      const res = await s.run(plan, flags);
+      assert.equal(res.exitCode, 7, JSON.stringify(res));
+      assert.equal(res.errors[0].code, "physical_not_allowed");
+    }
+    assert.deepEqual(Object.keys(readState(s.stateDir).leases || {}), [], "nothing was claimed");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: a step's env is used for its claim too", async () => {
+  const s = setup();
+  try {
+    const seen = [];
+    const { runBatch } = await import("../src/batch.mjs");
+    const { execDeps } = await import("../src/cli.mjs");
+    const deps = {
+      ...execDeps(s.stateDir, {}),
+      cmdClaim: (_dir, _flags, opts) => {
+        seen.push(opts.env.ANDROID_AVD_HOME);
+        return { exitCode: 2, error: "busy" };
+      },
+      cmdFree: () => ({ exitCode: 0 }),
+      sessionHasLease: () => false,
+      resolveSessionId: () => "s",
+    };
+    const res = await runBatch(
+      s.stateDir,
+      { version: 1, steps: [{ id: "i", op: "android.install", apk: "a.apk", env: { ANDROID_AVD_HOME: "/custom/avd" }, claim: { platform: "android" } }] },
+      deps,
+      { env: s.env, cwd: s.proj, json: true },
+    );
+    assert.notEqual(res.exitCode, 0);
+    assert.deepEqual(seen, ["/custom/avd"]);
   } finally {
     s.cleanup();
   }

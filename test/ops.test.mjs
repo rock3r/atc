@@ -507,12 +507,27 @@ test("parseOpArgv: --no-<flag> negates exec-level boolean selectors", () => {
 });
 
 test("xcode ops run from and resolve paths against the workspace param", () => {
-  const ctx = { cwd: "/repo", lease: null };
+  const repo = tmpDir();
+  fs.mkdirSync(path.join(repo, "ios"));
+  const ctx = { cwd: repo, lease: null };
   const [inv] = OPS["xcode.build"].invocations({ scheme: "App", workspace: "ios", project: "App.xcodeproj", derivedDataPath: "dd" }, ctx);
-  assert.equal(inv.cwd, path.resolve("/repo", "ios"));
-  assert.deepEqual(inv.args, ["-project", path.resolve("/repo", "ios", "App.xcodeproj"), "-scheme", "App", "-derivedDataPath", path.resolve("/repo", "ios", "dd"), "build"]);
+  assert.equal(inv.cwd, path.join(repo, "ios"));
+  assert.deepEqual(inv.args, ["-project", path.join(repo, "ios", "App.xcodeproj"), "-scheme", "App", "-derivedDataPath", path.join(repo, "ios", "dd"), "build"]);
   const [plain] = OPS["xcode.actions"].invocations({ scheme: "App", actions: ["clean", "build"] }, ctx);
-  assert.equal(plain.cwd, "/repo");
+  assert.equal(plain.cwd, repo);
+});
+
+test("build ops refuse a nonexistent workspace instead of walking up to a parent project", () => {
+  const repo = tmpDir();
+  touch(path.join(repo, "gradlew"));
+  touch(path.join(repo, "MODULE.bazel"), 0o644);
+  for (const [op, params] of [
+    ["gradle.tasks", { tasks: ["build"], workspace: "does-not-exist" }],
+    ["bazel.build", { targets: ["//..."], workspace: "does-not-exist" }],
+    ["xcode.build", { scheme: "App", workspace: "does-not-exist" }],
+  ]) {
+    assert.throws(() => OPS[op].invocations(params, { cwd: repo, platform: "darwin", which: () => null }), (e) => e.code === "workspace_not_found", op);
+  }
 });
 
 test("validateBatchPlan: wrong param types are reported, never thrown", () => {

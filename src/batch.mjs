@@ -98,7 +98,26 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
     });
     const idx = plan.steps.indexOf(step);
     for (const e of p.errors) planErrors.push({ ...e, path: `/steps/${idx}${e.path === "/" ? "" : e.path}` });
-    planned.set(id, { plan: p, cwd: stepCwd });
+    // Model the declared claim so guaranteed device-policy refusals (e.g. prop.set on a
+    // physical device) are caught before any device is claimed.
+    let placeholder = null;
+    if (p.errors.length === 0 && p.op.kind !== "snapshot" && (p.op.kind !== "build" || p.buildReqs.requiresDevice)) {
+      const claim = step.claim?.reuse !== undefined ? stepById.get(step.claim.reuse)?.claim : step.claim;
+      placeholder = {
+        serial: "<leased-device>",
+        leaseId: "<lease>",
+        kind: claim?.kind === "physical" ? "physical" : "emulator",
+        platform: p.op.platform || p.op.devicePlatform,
+      };
+      try {
+        p.makeInvocations(placeholder);
+      } catch (err) {
+        if (err?.code === "physical_not_allowed") {
+          planErrors.push({ path: `/steps/${idx}/claim`, code: err.code, message: err.message, ...(err.hint ? { hint: err.hint } : {}) });
+        }
+      }
+    }
+    planned.set(id, { plan: p, cwd: stepCwd, placeholder });
   }
   if (planErrors.length > 0) {
     return {
@@ -143,13 +162,13 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
       order,
       notices,
       steps: order.map((id) => {
-        const { plan: p, cwd: stepCwd } = planned.get(id);
+        const { plan: p, cwd: stepCwd, placeholder } = planned.get(id);
         let invocations = [];
         try {
           invocations =
             p.op.kind === "snapshot"
               ? [{ snapshot: p.op.action, name: p.params.name || null }]
-              : p.makeInvocations(p.op.kind === "build" && !p.buildReqs.requiresDevice ? null : { serial: "<leased-device>", leaseId: "<lease>", kind: "emulator", platform: p.op.platform || p.op.devicePlatform });
+              : p.makeInvocations(placeholder);
         } catch (err) {
           invocations = [{ error: err.message }];
         }
@@ -214,7 +233,7 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
         if (!h) claimError = { code: "claim_unavailable", message: `The device claimed by "${step.claim.reuse}" is not available.` };
         else flags.serial = h.lease.serial;
       } else if (step.claim) {
-        const res = deps.cmdClaim(stateDir, { ...claimFlagsFromProfile(step.claim), session: sessionId }, { env, cwd: stepCwd, inventory: options.inventory });
+        const res = deps.cmdClaim(stateDir, { ...claimFlagsFromProfile(step.claim), session: sessionId }, { env: { ...env, ...(step.env || {}) }, cwd: stepCwd, inventory: options.inventory });
         if (res.exitCode !== 0 || !res.lease) {
           claimError = { code: "claim_failed", message: res.error || "Device claim failed." };
         } else {
