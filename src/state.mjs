@@ -271,7 +271,6 @@ export const DEFAULT_CONFIG = Object.freeze({
   allowPhysicalDevices: "explicit",
   allowedPhysicalSerials: [],
   allowPhysicalPropSet: false,
-  coordinateBuilds: false,
   maxConcurrentBuilds: "auto",
   maxDeviceHolderBurstBuilds: 1,
   buildRamEstimateMb: 3072,

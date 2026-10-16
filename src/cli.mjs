@@ -25,9 +25,7 @@ import {
   probeWarmBuildDaemons,
   pruneAndSelectNextBuildTicket,
   reconcileBuildLease,
-  resolveBuildResources,
 } from "./build.mjs";
-import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
 import { readPlanInput, renderBatchResult, runBatch } from "./batch.mjs";
 import { cmdExecTokens, renderExecResult } from "./exec.mjs";
 import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
@@ -59,7 +57,7 @@ import {
 } from "./lock.mjs";
 import { resolveAuditLogPath } from "./logger.mjs";
 import { startMcpServer } from "./mcp.mjs";
-import { buildChildInvocation, prepareOpChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
+import { prepareOpChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
   DEFAULT_CONFIG,
   addLeaseWorker,
@@ -271,16 +269,6 @@ const SNAPSHOT_ALLOWED_FLAGS = new Set([
   "force",
 ]);
 
-const EXEC_ALLOWED_FLAGS = new Set([
-  ...CLAIM_ALLOWED_FLAGS,
-  "build",
-  "claim",
-  "workspace",
-  "phase",
-  "ramMb",
-  "ram-mb",
-]);
-
 const BATCH_ALLOWED_FLAGS = new Set([
   ...COMMON_ALLOWED_FLAGS,
   "file",
@@ -289,8 +277,6 @@ const BATCH_ALLOWED_FLAGS = new Set([
   "dryRun",
   "dry-run",
 ]);
-
-const VALID_EXEC_PHASES = new Set(["pure-build", "device-build", "device-test", "read-only"]);
 
 const STATUS_ALLOWED_FLAGS = new Set([
   ...COMMON_ALLOWED_FLAGS,
@@ -306,8 +292,6 @@ const STATUS_ALLOWED_FLAGS = new Set([
   "abi",
   "forced",
 ]);
-
-const GUARD_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "format"]);
 
 const GUIDE_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "topic"]);
 
@@ -7387,161 +7371,6 @@ export function cmdGc(stateDir, options = {}) {
   );
 }
 
-export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
-  const unknownFlagErr = validateCommandFlags(flags, GUARD_ALLOWED_FLAGS, "guard");
-  if (unknownFlagErr) {
-    return { exitCode: 1, allowed: false, reason: unknownFlagErr, error: unknownFlagErr };
-  }
-  const inventory = options.inventory || null;
-  let probedRunningCount = inventory ? (inventory.running || []).length : 0;
-  let probedAndroidRunning = 0;
-  let probedIosRunning = 0;
-  let hasPerPlatformProbe = false;
-
-  if (!inventory && options.runningCount === undefined) {
-    const unscopedSegments = splitShellSegments(commandStr)
-      .map((seg) =>
-        classifySegment(seg, {}, 0, {
-          cwd: options.cwd || process.cwd(),
-          env: options.env || process.env,
-        }),
-      )
-      .filter((c) => c.kind === "device_action" && !c.targetSerial);
-    const runner = options.runner || runCommandSync;
-    if (
-      unscopedSegments.some((c) => (c.targetPlatform || c.platform || "android") === "android")
-    ) {
-      const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
-      if (adbRes.status === 0 && adbRes.stdout !== undefined && adbRes.stdout !== null) {
-        probedAndroidRunning = parseAdbDevicesOutput(adbRes.stdout).length;
-      } else {
-        probedAndroidRunning = 2;
-      }
-      probedRunningCount = Math.max(probedRunningCount, probedAndroidRunning);
-      hasPerPlatformProbe = true;
-    }
-    if (unscopedSegments.some((c) => (c.targetPlatform || c.platform) === "ios")) {
-      const simRes = runner("xcrun", ["simctl", "list", "devices", "booted", "--json"], {
-        timeoutMs: 3000,
-      });
-      if (simRes.status === 0 && simRes.stdout !== undefined && simRes.stdout !== null) {
-        try {
-          const parsed = JSON.parse(simRes.stdout);
-          let count = 0;
-          for (const devs of Object.values(parsed?.devices || {})) {
-            if (Array.isArray(devs)) {
-              count += devs.filter((d) => d && d.state === "Booted").length;
-            }
-          }
-          probedIosRunning = count;
-        } catch {
-          probedIosRunning = 2;
-        }
-      } else {
-        probedIosRunning = 2;
-      }
-      probedRunningCount = Math.max(probedRunningCount, probedIosRunning);
-      hasPerPlatformProbe = true;
-    }
-  } else if (options.runningCount !== undefined) {
-    probedRunningCount = options.runningCount;
-  }
-
-  const evalRes = withStateTransaction(stateDir, (state, { now, auditEvents }) => {
-    const identity = resolveSessionIdentity({
-      flags,
-      env: options.env || process.env,
-      state,
-      cwd: options.cwd || process.cwd(),
-      ppid: options.ppid ?? process.ppid,
-      ancestorPids: options.ancestorPids,
-      processChain: options.processChain,
-    });
-    const allLeases = Object.values(state.leases);
-    const activeLeases = allLeases.filter(
-      (l) => l.state === "active" && l.sessionId === identity.sessionId,
-    );
-    const totalLeasedCount = allLeases.length;
-    const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
-    const runningCountByPlatform = hasPerPlatformProbe
-      ? {
-          android: Math.max(
-            probedAndroidRunning,
-            allLeases.filter((l) => (l.platform || "android") === "android").length,
-            activeLeases.filter((l) => (l.platform || "android") === "android").length,
-          ),
-          ios: Math.max(
-            probedIosRunning,
-            allLeases.filter((l) => l.platform === "ios").length,
-            activeLeases.filter((l) => l.platform === "ios").length,
-          ),
-        }
-      : options.runningCountByPlatform;
-    const guard = evaluateCommandGuard(commandStr, {
-      sessionId: identity.sessionId,
-      anchorPid: identity.anchorPid,
-      activeLeases,
-      runningCount,
-      runningCountByPlatform,
-      platform: options.platform,
-      cwd: options.cwd || process.cwd(),
-      env: options.env || process.env,
-      coordinateBuilds:
-        options.coordinateBuilds !== undefined
-          ? Boolean(options.coordinateBuilds)
-          : Boolean(state.config?.coordinateBuilds),
-    });
-    if (!guard.allowed) {
-      if (Array.isArray(auditEvents)) {
-        auditEvents.push({
-          event: "guard_deny",
-          sessionId: identity.sessionId,
-          command: commandStr,
-          reason: guard.reason,
-        });
-      }
-    } else if (guard.rewrittenCommand) {
-      if (Array.isArray(auditEvents)) {
-        auditEvents.push({
-          event: "guard_rewrite",
-          sessionId: identity.sessionId,
-          command: commandStr,
-          rewrittenCommand: guard.rewrittenCommand,
-        });
-      }
-    }
-    let mutated = false;
-    if (guard.allowed && guard.renewLease && activeLeases.length > 0) {
-      const ttlMs = (state.config?.defaultTtlSec ?? DEFAULT_CONFIG.defaultTtlSec ?? 600) * 1000;
-      const targeted =
-        Array.isArray(guard.targetSerials) && guard.targetSerials.length > 0
-          ? new Set(guard.targetSerials)
-          : guard.targetSerial
-            ? new Set([guard.targetSerial])
-            : null;
-      for (const lease of activeLeases) {
-        if (
-          !targeted ||
-          targeted.has(lease.serial) ||
-          (lease.udid && targeted.has(lease.udid)) ||
-          (lease.coreDeviceId && targeted.has(lease.coreDeviceId))
-        ) {
-          lease.loadedSnapshot = null;
-          lease.renewedAtMs = now;
-          lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
-          mutated = true;
-        }
-      }
-    }
-    return { mutated, value: guard };
-  }, options);
-
-  return {
-    exitCode: evalRes.allowed ? 0 : 2,
-    ...evalRes,
-  };
-}
-
 // `atc batch [--file plan.json | -] [--validate] [--json]` — see src/batch.mjs.
 export async function cmdBatch(stateDir, flags = {}, options = {}) {
   const unknownFlagErr = validateCommandFlags(flags, BATCH_ALLOWED_FLAGS, "batch");
@@ -7621,27 +7450,28 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
           `  workflow     claim -> exec -> snapshot -> free loop, rules, and done checklist\n` +
           `  profiles     3-tier fleet discovery, profile flags, and physical device safety\n` +
           `  snapshots    QEMU/APFS snapshots, wipe/cold/reset-app flags, and RAM/disk guardrails\n` +
-          `  multi-agent  session identity, warm-affinity queue, hooks, guard, and MCP\n` +
+          `  multi-agent  session identity, warm-affinity queue, hooks, and MCP\n` +
           `  traps        common Android/iOS/multi-agent failure modes and how atc fixes them\n`,
       );
       return 0;
     }
     process.stdout.write(
       `Agent Traffic Control (atc)\n\n` +
+        `ATC runs allowlisted typed operations for builds and devices. It never runs shell commands.\n\n` +
         `Usage:\n` +
         `  atc guide [workflow|profiles|snapshots|multi-agent|traps] [--json]\n` +
         `  atc claim [--ios|--android|--platform <p>] [--type <type>] [--api|--os <spec>] [--play|--no-play] [--snapshot-load <name>] [--ttl <sec>] [--wait <sec>]\n` +
         `  atc free [<target>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop]\n` +
         `  atc renew [<target>] [--ttl <sec>]\n` +
         `  atc snapshot <list|save|load|delete> [<name>]\n` +
-        `  atc exec [--build] [--claim] [--workspace <dir>] [--phase <phase>] [--ram-mb <mb>] -- <command> [args...]\n` +
-        `  atc batch [--file <path.json>] [--json]\n` +
-        `  atc status [--ios|--android] [--type <type>] [--api|--os <spec>] [--json]\n` +
+        `  atc exec <system> <operation> [args] [--options] [--json]   (atc exec --help for the catalog)\n` +
+        `  atc batch [--file <plan.json> | -] [--validate] [--json]\n` +
+        `  atc status [--ios|--android] [--type <type>] [--api|--os <spec>] [--forced] [--json]\n` +
         `  atc config <get|set> [key] [val]\n` +
         `  atc gc\n` +
-        `  atc guard [--format=json] <command>\n` +
         `  atc hook <pre-tool-use|stop>\n` +
-        `  atc mcp\n`,
+        `  atc mcp\n\n` +
+        `Missing an operation? Request it at https://github.com/rock3r/atc/issues\n`,
     );
     return 0;
   }
@@ -7906,29 +7736,11 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
     }
 
     case "guard": {
-      const cmdTokens =
-        parsed.restAfterDash.length > 0 ? parsed.restAfterDash : parsed.positionals;
-      let cmdStr = cmdTokens.join(" ");
-      if (!cmdStr) {
-        const rawStdin = readStdinSync();
-        if (rawStdin && rawStdin.trim()) {
-          try {
-            const payload = JSON.parse(rawStdin);
-            cmdStr = payload.command ?? payload.CommandLine ?? "";
-          } catch {
-            cmdStr = rawStdin.trim();
-          }
-        }
-      }
-      const res = cmdGuard(stateDir, cmdStr, parsed.flags, { env });
-      if (parsed.flags.format === "json" || parsed.flags.json) {
-        process.stdout.write(JSON.stringify(res) + "\n");
-      } else if (!res.allowed) {
-        process.stderr.write(`${res.reason}\n`);
-      } else if (res.rewrittenCommand) {
-        process.stdout.write(`${res.rewrittenCommand}\n`);
-      }
-      return res.exitCode;
+      process.stderr.write(
+        '[atc] "atc guard" was removed in ATC 3.0: ATC no longer inspects shell commands.\n' +
+          '      Use typed operations instead: "atc exec --help", "atc batch", or the atc_* MCP tools.\n',
+      );
+      return 2;
     }
 
     case "hook": {
