@@ -702,6 +702,19 @@ export function buildChildInvocation(
   }
 
   let nextArgs = [...args];
+  const appendArgsBeforeFindTerminator = (arr, ...toAdd) => {
+    if (
+      arr.length > 0 &&
+      arr.some((a) => a === "-exec" || a === "-execdir" || a === "-ok" || a === "-okdir") &&
+      (arr[arr.length - 1] === ";" ||
+        arr[arr.length - 1] === "\\;" ||
+        arr[arr.length - 1] === "+" ||
+        arr[arr.length - 1] === "\\+")
+    ) {
+      return [...arr.slice(0, -1), ...toAdd, arr[arr.length - 1]];
+    }
+    return [...arr, ...toAdd];
+  };
   if (
     base === "simctl" ||
     (base === "xcrun" && String(nextArgs[0] || "").toLowerCase() === "simctl")
@@ -842,7 +855,7 @@ export function buildChildInvocation(
       lease?.serial &&
       (lease.platform || "android") === "ios"
     ) {
-      nextArgs = [...nextArgs, "-destination", `id=${lease.serial}`];
+      nextArgs = appendArgsBeforeFindTerminator(nextArgs, "-destination", `id=${lease.serial}`);
     }
   }
 
@@ -983,10 +996,72 @@ export function buildChildInvocation(
           const parts = splitShellScriptParts(scriptText);
           const scriptHeredocs = parseScriptHeredocs(scriptText, parts);
           const rewrittenParts = [...parts];
+          let prevPipeOutputTokens = null;
+          const extractStaticPipeOutputTokens = (tokens, envObj) => {
+            if (!Array.isArray(tokens) || tokens.length === 0) return null;
+            let tIdx = 0;
+            while (
+              tIdx < tokens.length &&
+              /^[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(stripSentinels(tokens[tIdx]))
+            ) {
+              tIdx++;
+            }
+            while (tIdx < tokens.length) {
+              const t = stripSentinels(tokens[tIdx]).toLowerCase();
+              if (t === "builtin" || t === "command") {
+                tIdx++;
+                if (tIdx < tokens.length && stripSentinels(tokens[tIdx]) === "--") tIdx++;
+                continue;
+              }
+              break;
+            }
+            if (tIdx >= tokens.length) return null;
+            const cmdBase = (stripSentinels(tokens[tIdx]).split(/[\\/]/).pop() || "")
+              .toLowerCase()
+              .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
+            if (cmdBase !== "echo" && cmdBase !== "printf") return null;
+            let argIdx = tIdx + 1;
+            if (cmdBase === "echo") {
+              while (argIdx < tokens.length && /^-[neE]+$/.test(stripSentinels(tokens[argIdx]))) {
+                argIdx++;
+              }
+            } else if (cmdBase === "printf") {
+              if (
+                argIdx < tokens.length &&
+                stripSentinels(tokens[argIdx]) === "-v" &&
+                argIdx + 1 < tokens.length
+              ) {
+                return null;
+              }
+              if (argIdx < tokens.length && stripSentinels(tokens[argIdx]) === "--") {
+                argIdx++;
+              }
+              if (argIdx < tokens.length && stripSentinels(tokens[argIdx]).includes("%")) {
+                argIdx++;
+              }
+            }
+            const out = [];
+            for (; argIdx < tokens.length; argIdx++) {
+              const exp = expandOrValidateShellPath(tokens[argIdx], envObj, {
+                taintedVars: taintedEnvVars,
+                shellType,
+              });
+              if (exp.unresolved) return null;
+              for (const partItem of String(exp.resolved || "")
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean)) {
+                out.push(partItem);
+              }
+            }
+            return out;
+          };
           for (let idx = 0; idx < parts.length; idx += 2) {
             const rawPart = parts[idx];
             const sepBefore = idx >= 2 ? parts[idx - 1].trim() || "\n" : null;
             const sepAfter = idx + 1 < parts.length ? parts[idx + 1].trim() || "\n" : null;
+            const incomingPipeTokens = sepBefore === "|" ? prevPipeOutputTokens : null;
+            prevPipeOutputTokens = null;
             currentClauseBackgrounded = isAmpersandBackground && sepAfter === "&";
 
             if (
@@ -1668,11 +1743,29 @@ export function buildChildInvocation(
               continue;
             }
             chainHasCondition = true;
+            if (sepAfter === "|") {
+              prevPipeOutputTokens = extractStaticPipeOutputTokens(rawTokens, curShellEnv);
+            }
+            const appendFlagsToCorePart = (cp, flagsStr) => {
+              const trimmedCp = cp.trimEnd();
+              const findTermMatch =
+                rawTokens.some((t) => {
+                  const ct = stripSentinels(t);
+                  return (
+                    ct === "-exec" || ct === "-execdir" || ct === "-ok" || ct === "-okdir"
+                  );
+                }) && trimmedCp.match(/^(.*?\S)(\s+(?:\\;|;|\\\+|\+))$/s);
+              if (findTermMatch) {
+                return `${findTermMatch[1]} ${flagsStr}${findTermMatch[2]}`;
+              }
+              return `${trimmedCp} ${flagsStr}`;
+            };
             const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
               env: curShellEnv,
               inShell: true,
               taintedVars: taintedEnvVars,
               shellType,
+              xargsUpstreamArgs: incomingPipeTokens,
             });
             if (peeled.denySubkind === "unparseable_shell" && peeled.denyReason) {
               throw new Error(peeled.denyReason);
@@ -1813,7 +1906,7 @@ export function buildChildInvocation(
               }
               popSubshells();
               if (xcodeInjected.length > 0) {
-                rewrittenParts[idx] = `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}${trailingWs}`;
+                rewrittenParts[idx] = `${appendFlagsToCorePart(corePart, xcodeInjected.join(" "))}${redirSuffix}${trailingWs}`;
                 continue;
               }
               rewrittenParts[idx] = part;
@@ -1835,7 +1928,7 @@ export function buildChildInvocation(
               });
               popSubshells();
               if (!hasWorkersFlag) {
-                rewrittenParts[idx] = `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
+                rewrittenParts[idx] = `${appendFlagsToCorePart(corePart, `-Dorg.gradle.workers.max=${jobsLimit}`)}${redirSuffix}${trailingWs}`;
                 continue;
               }
               rewrittenParts[idx] = part;
@@ -1955,7 +2048,7 @@ export function buildChildInvocation(
         if (dashDash !== -1) {
           nextArgs = [...nextArgs.slice(0, dashDash), flag, ...nextArgs.slice(dashDash)];
         } else {
-          nextArgs = [...nextArgs, flag];
+          nextArgs = appendArgsBeforeFindTerminator(nextArgs, flag);
         }
       }
     } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "bazel") {
@@ -1996,7 +2089,7 @@ export function buildChildInvocation(
         return s === "-jobs" || s.startsWith("-jobs=");
       });
       if (!hasJobs) {
-        nextArgs = [...nextArgs, "-jobs", String(jobsLimit)];
+        nextArgs = appendArgsBeforeFindTerminator(nextArgs, "-jobs", String(jobsLimit));
       }
     }
   }

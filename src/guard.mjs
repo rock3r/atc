@@ -1299,6 +1299,7 @@ export function splitShellSegments(command, { allowHashComments = true } = {}) {
         segments.push(stage);
       }
       for (const arg of parsedStage.args) {
+        if (arg === "--") continue;
         if (
           !/^-[A-Za-z0-9]+$/.test(arg) ||
           matchesAndroidOrAtcText(arg, parsedStage.envVars, FAST_PATH_REGEX, {
@@ -3368,6 +3369,9 @@ export function classifySegment(
                 "android",
                 "gradlew",
                 "gradle",
+                "bazel",
+                "bazelisk",
+                "bazelw",
                 "xcrun",
                 "simctl",
                 "devicectl",
@@ -3387,7 +3391,11 @@ export function classifySegment(
     if (peelIdx !== -1) {
       const cleanedArgs = args
         .slice(peelIdx)
-        .filter((a) => a !== ";" && a !== "\\;" && a !== "+");
+        .filter((a) => a !== ";" && a !== "\\;" && a !== "+" && a !== "\\+")
+        .map((a) => (execFlagIdx !== -1 && a === "{}" ? "__xargs_stdin__" : a));
+      if (baseCmd === "xargs" || baseCmd === "parallel") {
+        cleanedArgs.push("__xargs_stdin__");
+      }
       if (cleanedArgs.length > 0) {
         const nestedSegment = cleanedArgs
           .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
@@ -5465,6 +5473,7 @@ function rewriteCompoundCommand(
         }
       }
       for (const arg of parsedStage.args) {
+        if (arg === "--") continue;
         if (!/^-[A-Za-z0-9]+$/.test(arg) || matchesAndroidOrAtcText(arg, parsedStage.envVars)) {
           pipeUpstreamArgs.push(arg);
         }

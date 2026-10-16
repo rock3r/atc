@@ -1299,6 +1299,9 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
   const incomingShellType = options?.shellType || "posix";
   const envVars = {};
   let clearedInheritedEnv = false;
+  let pendingXargsUpstreamArgs = Array.isArray(options?.xargsUpstreamArgs)
+    ? options.xargsUpstreamArgs
+    : null;
 
   for (let depth = 0; depth < 16; depth++) {
     const cleaned = stripLiteralSentinels(curCmd).trim().replace(/^@+/, "");
@@ -1595,6 +1598,160 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       curArgs = curArgs.slice(i + 1);
       continue;
     }
+    if (base === "xargs") {
+      let i = 0;
+      let replToken = "{}";
+      let brokenFlag = false;
+      while (i < curArgs.length) {
+        const a = stripLiteralSentinels(curArgs[i]);
+        if (a === "--") {
+          i++;
+          break;
+        }
+        if (a === "--help" || a === "--version") {
+          brokenFlag = true;
+          break;
+        }
+        if ((a === "-I" || a === "--replace" || a === "-J") && i + 1 < curArgs.length) {
+          replToken = stripLiteralSentinels(curArgs[i + 1]) || "{}";
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-I") && a.length > 2) {
+          replToken = a.slice(2);
+          i++;
+          continue;
+        }
+        if (a.startsWith("--replace=")) {
+          replToken = a.slice("--replace=".length) || "{}";
+          i++;
+          continue;
+        }
+        if (
+          (a === "-a" ||
+            a === "--arg-file" ||
+            a === "-d" ||
+            a === "--delimiter" ||
+            a === "-E" ||
+            a === "--eof" ||
+            a === "-L" ||
+            a === "--max-lines" ||
+            a === "-n" ||
+            a === "--max-args" ||
+            a === "-P" ||
+            a === "--max-procs" ||
+            a === "-R" ||
+            a === "-S" ||
+            a === "-s" ||
+            a === "--max-chars" ||
+            a === "--process-slot-var") &&
+          i + 1 < curArgs.length
+        ) {
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          i++;
+          continue;
+        }
+        break;
+      }
+      if (brokenFlag || i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      const remaining = curArgs
+        .slice(i + 1)
+        .filter((tok) => stripLiteralSentinels(tok) !== replToken);
+      const upstream = Array.isArray(pendingXargsUpstreamArgs) ? pendingXargsUpstreamArgs : [];
+      pendingXargsUpstreamArgs = null;
+      curArgs = [...remaining, ...upstream, "__xargs_stdin__"];
+      continue;
+    }
+    if (base === "parallel") {
+      let i = 0;
+      let brokenFlag = false;
+      while (i < curArgs.length) {
+        const a = stripLiteralSentinels(curArgs[i]);
+        if (a === "--") {
+          i++;
+          break;
+        }
+        if (a === ":::" || a === "::::") {
+          brokenFlag = true;
+          break;
+        }
+        if (
+          (a === "-j" ||
+            a === "--jobs" ||
+            a === "-P" ||
+            a === "--max-procs" ||
+            a === "-I" ||
+            a === "-S" ||
+            a === "--sshlogin" ||
+            a === "--results" ||
+            a === "--joblog" ||
+            a === "--tagstring" ||
+            a === "-a" ||
+            a === "--arg-file") &&
+          i + 1 < curArgs.length
+        ) {
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("-")) {
+          i++;
+          continue;
+        }
+        break;
+      }
+      if (brokenFlag || i >= curArgs.length) break;
+      curCmd = curArgs[i];
+      const remaining = [];
+      for (let k = i + 1; k < curArgs.length; k++) {
+        const cleanK = stripLiteralSentinels(curArgs[k]);
+        if (cleanK === "::::") {
+          k++;
+          continue;
+        }
+        if (cleanK === ":::" || cleanK === "{}") continue;
+        remaining.push(curArgs[k]);
+      }
+      const upstream = Array.isArray(pendingXargsUpstreamArgs) ? pendingXargsUpstreamArgs : [];
+      pendingXargsUpstreamArgs = null;
+      curArgs = [...remaining, ...upstream, "__xargs_stdin__"];
+      continue;
+    }
+    if (base === "find") {
+      const execIdx = curArgs.findIndex((a) => {
+        const cleanA = stripLiteralSentinels(a);
+        return (
+          cleanA === "-exec" ||
+          cleanA === "-execdir" ||
+          cleanA === "-ok" ||
+          cleanA === "-okdir"
+        );
+      });
+      if (execIdx !== -1 && execIdx + 1 < curArgs.length) {
+        const execFlag = stripLiteralSentinels(curArgs[execIdx]);
+        if (execFlag === "-execdir" || execFlag === "-okdir") {
+          unresolvedDynamicCwd = true;
+        }
+        const execTokens = [];
+        for (let k = execIdx + 1; k < curArgs.length; k++) {
+          const cleanK = stripLiteralSentinels(curArgs[k]);
+          if (cleanK === ";" || cleanK === "\\;" || cleanK === "+" || cleanK === "\\+") {
+            break;
+          }
+          execTokens.push(curArgs[k]);
+        }
+        if (execTokens.length > 0) {
+          curCmd = execTokens[0];
+          curArgs = execTokens
+            .slice(1)
+            .map((tok) => (stripLiteralSentinels(tok) === "{}" ? "__xargs_stdin__" : tok));
+          continue;
+        }
+      }
+    }
     if (
       base === "sh" ||
       base === "bash" ||
@@ -1881,9 +2038,72 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             }
           };
 
+          let prevPipeOutputTokens = null;
+          const extractStaticPipeOutputTokens = (tokens, expandFn, envObj) => {
+            if (!Array.isArray(tokens) || tokens.length === 0) return null;
+            let idx = 0;
+            while (
+              idx < tokens.length &&
+              /^[A-Za-z_][A-Za-z0-9_]*\+?=/i.test(stripLiteralSentinels(tokens[idx]))
+            ) {
+              idx++;
+            }
+            while (idx < tokens.length) {
+              const t = stripLiteralSentinels(tokens[idx]).toLowerCase();
+              if (t === "builtin" || t === "command") {
+                idx++;
+                if (idx < tokens.length && stripLiteralSentinels(tokens[idx]) === "--") idx++;
+                continue;
+              }
+              break;
+            }
+            if (idx >= tokens.length) return null;
+            const cmdBase = (stripLiteralSentinels(tokens[idx]).split(/[\\/]/).pop() || "")
+              .toLowerCase()
+              .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
+            if (cmdBase !== "echo" && cmdBase !== "printf") return null;
+            let argIdx = idx + 1;
+            if (cmdBase === "echo") {
+              while (
+                argIdx < tokens.length &&
+                /^-[neE]+$/.test(stripLiteralSentinels(tokens[argIdx]))
+              ) {
+                argIdx++;
+              }
+            } else if (cmdBase === "printf") {
+              if (
+                argIdx < tokens.length &&
+                stripLiteralSentinels(tokens[argIdx]) === "-v" &&
+                argIdx + 1 < tokens.length
+              ) {
+                return null;
+              }
+              if (argIdx < tokens.length && stripLiteralSentinels(tokens[argIdx]) === "--") {
+                argIdx++;
+              }
+              if (argIdx < tokens.length && stripLiteralSentinels(tokens[argIdx]).includes("%")) {
+                argIdx++;
+              }
+            }
+            const out = [];
+            for (; argIdx < tokens.length; argIdx++) {
+              const exp = expandFn(tokens[argIdx], envObj);
+              if (exp.unresolved) return null;
+              for (const part of String(exp.resolved || "")
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean)) {
+                out.push(part);
+              }
+            }
+            return out;
+          };
+
           for (let cIdx = 0; cIdx < clauses.length; cIdx++) {
             const clauseObj = clauses[cIdx];
             const { sepBefore, sepAfter } = clauseObj;
+            const incomingPipeTokens = sepBefore === "|" ? prevPipeOutputTokens : null;
+            prevPipeOutputTokens = null;
             currentClauseBackgrounded = Boolean(clauseObj.backgrounded);
             if (sepBefore && sepBefore !== "|") {
               flushConcPipe();
@@ -2934,6 +3154,13 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
               ? curShellRelCwd
               : path.resolve(baseCwd, curShellRelCwd)
             : baseCwd;
+          if (sepAfter === "|") {
+            prevPipeOutputTokens = extractStaticPipeOutputTokens(
+              rawTokens,
+              expandInShell,
+              shellEnv,
+            );
+          }
           const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
             env: shellEnv,
             cwd: clauseBaseCwd,
@@ -2941,6 +3168,7 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             taintedVars: taintedEnvVars,
             shellType,
             candidateBuildToolEnv,
+            xargsUpstreamArgs: incomingPipeTokens,
           });
           if (Array.isArray(peeled.allBuildClauses) && peeled.allBuildClauses.length > 0) {
             const subOffset = matchedClauses.length;
@@ -3543,7 +3771,9 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     };
   }
 
-  const strArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
+  const rawArgList = Array.isArray(args) ? args.map((a) => String(a)) : [];
+  const hasDynamicXargsInput = rawArgList.includes("__xargs_stdin__");
+  const strArgs = rawArgList.filter((a) => a !== "__xargs_stdin__");
 
   if (tool === "gradle") {
     if (strArgs.includes("--stop")) {
@@ -3604,7 +3834,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
       tasks.push({ raw: arg, metaOnly: false });
     }
 
-    if (tasks.length > 0 && tasks.every((t) => t.metaOnly)) {
+    if (!hasDynamicXargsInput && tasks.length > 0 && tasks.every((t) => t.metaOnly)) {
       return {
         kind: "read_only",
         tool: "gradle",
@@ -3622,7 +3852,11 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         return parts[parts.length - 1];
       });
 
-    if (taskNames.length > 0 && taskNames.every((name) => GRADLE_WORKSPACE_ONLY_TASKS.has(name))) {
+    if (
+      !hasDynamicXargsInput &&
+      taskNames.length > 0 &&
+      taskNames.every((name) => GRADLE_WORKSPACE_ONLY_TASKS.has(name))
+    ) {
       return {
         kind: "workspace_only",
         tool: "gradle",
@@ -3685,6 +3919,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     }
 
     if (
+      !hasDynamicXargsInput &&
       !subcmd &&
       (strArgs.length === 0 ||
         strArgs.includes("--version") ||
@@ -3702,11 +3937,12 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     }
 
     if (
-      subcmd === "version" ||
-      subcmd === "help" ||
-      bazelFlags.includes("--version") ||
-      bazelFlags.includes("--help") ||
-      bazelFlags.includes("-h")
+      !hasDynamicXargsInput &&
+      (subcmd === "version" ||
+        subcmd === "help" ||
+        bazelFlags.includes("--version") ||
+        bazelFlags.includes("--help") ||
+        bazelFlags.includes("-h"))
     ) {
       return {
         kind: "read_only",
@@ -3719,6 +3955,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     }
 
     if (
+      !hasDynamicXargsInput &&
       [
         "query",
         "cquery",
@@ -3873,11 +4110,12 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
 
   if (tool === "xcodebuild") {
     if (
-      strArgs.includes("-version") ||
-      strArgs.includes("-showsdks") ||
-      strArgs.includes("-usage") ||
-      strArgs.includes("-help") ||
-      strArgs.includes("--help")
+      !hasDynamicXargsInput &&
+      (strArgs.includes("-version") ||
+        strArgs.includes("-showsdks") ||
+        strArgs.includes("-usage") ||
+        strArgs.includes("-help") ||
+        strArgs.includes("--help"))
     ) {
       return {
         kind: "read_only",
@@ -3890,10 +4128,11 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
     }
 
     if (
-      strArgs.includes("-list") ||
-      strArgs.includes("-showBuildSettings") ||
-      strArgs.includes("-showDestinations") ||
-      strArgs.includes("-showTestPlans")
+      !hasDynamicXargsInput &&
+      (strArgs.includes("-list") ||
+        strArgs.includes("-showBuildSettings") ||
+        strArgs.includes("-showDestinations") ||
+        strArgs.includes("-showTestPlans"))
     ) {
       return {
         kind: "workspace_only",
@@ -4343,7 +4582,9 @@ export function resolveBuildResources(
     };
   }
 
-  const strArgs = Array.isArray(args) ? args.map((a) => String(a)) : [];
+  const strArgs = Array.isArray(args)
+    ? args.map((a) => String(a)).filter((a) => a !== "__xargs_stdin__")
+    : [];
 
   if (classified.tool === "gradle") {
     let projectDir = null;
@@ -5094,7 +5335,6 @@ export function resolveBuildResources(
         }
         const nextStack = new Set(activeStack);
         nextStack.add(resolvedRc);
-        const rcDir = path.dirname(resolvedRc);
         for (const rawLine of joinBackslashContinuations(content)) {
           const line = rawLine.trim();
           if (!line || line.startsWith("#")) continue;
@@ -5109,7 +5349,7 @@ export function resolveBuildResources(
               .trim()
               .replace(/^['"]|['"]$/g, "")
               .replace(/%workspace%/g, canonicalRoot);
-            const targetPath = path.resolve(rcDir, rawTarget);
+            const targetPath = resolveBazelPath(baseCwd, rawTarget);
             parseBazelrcFile(targetPath, {
               required: false,
               depth: depth + 1,
@@ -5125,7 +5365,7 @@ export function resolveBuildResources(
               .trim()
               .replace(/^['"]|['"]$/g, "")
               .replace(/%workspace%/g, canonicalRoot);
-            const targetPath = path.resolve(rcDir, rawTarget);
+            const targetPath = resolveBazelPath(baseCwd, rawTarget);
             parseBazelrcFile(targetPath, {
               required: isRequiredImport,
               depth: depth + 1,
@@ -5224,7 +5464,6 @@ export function resolveBuildResources(
             : baseEnv.BAZELRC
               ? String(baseEnv.BAZELRC)
               : null;
-      let hitNullRcSentinel = false;
       if (effectiveBazelMajor === null || effectiveBazelMajor >= 9) {
         if (effectiveBazelrcEnv === "__UNRESOLVED_DYNAMIC_ENV__") {
           hasCustomStartupOption = true;
@@ -5235,7 +5474,6 @@ export function resolveBuildResources(
           for (const rawEnvRc of effectiveBazelrcEnv.split(",")) {
             if (!rawEnvRc) continue;
             if (rawEnvRc === "/dev/null" || rawEnvRc.toUpperCase() === "NUL") {
-              hitNullRcSentinel = true;
               break;
             }
             const expandedRc = String(rawEnvRc).replace(/%workspace%/g, canonicalRoot);
@@ -5243,12 +5481,10 @@ export function resolveBuildResources(
           }
         }
       }
-      if (!hitNullRcSentinel) {
-        for (const rawExplicitRc of explicitBazelrcPaths) {
-          if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") break;
-          const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
-          parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
-        }
+      for (const rawExplicitRc of explicitBazelrcPaths) {
+        if (rawExplicitRc === "/dev/null" || rawExplicitRc.toUpperCase() === "NUL") break;
+        const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
+        parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
       }
       for (const grp of rcUnqualifiedStartupGroups) {
         applyStartupOptionTokens(grp.tokens, grp.baseDir, { ambiguous: grp.ambiguous });

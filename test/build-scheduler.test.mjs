@@ -4075,6 +4075,149 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(pipedTwoDaemonsProbe.warm, true);
     assert.equal(pipedTwoDaemonsProbe.coldRamMb, 0);
     assert.deepEqual(pipedTwoDaemonsProbe.claimedDaemonPids, [7020, 7021]);
+
+    // Round 57 regressions:
+    // 1. Relative bazelrc import/try-import/try-import-if-bazel-version resolve against invocation cwd (baseCwd)
+    const rcCwdSub = path.join(wsDir, "bazel-rc-cwd-test", "sub", "inv");
+    const rcConfigDir = path.join(wsDir, "bazel-rc-cwd-test", "configs");
+    fs.mkdirSync(path.join(rcCwdSub, "rel"), { recursive: true });
+    fs.mkdirSync(rcConfigDir, { recursive: true });
+    fs.writeFileSync(path.join(wsDir, "bazel-rc-cwd-test", "MODULE.bazel"), "", "utf8");
+    const cwdImportOutBase = path.join(wsDir, "bazel-cwd-import-out");
+    const cwdCondImportOutBase = path.join(wsDir, "bazel-cwd-cond-import-out");
+    fs.mkdirSync(cwdImportOutBase, { recursive: true });
+    fs.mkdirSync(cwdCondImportOutBase, { recursive: true });
+    fs.writeFileSync(
+      path.join(rcCwdSub, "rel", "imported.bazelrc"),
+      `startup --output_base=${cwdImportOutBase}\n`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(rcCwdSub, "rel", "cond.bazelrc"),
+      `startup --output_base=${cwdCondImportOutBase}\n`,
+      "utf8",
+    );
+    const outerRcPath = path.join(rcConfigDir, "outer.bazelrc");
+    fs.writeFileSync(
+      outerRcPath,
+      `import rel/imported.bazelrc\ntry-import-if-bazel-version >=8.0.0 rel/cond.bazelrc\n`,
+      "utf8",
+    );
+    const relImportFromCwdReqs = resolveBuildResources(
+      "bazel",
+      [`--bazelrc=${outerRcPath}`, "build", "//..."],
+      rcCwdSub,
+      { bazelVersion: "8.2.1" },
+    );
+    const canonicalRcWsRoot = fs
+      .realpathSync(path.join(wsDir, "bazel-rc-cwd-test"))
+      .replace(/\\/g, "/");
+    assert.deepEqual(relImportFromCwdReqs.resourceKeys, [
+      `bazel:ws:${canonicalRcWsRoot}`,
+      `bazel:out:${fs.realpathSync(cwdCondImportOutBase).replace(/\\/g, "/")}`,
+    ]);
+
+    // 2. BAZELRC=/dev/null stops reading remaining BAZELRC entries without ignoring explicit --bazelrc flags
+    const envBeforeNullRc = path.join(rcConfigDir, "env-before.bazelrc");
+    const envAfterNullRc = path.join(rcConfigDir, "env-after.bazelrc");
+    const cliAfterEnvNullRc = path.join(rcConfigDir, "cli-after-null.bazelrc");
+    const cliAfterNullOutBase = path.join(wsDir, "bazel-cli-after-env-null-out");
+    const ignoredAfterNullOutBase = path.join(wsDir, "bazel-ignored-after-null-out");
+    fs.mkdirSync(cliAfterNullOutBase, { recursive: true });
+    fs.mkdirSync(ignoredAfterNullOutBase, { recursive: true });
+    fs.writeFileSync(envBeforeNullRc, "build --jobs=2\n", "utf8");
+    fs.writeFileSync(
+      envAfterNullRc,
+      `startup --output_base=${ignoredAfterNullOutBase}\n`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      cliAfterEnvNullRc,
+      `startup --output_base=${cliAfterNullOutBase}\n`,
+      "utf8",
+    );
+    const bazelrcNullThenCliReqs = resolveBuildResources(
+      "bazel",
+      [`--bazelrc=${cliAfterEnvNullRc}`, "build", "//..."],
+      rcCwdSub,
+      {
+        bazelVersion: "9.0.0",
+        env: { BAZELRC: `${envBeforeNullRc},/dev/null,${envAfterNullRc}` },
+      },
+    );
+    assert.deepEqual(bazelrcNullThenCliReqs.resourceKeys, [
+      `bazel:ws:${canonicalRcWsRoot}`,
+      `bazel:out:${fs.realpathSync(cliAfterNullOutBase).replace(/\\/g, "/")}`,
+    ]);
+
+    // 3. Build tools delegated through xargs / parallel / find -exec are classified, guarded, and coordinated
+    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "assembleDebug"]).kind, "pure_build");
+    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "--version"]).kind, "pure_build");
+    assert.equal(classifyBuildCommand("xargs", ["bazel", "build", "//..."]).kind, "pure_build");
+    assert.equal(classifyBuildCommand("xargs", ["bazel", "shutdown"]).kind, "deny_lifecycle");
+    assert.equal(
+      classifyBuildCommand("sh", ["-c", "printf '%s\\n' --stop | xargs ./gradlew"]).kind,
+      "deny_lifecycle",
+    );
+    assert.equal(
+      classifyBuildCommand("sh", ["-c", "echo connectedDebugAndroidTest | xargs ./gradlew"]).kind,
+      "device_coupled_build",
+    );
+    assert.equal(
+      classifyBuildCommand("find", [".", "-maxdepth", "1", "-exec", "./gradlew", "assembleDebug", ";"]).kind,
+      "pure_build",
+    );
+    assert.equal(
+      classifyBuildCommand("find", [".", "-maxdepth", "1", "-exec", "./gradlew", "--stop", ";"]).kind,
+      "deny_lifecycle",
+    );
+
+    const xargsGradleReqs = resolveBuildResources("xargs", ["./gradlew", "assembleDebug"], dirB);
+    assert.equal(xargsGradleReqs.kind, "pure_build");
+    assert.equal(xargsGradleReqs.tool, "gradle");
+    assert.deepEqual(xargsGradleReqs.resourceKeys, [`gradle:${canonicalDirB}`]);
+
+    const xargsBazelGuard = evaluateCommandGuard("xargs bazel build //...", {
+      sessionId: "sess-xargs-build",
+      activeLeases: [],
+      coordinateBuilds: true,
+      cwd: rcCwdSub,
+    });
+    assert.equal(xargsBazelGuard.allowed, true);
+    assert.match(xargsBazelGuard.rewrittenCommand || "", /atc exec --build -- xargs bazel build \/\/\.\.\./);
+
+    const pipedStopXargsGuard = evaluateCommandGuard("printf '%s\\n' -- --stop | xargs ./gradlew", {
+      sessionId: "sess-xargs-stop",
+      activeLeases: [],
+      coordinateBuilds: true,
+      cwd: dirB,
+    });
+    assert.equal(pipedStopXargsGuard.allowed, false);
+    assert.match(pipedStopXargsGuard.reason || "", /gradle --stop/i);
+
+    const shPipedStopXargsGuard = evaluateCommandGuard(
+      "sh -c \"printf '%s\\\\n' --stop | xargs ./gradlew\"",
+      {
+        sessionId: "sess-sh-xargs-stop",
+        activeLeases: [],
+        coordinateBuilds: true,
+        cwd: dirB,
+      },
+    );
+    assert.equal(shPipedStopXargsGuard.allowed, false);
+    assert.match(shPipedStopXargsGuard.reason || "", /gradle --stop/i);
+
+    const findExecPrep = buildChildInvocation(
+      "find",
+      [".", "-maxdepth", "1", "-exec", "./gradlew", "assembleDebug", ";"],
+      null,
+      process.env,
+      dirB,
+      process.platform,
+      { buildConcurrency: 2 },
+    );
+    assert.equal(findExecPrep.args[findExecPrep.args.length - 1], ";");
+    assert.match(findExecPrep.args[findExecPrep.args.length - 2], /^-Dorg\.gradle\.workers\.max=\d+$/);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
