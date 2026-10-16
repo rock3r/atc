@@ -28,6 +28,7 @@ import {
   resolveBuildResources,
 } from "./build.mjs";
 import { classifySegment, evaluateCommandGuard, splitShellSegments } from "./guard.mjs";
+import { cmdExecTokens, renderExecResult } from "./exec.mjs";
 import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
 import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs";
 import {
@@ -57,7 +58,7 @@ import {
 } from "./lock.mjs";
 import { resolveAuditLogPath } from "./logger.mjs";
 import { startMcpServer } from "./mcp.mjs";
-import { buildChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
+import { buildChildInvocation, prepareOpChildInvocation, runCommandSync, spawnWithHeartbeat } from "./spawn.mjs";
 import {
   DEFAULT_CONFIG,
   addLeaseWorker,
@@ -5178,185 +5179,43 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   return { exitCode: 0, lease: finalLease, snapshot: effectiveName, action: effectiveAction };
 }
 
-export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
-  if (
-    typeof flags?.claim === "string" &&
-    flags.claim.trim() &&
-    !["true", "false", "1", "0", "yes", "no", "on", "off"].includes(
-      flags.claim.trim().toLowerCase(),
-    )
-  ) {
-    const parsedSelector = parseCliArgs(["exec", ...tokenizeClaimSelectorString(flags.claim)]);
-    flags = { ...parsedSelector.flags, ...flags, claim: true };
-  }
-  const unknownFlagErr = validateCommandFlags(flags, EXEC_ALLOWED_FLAGS, "exec");
-  if (unknownFlagErr) {
-    return { exitCode: 1, error: unknownFlagErr };
-  }
+// Internal runner for typed ops: admission (build slots, workspace locks, RAM), device lease
+// resolution or co-allocation, heartbeats, and sequential execution of literal invocations.
+// `plan` = { op, params, buildReqs, deviceClass, makeInvocations(lease) → [{cmd,args,cwd,timeoutSec}],
+//            readOnly, onOutput?, stdio? }.
+export async function runOpInvocations(stateDir, plan, flags = {}, options = {}) {
   let platFilter = null;
   try {
     platFilter = resolveExplicitPlatformFilter(flags);
   } catch (err) {
     return { exitCode: 1, error: err.message };
   }
-  if (!commandArgs || commandArgs.length === 0) {
-    return { exitCode: 1, error: "Usage: atc exec [--serial <serial>] -- <command> [args...]" };
-  }
-
-  const [cmd, ...args] = commandArgs;
   const cwd = options.cwd || process.cwd();
   const callerEnv = options.env || process.env;
-  let explicitWorkspace = null;
-  if (flags.workspace !== undefined && flags.workspace !== null) {
-    if (typeof flags.workspace === "boolean" || !String(flags.workspace).trim()) {
-      return { exitCode: 1, error: 'Option "--workspace" requires a directory path.' };
-    }
-    const candidateWs = path.resolve(cwd, String(flags.workspace).trim());
-    try {
-      if (!fs.existsSync(candidateWs) || !fs.statSync(candidateWs).isDirectory()) {
-        return { exitCode: 1, error: `Workspace directory does not exist: ${candidateWs}` };
-      }
-      explicitWorkspace = fs.realpathSync(candidateWs);
-    } catch {
-      return { exitCode: 1, error: `Workspace directory is not accessible: ${candidateWs}` };
-    }
-  }
+  const op = plan.op;
 
-  const rawRamMb = flags.ramMb ?? flags["ram-mb"];
+  const rawRamMb = flags.ramMb;
   let explicitRamMb = 0;
   if (rawRamMb !== undefined && rawRamMb !== null) {
-    const parsedRam =
-      typeof rawRamMb === "boolean" || (typeof rawRamMb === "string" && !rawRamMb.trim())
-        ? Number.NaN
-        : Number(rawRamMb);
+    const parsedRam = Number(rawRamMb);
     if (!Number.isInteger(parsedRam) || parsedRam < 1 || parsedRam > 1_048_576) {
       return {
         exitCode: 1,
-        error: `Invalid --ram-mb "${rawRamMb}". Expected an integer between 1 and 1048576.`,
+        error: `Invalid ramMb "${rawRamMb}". Expected an integer between 1 and 1048576.`,
       };
     }
     explicitRamMb = parsedRam;
   }
 
-  let explicitPhase = null;
-  if (flags.phase !== undefined && flags.phase !== null) {
-    const p = typeof flags.phase === "boolean" ? "" : String(flags.phase).trim().toLowerCase();
-    if (!VALID_EXEC_PHASES.has(p)) {
-      return {
-        exitCode: 1,
-        error: `Invalid --phase "${flags.phase}". Expected one of: pure-build, device-build, device-test, read-only.`,
-      };
-    }
-    explicitPhase = p;
-  }
-
-  const isBuildFlag =
-    parseBoolFlag(flags.build) ||
-    explicitPhase === "pure-build" ||
-    explicitPhase === "device-build";
+  const isBuildOp = op.kind === "build";
   const isClaimFlag = parseBoolFlag(flags.claim);
   const selectorSerial = flags.serial || flags.udid || null;
 
-  const buildReqs = resolveBuildResources(cmd, args, cwd, {
-    forceBuild: isBuildFlag,
-    env: callerEnv,
-    workspace: explicitWorkspace,
-  });
+  const buildReqs = { ...plan.buildReqs, resourceKeys: [...(plan.buildReqs?.resourceKeys || [])] };
   if (explicitRamMb > 0) {
     buildReqs.requestedHeapMb = Math.max(buildReqs.requestedHeapMb || 0, explicitRamMb);
   }
-  if (buildReqs.kind === "deny_lifecycle") {
-    return { exitCode: 3, error: buildReqs.reason };
-  }
-  if (buildReqs.kind === "reject_long_running") {
-    return { exitCode: 3, error: buildReqs.reason };
-  }
-
-  const rawCmdStrForDeviceCheck = commandArgs
-    .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
-    .join(" ");
-  const cmdDeviceClass = classifySegment(rawCmdStrForDeviceCheck, {}, 0, {
-    cwd,
-    env: callerEnv,
-  });
-  if (cmdDeviceClass.kind === "deny_lifecycle") {
-    return { exitCode: 3, error: cmdDeviceClass.reason };
-  }
-  if (cmdDeviceClass.buildClass === "reject_long_running") {
-    return {
-      exitCode: 3,
-      error:
-        cmdDeviceClass.rejectReason ||
-        "Continuous/watch build commands cannot be coordinated by atc exec because they hold build slots indefinitely.",
-    };
-  }
-
-  if (explicitPhase) {
-    if (
-      (explicitPhase === "pure-build" || explicitPhase === "read-only") &&
-      (isClaimFlag || Boolean(selectorSerial))
-    ) {
-      return {
-        exitCode: 3,
-        error: `Conflicting flags: --phase=${explicitPhase} cannot be combined with --claim or --serial/--udid.`,
-      };
-    }
-    if (explicitPhase === "read-only") {
-      if (
-        buildReqs.requiresHeavySlot ||
-        buildReqs.requiresWorkspaceLock ||
-        buildReqs.requiresDevice ||
-        cmdDeviceClass.kind === "device_action" ||
-        (cmdDeviceClass.isBuildTool &&
-          cmdDeviceClass.buildClass &&
-          cmdDeviceClass.buildClass !== "read_only")
-      ) {
-        const conflictKind =
-          buildReqs.kind && buildReqs.kind !== "not_build_tool"
-            ? buildReqs.kind
-            : cmdDeviceClass.buildClass || cmdDeviceClass.kind;
-        return {
-          exitCode: 3,
-          error: `Phase conflict: command requires build/workspace/device locks (${conflictKind}), which violates --phase=read-only.`,
-        };
-      }
-      buildReqs.kind = "read_only";
-      buildReqs.requiresWorkspaceLock = false;
-      buildReqs.requiresHeavySlot = false;
-      buildReqs.requiresDevice = false;
-    } else if (explicitPhase === "pure-build") {
-      if (buildReqs.requiresDevice || cmdDeviceClass.kind === "device_action") {
-        return {
-          exitCode: 3,
-          error: `Phase conflict: command interacts with a device (${buildReqs.kind}), which violates --phase=pure-build. Use --phase=device-build or split build and test phases.`,
-        };
-      }
-      buildReqs.kind = "pure_build";
-      buildReqs.requiresWorkspaceLock = true;
-      buildReqs.requiresHeavySlot = true;
-      buildReqs.requiresDevice = false;
-    } else if (explicitPhase === "device-build") {
-      buildReqs.kind = "device_coupled_build";
-      buildReqs.requiresWorkspaceLock = true;
-      buildReqs.requiresHeavySlot = true;
-      buildReqs.requiresDevice = true;
-    } else if (explicitPhase === "device-test") {
-      if (
-        (buildReqs.requiresHeavySlot && !buildReqs.requiresDevice) ||
-        (cmdDeviceClass.isBuildTool && cmdDeviceClass.buildClass === "pure_build")
-      ) {
-        const conflictKind =
-          buildReqs.kind && buildReqs.kind !== "not_build_tool"
-            ? buildReqs.kind
-            : cmdDeviceClass.buildClass;
-        return {
-          exitCode: 3,
-          error: `Phase conflict: command is a pure compilation (${conflictKind}) that does not target a device, which violates --phase=device-test. Use --phase=pure-build or --phase=device-build.`,
-        };
-      }
-      buildReqs.requiresDevice = true;
-    }
-  }
+  const cmdDeviceClass = plan.deviceClass || { kind: "not_build_tool", targetPlatform: null };
 
   const requiredDevicePlatform =
     (buildReqs.requiresDevice && buildReqs.targetPlatform) ||
@@ -5366,7 +5225,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     if (platFilter && platFilter !== requiredDevicePlatform) {
       return {
         exitCode: 3,
-        error: `Command targets ${requiredDevicePlatform}, which conflicts with explicit --${platFilter} selector.`,
+        error: `${op.name} targets ${requiredDevicePlatform}, which conflicts with explicit --${platFilter} selector.`,
       };
     }
     platFilter = requiredDevicePlatform;
@@ -5374,13 +5233,11 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
   const needsBuildCoordination = Boolean(buildReqs.requiresWorkspaceLock);
   const needsDeviceLease =
-    explicitPhase === "pure-build" || explicitPhase === "read-only"
-      ? false
-      : isClaimFlag ||
-        Boolean(selectorSerial) ||
-        Boolean(buildReqs.requiresDevice) ||
-        cmdDeviceClass.kind === "device_action" ||
-        !isBuildFlag;
+    isClaimFlag ||
+    Boolean(selectorSerial) ||
+    Boolean(buildReqs.requiresDevice) ||
+    cmdDeviceClass.kind === "device_action" ||
+    !isBuildOp;
 
   const rawWait = flags.wait ?? flags.waitSec;
   if (rawWait !== undefined && rawWait !== null) {
@@ -5570,11 +5427,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             !coClaimReq.coldBoot)),
     );
     if (owned.length > 1 && !selectorSerial) {
-      const rawCmdStr = commandArgs
-        .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
-        .join(" ");
-      const cmdClass = classifySegment(rawCmdStr, {}, 0, { cwd, env: callerEnv });
-      const preferredPlat = cmdClass.targetPlatform || buildReqs.targetPlatform;
+      const preferredPlat = cmdDeviceClass.targetPlatform || buildReqs.targetPlatform;
       if (preferredPlat === "ios" || preferredPlat === "android") {
         const platformMatched = owned.filter(
           (l) => (l.platform || "android") === preferredPlat,
@@ -5940,82 +5793,9 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
 
           const effectiveDeviceForCheck = lease || coClaimCandidate;
           if (effectiveDeviceForCheck) {
-            const leasePlat = effectiveDeviceForCheck.platform || "android";
-            const devSerial = effectiveDeviceForCheck.serial || effectiveDeviceForCheck.udid;
-            const wrappedClass = classifySegment(
-              [cmd, ...args]
-                .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
-                .join(" "),
-              devSerial
-                ? leasePlat === "ios"
-                  ? {
-                      SIMULATOR_UDID: devSerial,
-                      ATC_DEVICE_SERIAL: devSerial,
-                      ATC_PLATFORM: "ios",
-                    }
-                  : {
-                      ANDROID_SERIAL: devSerial,
-                      ATC_DEVICE_SERIAL: devSerial,
-                      ATC_PLATFORM: "android",
-                    }
-                : {},
-              0,
-              { cwd, env: callerEnv },
-            );
-            if (wrappedClass.kind === "deny_lifecycle") {
-              return {
-                mutated: false,
-                value: {
-                  status: "error",
-                  exitCode: 3,
-                  error: wrappedClass.reason,
-                },
-              };
-            }
-            const candidateTargetSerials = [
-              wrappedClass.targetSerial,
-              buildReqs.targetSerial,
-            ].filter(Boolean);
-            for (const ts of candidateTargetSerials) {
-              const conflictSel = devSerial
-                ? findConflictingLeaseSelector(effectiveDeviceForCheck, ts, {
-                    allowRewritableBooted: true,
-                  })
-                : null;
-              if (conflictSel) {
-                return {
-                  mutated: false,
-                  value: {
-                    status: "error",
-                    exitCode: 3,
-                    error: `Conflicting device selector "${conflictSel}" in atc exec; lease ${effectiveDeviceForCheck.leaseId || effectiveDeviceForCheck.deviceKey} is bound to "${devSerial}".`,
-                  },
-                };
-              }
-            }
-            try {
-              buildChildInvocation(
-                cmd,
-                args,
-                effectiveDeviceForCheck,
-                identity.sessionId,
-                callerEnv,
-                null,
-                { cwd },
-              );
-            } catch (err) {
-              return {
-                mutated: false,
-                value: {
-                  status: "error",
-                  exitCode: 3,
-                  error: err.message,
-                },
-              };
-            }
             if (!needsBuildCoordination && lease) {
               addLeaseWorker(lease, process.pid, livenessCheck);
-              if (wrappedClass.kind !== "read_only") {
+              if (!plan.readOnly) {
                 lease.loadedSnapshot = null;
               }
               lease.renewedAtMs = now;
@@ -6036,20 +5816,6 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               };
             }
           } else if (!needsDeviceLease) {
-            try {
-              buildChildInvocation(cmd, args, null, identity.sessionId, callerEnv, null, {
-                cwd,
-              });
-            } catch (err) {
-              return {
-                mutated: false,
-                value: {
-                  status: "error",
-                  exitCode: 3,
-                  error: err.message,
-                },
-              };
-            }
             if (!needsBuildCoordination) {
               return {
                 mutated: false,
@@ -6471,7 +6237,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
               createdAtMs: now,
               renewedAtMs: now,
               expiresAtMs: now + Math.max(ttlMs, prepBudgetMs),
-              commandPreview: [cmd, ...args].join(" ").slice(0, 200),
+              op: op.name,
+              commandPreview: (plan.probe?.[0] ? [plan.probe[0].cmd, ...plan.probe[0].args] : [op.name]).join(" ").slice(0, 200),
             };
             state.buildLeases[buildId] = buildLease;
 
@@ -6680,93 +6447,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         coAllocatedLeaseId = claimedLease.leaseId;
         coAllocatedDeviceKey = claimedLease.deviceKey || null;
       }
-      let postClaimValidationError = null;
-      const leasePlat = claimedLease.platform || "android";
-      const devSerial = claimedLease.serial || claimedLease.udid;
-      const wrappedClass = classifySegment(
-        [cmd, ...args]
-          .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
-          .join(" "),
-        devSerial
-          ? leasePlat === "ios"
-            ? {
-                SIMULATOR_UDID: devSerial,
-                ATC_DEVICE_SERIAL: devSerial,
-                ATC_PLATFORM: "ios",
-              }
-            : {
-                ANDROID_SERIAL: devSerial,
-                ATC_DEVICE_SERIAL: devSerial,
-                ATC_PLATFORM: "android",
-              }
-          : {},
-        0,
-        { cwd, env: callerEnv },
-      );
-      if (wrappedClass.kind === "deny_lifecycle") {
-        postClaimValidationError = wrappedClass.reason;
-      } else {
-        const candidateTargetSerials = [
-          wrappedClass.targetSerial,
-          buildReqs.targetSerial,
-        ].filter(Boolean);
-        let conflictSel = null;
-        if (devSerial) {
-          for (const ts of candidateTargetSerials) {
-            conflictSel = findConflictingLeaseSelector(claimedLease, ts, {
-              allowRewritableBooted: true,
-            });
-            if (conflictSel) break;
-          }
-        }
-        if (conflictSel) {
-          postClaimValidationError = `Conflicting device selector "${conflictSel}" in atc exec; lease ${claimedLease.leaseId || claimedLease.deviceKey} is bound to "${devSerial}".`;
-        } else {
-          try {
-            buildChildInvocation(
-              cmd,
-              args,
-              claimedLease,
-              txRes.sessionId,
-              callerEnv,
-              txRes.buildLease || null,
-              { cwd },
-            );
-          } catch (err) {
-            postClaimValidationError = err.message;
-          }
-        }
-      }
-      if (postClaimValidationError) {
-        try {
-          withStateTransaction(
-            stateDir,
-            (state) => {
-              let mutated = false;
-              if (txRes.buildLease?.buildId && state.buildLeases?.[txRes.buildLease.buildId]) {
-                delete state.buildLeases[txRes.buildLease.buildId];
-                mutated = true;
-              }
-              if (coldCreatedNewLease) {
-                const { key, lease: cur } = findLeaseEntry(
-                  state,
-                  claimedLease.deviceKey,
-                  claimedLease.leaseId,
-                );
-                if (cur && cur.leaseId === claimedLease.leaseId) {
-                  delete state.leases[key];
-                  mutated = true;
-                }
-              }
-              return { mutated };
-            },
-            options,
-          );
-        } catch {
-          // Best-effort rollback of reserved build and device leases
-        }
-        return { exitCode: 3, error: postClaimValidationError };
-      }
+      // Typed-op invocations carry the lease serial themselves; nothing to re-validate here.
 
       const postClaimTx = withStateTransaction(
         stateDir,
@@ -6992,25 +6673,51 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
     }
   };
 
+  const steps = [];
   try {
-    const exitCode = await spawnWithHeartbeat(
-      cmd,
-      args,
-      check.lease,
-      check.sessionId,
-      onHeartbeat,
-      {
+    let invocations;
+    try {
+      invocations = plan.makeInvocations(check.lease || null);
+    } catch (err) {
+      return { exitCode: err?.code === "physical_not_allowed" ? 3 : 1, error: err.message, errorCode: err?.code || null, steps };
+    }
+    let exitCode = 0;
+    for (const inv of invocations) {
+      const prepared = prepareOpChildInvocation(inv, {
+        lease: check.lease || null,
+        sessionId: check.sessionId,
+        baseEnv: callerEnv,
+        buildLease: check.buildLease || null,
+        tool: check.buildLease ? buildReqs.tool : null,
+      });
+      const startedAt = Date.now();
+      childExitInfo = { exitCode: 0, signal: null, aborted: false };
+      exitCode = await spawnWithHeartbeat(prepared.cmd, prepared.args, check.lease, check.sessionId, onHeartbeat, {
         ...options,
+        prepared: { ...prepared, cwd: prepared.cwd || cwd },
+        cwd: prepared.cwd || cwd,
         buildLease: check.buildLease,
         buildMode: Boolean(check.buildLease),
         heartbeatIntervalMs,
         onChildSpawn,
+        stdio: plan.stdio || options.stdio,
+        onOutput: plan.onOutput || options.onOutput,
+        timeoutMs: inv.timeoutSec ? inv.timeoutSec * 1000 : options.timeoutMs,
         onChildExit: (info) => {
           childExitInfo = info;
         },
-      },
-    );
-    return { exitCode };
+      });
+      steps.push({
+        cmd: prepared.cmd,
+        args: prepared.args,
+        cwd: prepared.cwd || cwd,
+        exitCode,
+        timedOut: Boolean(childExitInfo.timedOut),
+        durationMs: Date.now() - startedAt,
+      });
+      if (exitCode !== 0) break;
+    }
+    return { exitCode, steps, lease: check.lease || null, sessionId: check.sessionId };
   } finally {
     try {
       let keepSpawnedChildGroup = false;
@@ -7144,6 +6851,52 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       // Best-effort workerPid cleanup
     }
   }
+}
+
+function recordForcedRun(stateDir, entry, options = {}) {
+  const runId = `forced-${Date.now().toString(36)}-${String(randomNonce()).slice(0, 6)}`;
+  try {
+    withStateTransaction(
+      stateDir,
+      (state, { now, auditEvents }) => {
+        const identity = resolveSessionIdentity({
+          flags: options.flags || {},
+          env: options.env || process.env,
+          state,
+          cwd: entry.cwd,
+          ppid: options.ppid ?? process.ppid,
+        });
+        const rec = { runId, atMs: now, sessionId: identity.sessionId, ...entry };
+        state.forcedRuns = [...(state.forcedRuns || []), rec].slice(-50);
+        if (Array.isArray(auditEvents)) auditEvents.push({ event: "forced_run", ...rec });
+        return { mutated: true };
+      },
+      options,
+    );
+  } catch {
+    // Best-effort audit; the run itself is still attributed in the result payload
+  }
+  return runId;
+}
+
+export function execDeps(stateDir, options = {}) {
+  return {
+    runOpInvocations,
+    cmdSnapshot,
+    readConfig: () => {
+      try {
+        return readState(stateDir).config || DEFAULT_CONFIG;
+      } catch {
+        return DEFAULT_CONFIG;
+      }
+    },
+    recordForcedRun: (entry) => recordForcedRun(stateDir, entry, options),
+  };
+}
+
+// `atc exec <system> <op> ...` (tokens = raw argv after "exec").
+export async function cmdExec(stateDir, tokens, options = {}) {
+  return cmdExecTokens(stateDir, tokens || [], execDeps(stateDir, options), options);
 }
 
 export function cmdStatus(stateDir, flags = {}, options = {}) {
@@ -8468,7 +8221,7 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
     return 0;
   }
 
-  if (parsed.flags.help || parsed.flags.h || parsed.subcommand === "help") {
+  if ((parsed.flags.help || parsed.flags.h || parsed.subcommand === "help") && parsed.subcommand !== "exec") {
     const helpTopic =
       parsed.subcommand === "help" ? parsed.positionals[0] : parsed.subcommand;
     if (helpTopic === "guide") {
@@ -8639,12 +8392,13 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
     }
 
     case "exec": {
-      const cmdTokens =
-        parsed.restAfterDash.length > 0 ? parsed.restAfterDash : parsed.positionals;
-      const res = await cmdExec(stateDir, cmdTokens, parsed.flags, { env });
-      if (res.error) {
-        process.stderr.write(`[atc] ${res.error}\n`);
+      const execIdx = argv.indexOf("exec");
+      const res = await cmdExec(stateDir, argv.slice(execIdx + 1), { env, ...options });
+      if (res.help) {
+        (res.exitCode === 0 ? process.stdout : process.stderr).write(res.help);
+        return res.exitCode;
       }
+      renderExecResult(res, { json: res.json });
       return res.exitCode;
     }
 

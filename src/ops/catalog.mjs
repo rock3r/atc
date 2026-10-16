@@ -216,7 +216,7 @@ export const OPS = Object.freeze({
     positional: "target",
     params: {
       target: { type: "string", pattern: "bazelTarget", required: true },
-      runArgs: { type: "string[]", pattern: "transportSafe", maxItems: 64 },
+      runArgs: { type: "string[]", pattern: "passthroughArg", maxItems: 64 },
       configs: { type: "string[]", pattern: "bazelConfig" },
       timeoutSec: { type: "integer", min: 1, max: 86400, required: true },
       ...BUILD_COMMON,
@@ -377,6 +377,7 @@ export const OPS = Object.freeze({
   },
   "android.logcat": {
     name: "android.logcat",
+    readOnly: true,
     system: "android",
     kind: "device",
     platform: "android",
@@ -388,6 +389,7 @@ export const OPS = Object.freeze({
   },
   "android.screenshot": {
     name: "android.screenshot",
+    readOnly: true,
     system: "android",
     kind: "device",
     platform: "android",
@@ -404,6 +406,7 @@ export const OPS = Object.freeze({
   },
   "android.prop.get": {
     name: "android.prop.get",
+    readOnly: true,
     system: "android",
     kind: "device",
     platform: "android",
@@ -445,7 +448,7 @@ export const OPS = Object.freeze({
     positional: "bundleId",
     params: {
       bundleId: { type: "string", pattern: "iosBundleId", required: true },
-      launchArgs: { type: "string[]", pattern: "transportSafe", maxItems: 32 },
+      launchArgs: { type: "string[]", pattern: "passthroughArg", maxItems: 32 },
     },
     invocations: (p, ctx) => [simctl(ctx, "launch", p.bundleId, ...(p.launchArgs || []))],
   },
@@ -461,6 +464,7 @@ export const OPS = Object.freeze({
   },
   "ios.screenshot": {
     name: "ios.screenshot",
+    readOnly: true,
     system: "ios",
     kind: "device",
     platform: "ios",
@@ -536,6 +540,7 @@ function snapshotOp(name, action, needsName) {
     kind: "snapshot",
     action,
     virtualOnly: true,
+    readOnly: action === "list",
     positional: needsName ? "name" : null,
     params: needsName ? { name: { type: "string", pattern: "snapshotName", required: true } } : {},
   };

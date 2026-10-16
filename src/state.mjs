@@ -270,6 +270,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   autoStopIdleOnContention: true,
   allowPhysicalDevices: "explicit",
   allowedPhysicalSerials: [],
+  allowPhysicalPropSet: false,
   coordinateBuilds: false,
   maxConcurrentBuilds: "auto",
   maxDeviceHolderBurstBuilds: 1,
@@ -294,6 +295,7 @@ export function createDefaultState() {
     buildQueue: [],
     nextBuildQueueSeq: 1,
     hookSessions: {},
+    forcedRuns: [],
     lastOrphanSweepAtMs: 0,
   };
 }
@@ -358,6 +360,9 @@ function parseStateContent(raw) {
   }
   if (!Array.isArray(parsed.buildQueue)) {
     parsed.buildQueue = [];
+  }
+  if (!Array.isArray(parsed.forcedRuns)) {
+    parsed.forcedRuns = [];
   }
   if (
     typeof parsed.nextBuildQueueSeq !== "number" ||

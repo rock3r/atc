@@ -47,7 +47,9 @@ function didYouMean(value, candidates) {
 function patternError(p, patternKey, value, { force = false, overridden = [] } = {}) {
   const pat = PATTERNS[patternKey];
   if (checkPattern(patternKey, value)) return null;
-  if (force && pat.forceable) {
+  // Option injection: a leading "-" is never forceable, whatever the pattern.
+  const forceable = Boolean(pat.forceable) && !String(value ?? "").startsWith("-") && !/[\0\r\n]/.test(String(value ?? ""));
+  if (force && forceable) {
     overridden.push({ path: p, check: `pattern:${patternKey}`, value: String(value) });
     return null;
   }
@@ -55,10 +57,10 @@ function patternError(p, patternKey, value, { force = false, overridden = [] } =
     p,
     "pattern_mismatch",
     `${JSON.stringify(String(value))} is not ${pat.label}.`,
-    pat.forceable
+    forceable
       ? `If this value is legitimate, re-run with --force --reason "<why>" (you take responsibility), and request support at ${FEATURE_REQUEST_URL}.`
       : `This value cannot be overridden. Request support at ${FEATURE_REQUEST_URL} if you need it.`,
-    { forceable: Boolean(pat.forceable) },
+    { forceable },
   );
 }
 
@@ -364,6 +366,7 @@ export function parseOpArgv(tokens) {
       continue;
     }
     if (name === "cwd" || name === "env") {
+      if (inlineVal === undefined && i + 1 < rest.length && !rest[i + 1].startsWith("--")) i++;
       errors.push(
         err(`/${name}`, "batch_only", `--${rawName} is not available on "atc exec"; it needs ceremony.`, 'Use an "atc batch" plan, which supports cwd and env per step.'),
       );

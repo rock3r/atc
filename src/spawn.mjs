@@ -2161,36 +2161,94 @@ function terminateChildTree(childPid, signal = "SIGTERM", options = {}) {
   killProcessGroupTree(childPid, signal, options);
 }
 
+const BAZEL_RESOURCE_SUBCOMMANDS = new Set(["build", "test", "run", "coverage"]);
+
+// Build the child process env and argv for a typed-op invocation (see docs/scope.md §6).
+// Invocations are already literal argv generated from validated params; the only additions
+// are lease/session env vars and per-build resource caps for heavy build tools.
+export function prepareOpChildInvocation(invocation, { lease = null, sessionId = null, baseEnv = process.env, buildLease = null, tool = null } = {}) {
+  const cmd = String(invocation.cmd);
+  let args = (invocation.args || []).map(String);
+  if (buildLease && tool) {
+    const hostCpus = Math.max(1, os.cpus()?.length || 4);
+    const maxConcurrent = Math.max(1, Number(buildLease.maxConcurrentBuilds || 2));
+    const jobsLimit = Math.max(2, Number(buildLease.jobsLimit || Math.floor(hostCpus / maxConcurrent)));
+    const ramLimitMb = Math.max(1024, Number(buildLease.reservedRamMb || 3072));
+    if (tool === "gradle") {
+      args = [...args, `-Dorg.gradle.workers.max=${jobsLimit}`];
+    } else if (tool === "bazel" && BAZEL_RESOURCE_SUBCOMMANDS.has(args[0])) {
+      const dashDash = args.indexOf("--");
+      const head = dashDash === -1 ? args : args.slice(0, dashDash);
+      const tail = dashDash === -1 ? [] : args.slice(dashDash);
+      args = [head[0], `--jobs=${jobsLimit}`, `--local_ram_resources=${ramLimitMb}`, ...head.slice(1), ...tail];
+    } else if (tool === "xcodebuild" && !args.includes("clean")) {
+      args = [...args, "-jobs", String(jobsLimit)];
+    }
+  }
+  const sanitizedBaseEnv = { ...baseEnv };
+  delete sanitizedBaseEnv.ATC_BUILD_OP_ID;
+  delete sanitizedBaseEnv.ATC_BUILD_OP_NONCE;
+  delete sanitizedBaseEnv.ATC_BUILD_ID;
+  const leasePlatform = lease ? lease.platform || "android" : null;
+  const env = {
+    ...sanitizedBaseEnv,
+    ...(invocation.env || {}),
+    ...(lease
+      ? {
+          ...(leasePlatform === "ios"
+            ? lease.kind === "emulator"
+              ? { SIMULATOR_UDID: lease.serial }
+              : {}
+            : { ANDROID_SERIAL: lease.serial }),
+          ATC_PLATFORM: leasePlatform,
+          ATC_DEVICE_SERIAL: lease.serial,
+          ATC_LEASE_ID: lease.leaseId,
+        }
+      : {}),
+    ...(buildLease && buildLease.opId && buildLease.opNonce
+      ? {
+          ATC_BUILD_OP_ID: buildLease.opId,
+          ATC_BUILD_OP_NONCE: buildLease.opNonce,
+          ATC_BUILD_ID: buildLease.buildId || buildLease.opId,
+        }
+      : {}),
+    ...(sessionId ? { ATC_SESSION_ID: sessionId } : {}),
+  };
+  return { cmd, args, env, cwd: invocation.cwd || null };
+}
+
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
-  const invocation = buildChildInvocation(
-    cmd,
-    args,
-    lease,
-    sessionId,
-    options.env,
-    options.buildLease || null,
-    { cwd: options.cwd },
-  );
+  const invocation = options.prepared
+    ? options.prepared
+    : prepareOpChildInvocation(
+        { cmd, args, cwd: options.cwd },
+        { lease, sessionId, baseEnv: options.env || process.env, buildLease: options.buildLease || null, tool: options.tool || null },
+      );
   const detachChild = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
     stdio: options.stdio || "inherit",
     env: invocation.env,
-    cwd: options.cwd,
+    cwd: invocation.cwd || options.cwd,
     detached: detachChild,
   });
 
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
+    const onOutput = typeof options.onOutput === "function" ? options.onOutput : null;
     if (child.stdout) {
-      if (options.redirectStdoutToStderr) {
+      if (onOutput) {
+        child.stdout.on("data", (chunk) => onOutput(chunk, "stdout"));
+      } else if (options.redirectStdoutToStderr) {
         child.stdout.pipe(process.stderr);
       } else {
         child.stdout.resume();
       }
     }
     if (child.stderr) {
-      if (options.redirectStdoutToStderr) {
+      if (onOutput) {
+        child.stderr.on("data", (chunk) => onOutput(chunk, "stderr"));
+      } else if (options.redirectStdoutToStderr) {
         child.stderr.pipe(process.stderr);
       } else {
         child.stderr.resume();
@@ -2200,10 +2258,25 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     const effectivePlatform = options.platform || process.platform;
     let childStartToken = null;
     let wrapperSignal = null;
+    let timedOut = false;
+    let timeoutTimer = null;
     let killEscalationTimer = null;
     let earlyWinDiscoveryTimer = null;
     const forwardedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
     const signalHandlers = new Map();
+
+    const escalateKill = () => {
+      if (!killEscalationTimer) {
+        killEscalationTimer = setTimeout(() => {
+          if (isProcessGroupAlive(childPid)) {
+            terminateChildTree(childPid, "SIGKILL");
+          }
+        }, 1500);
+        if (typeof killEscalationTimer.unref === "function") {
+          killEscalationTimer.unref();
+        }
+      }
+    };
 
     for (const sig of forwardedSignals) {
       const handler = () => {
@@ -2212,20 +2285,23 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
         }
         if (childPid) {
           terminateChildTree(childPid, sig);
-          if (!killEscalationTimer) {
-            killEscalationTimer = setTimeout(() => {
-              if (isProcessGroupAlive(childPid)) {
-                terminateChildTree(childPid, "SIGKILL");
-              }
-            }, 1500);
-            if (typeof killEscalationTimer.unref === "function") {
-              killEscalationTimer.unref();
-            }
-          }
+          escalateKill();
         }
       };
       signalHandlers.set(sig, handler);
       process.on(sig, handler);
+    }
+
+    if (childPid && Number(options.timeoutMs) > 0) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        if (!wrapperSignal) wrapperSignal = "SIGTERM";
+        terminateChildTree(childPid, "SIGTERM");
+        escalateKill();
+      }, Number(options.timeoutMs));
+      if (typeof timeoutTimer.unref === "function") {
+        timeoutTimer.unref();
+      }
     }
 
     if (childPid && effectivePlatform === "win32") {
@@ -2303,6 +2379,10 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
 
     const cleanupListenersAndTimers = () => {
       clearInterval(timer);
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
       if (earlyWinDiscoveryTimer) {
         clearTimeout(earlyWinDiscoveryTimer);
         earlyWinDiscoveryTimer = null;
@@ -2341,7 +2421,9 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
       const finishClose = () => {
         cleanupListenersAndTimers();
         let resolvedExitCode = 1;
-        if (wrapperSignal) {
+        if (timedOut) {
+          resolvedExitCode = 124;
+        } else if (wrapperSignal) {
           const sigNum = os.constants?.signals?.[wrapperSignal];
           resolvedExitCode = typeof sigNum === "number" ? 128 + sigNum : 1;
         } else if (typeof code === "number") {
@@ -2358,8 +2440,10 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
               exitCode: resolvedExitCode,
               code: resolvedExitCode,
               signal: effectiveSignal || null,
+              timedOut,
               aborted: Boolean(
                 effectiveSignal ||
+                  resolvedExitCode === 124 ||
                   resolvedExitCode === 130 ||
                   resolvedExitCode === 137 ||
                   resolvedExitCode === 143,

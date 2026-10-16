@@ -90,6 +90,14 @@ export const PATTERNS = Object.freeze({
     label: "a transport-safe value ([A-Za-z0-9_.:/@+=,-], max 256 chars)",
     forceable: false,
   },
+  // Arguments forwarded to the program being run (after `--` for bazel run, after the bundle id
+  // for simctl launch). They cannot reach the tool's own option parser, so a leading "-" is fine.
+  passthroughArg: {
+    re: /^[A-Za-z0-9_.:/@+=,-]{1,256}$/,
+    label: "a program argument ([A-Za-z0-9_.:/@+=,-], max 256 chars)",
+    forceable: false,
+    allowLeadingDash: true,
+  },
 });
 
 // Windows: every argument passed through cmd.exe to a .bat/.cmd wrapper must match this.
@@ -106,7 +114,7 @@ export function checkPattern(patternKey, value) {
   const p = PATTERNS[patternKey];
   if (!p) throw new Error(`Unknown pattern "${patternKey}"`);
   const s = String(value ?? "");
-  if (s.startsWith("-")) return false;
+  if (s.startsWith("-") && !p.allowLeadingDash) return false;
   return p.re.test(s);
 }
 
