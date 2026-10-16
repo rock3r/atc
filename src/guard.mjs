@@ -3388,13 +3388,80 @@ export function classifySegment(
           ? startSearchIdx + nestedRelIdx
           : -1;
     let peeledClass = null;
-    if (peelIdx !== -1) {
+    if (baseCmd === "find" && execFlagIdx !== -1) {
+      const findRank = { ignore: 0, read_only: 1, atc: 2, device_action: 3, deny_lifecycle: 4 };
+      const findBuildRank = { workspace_only: 1, pure_build: 2, reject_long_running: 3 };
+      const findActions = [];
+      let actStart = -1;
+      for (let fi = 0; fi < args.length; fi++) {
+        const fa = String(args[fi]);
+        if (actStart === -1) {
+          if (fa === "-exec" || fa === "-execdir" || fa === "-ok" || fa === "-okdir") {
+            actStart = fi + 1;
+          }
+          continue;
+        }
+        if (fa === ";" || fa === "\\;" || fa === "+" || fa === "\\+") {
+          if (fi > actStart) findActions.push(args.slice(actStart, fi));
+          actStart = -1;
+        }
+      }
+      if (actStart !== -1 && actStart < args.length) findActions.push(args.slice(actStart));
+      for (const actTokens of findActions) {
+        const actSegment = actTokens
+          .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
+          .join(" ");
+        const actClass = classifySegment(actSegment, buildWrappedInheritedVars(parsed), depth + 1, {
+          allowHashComments,
+          cwd: effectiveCwd,
+          env,
+        });
+        if (actClass.kind === "deny_lifecycle") {
+          return actClass;
+        }
+        if (
+          !peeledClass ||
+          (findRank[actClass.kind] || 0) > (findRank[peeledClass.kind] || 0) ||
+          ((actClass.kind === "read_only" || actClass.kind === "ignore") &&
+            actClass.kind === peeledClass.kind &&
+            (findBuildRank[actClass.buildClass] || 0) > (findBuildRank[peeledClass.buildClass] || 0))
+        ) {
+          peeledClass = actClass;
+        }
+      }
+    } else if (peelIdx !== -1) {
       const cleanedArgs = args
         .slice(peelIdx)
-        .filter((a) => a !== ";" && a !== "\\;" && a !== "+" && a !== "\\+")
-        .map((a) => (execFlagIdx !== -1 && a === "{}" ? "__xargs_stdin__" : a));
+        .filter((a) => a !== ";" && a !== "\\;" && a !== "+" && a !== "\\+");
       if (baseCmd === "xargs" || baseCmd === "parallel") {
-        cleanedArgs.push("__xargs_stdin__");
+        const wrapperOpts = args.slice(startSearchIdx, peelIdx);
+        let fanout = baseCmd === "parallel";
+        for (let wi = 0; wi < wrapperOpts.length; wi++) {
+          const w = String(wrapperOpts[wi]);
+          let procsVal = null;
+          if (
+            (w === "-P" || w === "--max-procs" || (baseCmd === "parallel" && (w === "-j" || w === "--jobs"))) &&
+            wi + 1 < wrapperOpts.length
+          ) {
+            procsVal = wrapperOpts[wi + 1];
+          } else if (/^-[Pj]\d+$/.test(w)) {
+            procsVal = w.slice(2);
+          } else if (w.startsWith("--max-procs=") || w.startsWith("--jobs=")) {
+            procsVal = w.slice(w.indexOf("=") + 1);
+          }
+          if (procsVal !== null) fanout = Number(procsVal) !== 1;
+        }
+        const hasStaticParallelArgs =
+          baseCmd === "parallel" &&
+          cleanedArgs.some((a) => a === ":::" || a === ":::+") &&
+          !cleanedArgs.some((a) => a === "::::" || a === "::::+");
+        for (let ci = cleanedArgs.length - 1; ci >= 1; ci--) {
+          if (baseCmd === "parallel" && /^:{3,4}\+?$/.test(cleanedArgs[ci])) {
+            cleanedArgs.splice(ci, 1);
+          }
+        }
+        if (!hasStaticParallelArgs) cleanedArgs.push("__xargs_stdin__");
+        if (fanout) cleanedArgs.push("__xargs_parallel__");
       }
       if (cleanedArgs.length > 0) {
         const nestedSegment = cleanedArgs

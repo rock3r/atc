@@ -4109,12 +4109,10 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       rcCwdSub,
       { bazelVersion: "8.2.1" },
     );
-    const canonicalRcWsRoot = fs
-      .realpathSync(path.join(wsDir, "bazel-rc-cwd-test"))
-      .replace(/\\/g, "/");
+    const canonicalRcWsRoot = canonicalizeBuildPath(path.join(wsDir, "bazel-rc-cwd-test"));
     assert.deepEqual(relImportFromCwdReqs.resourceKeys, [
       `bazel:ws:${canonicalRcWsRoot}`,
-      `bazel:out:${fs.realpathSync(cwdCondImportOutBase).replace(/\\/g, "/")}`,
+      `bazel:out:${canonicalizeBuildPath(cwdCondImportOutBase)}`,
     ]);
 
     // 2. BAZELRC=/dev/null stops reading remaining BAZELRC entries without ignoring explicit --bazelrc flags
@@ -4147,14 +4145,25 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     );
     assert.deepEqual(bazelrcNullThenCliReqs.resourceKeys, [
       `bazel:ws:${canonicalRcWsRoot}`,
-      `bazel:out:${fs.realpathSync(cliAfterNullOutBase).replace(/\\/g, "/")}`,
+      `bazel:out:${canonicalizeBuildPath(cliAfterNullOutBase)}`,
     ]);
 
     // 3. Build tools delegated through xargs / parallel / find -exec are classified, guarded, and coordinated
-    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "assembleDebug"]).kind, "pure_build");
-    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "--version"]).kind, "pure_build");
-    assert.equal(classifyBuildCommand("xargs", ["bazel", "build", "//..."]).kind, "pure_build");
+    // Dynamic xargs input cannot be inspected for lifecycle flags, so Gradle/Bazel fail closed.
+    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "assembleDebug"]).kind, "deny_lifecycle");
+    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "--version"]).kind, "deny_lifecycle");
+    assert.equal(classifyBuildCommand("xargs", ["bazel", "build", "//..."]).kind, "deny_lifecycle");
     assert.equal(classifyBuildCommand("xargs", ["bazel", "shutdown"]).kind, "deny_lifecycle");
+    assert.match(
+      classifyBuildCommand("sh", ["-c", "cat args.txt | xargs ./gradlew"]).reason || "",
+      /dynamically through xargs/,
+    );
+    assert.match(
+      classifyBuildCommand("sh", ["-c", "echo assembleDebug | xargs -a extra.txt ./gradlew"]).reason ||
+        "",
+      /dynamically through xargs/,
+    );
+    // Static piped arguments are inspected directly.
     assert.equal(
       classifyBuildCommand("sh", ["-c", "printf '%s\\n' --stop | xargs ./gradlew"]).kind,
       "deny_lifecycle",
@@ -4164,6 +4173,29 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       "device_coupled_build",
     );
     assert.equal(
+      classifyBuildCommand("sh", ["-c", "echo assembleDebug | xargs ./gradlew"]).kind,
+      "pure_build",
+    );
+    // Parallel fan-out (xargs -P / GNU parallel) cannot be RAM-admitted as one build.
+    assert.match(
+      classifyBuildCommand("sh", ["-c", "printf 'build\\nbuild\\n' | xargs -n1 -P2 ./gradlew"])
+        .reason || "",
+      /Parallel fan-out/,
+    );
+    assert.equal(
+      classifyBuildCommand("sh", ["-c", "echo assembleDebug | xargs -P1 ./gradlew"]).kind,
+      "pure_build",
+    );
+    assert.equal(
+      classifyBuildCommand("parallel", ["-j1", "./gradlew", ":::", "assembleDebug"]).kind,
+      "pure_build",
+    );
+    assert.match(
+      classifyBuildCommand("parallel", ["./gradlew", ":::", "assembleDebug", "lintDebug"]).reason ||
+        "",
+      /Parallel fan-out/,
+    );
+    assert.equal(
       classifyBuildCommand("find", [".", "-maxdepth", "1", "-exec", "./gradlew", "assembleDebug", ";"]).kind,
       "pure_build",
     );
@@ -4171,11 +4203,42 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       classifyBuildCommand("find", [".", "-maxdepth", "1", "-exec", "./gradlew", "--stop", ";"]).kind,
       "deny_lifecycle",
     );
+    // Every find execution action is inspected, not just the first.
+    assert.equal(
+      classifyBuildCommand("find", [".", "-exec", "echo", "{}", ";", "-exec", "./gradlew", "build", ";"])
+        .kind,
+      "pure_build",
+    );
+    assert.equal(
+      classifyBuildCommand("find", [
+        ".",
+        "-exec",
+        "./gradlew",
+        "assembleDebug",
+        ";",
+        "-exec",
+        "./gradlew",
+        "--stop",
+        ";",
+      ]).kind,
+      "deny_lifecycle",
+    );
+    assert.equal(
+      classifyBuildCommand("sh", [
+        "-c",
+        "find . -exec echo {} \\; -exec bazel shutdown \\;",
+      ]).kind,
+      "deny_lifecycle",
+    );
 
-    const xargsGradleReqs = resolveBuildResources("xargs", ["./gradlew", "assembleDebug"], dirB);
-    assert.equal(xargsGradleReqs.kind, "pure_build");
-    assert.equal(xargsGradleReqs.tool, "gradle");
-    assert.deepEqual(xargsGradleReqs.resourceKeys, [`gradle:${canonicalDirB}`]);
+    const findGradleReqs = resolveBuildResources(
+      "find",
+      [".", "-maxdepth", "0", "-exec", "echo", "{}", ";", "-exec", "./gradlew", "assembleDebug", ";"],
+      dirB,
+    );
+    assert.equal(findGradleReqs.kind, "pure_build");
+    assert.equal(findGradleReqs.tool, "gradle");
+    assert.deepEqual(findGradleReqs.resourceKeys, [`gradle:${canonicalDirB}`]);
 
     const xargsBazelGuard = evaluateCommandGuard("xargs bazel build //...", {
       sessionId: "sess-xargs-build",
@@ -4183,8 +4246,23 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       coordinateBuilds: true,
       cwd: rcCwdSub,
     });
-    assert.equal(xargsBazelGuard.allowed, true);
-    assert.match(xargsBazelGuard.rewrittenCommand || "", /atc exec --build -- xargs bazel build \/\/\.\.\./);
+    assert.equal(xargsBazelGuard.allowed, false);
+    assert.match(xargsBazelGuard.reason || "", /dynamically through xargs/);
+
+    const xargsParallelGuard = evaluateCommandGuard("xargs -n1 -P4 ./gradlew < tasks.txt", {
+      sessionId: "sess-xargs-par",
+      activeLeases: [],
+      coordinateBuilds: true,
+      cwd: dirB,
+    });
+    assert.equal(xargsParallelGuard.allowed, false);
+
+    const findMultiGuard = evaluateCommandGuard(
+      "find . -exec echo {} \\; -exec ./gradlew --stop \\;",
+      { sessionId: "sess-find-multi", activeLeases: [], coordinateBuilds: true, cwd: dirB },
+    );
+    assert.equal(findMultiGuard.allowed, false);
+    assert.match(findMultiGuard.reason || "", /gradle --stop/i);
 
     const pipedStopXargsGuard = evaluateCommandGuard("printf '%s\\n' -- --stop | xargs ./gradlew", {
       sessionId: "sess-xargs-stop",
@@ -4211,13 +4289,55 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       "find",
       [".", "-maxdepth", "1", "-exec", "./gradlew", "assembleDebug", ";"],
       null,
+      null,
       process.env,
-      dirB,
-      process.platform,
-      { buildConcurrency: 2 },
+      null,
+      { cwd: dirB },
     );
     assert.equal(findExecPrep.args[findExecPrep.args.length - 1], ";");
     assert.match(findExecPrep.args[findExecPrep.args.length - 2], /^-Dorg\.gradle\.workers\.max=\d+$/);
+
+    const findMultiPrep = buildChildInvocation(
+      "find",
+      [
+        ".",
+        "-exec",
+        "./gradlew",
+        "assembleDebug",
+        ";",
+        "-exec",
+        "./gradlew",
+        "lintDebug",
+        "{}",
+        "+",
+      ],
+      null,
+      null,
+      process.env,
+      null,
+      { cwd: dirB },
+    );
+    const multiArgs = findMultiPrep.args.map(String);
+    const workersRe = /^-Dorg\.gradle\.workers\.max=\d+$/;
+    assert.match(multiArgs[4], workersRe);
+    assert.equal(multiArgs[5], ";");
+    assert.deepEqual(multiArgs.slice(-3, -1).map((a) => workersRe.test(a) || a), [true, "{}"]);
+    assert.equal(multiArgs[multiArgs.length - 1], "+");
+
+    const shFindPrep = buildChildInvocation(
+      "sh",
+      ["-c", "find . -exec echo {} \\; -exec ./gradlew assembleDebug {} +"],
+      null,
+      null,
+      process.env,
+      null,
+      { cwd: dirB },
+    );
+    assert.match(
+      String(shFindPrep.args[1]),
+      /-exec \.\/gradlew assembleDebug -Dorg\.gradle\.workers\.max=\d+ \{\} \+$/,
+    );
+    assert.match(String(shFindPrep.args[1]), /-exec echo \{\} \\; /);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

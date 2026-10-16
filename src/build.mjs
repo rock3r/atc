@@ -35,6 +35,9 @@ export function canonicalizeBuildPath(targetPath, options = {}) {
 }
 
 const LITERAL_SENTINEL = "\uE000";
+const XARGS_DYNAMIC_INPUT_MARKER = "__xargs_stdin__";
+const XARGS_PARALLEL_MARKER = "__xargs_parallel__";
+const XARGS_MARKERS = new Set([XARGS_DYNAMIC_INPUT_MARKER, XARGS_PARALLEL_MARKER]);
 
 function stripLiteralSentinels(value) {
   return String(value || "").replaceAll(LITERAL_SENTINEL, "");
@@ -1602,6 +1605,12 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       let i = 0;
       let replToken = "{}";
       let brokenFlag = false;
+      let hasArgFile = false;
+      let maxProcs = 1;
+      const parseProcs = (v) => {
+        const n = Number(String(v).trim());
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+      };
       while (i < curArgs.length) {
         const a = stripLiteralSentinels(curArgs[i]);
         if (a === "--") {
@@ -1627,10 +1636,33 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           i++;
           continue;
         }
+        if ((a === "-a" || a === "--arg-file") && i + 1 < curArgs.length) {
+          hasArgFile = true;
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("--arg-file=") || (a.startsWith("-a") && a.length > 2)) {
+          hasArgFile = true;
+          i++;
+          continue;
+        }
+        if ((a === "-P" || a === "--max-procs") && i + 1 < curArgs.length) {
+          maxProcs = parseProcs(stripLiteralSentinels(curArgs[i + 1]));
+          i += 2;
+          continue;
+        }
+        if (a.startsWith("--max-procs=")) {
+          maxProcs = parseProcs(a.slice("--max-procs=".length));
+          i++;
+          continue;
+        }
+        if (/^-P\d+$/.test(a)) {
+          maxProcs = parseProcs(a.slice(2));
+          i++;
+          continue;
+        }
         if (
-          (a === "-a" ||
-            a === "--arg-file" ||
-            a === "-d" ||
+          (a === "-d" ||
             a === "--delimiter" ||
             a === "-E" ||
             a === "--eof" ||
@@ -1638,8 +1670,6 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
             a === "--max-lines" ||
             a === "-n" ||
             a === "--max-args" ||
-            a === "-P" ||
-            a === "--max-procs" ||
             a === "-R" ||
             a === "-S" ||
             a === "-s" ||
@@ -1661,14 +1691,22 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       const remaining = curArgs
         .slice(i + 1)
         .filter((tok) => stripLiteralSentinels(tok) !== replToken);
-      const upstream = Array.isArray(pendingXargsUpstreamArgs) ? pendingXargsUpstreamArgs : [];
+      const staticUpstream =
+        !hasArgFile && Array.isArray(pendingXargsUpstreamArgs) ? pendingXargsUpstreamArgs : null;
       pendingXargsUpstreamArgs = null;
-      curArgs = [...remaining, ...upstream, "__xargs_stdin__"];
+      curArgs = [
+        ...remaining,
+        ...(staticUpstream || []),
+        ...(staticUpstream ? [] : [XARGS_DYNAMIC_INPUT_MARKER]),
+        ...(maxProcs !== 1 ? [XARGS_PARALLEL_MARKER] : []),
+      ];
       continue;
     }
     if (base === "parallel") {
       let i = 0;
       let brokenFlag = false;
+      let jobs = 0;
+      let hasArgFile = false;
       while (i < curArgs.length) {
         const a = stripLiteralSentinels(curArgs[i]);
         if (a === "--") {
@@ -1679,19 +1717,33 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
           brokenFlag = true;
           break;
         }
+        if ((a === "-j" || a === "--jobs" || a === "-P" || a === "--max-procs") && i + 1 < curArgs.length) {
+          jobs = Number(stripLiteralSentinels(curArgs[i + 1])) || 0;
+          i += 2;
+          continue;
+        }
+        if (/^-[jP]\d+$/.test(a)) {
+          jobs = Number(a.slice(2)) || 0;
+          i++;
+          continue;
+        }
+        if (a.startsWith("--jobs=") || a.startsWith("--max-procs=")) {
+          jobs = Number(a.slice(a.indexOf("=") + 1)) || 0;
+          i++;
+          continue;
+        }
+        if ((a === "-a" || a === "--arg-file") && i + 1 < curArgs.length) {
+          hasArgFile = true;
+          i += 2;
+          continue;
+        }
         if (
-          (a === "-j" ||
-            a === "--jobs" ||
-            a === "-P" ||
-            a === "--max-procs" ||
-            a === "-I" ||
+          (a === "-I" ||
             a === "-S" ||
             a === "--sshlogin" ||
             a === "--results" ||
             a === "--joblog" ||
-            a === "--tagstring" ||
-            a === "-a" ||
-            a === "--arg-file") &&
+            a === "--tagstring") &&
           i + 1 < curArgs.length
         ) {
           i += 2;
@@ -1706,50 +1758,91 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
       if (brokenFlag || i >= curArgs.length) break;
       curCmd = curArgs[i];
       const remaining = [];
+      let sawStaticArgs = false;
+      let sawArgFileSource = false;
       for (let k = i + 1; k < curArgs.length; k++) {
         const cleanK = stripLiteralSentinels(curArgs[k]);
-        if (cleanK === "::::") {
+        if (cleanK === "::::" || cleanK === "::::+") {
+          sawArgFileSource = true;
           k++;
           continue;
         }
-        if (cleanK === ":::" || cleanK === "{}") continue;
+        if (cleanK === ":::" || cleanK === ":::+") {
+          sawStaticArgs = true;
+          continue;
+        }
+        if (cleanK === "{}") continue;
         remaining.push(curArgs[k]);
       }
-      const upstream = Array.isArray(pendingXargsUpstreamArgs) ? pendingXargsUpstreamArgs : [];
+      const staticUpstream =
+        !hasArgFile && !sawArgFileSource && !sawStaticArgs && Array.isArray(pendingXargsUpstreamArgs)
+          ? pendingXargsUpstreamArgs
+          : null;
       pendingXargsUpstreamArgs = null;
-      curArgs = [...remaining, ...upstream, "__xargs_stdin__"];
+      const isDynamic = hasArgFile || sawArgFileSource || (!sawStaticArgs && !staticUpstream);
+      curArgs = [
+        ...remaining,
+        ...(staticUpstream || []),
+        ...(isDynamic ? [XARGS_DYNAMIC_INPUT_MARKER] : []),
+        ...(jobs !== 1 ? [XARGS_PARALLEL_MARKER] : []),
+      ];
       continue;
     }
     if (base === "find") {
-      const execIdx = curArgs.findIndex((a) => {
-        const cleanA = stripLiteralSentinels(a);
-        return (
-          cleanA === "-exec" ||
-          cleanA === "-execdir" ||
-          cleanA === "-ok" ||
-          cleanA === "-okdir"
-        );
-      });
-      if (execIdx !== -1 && execIdx + 1 < curArgs.length) {
-        const execFlag = stripLiteralSentinels(curArgs[execIdx]);
-        if (execFlag === "-execdir" || execFlag === "-okdir") {
+      const findActions = listFindExecActions(curArgs);
+      if (findActions.length > 0) {
+        const peeledActions = [];
+        for (const act of findActions) {
+          const actTokens = curArgs.slice(act.start, act.end);
+          const isDirAction = act.flag === "-execdir" || act.flag === "-okdir";
+          const sub = peelBuildWrapperTokens(actTokens[0], actTokens.slice(1), {
+            ...options,
+            env: baseEnv,
+            cwd: relCwd ? path.resolve(baseCwd, relCwd) : baseCwd,
+            xargsUpstreamArgs: null,
+          });
+          const subClauses =
+            Array.isArray(sub.allBuildClauses) && sub.allBuildClauses.length > 0
+              ? sub.allBuildClauses
+              : normalizeBuildToolName(stripLiteralSentinels(sub.cmd || ""))
+                ? [sub]
+                : [];
+          act.hasBuild = subClauses.length > 0;
+          for (const sc of subClauses) {
+            const scRel = sc.relCwd || sub.relCwd || null;
+            peeledActions.push({
+              cmd: sc.cmd,
+              args: sc.args,
+              relCwd: scRel ? (relCwd && !path.isAbsolute(scRel) ? path.join(relCwd, scRel) : scRel) : relCwd,
+              envVars: { ...envVars, ...(sub.envVars || {}), ...(sc.envVars || {}) },
+              backgrounded: Boolean(sc.backgrounded || sub.backgrounded),
+              unresolvedDynamicCwd: Boolean(
+                unresolvedDynamicCwd || isDirAction || sc.unresolvedDynamicCwd || sub.unresolvedDynamicCwd,
+              ),
+            });
+          }
+        }
+        if (peeledActions.length > 1) {
+          return {
+            cmd: peeledActions[0].cmd,
+            args: peeledActions[0].args,
+            relCwd: peeledActions[0].relCwd,
+            envVars: peeledActions[0].envVars,
+            backgrounded: peeledActions.some((c) => c.backgrounded),
+            unresolvedDynamicCwd: peeledActions.some((c) => c.unresolvedDynamicCwd),
+            allBuildClauses: peeledActions,
+            concurrencyTree: offsetConcurrencyTree(null, 0, peeledActions.length),
+          };
+        }
+        const chosenAct =
+          peeledActions.length === 1 ? findActions.find((act) => act.hasBuild) : findActions[0];
+        const targetAct = chosenAct || findActions[0];
+        if (targetAct.flag === "-execdir" || targetAct.flag === "-okdir") {
           unresolvedDynamicCwd = true;
         }
-        const execTokens = [];
-        for (let k = execIdx + 1; k < curArgs.length; k++) {
-          const cleanK = stripLiteralSentinels(curArgs[k]);
-          if (cleanK === ";" || cleanK === "\\;" || cleanK === "+" || cleanK === "\\+") {
-            break;
-          }
-          execTokens.push(curArgs[k]);
-        }
-        if (execTokens.length > 0) {
-          curCmd = execTokens[0];
-          curArgs = execTokens
-            .slice(1)
-            .map((tok) => (stripLiteralSentinels(tok) === "{}" ? "__xargs_stdin__" : tok));
-          continue;
-        }
+        curCmd = curArgs[targetAct.start];
+        curArgs = curArgs.slice(targetAct.start + 1, targetAct.end);
+        continue;
       }
     }
     if (
@@ -3680,6 +3773,174 @@ export function injectBazelFlagsIntoShellClause(corePart, injectedFlags = [], op
   return `${s.slice(0, insertPos)} ${injectedFlags.join(" ")}${s.slice(insertPos)}`;
 }
 
+const FIND_EXEC_ACTION_FLAGS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+const FIND_EXEC_TERMINATORS = new Set([";", "\\;", "+", "\\+"]);
+
+export function listFindExecActions(tokens = []) {
+  const actions = [];
+  let start = -1;
+  let flag = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const a = stripLiteralSentinels(tokens[i]);
+    if (start === -1) {
+      if (FIND_EXEC_ACTION_FLAGS.has(a)) {
+        start = i + 1;
+        flag = a;
+      }
+      continue;
+    }
+    if (FIND_EXEC_TERMINATORS.has(a)) {
+      if (i > start) actions.push({ start, end: i, flag, terminator: a });
+      start = -1;
+      flag = null;
+    }
+  }
+  if (start !== -1 && start < tokens.length) {
+    actions.push({ start, end: tokens.length, flag, terminator: null });
+  }
+  return actions;
+}
+
+export function computeFindExecInsertions(tokens = [], planFn) {
+  const cleanTokens = tokens.map((t) => stripLiteralSentinels(t));
+  const out = [];
+  for (const act of listFindExecActions(cleanTokens)) {
+    const head = cleanTokens[act.start];
+    const tool = normalizeBuildToolName(head);
+    if (!tool) continue;
+    const actionArgs = cleanTokens.slice(act.start + 1, act.end);
+    const plan = planFn(tool, actionArgs);
+    if (!plan || !Array.isArray(plan.tokens) || plan.tokens.length === 0) continue;
+    let index;
+    if (Number.isInteger(plan.afterArgIndex)) {
+      index = act.start + 1 + plan.afterArgIndex + 1;
+    } else {
+      index = act.end;
+      if (
+        (act.terminator === "+" || act.terminator === "\\+") &&
+        cleanTokens[act.end - 1] === "{}"
+      ) {
+        index = act.end - 1;
+      }
+    }
+    out.push({ index, tokens: plan.tokens });
+  }
+  return out.sort((a, b) => b.index - a.index);
+}
+
+export function applyFindExecInsertions(tokens = [], insertions = []) {
+  const arr = [...tokens];
+  for (const ins of [...insertions].sort((a, b) => b.index - a.index)) {
+    arr.splice(ins.index, 0, ...ins.tokens);
+  }
+  return arr;
+}
+
+export function makeFindExecFlagPlanner({ jobsLimit, ramLimitMb, lease = null } = {}) {
+  return (tool, actionArgs) => {
+    const cls = classifyBuildCommand(tool === "gradle" ? "gradle" : tool, actionArgs);
+    if (!cls.requiresHeavySlot && !cls.requiresDevice) return null;
+    const has = (pred) => actionArgs.some((a) => pred(String(a)));
+    if (tool === "gradle") {
+      if (!cls.requiresHeavySlot) return null;
+      if (
+        has(
+          (s) =>
+            s === "--max-workers" ||
+            s.startsWith("--max-workers=") ||
+            s.startsWith("-Dorg.gradle.workers.max="),
+        )
+      ) {
+        return null;
+      }
+      return { tokens: [`-Dorg.gradle.workers.max=${jobsLimit}`] };
+    }
+    if (tool === "bazel") {
+      if (!cls.requiresHeavySlot) return null;
+      const subIdx = findBazelSubcommandIndex(
+        actionArgs,
+        new Set(["build", "test", "run", "coverage"]),
+      );
+      if (subIdx === -1) return null;
+      const toks = [];
+      if (!has((s) => s === "--jobs" || s.startsWith("--jobs="))) {
+        toks.push(`--jobs=${jobsLimit}`);
+      }
+      if (
+        !has((s) => s === "--local_ram_resources" || s.startsWith("--local_ram_resources="))
+      ) {
+        toks.push(`--local_ram_resources=${ramLimitMb}`);
+      }
+      return toks.length > 0 ? { tokens: toks, afterArgIndex: subIdx } : null;
+    }
+    if (tool === "xcodebuild") {
+      const toks = [];
+      if (cls.requiresHeavySlot && !has((s) => s === "-jobs" || s.startsWith("-jobs="))) {
+        toks.push("-jobs", String(jobsLimit));
+      }
+      const isQueryOnly = has((s) =>
+        [
+          "-list",
+          "-showbuildsettings",
+          "-showdestinations",
+          "-version",
+          "-help",
+          "--help",
+          "-h",
+          "-usage",
+        ].includes(s.toLowerCase()),
+      );
+      if (
+        !isQueryOnly &&
+        lease?.serial &&
+        (lease.platform || "android") === "ios" &&
+        !has((s) => s === "-destination" || s.startsWith("-destination="))
+      ) {
+        toks.push("-destination", `id=${lease.serial}`);
+      }
+      return toks.length > 0 ? { tokens: toks } : null;
+    }
+    return null;
+  };
+}
+
+export function injectFindExecFlagsIntoShellClause(corePart, planFn, options = {}) {
+  const s = String(corePart || "");
+  const spans = tokenizeShellClauseWithSpans(s, { markLiterals: true });
+  const resolveTok = (v) => {
+    const exp = options?.env
+      ? expandOrValidateShellPath(v, options.env, {
+          taintedVars: options.taintedVars,
+          shellType: options.shellType,
+        })
+      : null;
+    return stripLiteralSentinels(exp && !exp.unresolved && exp.resolved ? exp.resolved : v);
+  };
+  const findIdx = spans.findIndex((t) => {
+    const base = (resolveTok(t.value).split(/[\\/]/).pop() || "").toLowerCase();
+    return base === "find" || base === "find.exe";
+  });
+  if (findIdx === -1) return null;
+  const tail = spans.slice(findIdx + 1);
+  const insertions = computeFindExecInsertions(
+    tail.map((t) => resolveTok(t.value)),
+    planFn,
+  );
+  if (insertions.length === 0) return null;
+  let out = s;
+  for (const ins of insertions) {
+    const text = ins.tokens.join(" ");
+    if (ins.index < tail.length) {
+      const pos = tail[ins.index].start;
+      out = `${out.slice(0, pos)}${text} ${out.slice(pos)}`;
+    } else {
+      const pos = tail.length > 0 ? tail[tail.length - 1].end : spans[findIdx].end;
+      out = `${out.slice(0, pos)} ${text}${out.slice(pos)}`;
+    }
+  }
+  return out;
+}
+
 export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
   const {
     cmd,
@@ -3772,8 +4033,34 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
   }
 
   const rawArgList = Array.isArray(args) ? args.map((a) => String(a)) : [];
-  const hasDynamicXargsInput = rawArgList.includes("__xargs_stdin__");
-  const strArgs = rawArgList.filter((a) => a !== "__xargs_stdin__");
+  const hasDynamicXargsInput = rawArgList.includes(XARGS_DYNAMIC_INPUT_MARKER);
+  const hasParallelFanout = rawArgList.includes(XARGS_PARALLEL_MARKER);
+  const strArgs = rawArgList.filter((a) => !XARGS_MARKERS.has(a));
+  const delegatedInputDeny = (toolName) => {
+    if (hasParallelFanout) {
+      return {
+        kind: "deny_lifecycle",
+        tool: toolName,
+        targetPlatform: null,
+        requiresDevice: false,
+        requiresHeavySlot: false,
+        requiresWorkspaceLock: false,
+        reason: `Parallel fan-out of "${toolName}" through xargs -P / GNU parallel cannot be RAM-admitted as a single coordinated build; run the builds sequentially (xargs -P 1 / parallel -j 1) or as separate atc exec invocations.`,
+      };
+    }
+    if (hasDynamicXargsInput && toolName !== "xcodebuild") {
+      return {
+        kind: "deny_lifecycle",
+        tool: toolName,
+        targetPlatform: null,
+        requiresDevice: false,
+        requiresHeavySlot: false,
+        requiresWorkspaceLock: false,
+        reason: `Arguments supplied to "${toolName}" dynamically through xargs / GNU parallel input cannot be inspected for lifecycle commands (e.g. --stop, shutdown, clean --expunge); pass the build arguments explicitly instead.`,
+      };
+    }
+    return null;
+  };
 
   if (tool === "gradle") {
     if (strArgs.includes("--stop")) {
@@ -3788,6 +4075,8 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
           'Direct "gradle --stop" is disabled under ATC because it terminates shared Gradle daemons across all active worktrees.',
       };
     }
+    const gradleDelegatedDeny = delegatedInputDeny("gradle");
+    if (gradleDelegatedDeny) return gradleDelegatedDeny;
     if (
       strArgs.includes("--continuous") ||
       strArgs.includes("-t") ||
@@ -3917,6 +4206,8 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         reason: `Direct "${label}" is disabled under ATC because it disrupts active workspace Bazel servers.`,
       };
     }
+    const bazelDelegatedDeny = delegatedInputDeny("bazel");
+    if (bazelDelegatedDeny) return bazelDelegatedDeny;
 
     if (
       !hasDynamicXargsInput &&
@@ -4109,6 +4400,8 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
   }
 
   if (tool === "xcodebuild") {
+    const xcodeDelegatedDeny = delegatedInputDeny("xcodebuild");
+    if (xcodeDelegatedDeny) return xcodeDelegatedDeny;
     if (
       !hasDynamicXargsInput &&
       (strArgs.includes("-version") ||
@@ -4583,7 +4876,7 @@ export function resolveBuildResources(
   }
 
   const strArgs = Array.isArray(args)
-    ? args.map((a) => String(a)).filter((a) => a !== "__xargs_stdin__")
+    ? args.map((a) => String(a)).filter((a) => !XARGS_MARKERS.has(a))
     : [];
 
   if (classified.tool === "gradle") {

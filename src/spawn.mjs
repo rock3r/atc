@@ -3,12 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  applyFindExecInsertions,
   classifyBuildCommand,
+  computeFindExecInsertions,
   expandOrValidateShellPath,
   expandShellBuildClausePaths,
   extractShellFunctionSpan,
   findBazelSubcommandIndex,
   injectBazelFlagsIntoShellClause,
+  injectFindExecFlagsIntoShellClause,
+  makeFindExecFlagPlanner,
   normalizeBuildToolName,
   peelBuildWrapperTokens,
   resolveBuildResources,
@@ -702,19 +706,6 @@ export function buildChildInvocation(
   }
 
   let nextArgs = [...args];
-  const appendArgsBeforeFindTerminator = (arr, ...toAdd) => {
-    if (
-      arr.length > 0 &&
-      arr.some((a) => a === "-exec" || a === "-execdir" || a === "-ok" || a === "-okdir") &&
-      (arr[arr.length - 1] === ";" ||
-        arr[arr.length - 1] === "\\;" ||
-        arr[arr.length - 1] === "+" ||
-        arr[arr.length - 1] === "\\+")
-    ) {
-      return [...arr.slice(0, -1), ...toAdd, arr[arr.length - 1]];
-    }
-    return [...arr, ...toAdd];
-  };
   if (
     base === "simctl" ||
     (base === "xcrun" && String(nextArgs[0] || "").toLowerCase() === "simctl")
@@ -850,12 +841,13 @@ export function buildChildInvocation(
     ]);
     const isQueryOnly = xbArgs.some((a) => queryFlags.has(String(a).toLowerCase()));
     if (
+      base !== "find" &&
       explicitDestinations.length === 0 &&
       !isQueryOnly &&
       lease?.serial &&
       (lease.platform || "android") === "ios"
     ) {
-      nextArgs = appendArgsBeforeFindTerminator(nextArgs, "-destination", `id=${lease.serial}`);
+      nextArgs = [...nextArgs, "-destination", `id=${lease.serial}`];
     }
   }
 
@@ -1746,20 +1738,6 @@ export function buildChildInvocation(
             if (sepAfter === "|") {
               prevPipeOutputTokens = extractStaticPipeOutputTokens(rawTokens, curShellEnv);
             }
-            const appendFlagsToCorePart = (cp, flagsStr) => {
-              const trimmedCp = cp.trimEnd();
-              const findTermMatch =
-                rawTokens.some((t) => {
-                  const ct = stripSentinels(t);
-                  return (
-                    ct === "-exec" || ct === "-execdir" || ct === "-ok" || ct === "-okdir"
-                  );
-                }) && trimmedCp.match(/^(.*?\S)(\s+(?:\\;|;|\\\+|\+))$/s);
-              if (findTermMatch) {
-                return `${findTermMatch[1]} ${flagsStr}${findTermMatch[2]}`;
-              }
-              return `${trimmedCp} ${flagsStr}`;
-            };
             const peeled = peelBuildWrapperTokens(rawTokens[0], rawTokens.slice(1), {
               env: curShellEnv,
               inShell: true,
@@ -1859,6 +1837,27 @@ export function buildChildInvocation(
             if (cClass.kind === "deny_lifecycle") {
               throw new Error(cClass.reason);
             }
+            const isFindExecClause =
+              rawTokens.some(
+                (t) =>
+                  (stripSentinels(t).split(/[\\/]/).pop() || "").toLowerCase() === "find",
+              ) &&
+              rawTokens.some((t) => {
+                const ct = stripSentinels(t);
+                return ct === "-exec" || ct === "-execdir" || ct === "-ok" || ct === "-okdir";
+              });
+            if (isFindExecClause) {
+              const findRewritten = injectFindExecFlagsIntoShellClause(
+                corePart,
+                makeFindExecFlagPlanner({ jobsLimit, ramLimitMb, lease }),
+                { env: curShellEnv, taintedVars: taintedEnvVars, shellType },
+              );
+              popSubshells();
+              rewrittenParts[idx] = findRewritten
+                ? `${findRewritten}${redirSuffix}${trailingWs}`
+                : part;
+              continue;
+            }
             if (cClass.tool === "xcodebuild" && (cClass.requiresHeavySlot || cClass.requiresDevice)) {
               const explicitDestinations = [];
               for (let i = 0; i < cArgs.length; i++) {
@@ -1906,7 +1905,7 @@ export function buildChildInvocation(
               }
               popSubshells();
               if (xcodeInjected.length > 0) {
-                rewrittenParts[idx] = `${appendFlagsToCorePart(corePart, xcodeInjected.join(" "))}${redirSuffix}${trailingWs}`;
+                rewrittenParts[idx] = `${corePart.trimEnd()} ${xcodeInjected.join(" ")}${redirSuffix}${trailingWs}`;
                 continue;
               }
               rewrittenParts[idx] = part;
@@ -1928,7 +1927,7 @@ export function buildChildInvocation(
               });
               popSubshells();
               if (!hasWorkersFlag) {
-                rewrittenParts[idx] = `${appendFlagsToCorePart(corePart, `-Dorg.gradle.workers.max=${jobsLimit}`)}${redirSuffix}${trailingWs}`;
+                rewrittenParts[idx] = `${corePart.trimEnd()} -Dorg.gradle.workers.max=${jobsLimit}${redirSuffix}${trailingWs}`;
                 continue;
               }
               rewrittenParts[idx] = part;
@@ -2029,6 +2028,14 @@ export function buildChildInvocation(
           nextArgs[cIdx + 1] = rewrittenScript;
         }
       }
+    } else if (base === "find") {
+      const findInsertions = computeFindExecInsertions(
+        nextArgs.map((a) => String(a)),
+        makeFindExecFlagPlanner({ jobsLimit, ramLimitMb, lease }),
+      );
+      if (findInsertions.length > 0) {
+        nextArgs = applyFindExecInsertions(nextArgs, findInsertions);
+      }
     } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "gradle") {
       const hasWorkersFlag = nextArgs.some((a) => {
         const s = String(a);
@@ -2048,7 +2055,7 @@ export function buildChildInvocation(
         if (dashDash !== -1) {
           nextArgs = [...nextArgs.slice(0, dashDash), flag, ...nextArgs.slice(dashDash)];
         } else {
-          nextArgs = appendArgsBeforeFindTerminator(nextArgs, flag);
+          nextArgs = [...nextArgs, flag];
         }
       }
     } else if (buildClassified.requiresHeavySlot && buildClassified.tool === "bazel") {
@@ -2089,7 +2096,7 @@ export function buildChildInvocation(
         return s === "-jobs" || s.startsWith("-jobs=");
       });
       if (!hasJobs) {
-        nextArgs = appendArgsBeforeFindTerminator(nextArgs, "-jobs", String(jobsLimit));
+        nextArgs = [...nextArgs, "-jobs", String(jobsLimit)];
       }
     }
   }
