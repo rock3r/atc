@@ -4,19 +4,19 @@ Ask the user before installing global packages or modifying agent configuration.
 
 ## 1. Install the `atc` CLI
 
-Requires Node.js 20 or newer (`node --version`) on macOS, Linux, or Windows:
+Install Node.js 20 or newer on macOS, Linux, or Windows. Check the version with `node --version`.
 
 ```bash
 npm install -g @rock3r/atc
 ```
 
-Or install directly from a local checkout:
+To install a local checkout, use its path:
 
 ```bash
 npm install -g /path/to/atc
 ```
 
-Verify the CLI and inspect your Android fleet:
+Check that the CLI runs and lists devices:
 
 ```bash
 atc --help
@@ -24,11 +24,11 @@ atc status
 atc guide
 ```
 
-## 2. Install the Agent Plugin (Skills + Guardrail Hooks)
+## 2. Install the agent plugin and hooks
 
 ### Claude Code
 
-Add the marketplace and install the `atc` plugin (installs both the `atc` skill and the `PreToolUse` / `SessionEnd` hooks):
+Add the marketplace and install the plugin. Claude Code loads the `atc` skill and the `PreToolUse` / `SessionEnd` hooks:
 
 ```text
 /plugin marketplace add rock3r/atc
@@ -46,24 +46,26 @@ codex plugin add atc@atc
 
 ### GitHub Copilot CLI & Copilot app
 
-Add the marketplace and install the `atc` plugin (the root `plugin.json` is an Agent Plugins 1.0 manifest; Copilot loads the skill from `skills/atc/`, the `preToolUse` / `sessionEnd` hooks from `com.github.copilot/hooks/hooks.json`, and the `atc mcp` server from `mcp.json`):
+Add the marketplace and install the plugin. The root `plugin.json` uses Agent Plugins 1.0. Copilot loads `skills/atc/`, the `preToolUse` / `sessionEnd` hooks in `com.github.copilot/hooks/hooks.json`, and the `atc mcp` server in `mcp.json`:
 
 ```bash
 copilot plugin marketplace add rock3r/atc
 copilot plugin install atc@atc
 ```
 
-To test a local checkout, pass its path to `copilot plugin marketplace add` instead. Run `copilot plugin marketplace update` and reinstall after updating, because Copilot caches plugin components. The hooks locate the globally installed `atc` CLI, so step 1 is required.
+To test a local checkout, pass its path to `copilot plugin marketplace add`. Copilot caches plugin components. After an update, run `copilot plugin marketplace update` and reinstall. Complete step 1 first because the hooks use the globally installed CLI.
 
-Copilot fires `sessionEnd` with `reason: "complete"` after every agent turn, so `atc` keeps the lease on that reason and releases it only on a terminal reason (`user_exit`, `abort`, `error`, `timeout`). Archiving a Copilot app session sends no hook event; its lease is reclaimed by TTL expiry (`defaultTtlSec`, 600 s by default), or run `atc free` before closing. Quitting the Copilot app releases its leases on the next `atc` invocation (dead-anchor GC). Long-running `atc exec` commands are never cut off by the TTL, because the worker heartbeat keeps the lease alive.
+Copilot sends `sessionEnd` with `reason: "complete"` after each agent turn. `atc` keeps the lease for this reason. It releases leases for terminal reasons: `user_exit`, `abort`, `error`, and `timeout`.
+
+Archiving a Copilot app session sends no hook event. Its lease expires after its time to live (TTL), controlled by `defaultTtlSec` (600 seconds by default). Run `atc free` before closing to release it immediately. After the app quits, the next `atc` command reclaims leases whose anchor process has died. Worker heartbeats keep leases alive during long-running `atc exec` commands.
 
 ### VS Code (GitHub Copilot agent mode)
 
-Experimental: VS Code hooks are in Preview. VS Code can load Claude-format plugins (`.claude-plugin/plugin.json` + `hooks/hooks.json`), or you can enable `chat.useClaudeHooks` and wire `atc hook pre-tool-use` / `atc hook stop` in `.claude/settings.json`.
+VS Code hooks are experimental and in Preview. VS Code can load Claude-format plugins (`.claude-plugin/plugin.json` and `hooks/hooks.json`). Another option is to enable `chat.useClaudeHooks` and configure `atc hook pre-tool-use` / `atc hook stop` in `.claude/settings.json`.
 
 ### Antigravity
 
-Copy or symlink the `atc` package/repository root into `~/.gemini/config/plugins/atc` (or register its `plugin.json` path in `~/.gemini/plugins.json`). Antigravity automatically loads `plugin.json`, the `skills/atc/SKILL.md` skill, the `PreToolUse` / `Stop` session hooks in `hooks.json`, and the `atc mcp` server in `mcp_config.json`:
+Copy or symlink the package or repository root into `~/.gemini/config/plugins/atc`. Another option is to register its `plugin.json` path in `~/.gemini/plugins.json`. Antigravity loads `plugin.json`, `skills/atc/SKILL.md`, the `PreToolUse` / `Stop` session hooks in `hooks.json`, and the `atc mcp` server in `mcp_config.json`:
 
 ```bash
 mkdir -p ~/.gemini/config/plugins
@@ -72,7 +74,7 @@ ln -s "$(npm root -g)/@rock3r/atc" ~/.gemini/config/plugins/atc
 
 ### Gemini CLI
 
-Copy or symlink `skills/atc` into your skills directory (`~/.gemini/skills/atc` or `~/.agents/skills/atc`), and wire `atc hook pre-tool-use` / `atc hook stop` in your hook configuration.
+Copy or symlink `skills/atc` to `~/.gemini/skills/atc` or `~/.agents/skills/atc`. Configure `atc hook pre-tool-use` / `atc hook stop` in the host's hook settings.
 
 ### Cursor
 
@@ -80,4 +82,4 @@ Copy `.cursor/hooks.json` into your project's `.cursor/hooks.json` (or user Curs
 
 ### Pi
 
-Load the Pi extension from `extensions/atc/index.ts`, which intercepts `tool_call` and `session_shutdown` events in-process and registers native `atc_*` tools.
+Load `extensions/atc/index.ts`. The Pi extension handles `tool_call` and `session_shutdown` events in the host process and registers native `atc_*` tools.
