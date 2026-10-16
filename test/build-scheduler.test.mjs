@@ -3365,7 +3365,13 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.deepEqual(fullDefaultDaemonProbe.daemonPids, [7020]);
 
     const mismatchedDefaultLocaleProbe = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "en_US.UTF-8" },
+      env: {
+        JAVA_HOME: canonicalMockJdk,
+        GRADLE_USER_HOME: fakeUserHome,
+        LC_ALL: "",
+        LC_MESSAGES: "",
+        LANG: "en_US.UTF-8",
+      },
       runner: () => ({
         stdout: `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
       }),
@@ -3374,7 +3380,13 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
 
     // 11. Round 46: rules_apple ios_simulator_device/version match lease profile metadata, and non-English host locale rejects English daemon
     const frHostRejectsEnDaemon = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" },
+      env: {
+        JAVA_HOME: canonicalMockJdk,
+        GRADLE_USER_HOME: fakeUserHome,
+        LC_ALL: "",
+        LC_MESSAGES: "",
+        LANG: "fr_FR.UTF-8",
+      },
       runner: () => ({
         stdout: `7022 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
       }),
@@ -3382,7 +3394,13 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(frHostRejectsEnDaemon.warm, false);
 
     const frHostAcceptsFrDaemon = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" },
+      env: {
+        JAVA_HOME: canonicalMockJdk,
+        GRADLE_USER_HOME: fakeUserHome,
+        LC_ALL: "",
+        LC_MESSAGES: "",
+        LANG: "fr_FR.UTF-8",
+      },
       runner: () => ({
         stdout: `7023 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
       }),
@@ -3393,10 +3411,24 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       "env",
       ["LANG=fr_FR.UTF-8", "./gradlew", "assembleDebug"],
       dirB,
-      { env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "en_US.UTF-8" } },
+      {
+        env: {
+          JAVA_HOME: canonicalMockJdk,
+          GRADLE_USER_HOME: fakeUserHome,
+          LC_ALL: "",
+          LC_MESSAGES: "",
+          LANG: "en_US.UTF-8",
+        },
+      },
     );
     const wrappedFrRejectsEnDaemon = probeWarmBuildDaemons(wrappedFrGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "en_US.UTF-8" },
+      env: {
+        JAVA_HOME: canonicalMockJdk,
+        GRADLE_USER_HOME: fakeUserHome,
+        LC_ALL: "",
+        LC_MESSAGES: "",
+        LANG: "en_US.UTF-8",
+      },
       runner: () => ({
         stdout: `7024 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
       }),
@@ -3407,10 +3439,24 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       "env",
       ["-u", "LANG", "./gradlew", "assembleDebug"],
       dirB,
-      { env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" } },
+      {
+        env: {
+          JAVA_HOME: canonicalMockJdk,
+          GRADLE_USER_HOME: fakeUserHome,
+          LC_ALL: "",
+          LC_MESSAGES: "",
+          LANG: "fr_FR.UTF-8",
+        },
+      },
     );
     const wrappedUnsetRejectsFrDaemon = probeWarmBuildDaemons(wrappedUnsetLangReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome, LANG: "fr_FR.UTF-8" },
+      env: {
+        JAVA_HOME: canonicalMockJdk,
+        GRADLE_USER_HOME: fakeUserHome,
+        LC_ALL: "",
+        LC_MESSAGES: "",
+        LANG: "fr_FR.UTF-8",
+      },
       runner: () => ({
         stdout: `7025 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
       }),

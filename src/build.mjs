@@ -5920,25 +5920,15 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
           ...baseProbeEnv,
           LC_ALL: buildReqs.envLcAllUnset
             ? ""
-            : buildReqs.envLcAll ||
-              (options.env && "LC_ALL" in options.env
-                ? options.env.LC_ALL
-                : process.env.LC_ALL) ||
-              "",
+            : buildReqs.envLcAll || baseProbeEnv.LC_ALL || "",
           LC_MESSAGES: buildReqs.envLcMessagesUnset
             ? ""
-            : buildReqs.envLcMessages ||
-              (options.env && "LC_MESSAGES" in options.env
-                ? options.env.LC_MESSAGES
-                : process.env.LC_MESSAGES) ||
-              "",
+            : buildReqs.envLcMessages || baseProbeEnv.LC_MESSAGES || "",
           LANG: buildReqs.envLangUnset
             ? ""
-            : buildReqs.envLang ||
-              (options.env && "LANG" in options.env ? options.env.LANG : process.env.LANG) ||
-              "",
+            : buildReqs.envLang || baseProbeEnv.LANG || "",
         }
-      : options.env;
+      : baseProbeEnv;
     const matchesCmdPathBoundary = (cmdLine, targetPath, { allowSubpath = false } = {}) => {
       if (!cmdLine || !targetPath) return false;
       const cleanTarget = String(targetPath).replace(/[\\/]+$/, "");
