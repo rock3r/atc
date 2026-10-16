@@ -3704,7 +3704,7 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(readOnlyHereStringBatch.exitCode, 3);
     assert.match(readOnlyHereStringBatch.error, /Phase conflict:.*violates --phase=read-only/);
 
-    // 14. Round 51: .bazelversion major version propagation for macOS warm daemon probing + busy Gradle daemon exclusion
+    // 14. Round 51-52: .bazelversion major version propagation for Bazelisk vs direct bazel, busy/incompatible Gradle daemon exclusion, and Cursor build hook denial
     const bvDir = path.join(wsDir, "bazel9-ws");
     fs.mkdirSync(bvDir, { recursive: true });
     fs.writeFileSync(path.join(bvDir, "MODULE.bazel"), 'module(name = "b9")\n');
@@ -3712,7 +3712,7 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     const canonicalBvDir = (fs.realpathSync.native || fs.realpathSync)(bvDir);
 
     const bvDarwinReqs = resolveBuildResources(
-      "bazel",
+      "bazelisk",
       ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
       bvDir,
       { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
@@ -3733,6 +3733,16 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(bvDarwinWarmProbe.warm, true);
     assert.deepEqual(bvDarwinWarmProbe.daemonPids, [9601]);
 
+    // Direct `/opt/bazel-8/bin/bazel` binary does not read .bazelversion and stays ambiguous on macOS
+    const directBazelDarwinReqs = resolveBuildResources(
+      "/opt/bazel-8/bin/bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bvDir,
+      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
+    );
+    assert.equal(directBazelDarwinReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(directBazelDarwinReqs.defaultBazelOutputBases, []);
+
     // Busy Gradle daemon is not double-counted as warm for a concurrent Gradle build
     const busyGradleProbeSingle = probeWarmBuildDaemons(defaultGradleReqs, {
       env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
@@ -3752,6 +3762,26 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     });
     assert.equal(busyGradleProbeSingle.warm, false);
     assert.deepEqual(busyGradleProbeSingle.daemonPids, []);
+
+    // Active Gradle lease holding a known incompatible daemon PID (8001) does not consume compatible idle daemon (7020)
+    const incompatibleBusyGradleProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      activeBuildLeases: {
+        build_other_gradle_jdk: {
+          buildId: "build_other_gradle_jdk",
+          tool: "gradle",
+          requiresHeavySlot: true,
+          state: "active",
+          preparingDevice: false,
+          claimedDaemonPid: 8001,
+        },
+      },
+      runner: () => ({
+        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(incompatibleBusyGradleProbe.warm, true);
+    assert.deepEqual(incompatibleBusyGradleProbe.daemonPids, [7020]);
 
     const busyGradleProbeTwoDaemons = probeWarmBuildDaemons(defaultGradleReqs, {
       env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
@@ -3786,6 +3816,20 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     });
     assert.equal(busyGradleClientPsProbe.warm, false);
     assert.deepEqual(busyGradleClientPsProbe.daemonPids, []);
+
+    // Cursor hook blocks pure build when coordinateBuilds is enabled because Cursor cannot rewrite commands
+    const cursorBuildHookRes = handlePreToolUseHook(
+      stateDir,
+      JSON.stringify({
+        conversation_id: "cursor-conv-build",
+        command: "./gradlew build",
+      }),
+      { coordinateBuilds: true },
+    );
+    assert.equal(cursorBuildHookRes.exitCode, 2);
+    const cursorOut = JSON.parse(cursorBuildHookRes.stdout);
+    assert.equal(cursorOut.permission, "deny");
+    assert.match(cursorOut.agent_message, /atc exec --build -- \.\/gradlew build/);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

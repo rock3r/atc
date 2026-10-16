@@ -359,23 +359,32 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
         platform: options.platform,
       });
 
-      if (guardRes.allowed && norm.hostFormat === "cursor" && guardRes.hasDirectDeviceAction) {
+      if (
+        guardRes.allowed &&
+        norm.hostFormat === "cursor" &&
+        (guardRes.hasDirectDeviceAction || guardRes.hasDirectBuildAction)
+      ) {
+        const isDeviceAction = Boolean(guardRes.hasDirectDeviceAction);
         if (Array.isArray(auditEvents)) {
           auditEvents.push({
             event: "guard_deny",
             sessionId: norm.sessionId,
             hostFormat: norm.hostFormat,
             command: norm.command,
-            reason: "cursor_cannot_rewrite_device_action",
+            reason: isDeviceAction
+              ? "cursor_cannot_rewrite_device_action"
+              : "cursor_cannot_rewrite_build_action",
           });
         }
         return {
           mutated: true,
           value: {
             allowed: false,
-            reason:
-              `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to attach a lease heartbeat.\n` +
-              `  Run device commands via: atc exec -- ${norm.command}`,
+            reason: isDeviceAction
+              ? `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to attach a lease heartbeat.\n` +
+                `  Run device commands via: atc exec -- ${norm.command}`
+              : `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to coordinate build resources.\n` +
+                `  Run build commands via: atc exec --build -- ${norm.command}`,
             rewrittenCommand: null,
           },
         };

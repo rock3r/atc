@@ -6397,6 +6397,7 @@ export function evaluateCommandGuard(
     fastPath: false,
     rewrittenCommand,
     hasDirectDeviceAction: hasDeviceAction,
+    hasDirectBuildAction: Boolean(hasBuildAction && coordinateBuilds),
     renewLease: hasDeviceAction && onlineLeases.length > 0,
     targetSerial: serialList && serialList.length === 1 ? serialList[0] : null,
     targetSerials: serialList,

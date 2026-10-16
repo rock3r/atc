@@ -3800,6 +3800,7 @@ export function resolveBuildResources(
     platform = undefined,
     bazelMajorVersion = undefined,
     bazelVersion = undefined,
+    isBazelisk = undefined,
   } = {},
 ) {
   const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
@@ -4516,33 +4517,62 @@ export function resolveBuildResources(
       };
     };
 
+    const isBazeliskLauncher = (() => {
+      if (typeof isBazelisk === "boolean") return isBazelisk;
+      const cleanedCmd = stripLiteralSentinels(String(cmd || "")).trim().replace(/^@+/, "");
+      const baseCmd = (cleanedCmd.split(/[\\/]/).pop() || "")
+        .toLowerCase()
+        .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
+      if (baseCmd === "bazelisk" || baseCmd === "bazelw") return true;
+      if (baseCmd === "bazel" && (cleanedCmd.includes("/") || cleanedCmd.includes("\\"))) {
+        try {
+          const candidatePath = path.resolve(baseCwd, cleanedCmd);
+          if (fs.existsSync(candidatePath)) {
+            const real = (fs.realpathSync.native || fs.realpathSync)(candidatePath);
+            const realBase = (real.split(/[\\/]/).pop() || "")
+              .toLowerCase()
+              .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
+            if (realBase.includes("bazelisk") || realBase === "bazelw") {
+              return true;
+            }
+          }
+        } catch {
+          // Ignore realpath errors
+        }
+      }
+      return false;
+    })();
     const rawUseBazelVersion =
       effectiveEnvVars.USE_BAZEL_VERSION === null || effectiveEnvVars.USE_BAZEL_VERSION === ""
         ? null
         : effectiveEnvVars.USE_BAZEL_VERSION || baseEnv.USE_BAZEL_VERSION || null;
-    const dotBazelversionRaw = (() => {
-      try {
-        const bvPath = path.join(canonicalRoot, ".bazelversion");
-        if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
-          const firstLine = fs
-            .readFileSync(bvPath, "utf8")
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .find((l) => Boolean(l) && !l.startsWith("#"));
-          return firstLine || null;
-        }
-      } catch {
-        // Ignore unreadable .bazelversion
-      }
-      return null;
-    })();
+    const dotBazelversionRaw = isBazeliskLauncher
+      ? (() => {
+          try {
+            const bvPath = path.join(canonicalRoot, ".bazelversion");
+            if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
+              const firstLine = fs
+                .readFileSync(bvPath, "utf8")
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .find((l) => Boolean(l) && !l.startsWith("#"));
+              return firstLine || null;
+            }
+          } catch {
+            // Ignore unreadable .bazelversion
+          }
+          return null;
+        })()
+      : null;
     const bazelVersionRange =
       parseBazelVersionRange(bazelVersion) ||
       parseBazelVersionRange(bazelMajorVersion) ||
-      (rawUseBazelVersion && rawUseBazelVersion !== "__UNRESOLVED_DYNAMIC_ENV__"
+      (isBazeliskLauncher &&
+      rawUseBazelVersion &&
+      rawUseBazelVersion !== "__UNRESOLVED_DYNAMIC_ENV__"
         ? parseBazelVersionRange(rawUseBazelVersion)
         : null) ||
-      parseBazelVersionRange(dotBazelversionRaw);
+      (isBazeliskLauncher ? parseBazelVersionRange(dotBazelversionRaw) : null);
 
     const rawBazelMajor =
       bazelVersionRange?.major ??
@@ -4980,6 +5010,7 @@ export function resolveBuildResources(
     const bazelEnvMeta = {
       baseCwd,
       platform: platform || process.platform,
+      isBazelisk: isBazeliskLauncher,
       bazelMajorVersion: resolvedBazelMajorVersion,
       envBazelTestTmpdir: effectiveEnvVars.TEST_TMPDIR,
       envBazelUser: effectiveEnvVars.USER,
@@ -4998,6 +5029,7 @@ export function resolveBuildResources(
         buildReqs: bazelEnvMeta,
         env: baseEnv,
         platform: platform || process.platform,
+        isBazelisk: isBazeliskLauncher,
         bazelMajorVersion: resolvedBazelMajorVersion,
       }),
       workspaceRoot: canonicalRoot,
@@ -5896,30 +5928,35 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
   const platform = options.platform || buildReqs?.platform || process.platform;
   const baseCwd = buildReqs?.baseCwd || process.cwd();
   let rawMajor = options.bazelMajorVersion ?? buildReqs?.bazelMajorVersion ?? null;
+  const allowBazeliskFallback = Boolean(options.isBazelisk ?? buildReqs?.isBazelisk);
   if (rawMajor === null || rawMajor === undefined || rawMajor === "") {
     const rawVerStr =
       options.bazelVersion ||
       buildReqs?.bazelVersion ||
-      (env?.USE_BAZEL_VERSION && env.USE_BAZEL_VERSION !== "__UNRESOLVED_DYNAMIC_ENV__"
+      (allowBazeliskFallback &&
+      env?.USE_BAZEL_VERSION &&
+      env.USE_BAZEL_VERSION !== "__UNRESOLVED_DYNAMIC_ENV__"
         ? String(env.USE_BAZEL_VERSION)
         : null) ||
-      (() => {
-        try {
-          const bvPath = path.join(String(wsRoot), ".bazelversion");
-          if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
-            return (
-              fs
-                .readFileSync(bvPath, "utf8")
-                .split(/\r?\n/)
-                .map((l) => l.trim())
-                .find((l) => Boolean(l) && !l.startsWith("#")) || null
-            );
-          }
-        } catch {
-          // Ignore unreadable .bazelversion
-        }
-        return null;
-      })();
+      (allowBazeliskFallback
+        ? (() => {
+            try {
+              const bvPath = path.join(String(wsRoot), ".bazelversion");
+              if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
+                return (
+                  fs
+                    .readFileSync(bvPath, "utf8")
+                    .split(/\r?\n/)
+                    .map((l) => l.trim())
+                    .find((l) => Boolean(l) && !l.startsWith("#")) || null
+                );
+              }
+            } catch {
+              // Ignore unreadable .bazelversion
+            }
+            return null;
+          })()
+        : null);
     if (rawVerStr) {
       const m = String(rawVerStr)
         .trim()
@@ -6193,18 +6230,37 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
         ? options.busyDaemonPids.map((p) => Number(p)).filter(Boolean)
         : [],
     );
+    let matchedBusyCount = 0;
     let unassignedBusyCount = 0;
     for (const b of activeGradleLeases) {
       const claimedPid =
         Number(b.claimedDaemonPid) ||
         (Array.isArray(b.daemonPids) && b.daemonPids.length === 1 ? Number(b.daemonPids[0]) : 0);
-      if (claimedPid && candidatePids.includes(claimedPid) && !busySet.has(claimedPid)) {
-        busySet.add(claimedPid);
+      if (claimedPid) {
+        if (candidatePids.length === 0) {
+          unassignedBusyCount++;
+          matchedBusyCount++;
+        } else if (candidatePids.includes(claimedPid)) {
+          if (!busySet.has(claimedPid)) {
+            busySet.add(claimedPid);
+          } else {
+            unassignedBusyCount++;
+          }
+          matchedBusyCount++;
+        }
+      } else if (
+        candidatePids.length > 0 &&
+        Array.isArray(b.daemonPids) &&
+        b.daemonPids.length > 0 &&
+        !b.daemonPids.some((pid) => candidatePids.includes(Number(pid)))
+      ) {
+        // Active lease has a known disjoint compatible daemon pool
       } else {
         unassignedBusyCount++;
+        matchedBusyCount++;
       }
     }
-    const extraPsBusy = Math.max(0, psClientCount - activeGradleLeases.length);
+    const extraPsBusy = Math.max(0, psClientCount - matchedBusyCount);
     const remainingPids = candidatePids.filter((pid) => !busySet.has(pid));
     const totalDeductions = unassignedBusyCount + extraPsBusy;
     if (remainingPids.length > 0) {
@@ -6520,6 +6576,30 @@ export function probeWarmBuildDaemons(buildReqs, options = {}) {
             cmdLine,
           )
         ) {
+          const clientFirstTok = splitShellWords(cmdLine)[0] || "";
+          const clientHasExplicitJavaPath =
+            clientFirstTok.includes("/") || clientFirstTok.includes("\\");
+          if (
+            expectedGradleJavaHome &&
+            clientHasExplicitJavaPath &&
+            !matchesCmdPathBoundary(cmdLine, expectedGradleJavaHome, { allowSubpath: true }) &&
+            !matchesCmdPathBoundary(cmdLine, canonicalizeBuildPath(expectedGradleJavaHome), {
+              allowSubpath: true,
+            })
+          ) {
+            continue;
+          }
+          if (cmdLine.includes("-Dgradle.user.home=")) {
+            if (
+              !expectedGradleUserHome ||
+              (!matchesCmdPathBoundary(cmdLine, expectedGradleUserHome, { allowSubpath: true }) &&
+                !matchesCmdPathBoundary(cmdLine, canonicalizeBuildPath(expectedGradleUserHome), {
+                  allowSubpath: true,
+                }))
+            ) {
+              continue;
+            }
+          }
           psGradleClientCount++;
           continue;
         }

@@ -6270,9 +6270,16 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
             if (newlyActiveGradle.length > 0) {
               for (const b of newlyActiveGradle) {
                 const claimedPid = Number(b.claimedDaemonPid) || 0;
-                const idx = claimedPid ? effectiveDaemonPids.indexOf(claimedPid) : -1;
-                if (idx >= 0) {
-                  effectiveDaemonPids.splice(idx, 1);
+                if (claimedPid) {
+                  const idx = effectiveDaemonPids.indexOf(claimedPid);
+                  if (idx >= 0) {
+                    effectiveDaemonPids.splice(idx, 1);
+                  } else if (
+                    !Array.isArray(warmDaemonProbe.daemonPids) ||
+                    warmDaemonProbe.daemonPids.length === 0
+                  ) {
+                    effectiveWarmDaemon = false;
+                  }
                 } else if (effectiveDaemonPids.length > 0) {
                   effectiveDaemonPids.shift();
                 } else {
