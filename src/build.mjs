@@ -3787,6 +3787,88 @@ function findNearestMarkerAncestor(startDir, markerFiles) {
   return null;
 }
 
+function readBazeliskRcUseBazelVersion(rcFilePath) {
+  if (!rcFilePath) return null;
+  try {
+    if (!fs.existsSync(rcFilePath) || !fs.statSync(rcFilePath).isFile()) return null;
+    const lines = fs.readFileSync(rcFilePath, "utf8").split(/\r?\n/);
+    let found = null;
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx <= 0) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (key !== "USE_BAZEL_VERSION") continue;
+      let val = trimmed.slice(eqIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1).trim();
+      }
+      found = val;
+    }
+    return found || null;
+  } catch {
+    return null;
+  }
+}
+
+function readDotBazelversion(wsRoot) {
+  if (!wsRoot) return null;
+  try {
+    const bvPath = path.join(String(wsRoot), ".bazelversion");
+    if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
+      const firstLine = fs
+        .readFileSync(bvPath, "utf8")
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => Boolean(l) && !l.startsWith("#"));
+      return firstLine || null;
+    }
+  } catch {
+    // Ignore unreadable .bazelversion
+  }
+  return null;
+}
+
+function resolveBazeliskVersionSelector(
+  wsRoot,
+  {
+    rawUseBazelVersion = null,
+    rawHome = null,
+    baseCwd = process.cwd(),
+    platform = process.platform,
+  } = {},
+) {
+  if (rawUseBazelVersion) {
+    return String(rawUseBazelVersion).trim();
+  }
+  if (wsRoot) {
+    const wsRcVer = readBazeliskRcUseBazelVersion(path.join(String(wsRoot), ".bazeliskrc"));
+    if (wsRcVer) return wsRcVer;
+  }
+  if (rawHome === "__UNRESOLVED_DYNAMIC_ENV__") {
+    return "__UNRESOLVED_DYNAMIC_ENV__";
+  }
+  if (rawHome) {
+    const resolvedHome =
+      platform === "win32" &&
+      (/^[a-zA-Z]:[\\/]/.test(rawHome) || String(rawHome).startsWith("\\\\"))
+        ? path.win32.resolve(String(rawHome))
+        : path.resolve(baseCwd || process.cwd(), String(rawHome));
+    const homeRcPath =
+      platform === "win32" &&
+      (/^[a-zA-Z]:[\\/]/.test(resolvedHome) || resolvedHome.startsWith("\\\\"))
+        ? path.win32.join(resolvedHome, ".bazeliskrc")
+        : path.join(resolvedHome, ".bazeliskrc");
+    const homeRcVer = readBazeliskRcUseBazelVersion(homeRcPath);
+    if (homeRcVer) return homeRcVer;
+  }
+  return readDotBazelversion(wsRoot);
+}
+
 export function resolveBuildResources(
   rawCmd,
   rawArgs = [],
@@ -4497,7 +4579,9 @@ export function resolveBuildResources(
     const parseBazelVersionRange = (rawVer) => {
       if (rawVer === null || rawVer === undefined || rawVer === "") return null;
       const s = String(rawVer).trim();
-      const m = s.match(/^v?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?(?:[-+][A-Za-z0-9_.-]+)?$/i);
+      const m = s.match(
+        /^(?:[A-Za-z0-9_.-]+\/)?v?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?(?:[-+][A-Za-z0-9_.-]+)?$/i,
+      );
       if (!m) return null;
       const maj = Number(m[1]);
       if (!Number.isFinite(maj) || maj <= 0) return null;
@@ -4520,24 +4604,74 @@ export function resolveBuildResources(
     const isBazeliskLauncher = (() => {
       if (typeof isBazelisk === "boolean") return isBazelisk;
       const cleanedCmd = stripLiteralSentinels(String(cmd || "")).trim().replace(/^@+/, "");
-      const baseCmd = (cleanedCmd.split(/[\\/]/).pop() || "")
-        .toLowerCase()
-        .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
+      const rawCmdLeaf = cleanedCmd.split(/[\\/]/).pop() || "";
+      const baseCmd = rawCmdLeaf.toLowerCase().replace(/\.(exe|cmd|bat|com|sh)$/i, "");
       if (baseCmd === "bazelisk" || baseCmd === "bazelw") return true;
-      if (baseCmd === "bazel" && (cleanedCmd.includes("/") || cleanedCmd.includes("\\"))) {
+      const checkCandidateIsBazelisk = (candidatePath) => {
         try {
-          const candidatePath = path.resolve(baseCwd, cleanedCmd);
-          if (fs.existsSync(candidatePath)) {
-            const real = (fs.realpathSync.native || fs.realpathSync)(candidatePath);
-            const realBase = (real.split(/[\\/]/).pop() || "")
-              .toLowerCase()
-              .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
-            if (realBase.includes("bazelisk") || realBase === "bazelw") {
-              return true;
+          if (!fs.existsSync(candidatePath) || !fs.statSync(candidatePath).isFile()) {
+            return null;
+          }
+          const real = (fs.realpathSync.native || fs.realpathSync)(candidatePath);
+          const realBase = (real.split(/[\\/]/).pop() || "")
+            .toLowerCase()
+            .replace(/\.(exe|cmd|bat|com|sh)$/i, "");
+          return (
+            realBase.includes("bazelisk") ||
+            realBase === "bazelw" ||
+            /[\\/]bazelisk[\\/]/i.test(real)
+          );
+        } catch {
+          return null;
+        }
+      };
+      if (baseCmd === "bazel") {
+        if (cleanedCmd.includes("/") || cleanedCmd.includes("\\")) {
+          return Boolean(checkCandidateIsBazelisk(path.resolve(baseCwd, cleanedCmd)));
+        }
+        const effPlatform = platform || process.platform;
+        if (
+          effectiveEnvVars.PATH === "__UNRESOLVED_DYNAMIC_ENV__" ||
+          (effPlatform === "win32" && effectiveEnvVars.Path === "__UNRESOLVED_DYNAMIC_ENV__")
+        ) {
+          return false;
+        }
+        const rawPathEnv =
+          effectiveEnvVars.PATH === null || effectiveEnvVars.PATH === ""
+            ? ""
+            : effectiveEnvVars.PATH !== undefined
+              ? String(effectiveEnvVars.PATH)
+              : effPlatform === "win32" &&
+                  (effectiveEnvVars.Path === null || effectiveEnvVars.Path === "")
+                ? ""
+                : effPlatform === "win32" && effectiveEnvVars.Path !== undefined
+                  ? String(effectiveEnvVars.Path)
+                  : String(
+                      baseEnv.PATH ?? (effPlatform === "win32" ? baseEnv.Path : "") ?? "",
+                    );
+        if (rawPathEnv) {
+          const pathSep =
+            rawPathEnv.includes(";") ||
+            (effPlatform === "win32" && /^[A-Za-z]:[\\/]/.test(rawPathEnv))
+              ? ";"
+              : ":";
+          const exeCandidates =
+            effPlatform === "win32" || process.platform === "win32"
+              ? Array.from(
+                  new Set([rawCmdLeaf || "bazel", "bazel.exe", "bazel.cmd", "bazel.bat", "bazel"]),
+                )
+              : [rawCmdLeaf || "bazel"];
+          for (const rawDir of rawPathEnv.split(pathSep)) {
+            const cleanedDir = rawDir.trim().replace(/^"+|"+$/g, "");
+            if (!cleanedDir) continue;
+            const resolvedDir = path.resolve(baseCwd, cleanedDir);
+            for (const exeName of exeCandidates) {
+              const res = checkCandidateIsBazelisk(path.join(resolvedDir, exeName));
+              if (res !== null) {
+                return res;
+              }
             }
           }
-        } catch {
-          // Ignore realpath errors
         }
       }
       return false;
@@ -4546,33 +4680,45 @@ export function resolveBuildResources(
       effectiveEnvVars.USE_BAZEL_VERSION === null || effectiveEnvVars.USE_BAZEL_VERSION === ""
         ? null
         : effectiveEnvVars.USE_BAZEL_VERSION || baseEnv.USE_BAZEL_VERSION || null;
-    const dotBazelversionRaw = isBazeliskLauncher
-      ? (() => {
-          try {
-            const bvPath = path.join(canonicalRoot, ".bazelversion");
-            if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
-              const firstLine = fs
-                .readFileSync(bvPath, "utf8")
-                .split(/\r?\n/)
-                .map((l) => l.trim())
-                .find((l) => Boolean(l) && !l.startsWith("#"));
-              return firstLine || null;
-            }
-          } catch {
-            // Ignore unreadable .bazelversion
-          }
-          return null;
-        })()
+    const effectiveHomeForBazelisk = (() => {
+      const effPlatform = platform || process.platform;
+      if (effPlatform === "win32") {
+        if (
+          effectiveEnvVars.HOME === "__UNRESOLVED_DYNAMIC_ENV__" ||
+          effectiveEnvVars.USERPROFILE === "__UNRESOLVED_DYNAMIC_ENV__"
+        ) {
+          return "__UNRESOLVED_DYNAMIC_ENV__";
+        }
+        return effectiveEnvVars.HOME === null || effectiveEnvVars.HOME === ""
+          ? null
+          : effectiveEnvVars.HOME !== undefined
+            ? String(effectiveEnvVars.HOME)
+            : effectiveEnvVars.USERPROFILE === null || effectiveEnvVars.USERPROFILE === ""
+              ? null
+              : effectiveEnvVars.USERPROFILE !== undefined
+                ? String(effectiveEnvVars.USERPROFILE)
+                : baseEnv.HOME || baseEnv.USERPROFILE || os.homedir() || null;
+      }
+      return effectiveEnvVars.HOME === null || effectiveEnvVars.HOME === ""
+        ? null
+        : effectiveEnvVars.HOME || baseEnv.HOME || os.homedir() || null;
+    })();
+    const winningBazeliskSelector = isBazeliskLauncher
+      ? resolveBazeliskVersionSelector(canonicalRoot, {
+          rawUseBazelVersion,
+          rawHome: effectiveHomeForBazelisk,
+          baseCwd,
+          platform: platform || process.platform,
+        })
       : null;
     const bazelVersionRange =
       parseBazelVersionRange(bazelVersion) ||
       parseBazelVersionRange(bazelMajorVersion) ||
       (isBazeliskLauncher &&
-      rawUseBazelVersion &&
-      rawUseBazelVersion !== "__UNRESOLVED_DYNAMIC_ENV__"
-        ? parseBazelVersionRange(rawUseBazelVersion)
-        : null) ||
-      (isBazeliskLauncher ? parseBazelVersionRange(dotBazelversionRaw) : null);
+      winningBazeliskSelector &&
+      winningBazeliskSelector !== "__UNRESOLVED_DYNAMIC_ENV__"
+        ? parseBazelVersionRange(winningBazeliskSelector)
+        : null);
 
     const rawBazelMajor =
       bazelVersionRange?.major ??
@@ -5012,6 +5158,7 @@ export function resolveBuildResources(
       platform: platform || process.platform,
       isBazelisk: isBazeliskLauncher,
       bazelMajorVersion: resolvedBazelMajorVersion,
+      envBazelUseBazelVersion: effectiveEnvVars.USE_BAZEL_VERSION,
       envBazelTestTmpdir: effectiveEnvVars.TEST_TMPDIR,
       envBazelUser: effectiveEnvVars.USER,
       envBazelUsername: effectiveEnvVars.USERNAME,
@@ -5927,49 +6074,6 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
   const env = options.env || process.env;
   const platform = options.platform || buildReqs?.platform || process.platform;
   const baseCwd = buildReqs?.baseCwd || process.cwd();
-  let rawMajor = options.bazelMajorVersion ?? buildReqs?.bazelMajorVersion ?? null;
-  const allowBazeliskFallback = Boolean(options.isBazelisk ?? buildReqs?.isBazelisk);
-  if (rawMajor === null || rawMajor === undefined || rawMajor === "") {
-    const rawVerStr =
-      options.bazelVersion ||
-      buildReqs?.bazelVersion ||
-      (allowBazeliskFallback &&
-      env?.USE_BAZEL_VERSION &&
-      env.USE_BAZEL_VERSION !== "__UNRESOLVED_DYNAMIC_ENV__"
-        ? String(env.USE_BAZEL_VERSION)
-        : null) ||
-      (allowBazeliskFallback
-        ? (() => {
-            try {
-              const bvPath = path.join(String(wsRoot), ".bazelversion");
-              if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
-                return (
-                  fs
-                    .readFileSync(bvPath, "utf8")
-                    .split(/\r?\n/)
-                    .map((l) => l.trim())
-                    .find((l) => Boolean(l) && !l.startsWith("#")) || null
-                );
-              }
-            } catch {
-              // Ignore unreadable .bazelversion
-            }
-            return null;
-          })()
-        : null);
-    if (rawVerStr) {
-      const m = String(rawVerStr)
-        .trim()
-        .match(
-          /^(?:[A-Za-z0-9_.-]+\/)?v?(\d+)(?:\.(?:\d+|x|\*))?(?:\.(?:\d+|x|\*))?(?:[-+][A-Za-z0-9_.-]+)?$/i,
-        );
-      if (m) rawMajor = Number(m[1]);
-    }
-  }
-  const bazelMajor =
-    rawMajor !== null && rawMajor !== undefined && rawMajor !== ""
-      ? Number(rawMajor)
-      : null;
 
   const resolveEnvVar = (key, wrapperVal) => {
     if (wrapperVal === null || wrapperVal === "") return null;
@@ -5992,6 +6096,48 @@ export function computeDefaultBazelOutputBases(wsRoot, options = {}) {
       : null;
   const rawHome = platform === "win32" ? rawPosixHome || rawWinUserProfile : rawPosixHome;
   const rawXdgCache = resolveEnvVar("XDG_CACHE_HOME", buildReqs?.envBazelXdgCacheHome);
+  const rawUseBazelVersion = resolveEnvVar(
+    "USE_BAZEL_VERSION",
+    buildReqs?.envBazelUseBazelVersion,
+  );
+
+  let rawMajor = options.bazelMajorVersion ?? buildReqs?.bazelMajorVersion ?? null;
+  const allowBazeliskFallback = Boolean(options.isBazelisk ?? buildReqs?.isBazelisk);
+  if (rawMajor === null || rawMajor === undefined || rawMajor === "") {
+    const rawVerStr =
+      options.bazelVersion ||
+      buildReqs?.bazelVersion ||
+      (allowBazeliskFallback
+        ? resolveBazeliskVersionSelector(wsRoot, {
+            rawUseBazelVersion,
+            rawHome:
+              rawHome ||
+              (() => {
+                try {
+                  return os.userInfo().homedir;
+                } catch {
+                  return null;
+                }
+              })() ||
+              os.homedir() ||
+              null,
+            baseCwd,
+            platform,
+          })
+        : null);
+    if (rawVerStr && rawVerStr !== "__UNRESOLVED_DYNAMIC_ENV__") {
+      const m = String(rawVerStr)
+        .trim()
+        .match(
+          /^(?:[A-Za-z0-9_.-]+\/)?v?(\d+)(?:\.(?:\d+|x|\*))?(?:\.(?:\d+|x|\*))?(?:[-+][A-Za-z0-9_.-]+)?$/i,
+        );
+      if (m) rawMajor = Number(m[1]);
+    }
+  }
+  const bazelMajor =
+    rawMajor !== null && rawMajor !== undefined && rawMajor !== ""
+      ? Number(rawMajor)
+      : null;
 
   if (
     rawTestTmpdir === "__UNRESOLVED_DYNAMIC_ENV__" ||

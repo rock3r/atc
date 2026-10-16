@@ -3743,6 +3743,90 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(directBazelDarwinReqs.bazelMajorVersion, undefined);
     assert.deepEqual(directBazelDarwinReqs.defaultBazelOutputBases, []);
 
+    // Bare `bazel` resolved through PATH symlink to `bazelisk` reads .bazelversion, whereas bare `bazel` pointing to standalone binary does not
+    const fakeBazeliskBinDir = path.join(wsDir, "fake-bazelisk-bin");
+    fs.mkdirSync(fakeBazeliskBinDir, { recursive: true });
+    const fakeBazeliskExe = path.join(fakeBazeliskBinDir, "bazelisk");
+    fs.writeFileSync(fakeBazeliskExe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    fs.symlinkSync(fakeBazeliskExe, path.join(fakeBazeliskBinDir, "bazel"));
+
+    const pathSymlinkBazelReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bvDir,
+      {
+        platform: "darwin",
+        env: { USER: "alice", HOME: "/Users/alice", PATH: fakeBazeliskBinDir },
+      },
+    );
+    assert.equal(pathSymlinkBazelReqs.isBazelisk, true);
+    assert.equal(pathSymlinkBazelReqs.bazelMajorVersion, 9);
+    assert.ok(
+      pathSymlinkBazelReqs.defaultBazelOutputBases.some((p) =>
+        p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/"),
+      ),
+    );
+
+    const fakeStandaloneBazelBinDir = path.join(wsDir, "fake-standalone-bazel-bin");
+    fs.mkdirSync(fakeStandaloneBazelBinDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeStandaloneBazelBinDir, "bazel"), "#!/bin/sh\nexit 0\n", {
+      mode: 0o755,
+    });
+    const pathStandaloneBazelReqs = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bvDir,
+      {
+        platform: "darwin",
+        env: { USER: "alice", HOME: "/Users/alice", PATH: fakeStandaloneBazelBinDir },
+      },
+    );
+    assert.equal(pathStandaloneBazelReqs.isBazelisk, false);
+    assert.equal(pathStandaloneBazelReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(pathStandaloneBazelReqs.defaultBazelOutputBases, []);
+
+    // .bazeliskrc USE_BAZEL_VERSION takes precedence over .bazelversion, and non-numeric selectors (e.g. last_green) do not fall back to .bazelversion
+    const bazeliskRcWs = path.join(wsDir, "bazeliskrc-ws");
+    fs.mkdirSync(bazeliskRcWs, { recursive: true });
+    fs.writeFileSync(path.join(bazeliskRcWs, "MODULE.bazel"), 'module(name = "brc")\n');
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazelversion"), "8.2.1\n");
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazeliskrc"), "USE_BAZEL_VERSION=9.2.0\n");
+    const bazeliskRcReqs = resolveBuildResources(
+      "bazelisk",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bazeliskRcWs,
+      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
+    );
+    assert.equal(bazeliskRcReqs.bazelMajorVersion, 9);
+    assert.ok(
+      bazeliskRcReqs.defaultBazelOutputBases.some((p) =>
+        p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/"),
+      ),
+    );
+
+    const lastGreenEnvReqs = resolveBuildResources(
+      "bazelisk",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bvDir,
+      {
+        platform: "darwin",
+        env: { USER: "alice", HOME: "/Users/alice", USE_BAZEL_VERSION: "last_green" },
+      },
+    );
+    assert.equal(lastGreenEnvReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(lastGreenEnvReqs.defaultBazelOutputBases, []);
+
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazelversion"), "9.0.0\n");
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazeliskrc"), "USE_BAZEL_VERSION=last_green\n");
+    const lastGreenRcReqs = resolveBuildResources(
+      "bazelisk",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+      bazeliskRcWs,
+      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
+    );
+    assert.equal(lastGreenRcReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(lastGreenRcReqs.defaultBazelOutputBases, []);
+
     // Busy Gradle daemon is not double-counted as warm for a concurrent Gradle build
     const busyGradleProbeSingle = probeWarmBuildDaemons(defaultGradleReqs, {
       env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
