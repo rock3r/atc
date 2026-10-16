@@ -4048,7 +4048,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         reason: `Parallel fan-out of "${toolName}" through xargs -P / GNU parallel cannot be RAM-admitted as a single coordinated build; run the builds sequentially (xargs -P 1 / parallel -j 1) or as separate atc exec invocations.`,
       };
     }
-    if (hasDynamicXargsInput && toolName !== "xcodebuild") {
+    if (hasDynamicXargsInput) {
       return {
         kind: "deny_lifecycle",
         tool: toolName,
@@ -4056,7 +4056,7 @@ export function classifyBuildCommand(rawCmd, rawArgs = [], options = {}) {
         requiresDevice: false,
         requiresHeavySlot: false,
         requiresWorkspaceLock: false,
-        reason: `Arguments supplied to "${toolName}" dynamically through xargs / GNU parallel input cannot be inspected for lifecycle commands (e.g. --stop, shutdown, clean --expunge); pass the build arguments explicitly instead.`,
+        reason: `Arguments supplied to "${toolName}" dynamically through xargs / GNU parallel input cannot be inspected for lifecycle commands or device selectors (e.g. --stop, shutdown, clean --expunge, -destination); pass the build arguments explicitly instead.`,
       };
     }
     return null;

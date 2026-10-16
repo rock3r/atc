@@ -4154,6 +4154,22 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     assert.equal(classifyBuildCommand("xargs", ["./gradlew", "--version"]).kind, "deny_lifecycle");
     assert.equal(classifyBuildCommand("xargs", ["bazel", "build", "//..."]).kind, "deny_lifecycle");
     assert.equal(classifyBuildCommand("xargs", ["bazel", "shutdown"]).kind, "deny_lifecycle");
+    assert.equal(classifyBuildCommand("xargs", ["xcodebuild", "build"]).kind, "deny_lifecycle");
+    assert.match(
+      classifyBuildCommand("sh", ["-c", "cat args | xargs xcodebuild"]).reason || "",
+      /device selectors/,
+    );
+    const xargsXcodeGuard = evaluateCommandGuard("cat args | xargs xcodebuild", {
+      sessionId: "sess-xargs-xcode",
+      activeLeases: [],
+      coordinateBuilds: true,
+      cwd: dirB,
+    });
+    assert.equal(xargsXcodeGuard.allowed, false);
+    assert.equal(
+      classifyBuildCommand("sh", ["-c", "echo build | xargs xcodebuild -scheme App"]).kind,
+      "pure_build",
+    );
     assert.match(
       classifyBuildCommand("sh", ["-c", "cat args.txt | xargs ./gradlew"]).reason || "",
       /dynamically through xargs/,
