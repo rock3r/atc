@@ -218,7 +218,6 @@ const EXEC_LEVEL_FLAGS = {
   ios: "boolean",
   claim: "boolean",
   wait: "string",
-  phase: "string",
   // Claim selector flags (used with --claim for device-coupled builds)
   type: "string",
   api: "string",
@@ -405,7 +404,6 @@ const STEP_COMMON_FIELDS = new Set([
   "cwd",
   "env",
   "claim",
-  "phase",
   "timeoutSec",
   "continueOnError",
   "force",
@@ -513,9 +511,6 @@ export function validateBatchPlan(plan, ctx = {}) {
     }
     if (step.continueOnError !== undefined && typeof step.continueOnError !== "boolean") {
       errors.push(err(`${p}/continueOnError`, "type", "Expected true or false."));
-    }
-    if (step.phase !== undefined && !["pure-build", "device-build", "device-test", "read-only"].includes(step.phase)) {
-      errors.push(err(`${p}/phase`, "enum", "Expected one of: pure-build, device-build, device-test, read-only."));
     }
     // Claims
     const needsDevice = op.kind === "device" || op.kind === "snapshot" || (op.deviceCoupled && op.deviceCoupled(opParams));

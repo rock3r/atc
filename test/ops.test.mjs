@@ -409,7 +409,7 @@ test("validateBatchPlan: step fields", () => {
     "/steps/0/env/OK:pattern_mismatch",
     "/steps/0/timeoutSec:range",
     "/steps/0/continueOnError:type",
-    "/steps/0/phase:enum",
+    "/steps/0/phase:unknown_field",
     "/steps/0/force:force_reason_required",
   ]) {
     assert.ok(codes.includes(c), `${c} in ${codes.join(", ")}`);

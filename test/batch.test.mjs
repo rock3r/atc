@@ -1,0 +1,178 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { cmdBatch } from "../src/cli.mjs";
+import { readState } from "../src/state.mjs";
+
+const posix = process.platform !== "win32";
+
+function script(file, body) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `#!/bin/sh\n${body}\n`);
+  fs.chmodSync(file, 0o755);
+}
+
+const mockInventory = {
+  host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
+  running: [
+    {
+      deviceKey: "avd:Pixel_8_API_35",
+      avd: "Pixel_8_API_35",
+      serial: "emulator-5554",
+      kind: "emulator",
+      online: true,
+      ramSizeMb: 2048,
+      requiredRamMb: 3072,
+      dataDiskMb: 6656,
+      snapshots: [],
+      profile: { deviceType: "phone", deviceName: "pixel_8", apiLevel: "android-35", services: "google_apis", playStore: false, abi: "arm64-v8a" },
+    },
+  ],
+  offline: [],
+  creatable: [],
+};
+
+function setup() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "atc-batch-"));
+  const stateDir = path.join(root, "state");
+  fs.mkdirSync(stateDir);
+  const bin = path.join(root, "bin");
+  const proj = path.join(root, "proj");
+  fs.mkdirSync(proj);
+  const log = path.join(root, "calls.log");
+  script(path.join(proj, "gradlew"), `echo "gradlew $* ENV_FOO=$FOO" >> ${log}; [ "$1" = "fail" ] && exit 5; exit 0`);
+  script(path.join(bin, "adb"), `echo "adb $*" >> ${log}; exit 0`);
+  const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin` };
+  return {
+    root,
+    stateDir,
+    proj,
+    log,
+    env,
+    calls: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : []),
+    run: (plan, flags = {}) => cmdBatch(stateDir, { session: "sess-batch", json: true, ...flags }, { env, cwd: proj, plan, inventory: mockInventory }),
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+const assembleInstallLaunch = () => ({
+  version: 1,
+  steps: [
+    { id: "assemble", op: "gradle.tasks", tasks: [":app:assembleDebug"], env: { FOO: "bar" } },
+    { id: "install", op: "android.install", apk: "app.apk", dependsOn: ["assemble"], claim: { platform: "android", api: "35", type: "phone" } },
+    { id: "launch", op: "android.launch", package: "com.ex.app", activity: ".Main", dependsOn: ["install"], claim: { reuse: "install" } },
+  ],
+});
+
+test("batch: invalid plans are rejected in full before anything runs", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const plan = assembleInstallLaunch();
+    plan.steps[0].tasks = ["bad;task"];
+    plan.steps[2].claim = { reuse: "nope" };
+    plan.steps.push({ id: "x", op: "shell.run", command: "rm -rf /" });
+    const res = await s.run(plan);
+    assert.equal(res.exitCode, 2);
+    assert.ok(res.errors.length >= 3);
+    assert.deepEqual(s.calls(), []);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: --validate prints exact argv and runs nothing", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const res = await s.run(assembleInstallLaunch(), { validate: true });
+    assert.equal(res.exitCode, 0, res.error);
+    assert.deepEqual(res.order, ["assemble", "install", "launch"]);
+    assert.deepEqual(res.steps[0].invocations[0].args, [":app:assembleDebug"]);
+    assert.equal(res.steps[2].invocations[0].args[3], "am start -n 'com.ex.app/.Main'");
+    assert.deepEqual(s.calls(), []);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: assemble → install → launch with claim reuse, per-step env, release after last consumer", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const res = await s.run(assembleInstallLaunch());
+    assert.equal(res.exitCode, 0, JSON.stringify(res, null, 2));
+    assert.deepEqual(res.steps.map((x) => x.status), ["ok", "ok", "ok"]);
+    const calls = s.calls();
+    assert.match(calls[0], /^gradlew :app:assembleDebug -Dorg\.gradle\.workers\.max=\d+ ENV_FOO=bar$/);
+    assert.match(calls[1], /^adb -s emulator-5554 install .*app\.apk$/);
+    assert.equal(calls[2], "adb -s emulator-5554 shell am start -n 'com.ex.app/.Main'");
+    const st = readState(s.stateDir);
+    assert.deepEqual(Object.keys(st.leases), [], "claim released after last consumer");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: failing step skips dependents and stops the batch", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const plan = assembleInstallLaunch();
+    plan.steps[0].tasks = ["fail"];
+    const res = await s.run(plan);
+    assert.equal(res.exitCode, 5);
+    assert.deepEqual(res.steps.map((x) => x.status), ["failed", "skipped", "skipped"]);
+    assert.equal(res.steps[1].reason, "dependency_failed");
+    assert.equal(s.calls().length, 1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: continueOnError lets independent steps run", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const res = await s.run({
+      version: 1,
+      steps: [
+        { id: "a", op: "gradle.tasks", tasks: ["fail"], continueOnError: true },
+        { id: "b", op: "gradle.tasks", tasks: ["lint"] },
+        { id: "c", op: "gradle.tasks", tasks: ["check"], dependsOn: ["a"] },
+      ],
+    });
+    assert.equal(res.exitCode, 0);
+    assert.deepEqual(res.steps.map((x) => x.status), ["failed", "ok", "skipped"]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: separate claims on the same platform produce an efficiency notice", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const res = await s.run(
+      {
+        version: 1,
+        steps: [
+          { id: "i1", op: "android.install", apk: "a.apk", claim: { platform: "android" } },
+          { id: "i2", op: "android.install", apk: "b.apk", claim: { platform: "android" } },
+        ],
+      },
+      { validate: true },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    assert.ok(res.notices.some((n) => /reuse/.test(n.fix)));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: unknown step fields such as phase or command are rejected", async () => {
+  const s = setup();
+  try {
+    const res = await s.run({ version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["x"], phase: "pure-build", command: "./gradlew x" }] });
+    assert.equal(res.exitCode, 2);
+    assert.deepEqual(res.errors.map((e) => e.code).sort(), ["unknown_field", "unknown_field"]);
+  } finally {
+    s.cleanup();
+  }
+});
