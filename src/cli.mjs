@@ -6922,7 +6922,12 @@ export function execDeps(stateDir, options = {}) {
         return DEFAULT_CONFIG;
       }
     },
-    recordForcedRun: (entry) => recordForcedRun(stateDir, entry, options),
+    recordForcedRun: (entry, identityFlags = {}) => {
+      // Attribute to the session the op actually ran under (explicit --session wins).
+      const flags = { ...(options.flags || {}) };
+      for (const k of ["session", "anchorPid"]) if (identityFlags[k] !== undefined && identityFlags[k] !== null) flags[k] = identityFlags[k];
+      return recordForcedRun(stateDir, entry, { ...options, flags });
+    },
     recentForcedRuns: () => {
       try {
         return readState(stateDir).forcedRuns || [];
@@ -7454,6 +7459,16 @@ export async function cmdBatch(stateDir, flags = {}, options = {}) {
         );
       } catch {
         return false;
+      }
+    },
+    sessionLeaseCount: (platform) => {
+      try {
+        const state = readState(stateDir);
+        return Object.values(state.leases || {}).filter(
+          (l) => l && l.state === "active" && l.sessionId === sessionId && (!platform || (l.platform || "android") === platform),
+        ).length;
+      } catch {
+        return 0;
       }
     },
     sessionLease: (platform) => {

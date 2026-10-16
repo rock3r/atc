@@ -334,3 +334,16 @@ test("exec: a missing build executable is a structured failure, not a crash", { 
     s.cleanup();
   }
 });
+
+test("exec: forced runs are attributed to the explicit --session", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    script(path.join(s.proj, "gradlew"), "exit 0");
+    const env = { ...s.env, ATC_SESSION_ID: "ambient-session" };
+    const res = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force", "--reason", "vendor task", "--session", "explicit-agent", "--json"], { env, cwd: s.proj, host: HOST });
+    assert.equal(res.exitCode, 0, res.error);
+    assert.equal(readState(s.stateDir).forcedRuns[0].sessionId, "explicit-agent");
+  } finally {
+    s.cleanup();
+  }
+});

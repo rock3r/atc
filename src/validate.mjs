@@ -558,10 +558,22 @@ export function validateBatchPlan(plan, ctx = {}) {
           errors.push(err(`${p}/claim`, "claim_unused", `${step.op} does not use a device here; remove the claim.`));
         }
       }
-    } else if (needsDevice && !ctx.sessionHasLease?.(platform)) {
-      errors.push(
-        err(`${p}/claim`, "claim_required", `${step.op} needs a ${platform || "device"} device.`, `Add "claim": { "platform": "${platform || "android"}", ... } or { "reuse": "<stepId>" }.`),
-      );
+    } else if (needsDevice) {
+      const leaseCount = ctx.sessionLeaseCount ? ctx.sessionLeaseCount(platform) : ctx.sessionHasLease?.(platform) ? 1 : 0;
+      if (leaseCount === 0) {
+        errors.push(
+          err(`${p}/claim`, "claim_required", `${step.op} needs a ${platform || "device"} device.`, `Add "claim": { "platform": "${platform || "android"}", ... } or { "reuse": "<stepId>" }.`),
+        );
+      } else if (leaseCount > 1) {
+        errors.push(
+          err(
+            `${p}/claim`,
+            "claim_ambiguous",
+            `This session holds ${leaseCount} ${platform || "device"} leases, so ${step.op} can't pick one.`,
+            `Add "claim": { "platform": "${platform || "android"}", ... } or { "reuse": "<stepId>" } to this step.`,
+          ),
+        );
+      }
     }
   });
   const order = errors.some((e) => e.code === "unknown_dependency" || e.code === "duplicate_id") ? [] : topoOrder(plan.steps, errors);

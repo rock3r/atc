@@ -224,7 +224,10 @@ export async function execOp(stateDir, request, deps, options = {}) {
   let forcedRunId = null;
   if (force) {
     forcedRunId = deps.recordForcedRun
-      ? deps.recordForcedRun({ op: opName, reason: String(flags.reason).trim(), overridden: plan.overridden, cwd })
+      ? deps.recordForcedRun(
+          { op: opName, reason: String(flags.reason).trim(), overridden: plan.overridden, cwd },
+          { session: flags.session, anchorPid: flags.anchorPid },
+        )
       : null;
     if (!json) {
       process.stderr.write(

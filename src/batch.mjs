@@ -68,6 +68,7 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
       }
     },
     sessionHasLease: deps.sessionHasLease || (() => false),
+    ...(deps.sessionLeaseCount ? { sessionLeaseCount: deps.sessionLeaseCount } : {}),
   });
   if (v.errors.length > 0) {
     return {
