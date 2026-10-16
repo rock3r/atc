@@ -1,6 +1,6 @@
 # Agent Traffic Control (`atc`)
 
-Coordinate exclusive Android and iOS device leases across concurrent coding agents without a daemon.
+`atc` gives coding agents exclusive Android and iOS device leases without a background daemon.
 
 - **User Guide (with diagrams & Q&A):** [`docs/user-guide.md`](./docs/user-guide.md)
 - **Architecture:** [`docs/architecture.md`](./docs/architecture.md)
@@ -9,19 +9,19 @@ Coordinate exclusive Android and iOS device leases across concurrent coding agen
 
 ## Overview
 
-When two coding agents share a machine, they collide on Android emulators, iOS Simulators, and USB phones. `atc` serializes access through a user-private `state.json` file under an atomic directory lock (`atc.lock`) with `<20 ms` in-memory critical sections and zero npm dependencies.
+Agents sharing a machine can install apps or stop devices that another agent is using. `atc` coordinates access through a user-private `state.json` file. An atomic directory lock (`atc.lock`) protects in-memory changes that take less than 20 ms. The package has no npm dependencies.
 
-Agents claim a device by hardware/OS profile, run `adb`, `./gradlew connected*`, `android` CLI, `xcrun simctl`, `xcrun devicectl`, or `xcodebuild` commands inside `atc exec` with a 15-second heartbeat, restore QEMU or APFS copy-on-write snapshots, and free the lease when done.
+Agents claim devices by hardware and operating system (OS) profile. They run device commands through `atc exec`, which renews leases every 15 seconds. Supported commands include `adb`, `./gradlew connected*`, `android`, `xcrun simctl`, `xcrun devicectl`, and `xcodebuild`. Agents can restore QEMU or APFS copy-on-write snapshots before releasing their leases.
 
 | Component | What it does |
 |---|---|
-| `atc` CLI | Discovers running, offline, and creatable Android & iOS devices; manages TTL leases (including dual-lease Kotlin Multiplatform / KMP sessions) and a 120-second warm-affinity wait queue; injects target flags in `atc exec`; and manages QEMU and APFS snapshots. |
-| `atc` skill & hooks | Agent skill (`skills/atc/SKILL.md`) plus `PreToolUse` and `Stop` hooks (`hooks.json`, `hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, `extensions/atc/index.ts`) that block unscoped device access and rewrite commands into `atc exec`. |
-| `atc mcp` | Optional stdio JSON-RPC 2.0 MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`). |
+| `atc` CLI | The CLI discovers running, offline, and creatable Android and iOS devices. It manages expiring leases, Kotlin Multiplatform (KMP) dual leases, a 120-second reorder window, command targets, and QEMU/APFS snapshots. |
+| `atc` skill & hooks | `skills/atc/SKILL.md` defines the agent workflow. `PreToolUse` and `Stop` hooks block unscoped access and rewrite commands through `atc exec`. Adapters use `hooks.json`, `hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, and `extensions/atc/index.ts`. |
+| `atc mcp` | The optional Model Context Protocol (MCP) server uses stdio JSON-RPC 2.0. It exposes `atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, and `atc_guide`. |
 
 ## Requirements and install
 
-Requires Node.js >= 20 on macOS, Linux, or Windows, plus the Android SDK (`adb`, `emulator`, `android` CLI) and/or Xcode (`xcrun simctl`, `xcrun devicectl`) on macOS.
+Install Node.js >= 20 on macOS, Linux, or Windows. Android requires the Android SDK (`adb`, `emulator`, and `android` CLI). iOS requires Xcode (`xcrun simctl` and `xcrun devicectl`) on macOS.
 
 ```bash
 npm install -g @rock3r/atc

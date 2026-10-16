@@ -1,31 +1,31 @@
 # `atc` user guide
 
-Coordinate exclusive Android and iOS device leases across concurrent coding agents without a daemon.
+`atc` gives coding agents exclusive Android and iOS device leases without a background daemon.
 
 Status: `v2.1.0` · Updated `2026-10-12` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 
-When two coding agents share a machine, they collide on emulators, iOS Simulators, and USB phones. One agent installs an APK or shuts down a simulator while another agent inspects the screen. Unscoped `adb` and `xcrun simctl` commands fail once a second device boots, and crashed turns leave orphan locks.
+Agents sharing a machine can change the same emulator, iOS Simulator, or USB phone. One agent can install an APK or stop a simulator while another agent inspects its screen. Unscoped `adb` and `xcrun simctl` commands can target the wrong device. An agent crash can leave its lease active.
 
-`atc` (Agent Traffic Control) serializes device access through a user-private `state.json` file under an atomic directory lock (`atc.lock`). Agents claim a device by hardware/OS profile, run commands inside `atc exec` with a 15-second heartbeat, restore QEMU or APFS snapshots, and free the lease when done.
+Agent Traffic Control (`atc`) coordinates access through a user-private `state.json` file and an atomic directory lock (`atc.lock`). Agents claim devices by hardware and operating system (OS) profile. They run commands through `atc exec`, which renews leases every 15 seconds. Agents can restore QEMU or APFS snapshots and release leases after use.
 
-`atc` is a cooperative coordinator, not a kernel sandbox. Any local process that skips `atc` can still open a socket to `adb` (`localhost:5037`) or `CoreSimulatorService`. Installing the `atc` host plugin closes that gap for coding agents by checking and rewriting shell commands before they run.
+Agents must cooperate with `atc` to keep device access exclusive. Any local process can bypass it and connect to `adb` (`localhost:5037`) or `CoreSimulatorService`. The host plugin checks and rewrites agent shell commands before execution. These checks do not create an OS security boundary.
 
 | Topic | Section |
 |---|---|
-| Setup & fleet check | [Install the CLI and inspect your fleet](#install-the-cli-and-inspect-your-fleet-in-one-command) |
+| Setup & fleet check | [Install the CLI and list devices](#install-the-cli-and-list-devices) |
 | Single-agent flow | [One agent claims by profile and runs with a 15-second heartbeat](#one-agent-claims-by-profile-and-runs-with-a-15-second-heartbeat) |
-| Multi-agent contention | [Warm jobs jump ahead within 120 seconds without starving cold boots](#warm-jobs-jump-ahead-within-120-seconds-without-starving-cold-boots) |
+| Multi-agent contention | [The queue protects earlier requests after 120 seconds](#the-queue-protects-earlier-requests-after-120-seconds) |
 | Kotlin Multiplatform (KMP) | [One KMP session holds an Android lease and an iOS lease at once](#one-kmp-session-holds-an-android-lease-and-an-ios-lease-at-once) |
 | Crashes & disconnects | [Crashed virtual devices reboot in place; unplugged phones fail in 15 seconds](#crashed-virtual-devices-reboot-in-place-unplugged-phones-fail-in-15-seconds) |
-| Snapshots & clean resets | [Snapshots reset emulator and simulator state in under two seconds](#snapshots-reset-emulator-and-simulator-state-in-under-two-seconds) |
+| Snapshots & clean resets | [Snapshots restore saved device state](#snapshots-restore-saved-device-state) |
 | Coordination Q&A | [Questions on how coordination works](#questions-on-how-coordination-works) |
-| CLI & exit codes | [Commands and exit codes map every failure to one action](#commands-and-exit-codes-map-every-failure-to-one-action) |
+| CLI & exit codes | [Commands and exit codes](#commands-and-exit-codes) |
 
-## Install the CLI and inspect your fleet in one command
+## Install the CLI and list devices
 
-Install `@rock3r/atc` globally with npm, then run `atc status` to inspect host memory, disk space, and discovered devices. On macOS, `atc status` probes both Android (`adb`, `~/.android/avd`) and iOS (`simctl`, `devicectl`) outside `atc.lock`.
+Install `@rock3r/atc` globally with npm. Then run `atc status` to check host memory, disk space, and devices. On macOS, `atc status` probes Android (`adb`, `~/.android/avd`) and iOS (`simctl`, `devicectl`) outside `atc.lock`.
 
 ```bash
 npm install -g @rock3r/atc
@@ -56,7 +56,7 @@ Install the optional agent plugin so your coding agent loads the `atc` skill and
 
 ## One agent claims by profile and runs with a 15-second heartbeat
 
-An agent claims a virtual device by form factor and OS version rather than a hardcoded AVD name or UDID. `atc exec` injects the leased target into child commands and renews the lease every 15 seconds while the command runs.
+An agent can claim a virtual device by form factor and OS version. It can also select an Android Virtual Device (AVD) name or device identifier (UDID). `atc exec` adds the leased target to child commands and renews the lease every 15 seconds while they run.
 
 ```mermaid
 sequenceDiagram
@@ -85,7 +85,7 @@ sequenceDiagram
     ATC-->>Agent: Lease freed (device stays warm for next agent)
 ```
 
-Notice that `atc.lock` is never held while an emulator boots or a test runs; slow work happens outside the lock under `"starting"` or `"active"` states.
+`atc` releases `atc.lock` before booting an emulator or running a test. The `"starting"` or `"active"` lease reserves the device during that work.
 
 ```bash
 # Android emulator loop
@@ -101,11 +101,11 @@ atc exec -- xcrun simctl launch booted com.example.app
 atc free
 ```
 
-## Warm jobs jump ahead within 120 seconds without starving cold boots
+## The queue protects earlier requests after 120 seconds
 
-When all device slots are busy, `atc claim --wait 300` places the caller into `state.queue` and updates its ticket heartbeat once per second. A strict FIFO queue would force back-to-back 45-second cold boots whenever two agents alternate between different device profiles.
+When device slots are busy, `atc claim --wait 300` adds the caller to `state.queue`. It updates the ticket heartbeat once per second. Strict first-in, first-out (FIFO) order can cause repeated cold boots when agents alternate device profiles.
 
-`atc` prevents cold-boot thrashing with a 120-second warm-affinity window (`reorderWindowSec = 120`). If a queued ticket matches a warm device (`Tier 0`) and the earlier cold-boot ticket has waited under 120 seconds, the warm ticket jumps ahead. At 120 seconds, any waiting ticket freezes at Priority #0.
+`atc` can reorder requests during a 120-second window (`reorderWindowSec = 120`). A ticket matching a running idle device (`Tier 0`) can precede an earlier cold-boot ticket that has waited less than 120 seconds. After 120 seconds, `atc` reserves competing resources for the earlier ticket. Later tickets can still use unrelated resources.
 
 ```mermaid
 flowchart LR
@@ -133,9 +133,9 @@ flowchart LR
 
 ## One KMP session holds an Android lease and an iOS lease at once
 
-Kotlin Multiplatform (KMP), Flutter, and React Native tasks on macOS often test Android and iOS side by side in the same agent session. A session can hold one Android lease and one iOS lease at the same time.
+Kotlin Multiplatform (KMP), Flutter, and React Native tasks can test Android and iOS in one macOS agent session. Each session can hold one Android lease and one iOS lease at the same time.
 
-When a session holds one lease on each platform, `atc exec` and `atc hook pre-tool-use` inspect the command and pick the matching platform lease automatically. You do not need to pass `--serial` or `--android`/`--ios` on `atc exec`.
+With one lease per platform, `atc exec` and `atc hook pre-tool-use` select the lease that matches each command. These commands do not require `--serial` or `--android`/`--ios` on `atc exec`.
 
 ```mermaid
 flowchart TD
@@ -163,9 +163,9 @@ atc free --ios --stop
 
 ## Crashed virtual devices reboot in place; unplugged phones fail in 15 seconds
 
-Virtual devices and physical USB/Wi-Fi phones fail for different reasons. If QEMU or `Simulator.app` crashes, `atc` can reboot the virtual device automatically; if a developer unplugs a USB phone, only a human can plug the cable back in.
+`atc` can reboot a virtual device after QEMU or `Simulator.app` crashes. A person must reconnect an unplugged USB phone.
 
-When a leased virtual device drops from `adb` or `simctl`, `atc` holds an offline reservation for 45 seconds so the owner can reboot it in place (`expiresAtMs` preserved). When a physical phone disconnects for over 15 seconds, `atc` writes a tombstone and fails fast (`exit 1`).
+When a leased virtual device disappears from `adb` or `simctl`, `atc` reserves it for up to 45 seconds. The owner can reclaim and reboot it while keeping `expiresAtMs`. A physical disconnect has a 15-second grace period. After that period, `atc` records the disconnect; an owner re-claim fails immediately (`exit 1`). An owner re-claim also fails during the grace period.
 
 ```mermaid
 flowchart TD
@@ -183,9 +183,9 @@ flowchart TD
 | Emulator or iOS Simulator crash | `45 s` | Blocks immediately (`exit 2`/`3`) with a message to run `atc claim`. | Reboots the crashed virtual device in place and preserves `expiresAtMs`. |
 | Physical Android or iPhone unplugged | `15 s` | Blocks immediately (`exit 2`/`3`) once offline is detected. | Fails fast (`exit 1`) telling the agent to ask the user to reconnect the cable. |
 
-## Snapshots reset emulator and simulator state in under two seconds
+## Snapshots restore saved device state
 
-Tests often leave dirty login tokens, permissions, or database rows on a device. `atc` supports instant checkpoints on both Android emulators (via QEMU snapshots) and iOS Simulators (via APFS copy-on-write `cp -cR` clones in `~/.atc-snapshots/<udid>/<name>`).
+Tests can change login tokens, permissions, and database rows. Android emulators use QEMU snapshots to save state. iOS Simulators use APFS copy-on-write `cp -cR` clones in `~/.atc-snapshots/<udid>/<name>`.
 
 | Operation | Command | Android emulator action | iOS Simulator action |
 |---|---|---|---|
@@ -208,11 +208,11 @@ atc snapshot load logged_in
 
 ### Can `atc` stop a rogue agent from talking to `adb` or `simctl` directly?
 
-`atc` is a cooperative system, like real air traffic control ([context thread](https://bsky.app/profile/sebastiano.dev/post/3mxm4nh77yc2f)). Air traffic control directs pilots over the radio and sequences the runway, but it cannot physically grab the yoke inside the cockpit.
+`atc` requires agents to follow its lease protocol ([context thread](https://bsky.app/profile/sebastiano.dev/post/3mxm4nh77yc2f)).
 
-At the OS level, `adb` (port `5037`) and `CoreSimulatorService` are shared user-space buses. Code cannot stop a process on the same user account from invoking `adb` or `xcrun simctl` outside `atc`.
+`adb` (port `5037`) and `CoreSimulatorService` accept commands from processes in the same user account. `atc` cannot prevent those processes from calling the tools directly.
 
-In practice, coding agents follow rules when given a clear protocol (`atc guide`), and the `atc` host plugin adds a gate in front of the shell tool (`atc hook pre-tool-use` / `atc guard`):
+`atc guide` defines the protocol. The host plugin checks shell commands with `atc hook pre-tool-use` / `atc guard`:
 
 | Command type | Example | `atc guard` / `PreToolUse` action |
 |---|---|---|
@@ -222,9 +222,9 @@ In practice, coding agents follow rules when given a clear protocol (`atc guide`
 
 ### Can an agent recover access after another agent exits without releasing the device?
 
-Yes, on two levels: reclaiming the lease lock and discarding dirty device state.
+`atc` can reclaim the lease. The next agent can reset device state separately.
 
-For the **lease lock**, `atc` never relies on an agent remembering to call `atc free`:
+`atc` handles leases that an agent leaves active:
 
 | Exit scenario | How `atc` reclaims the lease |
 |---|---|
@@ -232,7 +232,7 @@ For the **lease lock**, `atc` never relies on an agent remembering to call `atc 
 | Agent crash or closed terminal (`SIGKILL`) | The next `atc` command checks `kill(anchorPid, 0)` and `workerPgids` and reaps the dead-PID lease in `< 20 ms`. |
 | Idle hang with no active `atc exec` worker | The lease expires when its TTL (`defaultTtlSec = 600`) runs out. |
 
-For **device state**, "releasing" has no single definition across tasks—the previous agent may have left a dialog open or modified app storage. On emulators and iOS Simulators, `--snapshot-load <name>`, `--reset-app <id>`, or `--wipe-data` discards those changes. Physical phones only support app-level resets (`--reset-app <pkg>`).
+Releasing a lease leaves device state unchanged unless the agent requests cleanup. An agent can leave a dialog open or change app storage. On emulators and iOS Simulators, use `--snapshot-load <name>`, `--reset-app <id>`, or `--wipe-data` to discard changes. Physical phones support only app-level resets (`--reset-app <pkg>`).
 
 ```mermaid
 flowchart LR
@@ -246,7 +246,7 @@ flowchart LR
 
 ### Why does `atc` run without a background daemon?
 
-Background daemons drift out of sync on `npm` upgrades, hold stale `ANDROID_HOME` or `DEVELOPER_DIR` variables, and become single points of failure.
+A background daemon can retain an older package version or stale `ANDROID_HOME` and `DEVELOPER_DIR` values. Every caller would depend on that process remaining available.
 
 `atc` stores all state in `<stateDir>/state.json` protected by an atomic `mkdir <stateDir>/atc.lock` mutex (`< 20 ms` hold time):
 
@@ -258,7 +258,7 @@ Background daemons drift out of sync on `npm` upgrades, hold stale `ANDROID_HOME
 
 ### Can an agent install a test build onto my charging personal phone?
 
-No, unless you opt in explicitly. `atc claim` defaults to `--kind emulator`, which ignores physical USB and Wi-Fi devices on both Android and iOS. `atc guard` also blocks unscoped `adb install` and `./gradlew connectedCheck` commands whenever a physical device is attached.
+`atc claim` defaults to `--kind emulator` and excludes physical USB and Wi-Fi devices on Android and iOS. Physical claims require an explicit request. `atc guard` also blocks unscoped `adb install` and `./gradlew connectedCheck` commands when a physical device is attached. Processes that bypass `atc` can still access that phone.
 
 To target a physical phone on purpose, pass its identifier or `--kind physical`:
 
@@ -275,7 +275,7 @@ atc config set allowPhysicalDevices never
 
 ### How do Android emulator slots and iOS Simulator slots share a Mac?
 
-Android emulators boot full QEMU virtual machines with dedicated guest RAM, while iOS Simulators run as lightweight user-space containers sharing the macOS kernel. `atc` tracks them in separate pools:
+Android emulators boot QEMU virtual machines with dedicated guest RAM. iOS Simulators run user-space processes that share the macOS kernel. `atc` tracks the platforms in separate slot pools:
 
 | Pool | Config key & default | Admission check before boot |
 |---|---|---|
@@ -283,7 +283,7 @@ Android emulators boot full QEMU virtual machines with dedicated guest RAM, whil
 | iOS Simulators (macOS) | `maxRunningSimulators = 4` | Target volume must have at least `minFreeDiskMb (2048 MB)` free disk space. |
 | Physical devices | Unlimited (`0` virtual slots) | Must be online in `adb devices` or `xcrun devicectl list devices`. |
 
-## Commands and exit codes map every failure to one action
+## Commands and exit codes
 
 Run `atc guide [workflow|profiles|snapshots|multi-agent|traps]` at any time to read the built-in CLI guides.
 

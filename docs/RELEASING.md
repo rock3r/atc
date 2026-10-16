@@ -1,10 +1,10 @@
 # Releasing
 
-Releases publish one public npm CLI package (`@rock3r/atc`) and the matching portable Agent Plugins (`plugin.json`), Claude Code (`.claude-plugin/`), Codex (`.codex-plugin/`), and skill (`skills/atc/`) payload from the same tagged source tree.
+Each release publishes the public npm CLI package (`@rock3r/atc`) from a tagged source tree. That tree also contains matching Agent Plugins (`plugin.json`), Claude Code (`.claude-plugin/`), Codex (`.codex-plugin/`), and skill (`skills/atc/`) files.
 
-## Lockstep Version Locations
+## Keep eight version values equal
 
-Every release keeps the following files at the exact same semantic version:
+Set the same semantic version in these locations for every release:
 
 1. `package.json` (`"version"`)
 2. `plugin.json` (`"version"`)
@@ -26,28 +26,28 @@ Use `tools/check-versions.sh` to inspect or bump all 8 locations in one command:
 ./tools/check-versions.sh --set 1.1.0
 ```
 
-## One-time npm Trusted Publishing Setup
+## Configure npm trusted publishing once
 
-1. Publish the repository at `https://github.com/rock3r/atc` and set that URL as `origin`. npm provenance requires `repository.url` in `package.json` (`git+https://github.com/rock3r/atc.git`) to match.
+1. Publish the repository at `https://github.com/rock3r/atc` and use that URL for `origin`. Set `package.json`'s `repository.url` to `git+https://github.com/rock3r/atc.git` for npm provenance.
 2. Create a GitHub environment named `npm` on `rock3r/atc` (require reviewer approval if desired).
-3. If `@rock3r/atc` has not been published to npm yet, bootstrap the initial package creation once (`npm login && npm publish --access public`), then configure **npm Trusted Publishing** for:
+3. If npm has no `@rock3r/atc` package, create it once with `npm login && npm publish --access public`. Configure npm Trusted Publishing with these values:
    - GitHub owner/repository: `rock3r/atc`
    - Workflow filename: `release.yml`
    - Environment name: `npm`
    - Allowed actions: check **Allow `npm publish`**
-4. Set package publishing access on npmjs.com to require two-factor authentication and disallow traditional tokens so GitHub Actions publishes via OIDC with provenance (`id-token: write`, `npm@11`, `--access public`).
+4. On npmjs.com, require two-factor authentication for publishing and disable traditional tokens. GitHub Actions uses OpenID Connect (OIDC) with provenance (`id-token: write`, `npm@11`, `--access public`).
 
-## Release Gates
+## The release workflow checks each tag
 
-For every `v*` tag, `.github/workflows/release.yml` independently requires:
+For each `v*` tag, `.github/workflows/release.yml` runs these checks:
 
-- full syntax and test checks (`npm run check`) on Ubuntu, macOS, and Windows;
-- exact git tag, `package.json`, portable plugin, Claude plugin, Codex plugin, `SKILL.md` frontmatter, `skill-source.json` provenance sidecar, CLI `ATC_VERSION`, and MCP server version agreement (`npm run release:verify -- vX.Y.Z`);
-- one npm tarball built once (`npm pack`), then installed into a clean global prefix and smoke-tested (`atc --version`, `atc --help`, `atc guide`, `atc guide traps --json`, plus native OS shim execution) on Ubuntu, macOS, and Windows (`npm run package:smoke -- release`).
+1. Run syntax checks and tests (`npm run check`) on Ubuntu, macOS, and Windows.
+2. Check version agreement with `npm run release:verify -- vX.Y.Z`. The git tag must match `package.json`, the portable, Claude, and Codex plugins, and `SKILL.md` frontmatter. It must also match `skill-source.json`, CLI `ATC_VERSION`, and the MCP server version.
+3. Build one tarball with `npm pack`. Install that tarball into a clean global prefix on Ubuntu, macOS, and Windows. Run `npm run package:smoke -- release` on each OS. Checks include `atc --version`, `atc --help`, `atc guide`, `atc guide traps --json`, and native OS shim execution.
 
-Only the tarball that passed the 3-OS verification matrix is published to npm and attached to the GitHub Release.
+The workflow publishes the tarball to npm and attaches it to the GitHub Release only after all three operating systems pass verification.
 
-## Cutting a Release
+## Create a release
 
 1. Bump the version across all manifests, skill frontmatter/provenance, CLI, and MCP:
    ```bash

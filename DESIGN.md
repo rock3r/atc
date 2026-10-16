@@ -1,4 +1,4 @@
-# Android Traffic Control (ATC) — 1.0 Design Specification
+# Android Traffic Control (ATC) design
 
 - **Status:** 1.0 Design Specification (v1.0.0)
 - **Target Platforms:** macOS, Linux (Windows supported via `adb` and SDK `emulator` fallback; `android emulator` subcommands are macOS/Linux only per official Android CLI support)
@@ -9,39 +9,40 @@
 
 ## 1. Problem Statement & Scope
 
-When multiple AI coding agents or developer terminal sessions work concurrently on the same host machine, they contend for Android Virtual Devices (AVDs) and connected physical USB/Wi-Fi test devices:
+Agents and terminal sessions on one host can request the same Android Virtual Device (AVD) or physical USB/Wi-Fi device:
 
 1. **Mid-task collision:** Agent A is inspecting a UI tree (`android layout`) or running instrumentation tests while Agent B installs a different APK, clears app data, navigates away, or stops the emulator.
-2. **Multi-device ambiguity & personal-phone hazard:** When multiple emulators or a developer's personal USB phone are connected concurrently, `adb` and `android` commands without explicit device targeting (`ANDROID_SERIAL` or `--device=<serial>`) fail or hit the wrong device.
-3. **Host resource exhaustion & cold-boot thrashing:** Launching every offline AVD concurrently exhausts host RAM/CPU/disk, while strict FIFO ordering between different device profiles repeatedly kills and cold-boots emulators back-to-back.
+2. With multiple emulators or a connected personal phone, `adb` and `android` commands can fail or target the wrong device. Explicit `ANDROID_SERIAL` or `--device=<serial>` targets prevent this ambiguity.
+3. Starting every offline AVD at once can exhaust host RAM, CPU capacity, or disk space. Strict first-in, first-out (FIFO) ordering can require repeated cold boots between different profiles.
 4. **Orphaned locks:** An agent session crashes, hits a turn limit, or forgets to release its device, blocking subsequent sessions.
 
-### Design Goal ("It Has One Job")
-ATC provides **exclusive, TTL-bounded device leases matched by hardware/OS profile, a daemonless bounded-window affinity wait queue, snapshot/wipe state preparation, device-scoped command execution, and cooperative agent-hook guardrails** around the official `android` CLI.
+### ATC coordinates device ownership and preparation
+ATC matches exclusive device leases by hardware and operating system (OS) profile. Each lease has a time to live (TTL). ATC queues competing requests, prepares snapshots or clean storage, and scopes commands to leased devices. Agent hooks check commands before execution. ATC uses the official `android` CLI without a background daemon.
 
 ### Non-Goals
 - Replicating `android` CLI features (SDK management, layout inspection, screenshot capture, APK installation).
 - Remote/distributed device farms across multiple physical hosts.
 - Multi-instance booting of the same AVD simultaneously (Android AVDs lock their `.avd` directory via `hardware-qemu.ini.lock`; ATC enforces a strict 1-lease-per-AVD invariant).
-- OS-level mandatory access control against adversarial local users (hook guardrails are cooperative safety rails for coding agents, not a kernel sandbox).
+- OS-level mandatory access control against hostile local users. Agent hooks check cooperative agents; local processes can bypass them.
 - Persistent background daemon processes that require OS service managers, code signing, or notarization.
 
 ---
 
 ## 2. Stack & Portability Rationale
 
-ATC is implemented as a **zero-dependency Node.js (>= 20) ESM package** (`atc.mjs`):
+ATC uses Node.js >= 20 with ECMAScript modules (ESM) and no runtime dependencies (`atc.mjs`):
 
 - **Why Node.js with zero native dependencies?**
   - Every target coding agent environment (Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code) already runs on or alongside Node.js on macOS, Linux, and Windows.
-  - Pure JavaScript (`.mjs`) using only Node built-in modules (`node:fs`, `node:path`, `node:os`, `node:child_process`, `node:crypto`, `node:readline`) requires **no binary compilation (`node-gyp`), no Apple Developer ID signing/notarization, and no Windows SmartScreen binary whitelisting**.
-  - Works identically via `npx`, global `npm install -g`, or direct invocation from any agent plugin/extension directory (`node "<pluginRoot>/bin/atc.mjs"`).
+  - ATC uses JavaScript (`.mjs`) and Node's built-in modules: `node:fs`, `node:path`, `node:os`, `node:child_process`, `node:crypto`, and `node:readline`.
+  - It requires no binary compilation (`node-gyp`), Apple Developer ID signing or notarization, or Windows SmartScreen binary allowlisting.
+  - Agents can invoke it through `npx`, global `npm install -g`, or `node "<pluginRoot>/bin/atc.mjs"` from a plugin or extension directory.
 
 ---
 
 ## 3. Architecture Overview
 
-ATC uses a **daemonless, lock-directory-serialized state file** architecture. Every CLI command (`claim`, `free`, `renew`, `snapshot`, `exec`, `guard`, `status`, `config`, `gc`, `hook`, `mcp`) coordinates through a local user-private runtime directory.
+ATC coordinates CLI commands through a state file in a local user-private directory. An atomic directory lock serializes state changes. ATC has no background daemon. Commands include `claim`, `free`, `renew`, `snapshot`, `exec`, `guard`, `status`, `config`, `gc`, `hook`, and `mcp`.
 
 ```
 +-----------------------------------------------------------------------+
@@ -70,7 +71,7 @@ ATC uses a **daemonless, lock-directory-serialized state file** architecture. Ev
 ```
 
 ### 3.1 State Directory Location & Permissions
-To prevent cross-user symlink/temp-file attacks, ATC stores state on a **local filesystem** (NFS/SMB network shares are unsupported) in a user-private directory created with mode `0700` (files `0600` on POSIX):
+ATC stores state on a local filesystem in a user-private directory with mode `0700`. Files use mode `0600` on POSIX. These checks protect against symlink and temporary-file attacks from other users. ATC does not support NFS or SMB network shares.
 
 - **Override:** `ATC_STATE_DIR` (must be an absolute path on a local disk; verified via `fs.lstatSync` not to be a symlink and owned by `process.getuid()` on POSIX).
 - **macOS:** `~/Library/Application Support/atc`
@@ -80,9 +81,9 @@ To prevent cross-user symlink/temp-file attacks, ATC stores state on a **local f
 ### 3.2 Cross-Platform Mutual Exclusion (`atc.lock`) & Strict Lock Boundary
 
 #### Invariant: Zero Subprocesses Under Lock
-No external subprocess (`android`, `adb`, `ps`, `powershell`, etc.) may **ever** be spawned while holding `atc.lock`. Device inventory is gathered *before* acquiring `atc.lock`, and emulator boot/stop commands run *after* releasing `atc.lock` using persisted transitional lease states (`"starting"` and `"stopping"`).
+ATC must never spawn an external subprocess while holding `atc.lock`. This includes `android`, `adb`, `ps`, and `powershell`. ATC gathers inventory before acquiring the lock. It boots and stops devices after releasing the lock. Persisted `"starting"` and `"stopping"` leases reserve devices during these operations.
 
-What runs inside `atc.lock` is strictly bounded to <20ms of local in-memory and filesystem operations:
+ATC limits locked work to less than 20 ms of local memory and filesystem operations:
 1. Read and parse `<stateDir>/state.json`.
 2. Run in-memory Garbage Collection (timestamps + `process.kill(pid, 0)` syscalls).
 3. Mutate state in memory.
@@ -97,34 +98,38 @@ What runs inside `atc.lock` is strictly bounded to <20ms of local in-memory and 
    - Immediately write `<stateDir>/atc.lock/owner.json` (`{ pid: process.pid, createdAtMs: Date.now(), nonce: myNonce }`) via atomic write-and-rename inside `atc.lock`.
 2. **Contention & Stale Lock Recovery:**
    - If `mkdirSync` throws `EEXIST`, read `<stateDir>/atc.lock/owner.json`.
-   - A lock is considered **stale** if:
+   - ATC treats a lock as stale when any condition holds:
      - `owner.json` has existed for > `10,000ms` (`Date.now() - owner.createdAtMs > 10000`), OR
      - `owner.json` is missing/unreadable for > `2,000ms` across retries (crashed mid-acquire or unlinked during release), OR
      - `owner.pid` is confirmed dead via `process.kill(owner.pid, 0)` throwing `ESRCH`.
-   - To break a stale lock without racing other waiters, the waiter atomically renames `<stateDir>/atc.lock` to `<stateDir>/atc.lock.stale.<waiterNonce>`. (If `renameSync` fails with `ENOENT`/`EPERM`/`EACCES`, another waiter already broke it; sleep and retry normal acquisition.) Once renamed, the waiter deletes `atc.lock.stale.<waiterNonce>` recursively outside the critical path and retries `Acquire`.
+   - The waiter atomically renames `<stateDir>/atc.lock` to `<stateDir>/atc.lock.stale.<waiterNonce>` to avoid racing other waiters.
+   - If `renameSync` fails with `ENOENT`/`EPERM`/`EACCES`, the waiter sleeps and retries normal acquisition. Another waiter has already broken the lock.
+   - After a successful rename, the waiter recursively deletes `atc.lock.stale.<waiterNonce>` outside the critical section and retries `Acquire`.
    - Otherwise, sleep `20ms–60ms` (with random jitter) and retry up to `lockTimeoutMs` (`5,000ms`).
 3. **Nonce-Verified Commit & Release:**
    - Before renaming `state.json.tmp.<pid>.<myNonce>` onto `state.json`, the holder re-reads `<stateDir>/atc.lock/owner.json` and checks `owner.nonce === myNonce`.
-   - If `owner.json` is missing or `owner.nonce !== myNonce`, the holder was stale-broken: it **must abort** its write, unlink its temp file, and **must not** remove `atc.lock`. (Note: as with any userspace lock, a theoretical 2-syscall window exists if the kernel `SIGSTOP`s the process between nonce verification and `renameSync`; keeping critical sections <20ms against a 10s stale threshold makes this negligible in practice.)
-   - If `owner.nonce === myNonce`, commit `state.json`, unlink `<stateDir>/atc.lock/owner.json`, and call `fs.rmdirSync("<stateDir>/atc.lock")`. On Windows, if `rmdirSync` throws `EBUSY`/`EPERM`/`ENOTEMPTY` due to transient antivirus handle retention after `owner.json` is already unlinked, ignore the `rmdirSync` error and treat release as successful (the empty lock dir self-heals via the >2s missing-`owner.json` stale-break rule).
+   - If `owner.json` is missing or `owner.nonce !== myNonce`, another process has broken the lock. The holder must abort its write and unlink its temporary file. It must leave `atc.lock` intact.
+   - A two-syscall race remains if the kernel sends `SIGSTOP` between nonce verification and `renameSync`. The design limits this risk with critical sections below 20 ms and a 10-second stale threshold.
+   - If `owner.nonce === myNonce`, commit `state.json`, unlink `<stateDir>/atc.lock/owner.json`, and call `fs.rmdirSync("<stateDir>/atc.lock")`.
+   - Windows antivirus handles can cause `rmdirSync` to throw `EBUSY`/`EPERM`/`ENOTEMPTY` after ATC unlinks `owner.json`. Ignore that error and treat release as successful. The missing-owner rule removes the empty directory after more than two seconds.
 4. **Windows Atomic Rename & Corruption Recovery:**
    - State writes open `<stateDir>/state.json.tmp.<pid>.<myNonce>` with flag `"wx"` (`O_CREAT | O_EXCL`, mode `0o600`), write JSON, call `fsyncSync`, close the descriptor, and call `fs.renameSync(tmpPath, statePath)`.
-   - On Windows, if `renameSync` throws `EPERM` or `EACCES` (due to transient antivirus/indexer handles), retry up to 5 times with `15ms–45ms` backoff. If all 5 retries fail, unlink `tmpPath`, release `atc.lock`, and exit with code `1` (leaving previous `state.json` intact).
+   - On Windows, antivirus or indexer handles can make `renameSync` throw `EPERM` or `EACCES`. Retry up to five times with `15ms–45ms` delays. If all retries fail, unlink `tmpPath`, release `atc.lock`, and exit with code `1`. Keep the previous `state.json` intact.
    - If `state.json` cannot be parsed (`SyntaxError`) or fails top-level schema validation, quarantine it by renaming to `state.json.corrupt.<timestamp>`, log a warning to `stderr`, and initialize a fresh default state.
 
 ---
 
 ## 4. Data Model (`state.json`)
 
-To support both emulators/simulators and physical USB/Wi-Fi devices (in 1.0 and into 2.0 multiplatform mode — see §9) without a schema migration, `state.leases` is keyed by a canonical `deviceKey`:
+`state.leases` uses a canonical `deviceKey` for virtual and physical USB/Wi-Fi devices. These keys support the 1.0 and 2.0 platforms without a schema migration (see §9):
 - **`avd:<avdId>`** for Android Virtual Devices (enforcing at most one lease/instance per AVD, both before and after boot).
 - **`sim:<udid>`** *(reserved for ATC 2.0 iOS Simulators, keyed by `CoreSimulator` UDID)*.
 - **`serial:<serial>`** for physical devices (`kind: "physical"`, using `adb` serial on Android or hardware `UDID` on iOS).
 
-Every lease has `state` in `"starting" | "active" | "stopping"` (`"starting"` covers AVD creation, cold/warm boot, live snapshot restore, and data wipe outside `atc.lock`; `"stopping"` covers post-lease actions on `atc free` — `--snapshot-save`, `--snapshot-load`, and/or `android emulator stop` — outside `atc.lock`).
+Every lease has `state` in `"starting" | "active" | "stopping"`. The `"starting"` state covers AVD creation, boot, snapshot restore, and data wipe outside `atc.lock`. The `"stopping"` state covers `atc free` actions outside the lock: `--snapshot-save`, `--snapshot-load`, and `android emulator stop`.
 
 #### Forward-Compatibility & Mixed-Version Coexistence Invariants (1.0 <-> 2.0)
-Because multiple agents on the same machine may invoke different cached versions of `atc` (e.g., an older 1.0 binary alongside a 2.0 binary), 1.0 enforces three forward-compatibility rules from day one:
+Agents on one machine can invoke different cached versions of `atc`, including 1.0 and 2.0. Version 1.0 must follow these compatibility rules:
 1. **Round-Trip Preservation of Unknown Fields:** When reading and re-serializing `state.json`, 1.0 preserves any unrecognized keys in `config`, `leases[*]`, and `queue[*]` verbatim.
 2. **Platform-Scoped Offline Reconciliation & Matching:** 1.0's offline-grace reconciliation (§5.3 Step 2) and profile matching (§5.3 Step 4) only evaluate records where `(record.platform || "android") === "android"`. A 1.0 process will never reap an active `platform: "ios"` (`sim:<udid>`) lease simply because it is absent from `android emulator list` / `adb devices`.
 3. **Cross-Platform RAM Budget Awareness:** 1.0's `projectedAvailableRamMb` calculation (§5.2.4) subtracts `requiredRamMb` for all `"starting"` or recently activated leases regardless of `platform`.
@@ -231,18 +236,20 @@ Because multiple agents on the same machine may invoke different cached versions
 | `"active"` | Exclusively owned by `sessionId` until `expiresAtMs` (`emulator` or `physical`) | Emulators: Yes; Physical devices: **No** (zero host QEMU RAM/CPU cost) | Only idempotently by the same `sessionId` |
 | `"stopping"` | Device reserved by `workerPid` while post-lease actions (`--snapshot-save`, `--snapshot-load`, or `android emulator stop <serial>`) run outside lock | Emulators: Yes; Physical: No | No |
 
-#### Physical Devices (`kind: "physical"`): MVP Safety vs 1.0 Support
-1. **No Accidental Personal-Phone Hijack:** Unfiltered `atc claim` defaults to `--kind emulator` so agents do not automatically install test APKs onto a developer's personal plugged-in phone.
+#### Physical devices require an explicit claim
+1. Unfiltered `atc claim` defaults to `--kind emulator`. This keeps test APKs off a developer's connected phone unless the agent requests physical access.
 2. **Explicit / 1.0 Physical Device Claims:** A physical device can be claimed when explicitly targeted (`atc claim --serial <usb_or_wifi_serial>` or `atc claim --kind physical|any`, or when allowlisted in `config.allowedPhysicalSerials` for 1.0).
-3. **Lifecycle Guardrails for Physical Devices:** Physical devices cannot be booted or stopped (`--stop` on `atc free` is a no-op with a warning on physical leases, and Priority-3 idle eviction never targets `kind: "physical"`). They do not count toward `maxRunningEmulators`.
+3. ATC cannot boot or stop physical devices. On physical leases, `atc free --stop` warns and performs no stop action. Priority-3 eviction excludes `kind: "physical"`. Physical devices use no `maxRunningEmulators` slots.
 
 ### 4.2 Host-Agnostic Session Identity & `anchorPid` Resolution
-Agent tool calls execute in ephemeral subshells, so `process.pid` of `atc claim` exits immediately. ATC must identify sessions across **Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code, and plain terminals**. Session identity must work without command-rewriting hooks and distinguish agents that share the **same repository directory (`cwd`)**:
+Agent tool calls run in short-lived subshells. The `atc claim` process exits after each call. ATC must identify sessions across Codex, Pi, Cursor, Antigravity, Gemini CLI, Claude Code, and terminals. It must work without command-rewriting hooks and distinguish agents sharing one repository directory (`cwd`).
 
 1. **Explicit CLI Flag, Lease Token, or Env Var (Highest Priority, Universal):**
    - `--session <id>`, `ATC_SESSION_ID`, or `--lease <leaseId>` / `ATC_LEASE_ID` (with `anchorPid = parseEnvInt(ATC_ANCHOR_PID) || null`). Any agent or script can pass `--session` or `ATC_LEASE_ID` directly with zero hook dependencies.
 2. **Extension / Hook Command Rewrite (Pi, Antigravity, Gemini CLI, Claude Code):**
-   - On hosts whose tool-call extension or `PreToolUse` hook supports command rewriting (`event.input.command` in Pi's `tool_call` extension, `overwrite` in Antigravity/Gemini CLI, or `hookSpecificOutput.updatedInput` in Claude Code), calling `atc` without `--session` automatically prepends `ATC_SESSION_ID=<id> ATC_ANCHOR_PID=<agentPid>`. ATC reads the session identity directly from these variables, including when multiple sessions share the same `cwd`.
+   - Rewriting hosts add `ATC_SESSION_ID=<id> ATC_ANCHOR_PID=<agentPid>` before `atc` commands that lack `--session`.
+   - Pi uses `event.input.command` in its `tool_call` extension. Antigravity/Gemini CLI use `overwrite`. Claude Code uses `hookSpecificOutput.updatedInput`.
+   - ATC reads these variables to distinguish sessions, including sessions sharing one `cwd`.
 3. **Ambient Agent Environment Variables:**
    - Checks standard session/conversation variables exported by agent runtimes: `CODEX_SESSION_ID`, `PI_SESSION_ID`, `CURSOR_TRACE_ID`, `CURSOR_SESSION_ID`, `ANTIGRAVITY_CONVERSATION_ID`, `GEMINI_SESSION_ID`, `CLAUDE_SESSION_ID`, `CONVERSATION_ID`.
 4. **PID-Keyed Hook Breadcrumb (`state.hookSessions`, for non-rewriting hooks like Codex & Cursor):**
@@ -251,13 +258,18 @@ Agent tool calls execute in ephemeral subshells, so `process.pid` of `atc claim`
      - If `state.hookSessions[process.ppid]` exists and is fresh, use it directly (`0ms`).
      - Otherwise inspect fresh entries in `state.hookSessions` matching `process.cwd()`:
        - If **exactly one** active session exists for `cwd`, select it (`0ms`).
-       - If **multiple** concurrent sessions exist in the same `cwd` on a host without command rewriting, release `atc.lock` (preserving the zero-subprocesses-under-lock invariant) and walk ancestor PIDs (`ps` on POSIX; on Windows fail closed without spawning a subprocess) to match `agentPid` in `state.hookSessions`; if still ambiguous, fail closed with exit code `1` instructing the agent to pass `--session <unique_id>`.
-5. **Stdio MCP Server (`atc mcp` — Cursor, Windsurf, Zed, etc.):**
+       - If multiple sessions share `cwd` and the host cannot rewrite commands, release `atc.lock` before checking ancestor process IDs (PIDs).
+       - On POSIX, use `ps` to match an ancestor to `agentPid` in `state.hookSessions`. On Windows, reject the ambiguous call without spawning a subprocess.
+       - If the match remains ambiguous, exit `1` and require `--session <unique_id>`.
+5. **Stdio MCP server (`atc mcp`, including Cursor, Windsurf, and Zed):**
    - When invoked via `atc mcp`, the MCP server process stays alive for the duration of the agent session: `sessionId = "mcp-" + process.pid`, `anchorPid = process.pid`.
 6. **Universal Parent-Process / Terminal Fallback (Zero-Hook Agents & Interactive Shells):**
-   - Uses `TMUX_PANE`, `TERM_SESSION_ID`, or `ppid-${process.ppid}` with `anchorPid = process.ppid`. Because agent runtimes (Pi, Codex, Cursor, etc.) and interactive shells (`zsh`, `bash`, `pwsh`, `cmd`) are long-lived parent processes that spawn each tool command, `process.ppid` (or the nearest non-wrapper ancestor PID) provides automatic dead-agent lease reclamation via `process.kill(anchorPid, 0)` even when no hooks are installed. (`WT_SESSION` alone is not used because Windows Terminal shares `WT_SESSION` across tabs/panes.)
+   - ATC uses `TMUX_PANE`, `TERM_SESSION_ID`, or `ppid-${process.ppid}` with `anchorPid = process.ppid`.
+   - Agent runtimes and interactive shells (`zsh`, `bash`, `pwsh`, `cmd`) usually remain alive while their tool commands run and exit.
+   - ATC checks `process.ppid`, or the nearest non-wrapper ancestor, through `process.kill(anchorPid, 0)`. This enables dead-agent lease cleanup without hooks.
+   - ATC does not use `WT_SESSION` alone because Windows Terminal shares it across tabs and panes.
 
-Session IDs are validated against `/^[A-Za-z0-9._:-]{1,128}$/`. Requested `--ttl` values on both `claim` and `renew` are clamped to `[10, config.maxTtlSec]`. `--api` values are normalized so `"36"` and `"android-36"` both become `"android-36"`. (Note on OS PID reuse: in the rare event the OS recycles a dead `anchorPid` to an unrelated process, dead-anchor reclamation is bounded by `expiresAtMs` and `config.maxTtlSec` = 1 hour.)
+ATC validates session IDs against `/^[A-Za-z0-9._:-]{1,128}$/`. It clamps `claim` and `renew` `--ttl` values to `[10, config.maxTtlSec]`. It normalizes `--api` values `"36"` and `"android-36"` to `"android-36"`. The OS can reuse a dead `anchorPid` for an unrelated process. In that case, `expiresAtMs` and `config.maxTtlSec` (one hour) bound reclamation.
 
 ---
 
@@ -267,13 +279,18 @@ Session IDs are validated against `/^[A-Za-z0-9._:-]{1,128}$/`. Requested `--ttl
 At the start of every locked transaction:
 1. **Expired or Clock-Skewed Active Leases:** Remove any lease with `state === "active"` where `now >= lease.expiresAtMs`, `now < lease.claimedAtMs` (backward NTP clock jump guard), or `now > lease.claimedAtMs + (config.maxTtlSec * 1000)`.
 2. **Dead Anchor Reclamation:** Remove any `"active"` lease where `lease.anchorPid !== null` and `!isPidAlive(lease.anchorPid)` (`process.kill(anchorPid, 0)` throws `ESRCH`).
-3. **Stuck `"starting"` / `"stopping"` Leases:** While a worker process is running a `"starting"` or `"stopping"` operation outside `atc.lock` (e.g. cold boot, data wipe, crash recovery boot, or a multi-GB `adb emu avd snapshot save`), it runs an in-process `setInterval` heartbeat every `15,000ms` (`unref()`'d) that acquires `atc.lock`, verifies `leaseId` and `workerPid === process.pid`, and extends `lease.deadlineMs = Date.now() + timeoutMs` (keeping worker-liveness `deadlineMs` strictly separate from ownership `expiresAtMs`). If `lease.isRecovery === true` and the heartbeat observes `Date.now() >= lease.expiresAtMs`, the worker aborts its in-flight recovery boot, stops the virtual device outside `atc.lock`, deletes the `"starting"` lease under `atc.lock`, and exits `1`. Consequently, GC removes a `"starting"` or `"stopping"` lease only when `!isPidAlive(lease.workerPid)`, `now < lease.claimedAtMs`, or `now >= lease.deadlineMs` (meaning the worker died or hung for a full timeout window), preventing a live boot or snapshot worker from ever having its reservation stolen mid-operation.
+3. Workers protect `"starting"` and `"stopping"` leases during boot, wipe, recovery, and snapshot operations outside `atc.lock`.
+   - Each worker runs an `unref()`'d `setInterval` heartbeat every `15,000ms`. Under `atc.lock`, it checks `leaseId` and `workerPid === process.pid`, then sets `lease.deadlineMs = Date.now() + timeoutMs`.
+   - `deadlineMs` tracks worker liveness separately from ownership expiration (`expiresAtMs`).
+   - If `lease.isRecovery === true` and `Date.now() >= lease.expiresAtMs`, the worker aborts recovery. It stops the device outside `atc.lock`, deletes the `"starting"` lease under the lock, and exits `1`.
+   - Garbage collection (GC) removes transitional leases only for `!isPidAlive(lease.workerPid)`, `now < lease.claimedAtMs`, or `now >= lease.deadlineMs`.
+   - This preserves a live worker's reservation until its deadline, unless the clock moves backward.
 4. **Dead/Expired Queue Tickets:** Remove any ticket in `state.queue` where `now >= ticket.waitExpiresAtMs`, `now >= ticket.lastHeartbeatAtMs + (config.queueHeartbeatTimeoutSec * 1000)`, `now < ticket.enqueuedAtMs`, or `!isPidAlive(ticket.waiterPid)`.
 5. **Expired Hook Breadcrumbs & Disconnect Tombstones:** Remove any entry in `state.hookSessions` where `now - entry.updatedAtMs > 60_000` or `!isPidAlive(entry.agentPid)`, and remove any entry in `state.disconnectedPhysicalLeases` where `now >= entry.expiresAtMs` or `now < entry.disconnectedAtMs`.
 6. **Orphan Temp/Lock File Sweep (Best-Effort):** Periodically (at most once every 60s), unlink any `state.json.tmp.*` or `atc.lock.stale.*` entries in `<stateDir>` whose `mtimeMs` is older than `60,000ms`.
 
 ### 5.2 Fleet, Profile, Snapshot & Host Capacity Discovery (Always Outside `atc.lock`)
-Before acquiring `atc.lock` for `claim` or `status`, ATC builds a three-tier fleet inventory (`running`, `offline`, `creatable`) and a live host resource snapshot:
+Before acquiring `atc.lock`, `claim` and `status` discover `running`, `offline`, and `creatable` devices. They also read current host resources:
 
 1. **Base Device List (`android emulator list --long` + `adb devices`):**
    - `android emulator list --long` parses `AVD ID`, `AVD Name`, `API Level`, `Status` (`Online`/`Offline`), and `Serial` (`kind: "emulator"`).
@@ -282,23 +299,28 @@ Before acquiring `atc.lock` for `claim` or `status`, ATC builds a three-tier fle
      - **Physical devices (non-`emulator-*` serials in `device` state):** Indexed as `deviceKey: "serial:<serial>"`, `kind: "physical"`. Excluded from default `--kind emulator` claims and lifecycle stops, but claimable via `--serial <serial>` or `--kind physical|any`.
 2. **Zero-Subprocess Local AVD Profile, Resource & Snapshot Enrichment (`~/.android/avd`):**
    - For every discovered AVD, ATC reads `<ANDROID_AVD_HOME || ~/.android/avd>/<avdId>.ini` and `<avdPath>/config.ini` directly from the local filesystem (<1ms, zero subprocesses) to extract:
-     - **`deviceType` (Form Factor):** Normalized into `"phone" | "tablet" | "foldable" | "desktop" | "watch" | "xr" | "tv" | "automotive" | "resizable"` (with `--type wear` accepted as a deprecated alias that normalizes to `"watch"`) from `hw.device.name` (e.g., `pixel_9` -> `"phone"`, `medium_tablet` -> `"tablet"`, `wearos_small_round` -> `"watch"`, `xr_glasses_device` / `ai_glasses_*` -> `"xr"`, `resizable` -> `"resizable"`, which also matches `"phone" | "foldable" | "tablet" | "desktop"` as a secondary match) and `image.sysdir.1` (if neither `hw.device.name` nor `image.sysdir.1` matches a specialized form factor, `deviceType` defaults to `"phone"`).
+     - ATC derives `deviceType` from `hw.device.name` and `image.sysdir.1`. Values are `"phone" | "tablet" | "foldable" | "desktop" | "watch" | "xr" | "tv" | "automotive" | "resizable"`.
+     - The deprecated `--type wear` alias normalizes to `"watch"`.
+     - Examples include `pixel_9` as `"phone"`, `medium_tablet` as `"tablet"`, and `wearos_small_round` as `"watch"`.
+     - `xr_glasses_device` and `ai_glasses_*` map to `"xr"`. `resizable` maps to `"resizable"` and also satisfies `"phone" | "foldable" | "tablet" | "desktop"` as a secondary match.
+     - If neither source identifies a specialized form factor, ATC defaults to `"phone"`.
      - **`services` & `playStore`:** Parsed from `PlayStore.enabled` (`true`/`false`) and `image.sysdir.1` system-image tag:
        - `"play"`: `PlayStore.enabled=true` or tag contains `playstore` / `android-wear-signed`.
        - `"google_apis"`: `PlayStore.enabled=false` and tag contains `google_apis`.
        - `"aosp"`: `PlayStore.enabled=false` and tag is `default` or `aosp_*`.
      - **`abi`:** Parsed from `abi.type` (e.g., `arm64-v8a`, `x86_64`).
-     - **Resource Footprint (`ramSizeMb`, `cpuCores`, `dataDiskMb`):** Parsed from `hw.ramSize` (default `2048` MB; plus `config.qemuOverheadRamMb = 1024` MB hypervisor/GPU overhead -> `requiredRamMb = hwRamMb + 1024`), `hw.cpu.ncore` (default `4`), and `disk.dataPartition.size` + `sdcard.size` (default `6144 + 512 = 6656` MB).
+     - ATC reads `ramSizeMb` from `hw.ramSize`, defaulting to `2048` MB. It adds `config.qemuOverheadRamMb = 1024` MB for hypervisor and GPU overhead: `requiredRamMb = hwRamMb + 1024`.
+     - It reads `cpuCores` from `hw.cpu.ncore`, defaulting to `4`. It computes `dataDiskMb` from `disk.dataPartition.size` plus `sdcard.size`, defaulting to `6144 + 512 = 6656` MB.
      - **`snapshots`:** Directory names listed via `fs.readdirSync("<avdPath>/snapshots")` (e.g., `["default_boot", "logged_in"]`).
 3. **Creatable Capacity Discovery (`<sdk>/system-images` + `android emulator create --list-profiles`):**
    - Inspects `<sdk>/system-images/android-*/<tag>/<abi>/` on disk to report which `(deviceType, apiLevel, services, abi)` profiles do **not** yet have an AVD on disk:
      - `readyToCreate`: System image is already installed locally; an AVD can be created in ~2s via `android emulator create <profile>` (or automatically on `atc claim --create-if-missing`).
      - `requiresSdkInstall`: System image is not yet installed locally; outputs the exact `android sdk install "system-images/..."` command needed.
-4. **Host Resource Telemetry & Common-Sense Concurrency Rules:**
-   - Because ATC runs on everything from 8 GB laptops to 128 GB workstations, it combines a configurable slot ceiling with **hard pre-flight RAM and disk admission checks** (bypassable via `--force`):
+4. **Host resource checks and concurrency limits:**
+   - ATC combines a configurable slot limit with RAM and disk checks. The `--force` flag bypasses the resource checks.
    - **Effective Slot Limit (`effectiveMaxEmulators`):**
      - If `config.maxRunningEmulators` is an explicit integer (set via `atc config set maxRunningEmulators <N>` or `ATC_MAX_EMULATORS=<N>`), use `<N>`.
-     - Default is `2` concurrent emulators; if set to `"auto"`, compute a common-sense machine ceiling from `os.totalmem()` and `os.availableParallelism()`:
+     - The default is `2` concurrent emulators. With `"auto"`, compute the limit from `os.totalmem()` and `os.availableParallelism()`:
        - Reserve `max(6 GB, 30% of totalRamGb)` for the host OS, IDE, Gradle daemons, and agent runtimes; allocate `3.5 GB` and `4` logical CPU cores per concurrent emulator:
          `effectiveMaxEmulators = clamp(Math.min(Math.floor((totalRamGb - 6) / 3.5), Math.floor(cpuCores / 4)), 1, 6)`
          *(e.g., 16 GB RAM -> `1` emulator; 24–32 GB -> `2` emulators; 48–64 GB -> `4` emulators; 96–128 GB -> `6` emulators).*
@@ -310,15 +332,20 @@ Before acquiring `atc.lock` for `claim` or `status`, ATC builds a three-tier fle
      - Uses Node's built-in `fs.statfsSync(avdHomeDir)` (`Number(stat.bavail) * Number(stat.bsize)`), requiring zero subprocesses across macOS, Linux, and Windows.
    - **Hard Pre-Flight Admission Rules (Exit Code `5` `ERESOURCE_EXCEEDED`, Bypassable with `--force`):**
       - **Before Booting an Offline Emulator `C` (or Saving a Snapshot):**
-        - Every virtual-device (`kind === "emulator"`) lease stores `requiredRamMb` (`hw.ramSize + config.qemuOverheadRamMb` on Android; `config.simOverheadRamMb` on iOS), `requiredDiskMb` (set to the in-flight disk reservation during `"starting"` / `"stopping"` operations and reset to `0` once `"active"`), and `activatedAtMs` (refreshed to `now` on every activation, including crash recovery).
-        - Because a newly booted or recovered virtual device may take several seconds after `sys.boot_completed=1` / `bootstatus` to fault in its guest RAM in host `availableRamMb`, `projectedAvailableRamMb` conservatively subtracts all virtual-device (`kind === "emulator"`) leases across all platforms in `state === "starting"` **or** (`state === "active" && lease.firstSeenOfflineAtMs === null && now - lease.activatedAtMs < 30_000`) (excluding any `replacingAvd` / `replacingKey` currently being stopped by the caller):
+        - Each virtual-device lease (`kind === "emulator"`) stores `requiredRamMb`, `requiredDiskMb`, and `activatedAtMs`.
+        - Android reserves `hw.ramSize + config.qemuOverheadRamMb` RAM. iOS reserves `config.simOverheadRamMb`.
+        - During `"starting"` / `"stopping"`, `requiredDiskMb` records the pending disk reservation. Activation resets it to `0`.
+        - Every activation, including recovery, sets `activatedAtMs` to `now`.
+        - Guest RAM allocation can continue after `sys.boot_completed=1` / `bootstatus`. ATC accounts for that delay in `projectedAvailableRamMb`.
+        - It subtracts virtual-device reservations across all platforms for `state === "starting"` or (`state === "active" && lease.firstSeenOfflineAtMs === null && now - lease.activatedAtMs < 30_000`).
+        - It excludes any `replacingAvd` / `replacingKey` that the caller is stopping:
           `projectedAvailableRamMb = availableRamMb + (replacingVictim ? replacingVictim.requiredRamMb : 0) - sum(startingOrRecentlyActivatedVirtualLeases.requiredRamMb)`
-        - Likewise, to prevent concurrent boots, snapshot saves, data wipes, or AVD creations from collectively exhausting host storage while executing outside `atc.lock`, `projectedFreeDiskMb` subtracts `requiredDiskMb` across all in-flight `"starting"` and `"stopping"` leases on the target volume:
+        - `projectedFreeDiskMb` subtracts `requiredDiskMb` for all pending `"starting"` and `"stopping"` leases on the target volume. This accounts for concurrent boots, snapshot saves, wipes, and AVD creations outside `atc.lock`:
           `projectedFreeDiskMb = freeDiskMb - sum(inFlightTransitionalLeases.requiredDiskMb)`
-        - **Rule R1 (RAM):** Require `projectedAvailableRamMb >= C.requiredRamMb + config.minFreeRamMb (2048 MB)`. If violated and an idle running virtual device `V` can be evicted (`Priority 3`), evict `V` first to reclaim its RAM (and re-verify live `availableRamMb` after `V` stops in Step 5.1 before booting `C`). If still insufficient and `--force` is not set, fail fast with exit code `5` (`ERESOURCE_EXCEEDED`).
-        - **Rule D1 (Boot/Snapshot Disk):** Require `projectedFreeDiskMb >= C.ramSizeMb + config.minFreeDiskMb (2048 MB)` (reserving `lease.requiredDiskMb = C.ramSizeMb` while `"starting"` / `"stopping"` so concurrent QCOW2 overlay growth and snapshot writes cannot exhaust host disk and corrupt the AVD).
+        - Rule R1 requires `projectedAvailableRamMb >= C.requiredRamMb + config.minFreeRamMb (2048 MB)`. If it fails, evict an eligible idle virtual device `V` under Priority 3. After `V` stops, check live `availableRamMb` again before booting `C` (Step 5.1). If RAM remains insufficient without `--force`, exit `5` (`ERESOURCE_EXCEEDED`).
+        - Rule D1 requires `projectedFreeDiskMb >= C.ramSizeMb + config.minFreeDiskMb (2048 MB)`. Reserve `lease.requiredDiskMb = C.ramSizeMb` during `"starting"` / `"stopping"`. This accounts for concurrent QCOW2 overlay growth and snapshot writes that could exhaust disk and corrupt the AVD.
       - **Before Creating an AVD (`--create-if-missing`) or Wiping Data (`--wipe-data`):**
-        - **Rule D2 (Creation/Wipe Disk):** Require `projectedFreeDiskMb >= C.dataDiskMb + config.minFreeDiskMb (2048 MB)` (typically `6.5 GB + 2.0 GB = 8.5 GB`, reserving `lease.requiredDiskMb = C.dataDiskMb` while `"starting"`). If violated and `--force` is not set, fail fast with exit code `5` (`ERESOURCE_EXCEEDED`).
+        - Rule D2 requires `projectedFreeDiskMb >= C.dataDiskMb + config.minFreeDiskMb (2048 MB)`, typically `6.5 GB + 2.0 GB = 8.5 GB`. Reserve `lease.requiredDiskMb = C.dataDiskMb` while `"starting"`. If the check fails without `--force`, exit `5` (`ERESOURCE_EXCEEDED`).
 
 ### 5.3 Claiming a Device by Profile, Snapshot/Wipe State & Bounded-Window Affinity (`atc claim`)
 Inputs:
@@ -332,43 +359,63 @@ Run §5.2 to obtain the current snapshot of running devices, offline AVDs (with 
 #### Step 2: Acquire `atc.lock` & Run GC (§5.1) + Offline Grace & Owner-Recovery Window
 - Only evaluate `"active"` leases whose `lease.platform || "android"` was queried in Step 1's inventory snapshot (in 1.0, `"android"` only; in 2.0, any platform whose inventory was gathered in Step 1).
 - Platform-specific offline predicates (using Step 1's discovered **AVD/device-to-serial mapping** rather than raw serial presence):
-  - **Android emulator (`platform: "android"`, `kind: "emulator"`):** Confirmed offline when `android emulator list --long` reports `L.avd` as `Offline` **and** no running `emulator-*` serial in `adb devices` resolves to `L.avd` in Step 1's AVD-to-serial mapping (preventing a recycled `emulator-<port>` serial now running a different AVD from falsely keeping `L` online). Conversely, if `L.avd` is online in Step 1 with a different `emulator-<port>` serial, update `L.serial` to the resolved serial for `L.avd`.
+  - An Android emulator (`platform: "android"`, `kind: "emulator"`) is offline when `android emulator list --long` reports `L.avd` as `Offline`.
+    No running `emulator-*` serial in `adb devices` may resolve to `L.avd` in Step 1's mapping.
+    This prevents a reused `emulator-<port>` serial for another AVD from keeping `L` online.
+    If Step 1 finds `L.avd` online with a different serial, update `L.serial` to that AVD's current serial.
   - **Android physical (`platform: "android"`, `kind: "physical"`):** Confirmed offline when `L.serial` is absent from `adb devices` (or not in `device` state).
-  - **iOS Simulator (`platform: "ios"`, `kind: "emulator"` — 2.0, §9.3):** Confirmed offline when `xcrun simctl list --json` reports the simulator's `state !== "Booted"` (or its `udid` is absent).
-  - **iOS physical (`platform: "ios"`, `kind: "physical"` — 2.0, §9.3):** Confirmed offline when `xcrun devicectl list devices --json-output` reports the device's hardware `udid` as absent or disconnected/unavailable.
+  - An iOS Simulator (`platform: "ios"`, `kind: "emulator"`; 2.0, §9.3) is offline when `xcrun simctl list --json` reports `state !== "Booted"` or omits its `udid`.
+  - A physical iOS device (`platform: "ios"`, `kind: "physical"`; 2.0, §9.3) is offline when `xcrun devicectl list devices --json-output` omits its hardware `udid` or reports it disconnected/unavailable.
 - **Bounded Owner-Recovery Guard Window (Strictly Scoped to Confirmed-Offline Leases; Never Prolongs `expiresAtMs`):**
   - **Online leases (`L` confirmed online in Step 1):** Ensure `L.firstSeenOfflineAtMs = null` and leave `L` intact (online leases are **never** removed by Step 2 reconciliation).
   - **Confirmed-offline leases (`L` confirmed offline in Step 1):**
-    - On the first inventory snapshot where `L` is confirmed offline, set `L.firstSeenOfflineAtMs = now` (if not already set), and if `L` is an Android emulator (`L.platform === "android" && L.kind === "emulator"`), clear `L.serial = null` so the stale `emulator-<port>` serial can never target another AVD that reuses that port. Any lease with `L.firstSeenOfflineAtMs !== null` acts strictly as a **non-executable offline reservation**: it holds `L.deviceKey` and its slot for Step 3 recovery, but cannot authorize `atc exec`, `atc snapshot`, `atc renew`, `atc guard`, or post-lease `adb`/`stop` commands in `atc free`.
-    - Let `graceMs = L.kind === "physical" ? (config.physicalOfflineGraceMs ?? 15000) : (config.offlineGraceMs ?? 45000)` (`45,000ms` for virtual devices so a live agent has time to finish its LLM turn after a crash and request in-place recovery in Step 3; `15,000ms` for physical USB/Wi-Fi devices to tolerate transient wireless reconnects).
+    - When inventory first confirms `L` offline, set `L.firstSeenOfflineAtMs = now` unless already set.
+    - For an Android emulator (`L.platform === "android" && L.kind === "emulator"`), clear `L.serial = null`. This prevents commands from reaching another AVD that reuses its port.
+    - A lease with `L.firstSeenOfflineAtMs !== null` reserves `L.deviceKey` and its slot for Step 3 recovery.
+    - That reservation cannot authorize `atc exec`, `atc snapshot`, `atc renew`, or `atc guard`. It also cannot authorize post-lease `adb`/`stop` commands in `atc free`.
+    - Set `graceMs = L.kind === "physical" ? (config.physicalOfflineGraceMs ?? 15000) : (config.offlineGraceMs ?? 45000)`.
+    - Virtual devices default to `45,000ms`, giving the agent time to request recovery after a crash. Physical devices default to `15,000ms` to allow brief USB/Wi-Fi reconnects.
     - The offline guard window is strictly capped by the lease's existing expiration: `recoveryDeadlineMs = Math.min(L.expiresAtMs, L.firstSeenOfflineAtMs + graceMs)`. It **never** extends `L.expiresAtMs`.
     - **If `now >= recoveryDeadlineMs`:**
-      - If `L.kind === "physical"`, record a bounded disconnect tombstone in `state.disconnectedPhysicalLeases[L.leaseId] = { leaseId: L.leaseId, sessionId: L.sessionId, serial: L.serial, platform: L.platform || "android", profile: L.profile, disconnectedAtMs: L.firstSeenOfflineAtMs, expiresAtMs: L.expiresAtMs }` (swept by §5.1 GC at `L.expiresAtMs` so that even if another waiter reaps `L` after 15s, the owner still receives the fast-fail disconnect diagnostic in Step 3 instead of silently queueing).
+      - If `L.kind === "physical"`, record `state.disconnectedPhysicalLeases[L.leaseId] = { leaseId: L.leaseId, sessionId: L.sessionId, serial: L.serial, platform: L.platform || "android", profile: L.profile, disconnectedAtMs: L.firstSeenOfflineAtMs, expiresAtMs: L.expiresAtMs }`.
+      - GC (§5.1) removes this disconnect record at `L.expiresAtMs`. It lets Step 3 report the disconnect even when another waiter has already removed `L` after 15 seconds.
       - Delete the confirmed-offline lease `L` from `state.leases`.
-    - **If `now < recoveryDeadlineMs`:** Retain the confirmed-offline lease `L` in `state.leases` for **Step 3 (In-Place Crash Recovery / Physical Disconnect Fail-Fast)** so a virtual-device owner does not lose its spot to queued waiters.
+    - If `now < recoveryDeadlineMs`, keep `L` in `state.leases` for Step 3. This preserves a virtual-device owner's reservation while other callers wait.
 
 #### Step 3: Idempotent Re-Claim & In-Place Crash Recovery (Same Session)
 Inspect any `"active"` lease `L` owned by `sessionId` matching the requested profile filters (`matchesProfile(L, req)`), as well as any disconnect tombstone `T` in `state.disconnectedPhysicalLeases` where `T.sessionId === sessionId` and `matchesProfile(T, req)`:
 1. **Device is Online (`L.firstSeenOfflineAtMs === null`):**
    - If no state reset (`--wipe-data` / `--cold` / `--snapshot-load` / `--reset-app`, or `L.loadedSnapshot === req.snapshotLoad` and no `--reset-app`) is requested: renew `L.expiresAtMs = now + ttlMs` and return `L` immediately.
-   - If a state reset *is* requested on the session's own online virtual device: transition `L` in-place to `state: "starting"`, `workerPid: process.pid`, `deadlineMs: now + bootTimeoutMs`, `requiredDiskMb: req.wipeData ? C.dataDiskMb : C.ramSizeMb`, `isRecovery: false`, commit, release `atc.lock`, and proceed to Step 5.
+   - If the session requests a reset of its online virtual device, update `L` in place.
+   - Set `state: "starting"`, `workerPid: process.pid`, `deadlineMs: now + bootTimeoutMs`, `requiredDiskMb: req.wipeData ? C.dataDiskMb : C.ramSizeMb`, and `isRecovery: false`.
+   - Commit, release `atc.lock`, and continue to Step 5.
 2. **Virtual Device Crashed / Closed (`L.kind === "emulator"` and `L.firstSeenOfflineAtMs !== null`):**
    - Because `L` remained in `state.leases` (`now < recoveryDeadlineMs`), `L` still holds its `deviceKey` and its slot in `occupiedVirtualKeys` ahead of queued waiters.
    - Check whether `L` can be recovered in-place right now:
-     - Verify the underlying AVD/Simulator still exists in Step 1's offline inventory, target-platform `usedSlots <= effectiveMaxSlotLimit` (where `usedSlots` already includes `L.deviceKey`, so rebooting `L` adds `0` net slots unless an out-of-band virtual device was started outside ATC; if `usedSlots > effectiveMaxSlotLimit` or host RAM is short and an unreserved idle running virtual device `V` can be evicted per Priority 3, `V` is marked `"stopping"` via `replacingAvd: V.avd`), and `L` passes **Rule R1 (RAM)** and **Rule D1/D2 (Disk)** in §5.2.4 (or `--force` is set).
-     - **If recovery headroom exists:** Transition `L` in-place to `state: "starting"`, `workerPid: process.pid`, `isRecovery: true`, `requiredDiskMb: req.wipeData ? C.dataDiskMb : C.ramSizeMb`, `deadlineMs: now + bootTimeoutMs` (keeping worker-liveness `deadlineMs` separate from ownership expiration `L.expiresAtMs`, which is **preserved unchanged without prolonging the claim duration**), remove any queue ticket for `sessionId`, commit, release `atc.lock`, and proceed to Step 5 to reboot `L`.
-     - **If recovery is not possible** (e.g., another emulator started out-of-band or host RAM/disk no longer has headroom to relaunch `L`): Delete `L` from `state.leases`, log a warning to `stderr` that in-place crash recovery had insufficient headroom and the session is rejoining the queue, and fall through to Step 4 / Step 6 (Wait Queue Phase).
+     - Check that Step 1's offline inventory still contains the AVD/Simulator. Require target-platform `usedSlots <= effectiveMaxSlotLimit`.
+     - `usedSlots` already includes `L.deviceKey`, so recovery adds `0` slots unless another process started a device outside ATC.
+     - If slots or RAM are insufficient, Priority 3 can select an unreserved idle device `V`. Mark `V` as `"stopping"` through `replacingAvd: V.avd`.
+     - Require `L` to pass Rule R1 and Rule D1/D2 (§5.2.4), unless `--force` is set.
+     - If recovery can proceed, set `state: "starting"`, `workerPid: process.pid`, `isRecovery: true`, `requiredDiskMb: req.wipeData ? C.dataDiskMb : C.ramSizeMb`, and `deadlineMs: now + bootTimeoutMs` on `L`.
+     - Keep `L.expiresAtMs` unchanged. `deadlineMs` tracks worker liveness separately. Remove the session's queue ticket, commit, release `atc.lock`, and continue to Step 5.
+     - If recovery cannot proceed, delete `L` from `state.leases`. Warn on `stderr` that recovery lacks resources and the session is rejoining the queue. Continue to Step 4 / Step 6.
 3. **Physical Device Disconnected (`L.kind === "physical"` with `L.firstSeenOfflineAtMs !== null`, OR a matching tombstone `T` in `state.disconnectedPhysicalLeases` for `sessionId`):**
-   - Physical devices cannot be restarted from code. Delete `L` (if still in `state.leases`) and delete `T` (if present in `state.disconnectedPhysicalLeases` so a subsequent `atc claim` after the agent re-checks `atc status` can proceed cleanly), commit, release `atc.lock`, and **fail fast with exit code `1`** (do **not** place the caller into the wait queue):
-     > *"Physical device `<serial>` disconnected while leased and cannot be restarted automatically. Your lease was released — run `atc status` to re-check what is available before claiming again."*
+   - ATC cannot restart the disconnected physical device. Delete `L` from `state.leases` and `T` from `state.disconnectedPhysicalLeases` if present.
+   - Commit, release `atc.lock`, and exit `1` without queuing. Removing `T` lets a later claim proceed after the agent checks `atc status`.
+   - Report that the physical device `<serial>` disconnected, ATC released its lease, and the agent must run `atc status` before claiming again.
 
 #### Step 4: Bounded-Window Warm-Affinity Scheduling & Candidate Selection (Under Lock)
-To maximize throughput on already-spun-up emulators while guaranteeing that jobs with niche profiles (e.g. Wear OS, XR Glasses, older AOSP APIs) **never** starve, ATC schedules queued and incoming requests using **Bounded-Window Warm-Affinity Ordering**:
+ATC can reorder requests to reuse running emulators. A bounded reorder window limits delays for profiles that need a cold boot, including Wear OS, XR, and older AOSP APIs:
 
 1. **Profile Matching (`matchesProfile(device, req)`):**
-   - Checks `platform` (`(device.platform || "android") === (req.platform || "android")`), `kind`, `avd`, `serial`, `deviceType` (exact match preferred over `resizable` fallback), `apiSpec` (exact `36`, minimum `>=34`, or range `34..36`), `services` (`--play` requires `services === "play"`; `--no-play` requires `playStore === false`), `abi`, and (if `--snapshot-load <name>` is set) verifies `<name>` exists in `device.snapshots`.
+   - `matchesProfile` checks `(device.platform || "android") === (req.platform || "android")`, `kind`, `avd`, `serial`, and `abi`.
+   - It checks `deviceType` and prefers an exact match over `resizable`. It accepts `apiSpec` values such as `36`, `>=34`, and `34..36`.
+   - `--play` requires `services === "play"`. `--no-play` requires `playStore === false`.
+   - With `--snapshot-load <name>`, it requires `<name>` in `device.snapshots`.
 2. **Affinity Tiers (Cost to Run Now):**
-   - **Tier 0 (`WARM_IDLE_MATCH`):** Candidate device (whether an online emulator or a connected `kind: "physical"` device when `--kind physical|any` or `--serial` is requested) is **online, unleased**, matches `req`, and does **not** require a full QEMU process restart (`--wipe-data` and `--cold` are false; live `--snapshot-load <name>` via `adb emu avd snapshot load` and `--reset-app <pkg>` stay in Tier 0 because they keep the warm QEMU instance alive and require zero extra RAM). Physical devices are only ever matched in Tier 0 (boot/eviction Tiers 1 and 2 never apply to physical devices).
+   - Tier 0 (`WARM_IDLE_MATCH`) requires an online, unleased device matching `req` without a QEMU restart. `--wipe-data` and `--cold` must be false.
+   - Live `--snapshot-load <name>` through `adb emu avd snapshot load` and `--reset-app <pkg>` remain in Tier 0. They keep QEMU running and need no extra RAM.
+   - Physical devices can match Tier 0 only when `--kind physical|any` or `--serial` requests them. Tiers 1 and 2 never apply to physical devices.
    - **Tier 1 (`FREE_SLOT_BOOT`):** Candidate AVD is **offline** (or requires reboot for `--wipe-data` / `--cold`), `usedSlots < effectiveMaxEmulators`, and host RAM/disk passes §5.2(4) without stopping a running emulator.
    - **Tier 2 (`COLD_EVICT_BOOT`):** `usedSlots >= effectiveMaxEmulators` (or free host RAM is insufficient without eviction) and running `req` requires stopping an idle running emulator (`Priority 3`) to cold-boot a different offline AVD.
 3. **Bounded Reorder Window & Resource-Scoped Anti-Starvation Invariant (`reorderWindowSec`, default `120s`):**
@@ -377,30 +424,53 @@ To maximize throughput on already-spun-up emulators while guaranteeing that jobs
      - `now >= E.starvationDeadlineMs` (i.e., `E` has already waited `>= reorderWindowSec` since it was enqueued), **OR**
      - `C.enqueuedAtMs - E.enqueuedAtMs > config.reorderWindowSec * 1000` (`C` arrived outside `E`'s reorder window).
    - **Resource-Scoped Reservation Helper `isReservedForEarlierTicket(candidateDeviceOrSlot)` (No Unrelated Head-of-Line Blocking):**
-     Starvation protection applies strictly to **competing devices, slots, RAM, and eviction victims** — never as a global head-of-line barrier across unrelated resources:
+     Starvation protection reserves competing devices, slots, RAM, and devices selected for eviction. Later requests can use unrelated resources:
      1. **Direct Device Contention:** If an earlier ticket `E` matches `candidateDevice` (`matchesProfile(candidateDevice, E.req)`), then `candidateDevice` is reserved for `E` (unless `E` itself is still blocked on another condition).
-     2. **Slot, RAM & Eviction Contention:** If an earlier ticket `E` is **Starvation-Protected** and needs a free virtual slot, host RAM, or an idle eviction victim `V` to boot its offline virtual device, then (a) no later caller `C` may consume a Tier 1 boot slot or host RAM that would leave `E` unable to boot, and (b) the eviction victim `V` needed by `E` is **reserved for `E`** — no later Tier 0 warm-hit job may re-lease `V` once `E` is Starvation-Protected.
-     3. **Non-Competing Bypass:** Conversely, if `C` claims a Tier 0 warm device `D` (such as an already-online simulator/emulator or physical device that `E` does not match and that is not needed as an eviction victim `V` for `E` — e.g., `E` is waiting on a busy physical phone `--serial X` or has its own reserved victim `V1` while `D` is an unrelated warm device), `isReservedForEarlierTicket(D)` is `false` and `C` proceeds immediately even when `E` is Starvation-Protected.
+     2. If protected ticket `E` needs a slot or RAM, later caller `C` must leave enough resources for `E` to boot.
+        If `E` needs an idle device `V` for eviction, reserve `V` for `E`. Later Tier 0 jobs cannot re-lease `V` after protection starts.
+     3. If Tier 0 device `D` neither matches `E` nor provides its required eviction resources, `isReservedForEarlierTicket(D)` is `false`.
+        Caller `C` can claim `D` immediately, even while `E` has protection. For example, `E` can wait on physical phone `--serial X` while `C` claims an unrelated emulator.
 4. **Candidate Selection & Resource Admission Order:**
-   - Compute occupied virtual-device capacity `usedSlots` (for the target platform's slot pool) without double-counting, where `occupiedVirtualKeys` is the set union of canonical `deviceKey`s for all running virtual devices on that platform observed in the pre-lock inventory snapshot (whether leased or unleased/idle) **and** all virtual-device (`kind === "emulator"`) leases for that platform with `state === "active" | "stopping"` (closing the window where another caller activated a lease after this caller's pre-lock inventory was taken):
+   - Compute `occupiedVirtualKeys` as a set of canonical `deviceKey` values in the target platform's slot pool.
+   - Include running devices from the pre-lock inventory, whether leased or idle. Also include current virtual leases (`kind === "emulator"`) with `state === "active" | "stopping"`.
+   - This counts leases activated after discovery without counting a device twice:
      `usedSlots = count(occupiedVirtualKeys) + count(startingVirtualLeases for platform where lease.deviceKey not in occupiedVirtualKeys and (lease.replacingAvd === null or ("avd:" + lease.replacingAvd) not in occupiedVirtualKeys))`
-     *(Note: a `"starting"` lease's `replacingAvd` / `replacingKey` only offsets `usedSlots` when the `"stopping"` eviction victim `V` belongs to the **same** platform pool.)*
-   - **Priority 1 — Tier 0 Warm Idle Match:** Select an online, unleased device matching `req` where `isReservedForEarlierTicket(candidate)` is `false` (and `--wipe-data` / `--cold` are not set).
+     A `"starting"` lease's `replacingAvd` / `replacingKey` offsets `usedSlots` only when its `"stopping"` device `V` belongs to the same platform pool.
+   - Priority 1 selects a Tier 0 online, unleased device matching `req`. Require `isReservedForEarlierTicket(candidate)` false and no `--wipe-data` / `--cold`.
      - If **neither** `--snapshot-load` nor `--reset-app` is requested: transition immediately to `state: "active"`, remove caller's queue ticket, commit, release lock, and return in <5ms.
      - If `--snapshot-load <name>` or `--reset-app <pkg>` **is** requested: write lease with `state: "starting"`, `workerPid: process.pid`, `deadlineMs: now + bootTimeoutMs`, remove caller's queue ticket, commit, release lock, and proceed to Step 5 (Warm State Preparation outside lock).
-   - **Priority 2 — Tier 1 Boot Into Free Slot (or Reboot Running Match for `--wipe-data` / `--cold`):** If `usedSlots < effectiveMaxEmulators` (or the candidate itself is an already-running unleased AVD that needs a `--wipe-data`/`--cold` restart), `isReservedForEarlierTicket(candidate)` is `false`, and candidate passes the **Pre-Flight RAM & Disk Admission Check (§5.2.4)** (or `--force` is set):
+   - Priority 2 boots a Tier 1 device when `usedSlots < effectiveMaxEmulators`. It can also restart an already-running unleased match for `--wipe-data` / `--cold`.
+     Require `isReservedForEarlierTicket(candidate)` false. The candidate must pass §5.2.4's RAM and disk checks unless `--force` is set.
      - Write lease with `state: "starting"`, `workerPid: process.pid`, `requiredDiskMb: req.wipeData ? C.dataDiskMb : C.ramSizeMb`, `deadlineMs: now + bootTimeoutMs`, remove caller's queue ticket, commit, and release lock. Proceed to Step 5.
-   - **Priority 3 — Tier 2 Evict Idle Running Virtual Device (Slot or RAM Contention):** If (`usedSlots >= effectiveMaxEmulators` OR host free RAM is insufficient for Priority 2 without stopping an idle virtual device) and `config.autoStopIdleOnContention` is `true`, look for a running **unleased** virtual device `V` where `isReservedForEarlierTicket(V)` is `false` (preferring the longest-idle virtual device with zero matching queued tickets; when `usedSlots >= effectiveMaxEmulators`, `V` **must** belong to the **same platform** as `req` so stopping `V` frees a target-platform slot, whereas when `usedSlots < effectiveMaxEmulators` and eviction is needed solely for shared host RAM under `Rule R1`, `V` may belong to either platform), and an offline unleased AVD `C` matching `req` where `isReservedForEarlierTicket(C)` is `false` and `C` passes both target-platform slot admission and §5.2(4) after reclaiming `V.requiredRamMb`:
+   - Priority 3 uses Tier 2 eviction when `usedSlots >= effectiveMaxEmulators` or Priority 2 lacks RAM, and `config.autoStopIdleOnContention` is `true`.
+     - Select a running unleased device `V` with `isReservedForEarlierTicket(V)` false. Prefer the longest-idle device with no matching queued tickets.
+     - When the target platform's slots are full, `V` must belong to that platform. Stopping it frees a target-platform slot.
+     - With a free target slot and only shared RAM pressure under Rule R1, `V` can belong to either platform.
+     - Select an offline unleased AVD `C` matching `req` with `isReservedForEarlierTicket(C)` false.
+     - After reclaiming `V.requiredRamMb`, `C` must pass the target-platform slot check and §5.2(4).
      - Atomically write two records in `state.leases`:
        1. `state.leases[V.deviceKey] = { state: "stopping", serial: V.serial, workerPid: process.pid, deadlineMs: now + stopTimeoutMs, ... }`
        2. `state.leases[C.deviceKey] = { state: "starting", replacingAvd: V.avd, requiredDiskMb: req.wipeData ? C.dataDiskMb : C.ramSizeMb, workerPid: process.pid, deadlineMs: now + bootTimeoutMs, ... }`
      - Remove caller's queue ticket, commit, and release lock. Proceed to Step 5.
-   - **Priority 4 — Auto-Create Missing AVD (`--create-if-missing`):** If no existing AVD on disk or in `state.leases` matches `req` and `--create-if-missing` is passed, verify a `readyToCreate` profile exists in §5.2(3), passes **Rule D2 (Creation Disk Check)** and **Rule R1 (RAM Check)**, and satisfies the same **slot, starvation (`!isReservedForEarlierTicket`), and Priority-3 idle-eviction admission** as booting an offline AVD (either `usedSlots < effectiveMaxEmulators` or an unreserved idle running emulator `V` is simultaneously marked `"stopping"` via `replacingAvd: V.avd`). Reserve a synthetic `"starting"` record `state.leases["avd:creating:" + ticketId] = { state: "starting", avd: avdId, replacingAvd: V?.avd || null, requiredDiskMb: C.dataDiskMb, workerPid: process.pid, claimedAtMs: now, deadlineMs: now + bootTimeoutMs, ... }`, commit, and release `atc.lock`. Outside `atc.lock`, create the AVD via `android emulator create <profile>`, immediately acquire `atc.lock` **before booting** to atomically migrate the `"starting"` lease key from `"avd:creating:" + ticketId` to `"avd:" + actualAvdId`, release `atc.lock`, and proceed to Step 5.
-   - **Hard Resource Failure vs Queue Wait:** If an offline candidate `C` exists and **no virtual devices are running or starting on any platform** (`usedSlots === 0` and zero active/starting virtual-device RAM leases), yet `C` still fails **Rule R1 (RAM)** or **Rule D1/D2 (Disk)** (and `--force` is not set), waiting in the queue cannot free virtual-device RAM/disk: release `atc.lock` and fail immediately with exit code `5` (`ERESOURCE_EXCEEDED`) and an actionable diagnostic message.
+   - Priority 4 creates a missing AVD when `--create-if-missing` is set and no AVD on disk or in `state.leases` matches `req`.
+     - Require a `readyToCreate` profile from §5.2(3) that passes Rule D2 and Rule R1.
+     - Apply the same slot, starvation (`!isReservedForEarlierTicket`), and Priority-3 eviction checks as an offline boot.
+     - Require `usedSlots < effectiveMaxEmulators`, or simultaneously mark an unreserved idle device `V` as `"stopping"` with `replacingAvd: V.avd`.
+     - Reserve `state.leases["avd:creating:" + ticketId] = { state: "starting", avd: avdId, replacingAvd: V?.avd || null, requiredDiskMb: C.dataDiskMb, workerPid: process.pid, claimedAtMs: now, deadlineMs: now + bootTimeoutMs, ... }`.
+     - Commit and release `atc.lock`. Create the AVD with `android emulator create <profile>` outside the lock.
+     - Before booting, acquire `atc.lock` and atomically move the lease key from `"avd:creating:" + ticketId` to `"avd:" + actualAvdId`.
+     - Release the lock and continue to Step 5.
+   - If no virtual devices run or start on any platform, waiting cannot free virtual-device RAM or disk.
+     - This requires `usedSlots === 0` and zero active/starting virtual-device RAM leases.
+     - If offline candidate `C` still fails Rule R1 or Rule D1/D2 without `--force`, release `atc.lock` and exit `5` (`ERESOURCE_EXCEEDED`).
+     - Report the failed resource check and the action needed.
 
 #### Step 5: Evict, Boot & Snapshot/Wipe Preparation Phase (Outside Lock)
 All external commands run strictly outside `atc.lock` while the device is protected by `state: "starting"`:
-1. **Evict Victim (if `replacingAvd` set):** Run `android emulator stop <V.serial>` (or `xcrun simctl shutdown <V.serial>` if `V` is an iOS Simulator), refresh host `availableRamMb` outside `atc.lock`, then acquire `atc.lock`, delete `state.leases[V.deviceKey]` (verifying `leaseId`), clear `replacingAvd = null` on `C`'s `"starting"` lease, and re-verify **Rule R1 (RAM)** against the live post-eviction `availableRamMb` and current `"starting"` / recently-activated leases (excluding `C` itself) before releasing `atc.lock` to boot `C` (if post-eviction RAM is still insufficient and `--force` is not set, delete `state.leases[C.deviceKey]`, commit, and exit with code `5` `ERESOURCE_EXCEEDED`).
+1. If `replacingAvd` is set, stop `V` with `android emulator stop <V.serial>` or, for iOS, `xcrun simctl shutdown <V.serial>`.
+   Refresh `availableRamMb` outside `atc.lock`. Then acquire the lock, check `leaseId`, and delete `state.leases[V.deviceKey]`.
+   Set `replacingAvd = null` on `C`'s `"starting"` lease. Check Rule R1 against current RAM and starting or recently activated leases, excluding `C`.
+   If RAM remains insufficient without `--force`, delete `state.leases[C.deviceKey]`, commit, and exit `5` (`ERESOURCE_EXCEEDED`). Otherwise, release the lock before booting `C`.
 2. **Warm State Preparation (if device was already online and `--wipe-data` / `--cold` are false):**
    - If `--snapshot-load <name>` is requested: run `adb -s <serial> emu avd snapshot load <name>`.
    - If `--reset-app <pkg>` is requested: run `adb -s <serial> shell pm clear <pkg>`.
@@ -410,24 +480,34 @@ All external commands run strictly outside `atc.lock` while the device is protec
    - Run `android emulator start <C.avd> [--headless] [--cold]` bounded by `bootTimeoutSec` and resolve the resulting `emulator-<port>` serial.
    - If `--snapshot-load <name>` is requested, run `adb -s <serial> emu avd snapshot load <name>` after boot.
    - If `--reset-app <pkg>` is also requested, run `adb -s <serial> shell pm clear <pkg>`.
-4. **Activate Lease:** Acquire `atc.lock`, verify `state.leases[C.deviceKey]` still matches our `leaseId`. If `lease.isRecovery === true` and `now >= lease.expiresAtMs` (the original lease TTL expired while recovery was booting), release `atc.lock`, best-effort stop the newly booted virtual device, re-acquire `atc.lock`, delete `state.leases[C.deviceKey]`, commit, and exit with code `1`. Otherwise, transition `state` to `"active"` with `serial`, `loadedSnapshot`, `saveSnapshotOnFree`, `requiredDiskMb: 0`, `activatedAtMs: now` (always refreshed on activation, including recovery, so §5.2.4's 30s RAM fault-in guard applies), `firstSeenOfflineAtMs: null`, `isRecovery: false`, and `expiresAtMs = lease.isRecovery ? lease.expiresAtMs : (now + ttlMs)` (preserving the original `expiresAtMs` on crash recovery so recovery never prolongs the claim duration), commit, and return.
+4. Acquire `atc.lock` and check that `state.leases[C.deviceKey]` still matches the worker's `leaseId`.
+   If `lease.isRecovery === true` and `now >= lease.expiresAtMs`, the original lease expired during boot.
+   Release the lock and attempt to stop the newly booted device. Reacquire the lock, delete `state.leases[C.deviceKey]`, commit, and exit `1`.
+   Otherwise, activate the lease with `serial`, `loadedSnapshot`, `saveSnapshotOnFree`, `requiredDiskMb: 0`, `activatedAtMs: now`, `firstSeenOfflineAtMs: null`, and `isRecovery: false`.
+   Compute expiration from the previous recovery flag: `expiresAtMs = lease.isRecovery ? lease.expiresAtMs : (now + ttlMs)`. Recovery must preserve the original expiration.
+   Refresh `activatedAtMs` even during recovery so the 30-second RAM accounting window in §5.2.4 applies. Commit and return.
 5. **Rollback on Failure / Timeout / Signal:** Best-effort stop any newly booted emulator, acquire `atc.lock`, delete `state.leases[C.deviceKey]` (and `state.leases[V.deviceKey]` if still `"stopping"`), and exit with code `1`.
 
 #### Step 6: Wait Queue Phase (If No Candidate Available)
 - If `--wait 0` (non-blocking), release `atc.lock` and exit with code `2` (`EBUSY`).
-- Under `atc.lock`, if caller has no ticket in `state.queue`, append `{ ticketId, sessionId, waiterPid: process.pid, requestedKind, requestedAvd, requestedSerial, requestedProfile, enqueuedAtMs: now, starvationDeadlineMs: now + reorderWindowMs, lastHeartbeatAtMs: now, waitExpiresAtMs: now + waitMs }`. (If re-inserting after an OS sleep while `now < waitExpiresAtMs`, the waiter process retains its original `enqueuedAtMs` and `starvationDeadlineMs` in local process memory and restores them on re-insert. Note: if a laptop sleeps longer than a lease TTL or `waitExpiresAtMs`, in-flight waits/leases time out and self-heal on the next command.)
+- Under `atc.lock`, append a ticket if the caller has none in `state.queue`:
+  `{ ticketId, sessionId, waiterPid: process.pid, requestedKind, requestedAvd, requestedSerial, requestedProfile, enqueuedAtMs: now, starvationDeadlineMs: now + reorderWindowMs, lastHeartbeatAtMs: now, waitExpiresAtMs: now + waitMs }`.
+- After OS sleep, the waiter restores its original `enqueuedAtMs` and `starvationDeadlineMs` from process memory when reinserting before `waitExpiresAtMs`.
+- Sleep beyond a lease TTL or `waitExpiresAtMs` expires the lease or wait. The next command performs cleanup.
 - Release `atc.lock` and enter the **Two-Stage Poll Loop** (every `1,000ms` ± `200ms` jitter):
-  1. **Stage A (In-Memory Heartbeat & Fast Check Under `atc.lock`, 0 Subprocesses):** Acquire `atc.lock`, run GC, update `ticket.lastHeartbeatAtMs = now`, and check whether a lease was freed or if the caller is now eligible to run. Release `atc.lock`.
-  2. **Stage B (External Inventory Refresh Outside `atc.lock`):** Run §5.2 (`android emulator list --long`, `adb devices`, and host RAM/disk telemetry) only when Stage A indicates a slot/device opened up, **or** every 5th poll tick (~5s) as a fallback to detect out-of-band device changes (e.g., an emulator closed manually by the user), then re-enter Step 2.
+  1. Acquire `atc.lock`, run GC, and update `ticket.lastHeartbeatAtMs = now`. Check for a released lease or a caller now eligible to run, then release the lock. This stage starts no subprocesses.
+  2. Outside the lock, refresh inventory through §5.2 when the first stage detects an available slot or device. Also refresh every fifth poll, about five seconds, to detect changes outside ATC. This includes an emulator that the user closed manually. Return to Step 2 after the refresh.
 
 ### 5.4 Releasing a Device & Post-Lease Snapshot Actions (`atc free`)
 Inputs: `[<target>] [--session <id>] [--snapshot-save <name>] [--snapshot-load <name>] [--stop] [--force]`
 1. Target resolution precedence: match `<target>` against `leaseId` first, then `serial`, then `avd`. If `<target>` is omitted, select all `"active"` leases owned by `sessionId`.
 2. Verify ownership and state under `atc.lock`:
    - Require `lease.sessionId === callerSessionId || lease.leaseId === target || flags.force`; otherwise exit with code `3` (`EPERM`).
-   - Require `lease.state === "active" || flags.force`. If an explicitly targeted lease is currently in a transitional state (`"starting"` during boot/snapshot or `"stopping"`) and `--force` is not set, reject with exit code `2` (`EBUSY`: transition in progress by `workerPid`), preventing `atc free <target>` from racing an in-flight snapshot or boot. (When `--force` is set on a transitional lease, terminate `workerPid` if alive before cleanup.)
+   - Require `lease.state === "active" || flags.force`. Reject an explicitly targeted transitional lease (`"starting"` or `"stopping"`) without `--force` with exit `2` (`EBUSY`). Report the transition's `workerPid`.
+   - This prevents `atc free <target>` from racing a boot or snapshot operation. With `--force`, terminate a live `workerPid` before cleaning up a transitional lease.
 3. Determine post-lease actions: let `saveSnap = flags.snapshotSave || lease.saveSnapshotOnFree`.
-4. **If the lease is confirmed offline (`lease.firstSeenOfflineAtMs !== null` or `lease.serial === null`), or if no `--stop`, no `saveSnap`, and no `--snapshot-load`:** Delete the lease from `state.leases`, commit, release `atc.lock`, and exit `0` (never running `adb` or `stop` commands against a dead or recycled serial).
+4. Delete the lease when it is offline (`lease.firstSeenOfflineAtMs !== null` or `lease.serial === null`). Also delete it when `--stop`, `saveSnap`, and `--snapshot-load` are all absent.
+   Commit, release `atc.lock`, and exit `0`. Never run `adb` or stop commands against an offline or reused serial.
 5. **If the lease is online (`lease.firstSeenOfflineAtMs === null && lease.serial !== null`) and `saveSnap`, `--snapshot-load`, or `--stop` IS set (Race-Free Post-Lease Transition):**
    - If `saveSnap` is set, gather a host disk/AVD footprint snapshot outside `atc.lock` (`fs.statfsSync(avdHomeDir)` + `<avdPath>/config.ini`) and verify **Rule D1 (Disk Check against `projectedFreeDiskMb`)** under `atc.lock` (unless `--force` is set).
    - Under `atc.lock`, transition the lease to `state: "stopping"`, `workerPid: process.pid`, `requiredDiskMb: saveSnap ? C.ramSizeMb : 0`, `deadlineMs: now + stopTimeoutMs`, commit, and release `atc.lock` (preventing any concurrent `atc claim` from claiming the emulator mid-snapshot or mid-shutdown).
@@ -435,7 +515,7 @@ Inputs: `[<target>] [--session <id>] [--snapshot-save <name>] [--snapshot-load <
      - If `saveSnap` is set (and `lease.kind === "emulator"`): run `adb -s <lease.serial> emu avd snapshot save <saveSnap>`.
      - If `--snapshot-load <name>` is set (and `--stop` is not set and `lease.kind === "emulator"`): run `adb -s <lease.serial> emu avd snapshot load <name>` so the emulator is left clean and warm for the next waiter.
      - If `--stop` is set (and `lease.kind === "emulator"`): run `android emulator stop <lease.serial || lease.avd>`.
-   - Re-acquire `atc.lock`, delete the `"stopping"` entry (if `leaseId` matches, regardless of whether the post-lease command succeeded or failed so the lease is always released), commit, and exit `0` (or `1` if a post-lease snapshot/stop command failed).
+   - Reacquire `atc.lock` and delete the `"stopping"` entry if `leaseId` matches. Release the lease even if the external action failed. Commit and exit `0`, or `1` if a snapshot or stop action failed.
 
 ### 5.5 Live Snapshot Management During an Active Lease (`atc snapshot`)
 Usage: `atc snapshot <list|save|load|delete> [<name>] [--serial <serial> | --avd <avdId>] [--force]`
@@ -443,16 +523,25 @@ Usage: `atc snapshot <list|save|load|delete> [<name>] [--serial <serial> | --avd
 - `atc snapshot <save|load|delete> <name>`:
   1. Validates `<name>` against `/^[A-Za-z0-9._-]{1,64}$/`.
   2. For `save`, gathers host disk telemetry outside `atc.lock` and checks **Rule D1 (`projectedFreeDiskMb`)** under `atc.lock` unless `--force` is set (exit code `5` if insufficient).
-  3. Under `atc.lock`, verifies that `sessionId` holds an **online** `"active"` virtual-device lease (`lease.firstSeenOfflineAtMs === null && lease.serial !== null`) for the target device (if the lease is in its offline recovery window, reject with exit code `1` instructing the agent to run `atc claim` to recover the crashed device first). For `save` or `load`, transitions the lease to `state: "starting"`, `workerPid: process.pid`, `requiredDiskMb: action === "save" ? C.ramSizeMb : 0`, `deadlineMs: now + bootTimeoutMs` (protecting the lease with the 15s worker heartbeat per §5.1 Rule 3 so neither offline-grace reconciliation in §5.3 Step 2 nor a concurrent `atc free` can race while the snapshot is being saved/restored).
-  4. Outside `atc.lock`, executes `adb -s <lease.serial> emu avd snapshot <save|load|delete> <name>` (and for `load`, waits until `sys.boot_completed == 1`), then re-acquires `atc.lock`, verifies `leaseId`, transitions `state` back to `"active"` with `requiredDiskMb: 0`, `expiresAtMs = now + ttlMs` (and updated `loadedSnapshot` on `load`), and commits.
+  3. Under `atc.lock`, require the session's online `"active"` virtual lease: `lease.firstSeenOfflineAtMs === null && lease.serial !== null`.
+     During offline recovery, exit `1` and require `atc claim` before snapshot changes.
+     For `save` or `load`, set `state: "starting"`, `workerPid: process.pid`, `requiredDiskMb: action === "save" ? C.ramSizeMb : 0`, and `deadlineMs: now + bootTimeoutMs`.
+     The 15-second worker heartbeat (§5.1 Rule 3) protects the reservation against offline reconciliation (§5.3 Step 2) and concurrent `atc free`.
+  4. Outside the lock, run `adb -s <lease.serial> emu avd snapshot <save|load|delete> <name>`. For `load`, wait for `sys.boot_completed == 1`.
+     Reacquire the lock and check `leaseId`. Restore `state: "active"`, `requiredDiskMb: 0`, and `expiresAtMs = now + ttlMs`.
+     Update `loadedSnapshot` on load, then commit.
 
 ### 5.6 Executing Scoped Commands (`atc exec`) with In-Process Heartbeat
 Usage: `atc exec [--serial <serial>] [--session <id>] -- <command> [args...]`
-1. Under `atc.lock`, verify that `sessionId` holds an **online** `"active"` lease (`lease.firstSeenOfflineAtMs === null && lease.serial !== null`; if the session holds one online lease, select it; if multiple, require `--serial`; if the session's lease is in its offline recovery window, exit `1` instructing the agent to run `atc claim` to recover the crashed device or `atc status` if physical).
+1. Under `atc.lock`, require the session's online `"active"` lease: `lease.firstSeenOfflineAtMs === null && lease.serial !== null`.
+   Select the only online lease, or require `--serial` when several match. During offline recovery, exit `1`.
+   Ask the agent to run `atc claim` for a crashed virtual device or `atc status` for a physical device.
 2. Extend `expiresAtMs = Math.max(lease.expiresAtMs, now + defaultTtlMs)` and `renewedAtMs = now`.
 3. Release `atc.lock`.
 4. **Start In-Process Lease Heartbeat Timer:**
-   - Start a `setInterval` timer firing every `Math.min(60_000, Math.floor(ttlMs / 3))` (`unref()`'d) that acquires `atc.lock`, verifies `leaseId` is still owned by `sessionId` and `firstSeenOfflineAtMs === null`, and updates `renewedAtMs = Date.now()` and `expiresAtMs = Date.now() + ttlMs`. This guarantees that long-running commands (e.g., a 20-minute `./gradlew connectedAndroidTest` suite) **never** expire mid-run.
+   - Start an `unref()`'d `setInterval` timer with interval `Math.min(60_000, Math.floor(ttlMs / 3))`.
+   - Each tick acquires `atc.lock`, checks ownership of `leaseId` by `sessionId`, and requires `firstSeenOfflineAtMs === null`.
+   - Set `renewedAtMs = Date.now()` and `expiresAtMs = Date.now() + ttlMs`. These updates keep leases alive during long commands, including a 20-minute `./gradlew connectedAndroidTest` run.
 5. **Spawn Child Process:**
    - Resolve `<command>` via the Cross-Platform Executable Resolver (§8.1).
    - Set child environment variables `ANDROID_SERIAL=<lease.serial>`, `ATC_LEASE_ID=<lease.leaseId>`, and `ATC_SESSION_ID=<sessionId>`.
@@ -491,7 +580,7 @@ For MCP-centric agent hosts, `atc mcp` implements the MCP stdio transport exposi
 
 ## 7. Multi-Agent Plugin, Extension & Hook Guardrails
 
-All command classification and lease validation logic lives in `atc` itself (`atc guard <cmd>` and `atc hook <pre-tool-use|stop>`), so every agent ecosystem uses a thin, native adapter without duplicating parsing rules (following the same multi-agent architecture as `build-brief`):
+`atc guard <cmd>` and `atc hook <pre-tool-use|stop>` classify commands and check leases. Host adapters call these handlers, so each host uses the same parsing rules. `build-brief` uses the same adapter structure:
 
 ```text
 atc/
@@ -533,10 +622,11 @@ atc/
 ```
 
 ### 7.1 Universal Command Guard (`atc guard` & `atc hook pre-tool-use`)
-> **Scope Note:** Guardrail enforcement is a **cooperative safety net** designed to catch agents that forget to run `atc claim` or forget `--device` / `ANDROID_SERIAL`. It inspects shell command strings and is not an OS security boundary against deliberate obfuscation.
+> The guard checks shell command strings for missing leases and missing `--device` / `ANDROID_SERIAL` targets. Agents can bypass these checks through deliberate command obfuscation. The guard provides no OS security boundary.
 
-1. **Multi-Host Input Plumbing (Zero Shell Interpolation):**
-   - **Pi Extension (`extensions/atc/index.ts`):** Intercepts `tool_call` events where `event.toolName === "bash"`, invokes `pi.exec("atc", ["guard", "--format=json", event.input.command])`, and either updates `event.input.command` in place or throws/blocks when a device command lacks a lease.
+1. **Host input handling without shell interpolation:**
+   - The Pi extension (`extensions/atc/index.ts`) handles `tool_call` events where `event.toolName === "bash"`.
+   - It calls `pi.exec("atc", ["guard", "--format=json", event.input.command])`. It updates `event.input.command` in place or blocks a device command that lacks a lease.
    - **Stdin JSON Hooks (`atc hook pre-tool-use`):** Reads the JSON hook event from `stdin` (never `argv`), normalizing across agent hosts:
      - **Codex / Cursor / Claude Code:** `{ session_id, tool_name: "Bash" | "Shell", tool_input: { command } }`
      - **Antigravity / Gemini CLI:** `{ conversationId, toolCall: { name: "run_command", args: { CommandLine } } }`
@@ -544,21 +634,29 @@ atc/
 2. **Fast Path (<2ms, Zero Lock):**
    - If the command string contains no whole-word token matching `/\b(android|adb|emulator|gradlew|gradle|atc)\b/`, exit `0`.
 3. **Compound Command Segment Analysis:**
-   - Split the shell string into segments across `;`, `&&`, `||`, `|`, `&`, `$()`, and newlines; strip leading environment variable assignments (`VAR=val`) and transparent wrappers (`env`, `command`, `nohup`, `timeout`, `build-brief`).
+   - Split shell commands at `;`, `&&`, `||`, `|`, `&`, `$()`, and newlines.
+   - Remove leading environment assignments (`VAR=val`) and wrappers (`env`, `command`, `nohup`, `timeout`, `build-brief`) before classification.
    - Record `state.hookSessions[process.ppid] = { sessionId, agentPid: process.ppid, cwd: process.cwd(), updatedAtMs: now }` under `atc.lock`.
    - Classify each segment in strict precedence order (most-specific rules first):
-     1. **ATC commands (`atc ...`)**: Allowed. If `ATC_SESSION_ID` / `--session` is not present in the command, emit a rewritten command (`event.input.command` in Pi, `overwrite` in Antigravity/Gemini CLI, `updatedInput` in Claude Code) prepending `ATC_SESSION_ID=<sessionId> ATC_ANCHOR_PID=<process.ppid>` so the `atc` CLI invocation receives the exact session identity even when multiple agents share the same `cwd`.
+     1. Allow `atc ...` commands. When `ATC_SESSION_ID` / `--session` is absent, add `ATC_SESSION_ID=<sessionId> ATC_ANCHOR_PID=<process.ppid>` before the command.
+        Emit the rewrite through Pi's `event.input.command`, Antigravity/Gemini CLI's `overwrite`, or Claude Code's `updatedInput`.
+        This supplies the session identity even when agents share `cwd`.
      2. **Direct lifecycle bypass (evaluated before generic `android` subcommands)**: `android emulator (start|stop|remove|create)` or `emulator @<avd>` or `adb ... emu kill` -> **Denied** (`Use "atc claim --type <type> --api <api>" or "atc free --stop" instead of starting/stopping emulators directly.`).
      3. **Read-only Android/ADB commands**: `android emulator list`, `android (docs|sdk|info|help|skills|studio|describe|create|init|update)` (where top-level `android create` is project creation, distinct from `android emulator create`), `adb (devices|version|help|start-server)` -> Allowed.
      4. **Device-interacting commands**: `android (run|install|layout|screen)`, `adb ... (shell|install|uninstall|push|pull|logcat|forward|reverse|bugreport)`, `(./gradlew|gradle) ... connected*`, or any unparseable segment containing `android`/`adb`/`emulator` (fail-closed toward requiring a lease):
        - Check active leases in `state.json` for `sessionId`:
-       - Require an **online** `"active"` lease (`lease.firstSeenOfflineAtMs === null && lease.serial !== null`). If `sessionId` holds no active lease (or its lease is currently in its offline recovery window with `firstSeenOfflineAtMs !== null`), deny the tool call: write an actionable error message to `stderr` (if `firstSeenOfflineAtMs !== null`, instructing the agent to run `atc claim` to recover its crashed device in-place or `atc status` if physical), emit the structured deny JSON on `stdout`, and exit with code `2` (which blocks execution in Codex, Cursor, Antigravity, Gemini CLI, and Claude Code).
+       - Require an online `"active"` lease: `lease.firstSeenOfflineAtMs === null && lease.serial !== null`.
+       - Deny calls without that lease, including leases in the offline recovery window (`firstSeenOfflineAtMs !== null`).
+       - Write the error and next action to `stderr`. For an offline lease, require `atc claim` to recover a virtual device or `atc status` for a physical device.
+       - Emit structured deny JSON on `stdout` and exit `2`. Codex, Cursor, Antigravity, Gemini CLI, and Claude Code block execution for this result.
        - If the command specifies `--device=<serial>` or `-s <serial>` (or `ANDROID_SERIAL=<serial>`) that does not belong to `sessionId`'s online active lease(s), deny the tool call.
-       - If `sessionId` holds multiple online active leases, or if multiple emulators are running and the command is not wrapped in `atc exec` and lacks `ANDROID_SERIAL` / `--device` / `-s`, deny with instructions to use `atc exec -- <cmd>` or specify `ANDROID_SERIAL=<serial>`.
+       - Deny ambiguous commands when the session holds multiple online active leases.
+       - Also deny commands when multiple emulators run and the command lacks both `atc exec` and `ANDROID_SERIAL` / `--device` / `-s`.
+       - Require `atc exec -- <cmd>` or `ANDROID_SERIAL=<serial>`.
        - Otherwise, **auto-renew** `sessionId`'s online active lease (`expiresAtMs = now + ttlMs`) and allow (`exit 0`).
 
 ### 7.2 `Stop` / `SessionEnd` Hook (`atc hook stop`)
-When the agent turn or session terminates (`Stop` / `SessionEnd` event where `fullyIdle !== false`), `atc hook stop` reads `session_id` / `conversationId` from `stdin` JSON and frees all `"active"` leases owned by that session (`atc free --session <sessionId>`), executing any configured `saveSnapshotOnFree` action before releasing the device to queued waiters.
+`atc hook stop` handles `Stop` / `SessionEnd` events where `fullyIdle !== false`. It reads `session_id` / `conversationId` from `stdin` JSON. It releases the session's `"active"` leases through `atc free --session <sessionId>`. Before releasing a device to queued callers, it runs the configured `saveSnapshotOnFree` action.
 
 ---
 
@@ -571,24 +669,26 @@ Node.js >= 20.12 throws `EINVAL` when spawning `.bat` or `.cmd` files on Windows
    - On Windows, resolve the target binary against `PATH` (plus `%LOCALAPPDATA%\Android\Sdk\platform-tools` and `%USERPROFILE%\.local\bin` for `adb`/`android`) checking extensions `.exe`, `.cmd`, `.bat` in order.
 2. **Direct `.exe` Execution:** If the resolved file ends in `.exe` (e.g., `adb.exe` or `android.exe`), spawn it directly with `shell: false`.
 3. **Safe `.cmd` / `.bat` Execution on Windows:**
-   - When the resolved file is a `.cmd` or `.bat` batch file (e.g., `android.cmd` or `gradlew.bat` inside `atc exec`), first validate that no argument contains `\0`, `\r`, `\n`, or unescaped `%` environment expansion tokens when invoked internally by ATC.
-   - For internal `android` CLI calls, all arguments (`avd`, `serial`, flags) are strictly validated against `/^[A-Za-z0-9._:-]+$/` before invocation, and positional arguments are preceded by `--` where supported, making command injection impossible even when routed through `[process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", ...]]` with `windowsVerbatimArguments: true`.
+   - For internal `.cmd` or `.bat` calls, reject arguments containing `\0`, `\r`, `\n`, or unescaped `%` environment expansion tokens.
+   - Batch targets include `android.cmd` and `gradlew.bat` inside `atc exec`.
+   - ATC validates internal `android` arguments (`avd`, `serial`, and flags) against `/^[A-Za-z0-9._:-]+$/`. It adds `--` before positional arguments where the command supports it.
+   - These checks restrict command injection when ATC uses `[process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", ...]]` with `windowsVerbatimArguments: true`.
 
 ### 8.2 State Directory & Symlink Protection
-- On POSIX, `stateDir` is created with `0o700`, checked via `fs.lstatSync` to reject symlinks, and verified to match `process.getuid()`.
-- All temporary files (`state.json.tmp.<pid>.<nonce>`) are opened with `fs.openSync(path, "wx", 0o600)` (`O_CREAT | O_EXCL`) and cryptographic random nonces (`crypto.randomBytes(12).toString("hex")`).
+- On POSIX, ATC creates `stateDir` with `0o700`. It uses `fs.lstatSync` to reject symlinks and checks ownership against `process.getuid()`.
+- ATC opens temporary files (`state.json.tmp.<pid>.<nonce>`) with `fs.openSync(path, "wx", 0o600)` (`O_CREAT | O_EXCL`). It generates nonces with `crypto.randomBytes(12).toString("hex")`.
 
 ---
 
 ## 9. Historical ATC 2.0 Plan: Multiplatform iOS & Android
 
-ATC **2.1.0** ships Android and iOS support. This section preserves the **2.0** plan and its original requirements; use [the user guide](docs/user-guide.md) for current behavior.
+ATC 2.1.0 supports Android and iOS. This section records the 2.0 plan and its original requirements. [The user guide](docs/user-guide.md) describes current behavior.
 
 ATC **1.0** shipped as **Android Traffic Control**. The **2.0** plan added iOS Simulator (`xcrun simctl`) and physical iOS device (`xcrun devicectl`) support through `src/ios.mjs`. It required compatibility with the 1.0 `state.json` schema and CLI. The plan retained the lock boundary (§3.2), session identity ladder (§4.2), bounded-window scheduler (§5.3), and hook architecture (§7).
 
-> **Strict Agnosticism Boundary ("Not Our Business"):** Just as on Android, ATC 2.0 only coordinates **who owns which device, lifecycle/snapshot preparation, and target-pinning guardrails**. What an agent actually builds, signs, or runs on the leased device — including Apple code-signing certificates, provisioning profiles, Developer Mode toggles, or locked physical screens — is strictly the agent's responsibility, not ATC's.
+> ATC 2.0 coordinates device ownership, lifecycle and snapshot preparation, and command targets. The agent handles builds, signing, and execution on the device. The agent also handles Apple code-signing certificates, provisioning profiles, Developer Mode, and locked physical screens.
 
-### 9.1 Smart Platform Resolution & Unified Profile Schema
+### 9.1 Resolve platforms and match shared profiles
 1. **Implicit vs. Explicit Platform Selection (`--platform <android|ios>`):**
    - Calling `atc claim` without `--platform` resolves the target platform in order:
      1. **Explicit Flag:** `--platform ios` (or shorthand `--ios`) vs. `--platform android` (`--android`).
@@ -596,40 +696,55 @@ ATC **1.0** shipped as **Android Traffic Control**. The **2.0** plan added iOS S
      3. **Workspace Inference (`cwd`):** If `cwd` contains an Xcode workspace/project (`*.xcworkspace`, `*.xcodeproj`, or `Package.swift` with iOS targets) and no Android build files (`build.gradle*`, `settings.gradle*`, `AndroidManifest.xml`), infer `platform: "ios"`.
      4. **Default:** Otherwise default to `platform: "android"` (preserving 100% backward compatibility with 1.0 callers).
 2. **Canonical `deviceKey` & Shared Form-Factor Taxonomy:**
-   - **`avd:<avdId>`** — Android Virtual Device (`platform: "android"`, `kind: "emulator"`).
-   - **`sim:<udid>`** — iOS Simulator (`platform: "ios"`, `kind: "emulator"`, keyed by `CoreSimulator` UDID since multiple simulators can share a display name like `"iPhone 16 Pro"` across OS runtimes).
-   - **`serial:<serial>`** — Physical device (`kind: "physical"`, keyed by `adb` serial on Android or hardware `UDID` on iOS).
-   - **Form Factors (`--type`):** The hardware-noun taxonomy (`phone`, `tablet`, `watch`, `tv`, `xr`) maps 1:1 across both platforms (`iPhone` -> `phone`, `iPad` -> `tablet`, `Apple Watch` / `Wear OS` -> `watch`, `Apple TV` -> `tv`, `Apple Vision` -> `xr`), with convenience aliases `iphone` (`ios` + `phone`), `ipad` (`ios` + `tablet`), and `wear` (deprecated alias for `watch`).
+   - `avd:<avdId>` identifies an Android Virtual Device (`platform: "android"`, `kind: "emulator"`).
+   - `sim:<udid>` identifies an iOS Simulator (`platform: "ios"`, `kind: "emulator"`) by `CoreSimulator` UDID. Multiple OS runtimes can share a display name such as `"iPhone 16 Pro"`.
+   - `serial:<serial>` identifies a physical device (`kind: "physical"`). It uses the Android `adb` serial or iOS hardware `UDID`.
+   - `--type` uses the shared form factors `phone`, `tablet`, `watch`, `tv`, and `xr`.
+   - iPhone maps to `phone`; iPad maps to `tablet`; Apple Watch and Wear OS map to `watch`. Apple TV maps to `tv`; Apple Vision maps to `xr`.
+   - The aliases `iphone` and `ipad` select `ios` with `phone` and `tablet`, respectively. The deprecated alias `wear` selects `watch`.
    - **OS / API Version (`--api` / `--os`):** Accepts integer API specs (`36`, `>=34`) for Android `apiLevel` and semver specs (`18.2`, `>=17.5`) for iOS `osVersion`.
 
 ### 9.2 Unified Queue, Per-Platform Slot Ceilings & Cross-Platform Resource Accounting
-Android emulators and iOS Simulators share **one `state.queue` and one host RAM/disk budget**, with per-platform virtual slot ceilings tailored to their hypervisor vs. process-tree architecture:
+Android emulators and iOS Simulators share `state.queue` and the host RAM and disk budget. Each platform has its own virtual-device slot limit:
 - **Separate Virtual Slot Ceilings + Shared Host RAM/Disk Budget (`Rule R1` / `Rule D1`):**
-  - Unlike Android emulators (which run a full guest kernel in QEMU and fault in `hw.ramSize + 1024 MB` ≈ `3.0–4.5 GB`, governed by `config.maxRunningEmulators`, default `2`), an iOS Simulator is a native macOS process tree (`launchd_sim` + `SpringBoard`) with dynamic memory allocation (`requiredRamMb: config.simOverheadRamMb` = `1280 MB`).
-  - To avoid throttling lightweight iOS Simulators with a QEMU-sized slot cap, 2.0 adds `config.maxRunningSimulators` (default `4`; when `"auto"`, computed at `1.5 GB` RAM and `2` logical CPU cores per simulator, clamped to `[1, 8]`), while **both** platforms enforce the shared host `projectedAvailableRamMb` (`Rule R1`) and `projectedFreeDiskMb` (`Rule D1`/`D2`) checks in §5.2.4.
+  - Android emulators run a guest kernel in QEMU and allocate `hw.ramSize + 1024 MB`, about `3.0–4.5 GB`. `config.maxRunningEmulators` defaults to `2`.
+  - An iOS Simulator runs a macOS process tree (`launchd_sim` and `SpringBoard`) with dynamic memory allocation. Its reservation is `requiredRamMb: config.simOverheadRamMb`, or `1280 MB`.
+  - The 2.0 plan adds `config.maxRunningSimulators`, with default `4`. Its `"auto"` limit uses `1.5 GB` RAM and `2` logical CPU cores per simulator, clamped to `[1, 8]`.
+  - Each platform enforces `projectedAvailableRamMb` (`Rule R1`) and `projectedFreeDiskMb` (`Rule D1`/`D2`) from §5.2.4.
 - **Resource-Scoped Starvation Protection & Cross-Platform Idle Eviction (`Priority 3`):**
-  - Per §5.3 Step 4(3), `isReservedForEarlierTicket(candidateDeviceOrSlot)` is strictly **resource-scoped**: an earlier Starvation-Protected ticket `E` only blocks a later caller `C` if `C` competes for a device `E` matches, `E`'s platform slot pool, shared host RAM needed by `E`, or the idle eviction victim `V` reserved for `E`. A Tier 0 claim for an already-warm iOS Simulator (or physical device) never experiences head-of-line blocking behind a Starvation-Protected Android ticket waiting on a busy physical phone or an Android slot.
-  - When host RAM (`Rule R1`) is exhausted and a ticket on *either* platform needs RAM to boot its virtual device while the target platform already has a free slot (`usedSlots < effectiveMaxSlotLimit`), Priority 3 can evict the longest-idle unleased virtual device across **either** platform (`android` or `ios`) for **RAM credit (`V.requiredRamMb`)**, followed by live post-eviction `availableRamMb` re-verification in Step 5.1 before booting. When the target platform's own slot pool is full (`usedSlots >= effectiveMaxSlotLimit`), the eviction victim `V` must belong to the **same platform** so stopping `V` frees both a target-platform slot and `V.requiredRamMb`.
+  - `isReservedForEarlierTicket(candidateDeviceOrSlot)` applies to shared resources (§5.3 Step 4(3)). Protected ticket `E` blocks later caller `C` only when they compete for a matched device, platform slot, RAM, or reserved eviction device `V`.
+  - An unrelated Tier 0 iOS or physical claim can proceed while an Android ticket waits for its platform slot or a busy phone.
+  - If the target platform has a free slot (`usedSlots < effectiveMaxSlotLimit`), Priority 3 can evict an idle device from either platform for RAM.
+  - Select the longest-idle unleased device `V` and reclaim `V.requiredRamMb`. Check live `availableRamMb` after eviction before booting (Step 5.1).
+  - When `usedSlots >= effectiveMaxSlotLimit`, `V` must belong to the target platform. Stopping it frees a target slot and its RAM reservation.
 
 ### 9.3 iOS Fleet Discovery, Lifecycle & Protected APFS Copy-on-Write Snapshots (Outside `atc.lock`)
 1. **Single-Call JSON Fleet Discovery (~40ms):**
-   - **Simulators (`xcrun simctl list --json`):** Invoked with `--json` (and no category filter so a single subprocess returns `{ devicetypes, runtimes, devices, pairs }`). Parses `Booted` (`running`), `Shutdown` (`offline`), and available `SimRuntime` + `SimDeviceType` combinations (`creatable` in ~150ms via `xcrun simctl create`).
-   - **Physical iOS Devices (`xcrun devicectl list devices --json-output <tmp>`):** Extracts connected USB/Wi-Fi devices in Xcode 15+ / iOS 17+. Stores `hardwareProperties.udid` (the classic hardware UDID rather than the `CoreDevice` UUID) as `lease.serial` so a single ID works across `xcrun devicectl`, `xcodebuild -destination "id=<udid>"`, and third-party runners.
+   - ATC calls `xcrun simctl list --json` without a category filter. One subprocess returns `{ devicetypes, runtimes, devices, pairs }`.
+   - ATC classifies `Booted` devices as `running` and `Shutdown` devices as `offline`. Available `SimRuntime` and `SimDeviceType` combinations are `creatable` through `xcrun simctl create` (about 150 ms).
+   - `xcrun devicectl list devices --json-output <tmp>` lists connected USB/Wi-Fi devices with Xcode 15+ and iOS 17+.
+   - ATC stores `hardwareProperties.udid` as `lease.serial`. This hardware UDID works with `xcrun devicectl`, `xcodebuild -destination "id=<udid>"`, and third-party runners. The CoreDevice UUID identifies a separate record.
 2. **Headless Boot, Creation, Erase & App Reset:**
    - **Boot:** `xcrun simctl boot <udid>` boots the simulator headlessly in the background in ~2–5s without launching the `Simulator.app` GUI window (`xcrun simctl bootstatus <udid> -b` waits until boot completes).
    - **Stop:** `xcrun simctl shutdown <udid>`.
-   - **Auto-Create (`--create-if-missing`):** Enforces the same slot (`usedSimSlots < effectiveMaxSimulators`), starvation (`!isReservedForEarlierTicket`), RAM/disk, and Priority-3 idle-eviction admission as booting an offline simulator. Because a new simulator's `UDID` is generated by `simctl create`, Priority 4 reserves a synthetic `"starting"` record `state.leases["sim:creating:" + ticketId]` under `atc.lock` with pending name `atc_creating_<ticketId>` (which fleet discovery excludes from unleased candidates). Outside `atc.lock`, the worker runs `xcrun simctl create "atc_creating_<ticketId>" <deviceTypeId> <runtimeId>` (~150ms) to obtain `<newUdid>`, **immediately acquires `atc.lock` before booting** to atomically migrate the `"starting"` key from `"sim:creating:" + ticketId` to `"sim:" + newUdid`, releases `atc.lock`, renames the simulator (`xcrun simctl rename <newUdid> "<displayName>"`), and boots `<newUdid>` before activating the lease.
+   - `--create-if-missing` uses the same slot (`usedSimSlots < effectiveMaxSimulators`), starvation (`!isReservedForEarlierTicket`), RAM/disk, and Priority-3 eviction checks as offline boot.
+   - Before `simctl create` supplies a UDID, Priority 4 reserves `state.leases["sim:creating:" + ticketId]` as `"starting"` under `atc.lock`.
+   - Its pending name is `atc_creating_<ticketId>`. Discovery excludes pending names from unleased candidates.
+   - Outside the lock, run `xcrun simctl create "atc_creating_<ticketId>" <deviceTypeId> <runtimeId>` (about 150 ms) to get `<newUdid>`.
+   - Before booting, acquire `atc.lock` and atomically move the key from `"sim:creating:" + ticketId` to `"sim:" + newUdid`.
+   - Release the lock, run `xcrun simctl rename <newUdid> "<displayName>"`, boot `<newUdid>`, and activate the lease.
    - **Factory Wipe (`--wipe-data`):** `xcrun simctl erase <udid>` (~1s).
    - **App Reset (`--reset-app <bundleId>`):** Runs `xcrun simctl terminate <udid> <bundleId>`, `xcrun simctl privacy <udid> reset all <bundleId>`, and clears the data container returned by `xcrun simctl get_app_container <udid> <bundleId> data` (or `xcrun devicectl device uninstall app --device <udid> <bundleId>` on physical devices).
 3. **Race-Free APFS Copy-on-Write (`clonefile`) Snapshots (`atc snapshot`):**
-   - Because iOS Simulators are host process trees rather than hypervisor VMs, they do not have QEMU live RAM snapshots. Instead, ATC uses macOS **APFS Copy-on-Write (`cp -cR` / `clonefile(2)`)** between `~/Library/Developer/CoreSimulator/Devices/<UDID>/data` and `<stateDir>/ios-snapshots/<UDID>/<name>/data` (stored under `<stateDir>` on the same local APFS volume so snapshots survive `simctl delete` or Xcode cache sweeps, alongside a `meta.json` recording `runtimeId` to verify `SimRuntime` compatibility on restore).
-   - **Protected Transitional Lease (`state: "starting"` During Shutdown Window):** Because `save` and `load` temporarily shut down the simulator (`Shutdown` for ~2–4s), leaving the lease in `state: "active"` would allow concurrent `atc claim` offline-grace reconciliation (§5.3 Step 2) or a concurrent `atc free` to reap/release the simulator mid-snapshot. Therefore, per §5.5:
+   - iOS Simulators have no QEMU live RAM snapshots. ATC uses APFS copy-on-write (`cp -cR` / `clonefile(2)`) to copy `~/Library/Developer/CoreSimulator/Devices/<UDID>/data` to `<stateDir>/ios-snapshots/<UDID>/<name>/data`.
+   - The snapshot stays under `<stateDir>` on the same local APFS volume. It survives `simctl delete` and Xcode cache cleanup. A `meta.json` file records `runtimeId` for `SimRuntime` compatibility checks on restore.
+   - Saving and loading shut down the simulator for about 2–4 seconds. An `"active"` lease would let concurrent `atc claim` reconciliation (§5.3 Step 2) or `atc free` release it during the operation. The `"starting"` state prevents that race, as required by §5.5:
      1. Under `atc.lock`, `atc snapshot save|load` verifies ownership and transitions the lease from `"active"` to `state: "starting"`, `workerPid: process.pid`, `deadlineMs: now + bootTimeoutMs` (activating the 15s worker heartbeat per §5.1 Rule 3).
      2. Outside `atc.lock`, runs `xcrun simctl shutdown <udid>`, executes the APFS `cp -cR` clone (completing in ~100–200ms with 0 MB of initial disk overhead), and re-boots via `xcrun simctl boot <udid>` + `bootstatus <udid> -b`.
      3. Under `atc.lock`, verifies `leaseId` and transitions the lease back to `state: "active"` with `expiresAtMs = now + ttlMs` (or on failure/timeout, attempts best-effort reboot to restore online state before exiting `1`).
 
 ### 9.4 iOS `atc exec` & `atc guard` (Fast-Path, Explicit Target Validation & `"booted"` Protection)
-Unlike Android's universal `ANDROID_SERIAL` environment variable, Apple's `simctl`, `devicectl`, and `xcodebuild` require explicit UDID arguments — and agents habitually invoke `xcrun simctl ... booted`, which **silently targets an arbitrary booted simulator** when multiple simulators are running:
+Apple's `simctl`, `devicectl`, and `xcodebuild` require explicit UDID arguments. Android tools can use `ANDROID_SERIAL`. When several simulators run, `xcrun simctl ... booted` can select an arbitrary simulator:
 1. **`atc exec` Environment & Injection:**
    - Sets `ATC_DEVICE_SERIAL=<lease.serial>`, `ATC_PLATFORM=ios`, and `SIMULATOR_UDID=<lease.serial>`.
    - When executing `xcrun simctl ...`, automatically rewrites any positional `booted` target token to `<lease.serial>`.
@@ -639,24 +754,28 @@ Unlike Android's universal `ANDROID_SERIAL` environment variable, Apple's `simct
    - **Read-only & SDK/runtime setup commands allowed without lease:** `xcrun simctl (list|help|runtime)`, `xcrun devicectl (list|help)`, `xcodebuild (-version|-showsdks|-list|-downloadPlatform|-checkFirstLaunchStatus)` -> **Allowed** (`exit 0`).
    - **Device-interacting iOS commands (explicit-target & missing-target validation):**
      Applies to `xcrun simctl (install|uninstall|launch|terminate|io|openurl|push|pbcopy|pbpaste|privacy|spawn|keychain|addmedia|status_bar|ui|get_app_container) <target> ...`, `xcrun devicectl device (install|uninstall|process|info|copy|reboot) ...`, `xcodebuild (test|build-for-testing|test-without-building) ...`, or any unparseable `simctl`/`devicectl` segment:
-     1. Require `sessionId` to hold an **online** `"active"` lease with `platform === "ios"` and `firstSeenOfflineAtMs === null` (otherwise deny with exit code `2`, instructing the agent to run `atc claim` to recover in-place if its simulator crashed).
-     2. **Explicit target ownership check:** If the command specifies an explicit simulator/device `<udid>`, `--device <id>`, or `-destination "...id=<id>..."` that does **not** match `sessionId`'s active iOS lease(s), **deny** the tool call (`exit 2`) to prevent cross-session interference with another agent's device.
-     3. **`simctl ... booted` protection:** If a `simctl` command targets `booted`, rewrite `booted` -> `<lease.serial>` on hosts supporting command rewriting (assuming a single active iOS simulator lease); on non-rewriting hosts, deny when multiple simulators are booted or when `<lease.serial>` is not the sole booted simulator.
-     4. **Missing target / destination check:** If `devicectl device ...` omits `--device <id>`, or if `xcodebuild (test|test-without-building|build-for-testing)` omits `-destination` or supplies any `-destination` without an explicit `id=<lease.serial>` belonging to `sessionId`'s active iOS lease(s) (e.g., passing only `name=iPhone 16`), deny with the exact `--device <lease.serial>` or `-destination "platform=iOS Simulator,id=<lease.serial>"` flag to pass.
+     1. Require the session's online `"active"` lease with `platform === "ios"` and `firstSeenOfflineAtMs === null`. Otherwise, deny with exit `2`. For a crashed simulator, require `atc claim` to recover it in place.
+     2. Check explicit `<udid>`, `--device <id>`, and `-destination "...id=<id>..."` targets against the session's active iOS leases. Deny a mismatch with exit `2` to prevent access to another session's device.
+     3. For one active iOS Simulator lease, rewriting hosts replace a `simctl` `booted` target with `<lease.serial>`.
+        Other hosts deny the command when several simulators run or `<lease.serial>` is not the only booted simulator.
+     4. Deny `devicectl device ...` without `--device <id>`. Require `--device <lease.serial>`.
+        Deny `xcodebuild (test|test-without-building|build-for-testing)` without `-destination` or with any destination lacking a session-owned `id=<lease.serial>`.
+        A name-only destination such as `name=iPhone 16` fails this check. Require `-destination "platform=iOS Simulator,id=<lease.serial>"`.
      5. Otherwise, auto-renew `sessionId`'s active iOS lease (`expiresAtMs = now + ttlMs`) and allow (`exit 0`).
 
-### 9.5 Platform- & Kind-Scoped Tooling Pre-Flight Diagnostics (Xcode & Android CLI Setup Bullshit)
-ATC is **not** an SDK installer or privilege escalation tool (it never runs `sudo` or downloads multi-GB SDKs behind the scenes). However, both Xcode and the Android SDK frequently fail with environment setup roadblocks after OS/IDE updates.
+### 9.5 Report setup errors for the requested platform and device kind
+ATC never runs `sudo` or downloads SDK packages automatically. Xcode and Android SDK setup errors can prevent discovery after an OS or IDE update.
 
-If ATC treated a failing discovery command (`xcrun simctl list` or `android emulator list`) as simply "0 devices found", `atc claim` would mistakenly place the agent into the 300-second wait queue waiting for a device that can never appear. Instead, ATC enforces three rules:
+ATC must distinguish failed discovery from an empty device list. Otherwise, `atc claim` could wait 300 seconds for a device that cannot appear. ATC follows three rules:
 
 1. **Zero-`sudo` `DEVELOPER_DIR` Auto-Fallback (macOS / Xcode):**
-   - A common macOS trap occurs when `xcode-select -p` points to `/Library/Developer/CommandLineTools` (which lacks `simctl` and `devicectl`) even though `Xcode.app` is installed.
+   - `xcode-select -p` can point to `/Library/Developer/CommandLineTools` even when `Xcode.app` is installed. That directory lacks `simctl` and `devicectl`.
    - If `xcrun simctl` fails with `unable to find utility "simctl"` and `/Applications/Xcode.app/Contents/Developer` exists on disk, ATC retries automatically. It sets `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` in the child `xcrun` environment. The retry uses that Xcode installation without changing the system setting or requiring `sudo xcode-select -s`.
 2. **Platform- & Kind-Scoped Fail-Fast Classification (Never Queue on Broken Tooling, Never Block Unrelated Claims):**
    - Pre-flight errors are strictly scoped to the **requested `platform` and `requestedKind`**:
-     - An Xcode/iOS toolchain failure never blocks an Android claim (and vice versa; in `atc status`, errors on an unrequested platform are surfaced as non-fatal `diagnostics` warnings).
-     - A missing iOS Simulator runtime only fails claims that require a simulator (`platform === "ios"` and `requestedKind !== "physical"` when no matching physical device satisfies `--kind any`) — it **never** rejects a valid physical iPhone claim (`--kind physical` or `--serial <udid>` via `devicectl`).
+     - An Xcode/iOS setup failure must leave Android claims available. An Android setup failure must leave iOS claims available. `atc status` reports unrequested-platform errors as non-fatal `diagnostics` warnings.
+     - A missing runtime fails only claims that require a simulator: `platform === "ios"` and `requestedKind !== "physical"`, without a physical match for `--kind any`.
+     - A valid physical iPhone claim (`--kind physical` or `--serial <udid>` through `devicectl`) must remain available when a simulator runtime is missing.
    - When the requested platform/kind itself is blocked by a toolchain setup error, `atc claim` **aborts immediately with exit code `1`** (never entering `state.queue`) with an actionable remediation message:
      | Scope | Condition Detected (`stderr` / exit code) | ATC Action & Remediation Output |
      | :--- | :--- | :--- |
@@ -667,4 +786,5 @@ If ATC treated a failing discovery command (`xcrun simctl list` or `android emul
      | **Android (`emu` only)** | Requested profile has no local AVD and system image is not installed | Fail fast / report in `creatable.requiresSdkInstall`: *"Run `android sdk install \"system-images/...\"` (or `yes | sdkmanager --licenses` if prompted for SDK licenses)."* |
      | **Android (Linux `emu`)** | `/dev/kvm` missing or `EACCES` when attempting to boot an x86_64 emulator | Fail fast: *"Linux KVM acceleration unavailable (`/dev/kvm` permission denied). Add user to the `kvm` group."* |
 3. **Allowlisting SDK / Setup Commands in `atc guard` (§7.1 & §9.4):**
-   - Non-device setup and inspection commands — `android sdk ...`, `sdkmanager ...`, `xcodebuild (-version|-showsdks|-list|-downloadPlatform|-checkFirstLaunchStatus)`, `xcrun simctl (list|help|runtime)`, and `xcrun devicectl (list|help)` — are classified as **Allowed without a device lease** so agents can install user-space SDK packages/runtimes or inspect toolchains unimpeded.
+   - The guard allows SDK setup and inspection without a device lease. This includes `android sdk ...`, `sdkmanager ...`, and `xcodebuild (-version|-showsdks|-list|-downloadPlatform|-checkFirstLaunchStatus)`.
+   - It also allows `xcrun simctl (list|help|runtime)` and `xcrun devicectl (list|help)`. Agents can use these commands to inspect tools or install user-space packages and runtimes.
