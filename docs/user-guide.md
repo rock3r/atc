@@ -204,7 +204,7 @@ gantt
 
 | If… | then `atc`… |
 |---|---|
-| the plan has any invalid field, cycle, unknown op, or a device step with no claim | rejects the whole plan with every problem listed (exit `7`); nothing runs |
+| the plan has any invalid field, cycle, or unknown op, or a device step with no claim while the session holds no matching lease (or more than one) | rejects the whole plan with every problem listed (exit `7`); nothing runs |
 | a step fails | skips the steps that depend on it, stops the batch, and releases claims nobody else needs |
 | a step fails with `continueOnError: true` | still skips its dependents but keeps running independent steps; the batch doesn't fail because of it |
 | a step's `timeoutSec` elapses | stops that step (exit `124`); multi-command ops share one deadline |

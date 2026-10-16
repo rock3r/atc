@@ -59,7 +59,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | `android.prop.get` / `android.prop.set` | `key` (+ `value`). `set` is refused on physical devices unless `atc config set allowPhysicalPropSet true`. |
 
 **Device-side transport contract.** Ops that go through `adb shell` (launch, clearData, permission, prop.*, screenshot) use **fixed command templates**. The remote side gets a shell string, so passing separate host argv entries is **not** enough protection. Therefore:
-- every value interpolated into a remote template must match its pattern, all of which are subsets of the **transport-safe charset** `^[A-Za-z0-9_.:/@+=,-]{1,256}$` (no spaces, quotes, `;`, `$` outside activity names, backticks, `&`, `|`, `<`, `>`, `\`, `*`, `?`, `~`, `#`);
+- every value interpolated into a remote template must match its pattern, all of which use only the **transport-safe charset** `[A-Za-z0-9_.:/@+=,-]` (no spaces, quotes, `;`, `$` outside activity names, backticks, `&`, `|`, `<`, `>`, `\`, `*`, `?`, `~`, `#`); length limits are per pattern (e.g. prop keys ≤ 128, prop values ≤ 256);
 - each value is additionally single-quote-wrapped in the template;
 - this restriction is **not overridable by `--force`**;
 - tests assert on the **exact remote command string** a fake `adb` receives.
