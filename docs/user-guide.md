@@ -102,6 +102,17 @@ $ atc exec gradle tasks "bad;name" -x --cwd app
 
 If validation is too strict for a legitimate build value, `--force --reason "<why>"` overrides pattern checks for build values only. You take responsibility: the run is recorded (`atc status --forced`), and later failures in that workspace point back to it. `--force` never unlocks shell, unknown ops, values starting with `-`, device transport rules, claims, or locks.
 
+```mermaid
+flowchart TD
+    V["A value in your request<br/>(task, target, package, path…)"] --> M{"Matches its<br/>allowlist pattern?"}
+    M -->|"yes"| OK["Accepted"]
+    M -->|"no"| D{"Build value, and<br/>doesn't start with '-'?"}
+    D -->|"no: device value, transport, Windows,<br/>claims, locks, leading '-'"| NO["Rejected, exit 7<br/>not overridable<br/>request support via issues"]
+    D -->|"yes"| F{"--force --reason given?"}
+    F -->|"no"| RJ["Rejected, exit 7<br/>hint: --force --reason"]
+    F -->|"yes"| REC["Runs as requested<br/>recorded in atc status --forced<br/>blamed if a later run in this workspace fails"]
+```
+
 ## One agent claims by profile and runs with a heartbeat
 
 An agent claims a virtual device by form factor and OS version rather than a hardcoded AVD name or UDID. Device operations run against the leased serial or UDID, and `atc` renews the lease while they run.
@@ -175,6 +186,27 @@ atc batch --file plan.json --json
 ```
 
 The compile step holds no device. The `install` step claims a phone, and `test` reuses that same lease (`claim: { "reuse": "install" }`); `atc` keeps the lease renewed until the last consumer finishes and then releases it. Leases you held before the batch are never released by it.
+
+```mermaid
+gantt
+    title Who holds what during the example batch
+    dateFormat X
+    axisFormat %s
+    section Build slot
+    assemble (gradle)           :a, 0, 4
+    test (gradle, device build) :t, 6, 10
+    section Phone lease
+    claimed by install          :crit, c, 4, 6
+    reused by test              :crit, r, 6, 10
+    released                    :milestone, m, 10, 10
+```
+
+| If… | then `atc`… |
+|---|---|
+| the plan has any invalid field, cycle, unknown op, or a device step with no claim | rejects the whole plan with every problem listed (exit `7`); nothing runs |
+| a step fails | skips the steps that depend on it, stops the batch, and releases claims nobody else needs |
+| a step fails with `continueOnError: true` | still skips its dependents but keeps running independent steps; the batch doesn't fail because of it |
+| a step's `timeoutSec` elapses | stops that step (exit `124`); multi-command ops share one deadline |
 
 ## Warm jobs jump ahead within 120 seconds without starving cold boots
 

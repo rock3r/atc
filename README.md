@@ -5,7 +5,7 @@ Coordinate builds and exclusive Android and iOS device leases across concurrent 
 - **User Guide (with diagrams & Q&A):** [`docs/user-guide.md`](./docs/user-guide.md)
 - **Architecture:** [`docs/architecture.md`](./docs/architecture.md)
 - **Scope & design decisions for 3.0:** [`docs/scope.md`](./docs/scope.md)
-- **Migrating from 2.x:** [`docs/migration-3.0.md`](./docs/migration-3.0.md)
+- **Migrating from 2.x:** [`docs/migration-3.0.md`](./docs/migration-3.0.md) · **3.0 release notes:** [`docs/releases/v3.0.0.md`](./docs/releases/v3.0.0.md)
 - **Design Specification:** [https://specs.sebastiano.dev/atc/](https://specs.sebastiano.dev/atc/) ([`DESIGN.md`](./DESIGN.md))
 - **License:** Apache-2.0
 
@@ -22,6 +22,38 @@ When several coding agents share a machine, they collide on Android emulators, i
 | `atc mcp` | The same ops as MCP tools (`atc_gradle`, `atc_bazel`, `atc_xcode`, `atc_android`, `atc_ios`, `atc_batch`, plus `atc_claim`, `atc_free`, `atc_renew`, `atc_snapshot`, `atc_status`, `atc_guide`). |
 
 Invalid requests are rejected before anything runs, with **all** problems listed at once (`{path, code, message, hint}`). Unsupported things are refused with the supported alternative and a link to request them: <https://github.com/rock3r/atc/issues>.
+
+```mermaid
+flowchart LR
+    A["Coding agent"] -->|"atc exec gradle tasks …<br/>atc batch plan.json<br/>atc_* MCP tools"| V{"Validate<br/>every value"}
+    V -->|"any problem"| R["Rejected, exit 7<br/>all problems + hints<br/>nothing ran"]
+    V -->|"valid"| P["Plan<br/>find wrapper, workspace,<br/>exact argv"]
+    P --> Q["Admit<br/>build slot, workspace lock,<br/>RAM, device lease"]
+    Q -->|"busy"| W["Queue<br/>warm-affinity"]
+    W --> Q
+    Q --> X["Run<br/>literal argv + heartbeat"]
+    X --> T["Gradle / Bazel / Xcode<br/>adb / simctl"]
+```
+
+Two agents on one machine, both building the same app and testing on devices, end up like this:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent A
+    participant B as Agent B
+    participant ATC as atc
+    A->>ATC: gradle tasks assembleDebug
+    ATC-->>A: build slot + workspace lock
+    B->>ATC: gradle tasks assembleDebug (same repo)
+    ATC-->>B: queued (same workspace)
+    A->>ATC: claim phone, android install
+    ATC-->>A: lease emulator-5554
+    Note over ATC: A's build finished, so B's build starts
+    B->>ATC: claim phone
+    ATC-->>B: lease emulator-5556 (a different device)
+    A->>ATC: free
+    B->>ATC: free
+```
 
 ## Requirements and install
 
@@ -89,6 +121,20 @@ For multi-step flows, write a plan and let `atc` run it (validate first with `--
 atc batch --file plan.json --validate   # prints the exact argv of every step, runs nothing
 atc batch --file plan.json
 ```
+
+The phone is claimed only when the first step that needs it starts, and released right after the last step that reuses it:
+
+```mermaid
+flowchart LR
+    S1["assemble<br/>gradle.tasks<br/>no device"] --> S2["install<br/>android.install<br/>claims a phone"]
+    S2 --> S3["launch<br/>android.launch<br/>reuses the phone"]
+    S3 --> F(["phone released"])
+    style S1 fill:#eef6ff,stroke:#5b8def
+    style S2 fill:#fff4e5,stroke:#e08a00
+    style S3 fill:#fff4e5,stroke:#e08a00
+```
+
+If a step fails, the steps that depend on it are skipped, the batch stops, and any claim it made is released. Nothing in the plan runs at all if the plan is invalid.
 
 ## Commands
 

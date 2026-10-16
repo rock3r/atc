@@ -2,6 +2,30 @@
 
 ATC 3.0 is a breaking release. ATC no longer accepts, inspects, rewrites or runs shell commands. Agents ask for **allowlisted typed operations** instead, and ATC builds every invocation itself. See [`scope.md`](./scope.md) for the full catalog and rules.
 
+```mermaid
+flowchart LR
+    subgraph Before["2.x"]
+        direction TB
+        a1["agent runs a shell command"] --> h1["PreToolUse hook parses the shell text"]
+        h1 -->|"guess: device/build command"| r1["rewritten into<br/>atc exec -- …"]
+        h1 -->|"guess wrong"| x1["blocked, or slips through"]
+    end
+    subgraph After["3.0"]
+        direction TB
+        a2["agent asks for an op<br/>atc exec android install app.apk"] --> v2["validated against the catalog"]
+        v2 --> r2["atc builds the exact argv<br/>and runs it under lease/slot/lock"]
+        v2 --> x2["or: rejected with every problem<br/>+ how to fix it (exit 7)"]
+    end
+```
+
+## Upgrade checklist
+
+1. Upgrade the CLI: `npm install -g @rock3r/atc@3`.
+2. Update the agent plugin or hooks (Claude Code, Codex, Copilot, Cursor, Antigravity, Gemini CLI, Pi) so the 3.0 hooks replace the 2.x ones. The 2.x PreToolUse hook keeps blocking shell commands that mention `adb`, `gradle`, `xcodebuild`, … until it is replaced.
+3. Replace `atc exec -- <command>` calls in prompts, scripts, and skills with typed ops (table below), and multi-step shell sequences with an `atc batch` plan.
+4. Remove `atc guard` calls and the `coordinateBuilds` config (both are gone).
+5. Run `atc exec --help` and `atc guide` to check what's available.
+
 ## What changed
 
 | 2.x | 3.0 |
