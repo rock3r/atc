@@ -20,7 +20,7 @@ This document is the source of truth for what ATC 3.x supports. Anything not lis
 
 Device lifecycle commands are unchanged: `atc claim/free/renew/status/snapshot/gc/config/guide`.
 
-`atc exec` CLI shape: `atc exec <system> <verb> [positional…] [--param value | --param=value | --flag | --no-flag]`. Verbs are kebab-case (`build-for-testing`), two-word verbs are allowed (`android prop get`), array params repeat (`--config ci --config remote`), map params use `--property key=value`. Exec-level flags: `--json`, `--claim` (plus claim selectors `--type`, `--api`, `--os`, `--kind`, `--play`, `--abi`, `--services`, `--ttl`), `--serial`/`--udid`, `--android`/`--ios`, `--wait <sec>`, `--session`, `--force --reason "<why>"`. `--cwd`/`--env` and `-- <command>` are refused with a pointer to `atc batch` / the catalog.
+`atc exec` CLI shape: `atc exec <system> <verb> [positional…] [--param value | --param=value | --flag | --no-flag]`. Verbs are kebab-case (`build-for-testing`), two-word verbs are allowed (`android prop get`), array params repeat (`--config ci --config remote`), map params use `--property key=value`. Exec-level flags: `--json`, `--claim` (plus claim selectors `--type`, `--api`, `--os`, `--kind`, `--play`/`--no-play`, `--abi`, `--services`, `--ttl`), `--serial`/`--udid`, `--android`/`--ios`, `--wait <sec>`, `--session`, `--force --reason "<why>"`. `--cwd`/`--env` and `-- <command>` are refused with a pointer to `atc batch` / the catalog.
 
 ## 2. v1 op catalog (approved)
 
@@ -59,19 +59,19 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | `android.prop.get` / `android.prop.set` | `key` (+ `value`). `set` is refused on physical devices unless `atc config set allowPhysicalPropSet true`. |
 
 **Device-side transport contract.** Ops that go through `adb shell` (launch, clearData, permission, prop.*, screenshot) use **fixed command templates**. The remote side gets a shell string, so passing separate host argv entries is **not** enough protection. Therefore:
-- every value interpolated into a remote template must match its pattern, all of which are subsets of the **transport-safe charset** `^[A-Za-z0-9_.:/@+=,-]+$` (no spaces, quotes, `;`, `$` outside activity names, backticks, `&`, `|`, `<`, `>`, `\`, `*`, `?`, `~`, `#`);
+- every value interpolated into a remote template must match its pattern, all of which are subsets of the **transport-safe charset** `^[A-Za-z0-9_.:/@+=,-]{1,256}$` (no spaces, quotes, `;`, `$` outside activity names, backticks, `&`, `|`, `<`, `>`, `\`, `*`, `?`, `~`, `#`);
 - each value is additionally single-quote-wrapped in the template;
 - this restriction is **not overridable by `--force`**;
 - tests assert on the **exact remote command string** a fake `adb` receives.
 
-### 2.3 iOS simulator ops (require an iOS lease; UDID always injected; macOS only)
+### 2.3 iOS simulator ops (require an iOS simulator lease; UDID always injected; macOS only)
 | Op | Params |
 |---|---|
 | `ios.install` / `ios.uninstall` | `app` / `bundleId` |
 | `ios.launch` / `ios.terminate` | `bundleId`, `launchArgs[]` (launch only; passed to the app after the bundle id) |
 | `ios.openUrl` | `url` (`^[a-zA-Z][a-zA-Z0-9+.-]*:[^\s'"`;|&<>\\]*$`) |
 | `ios.screenshot` | `output` |
-| `ios.privacy` | `bundleId`, `service` (enum), `action ∈ {grant, revoke, reset}` |
+| `ios.privacy` | `bundleId`, `service ∈ {all, calendar, contacts-limited, contacts, location, location-always, photos-add, photos, media-library, microphone, motion, reminders, siri, camera}`, `action ∈ {grant, revoke, reset}` |
 
 ### 2.4 Snapshots (virtual devices only)
 - Ops: `snapshot.list`, and `snapshot.save` / `snapshot.load` / `snapshot.delete` with `name` (CLI: `atc exec snapshot save <name>`, same as `atc snapshot save <name>`).
@@ -107,12 +107,12 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | Prop key / value | `^[A-Za-z0-9_.-]{1,128}$` / transport-safe charset, ≤ 256 chars |
 | Snapshot name / step id | `^[A-Za-z0-9_.-]{1,64}$` |
 | Env var name / value (batch) | `^[A-Za-z_][A-Za-z0-9_]{0,127}$` / transport-safe charset |
-| Claim `api` / `os` (batch) | same grammar as `atc claim`: `^(>=\|<=\|>\|<\|=)?[A-Za-z0-9._-]+(\.\.[A-Za-z0-9._-]+)?$` (e.g. `36`, `>=35`, `34..36`, `18.2`) |
+| Claim `api` / `os` (batch) | same grammar as `atc claim`: `^(>=\|<=\|>\|<\|=)?[A-Za-z0-9._-]{1,32}(\.\.[A-Za-z0-9._-]{1,32})?$` (e.g. `36`, `>=35`, `34..36`, `18.2`) |
 | Paths (`apk`, `app`, `cwd`, `workspace`, `output`, `derivedDataPath`, `workspaceFile`, `project`) | no NUL/newline, no leading `-`. **Syntax is checked at validation time; existence is checked at execution time** (inputs may be produced by ancestor steps). A batch step's `cwd` must exist at validation; a build's wrapper/workspace marker must be found before anything runs. |
 
 **Windows execution contract:**
 - `bazel(isk).exe` runs by direct spawn.
-- `gradlew.bat` goes through `cmd.exe /d /s /c` using the salvaged, reviewed resolution and quoting.
+- `gradlew.bat` runs through `cmd.exe /d /s /c` with resolved absolute paths and quoted arguments.
 - For batch-file invocations, **every argument** must additionally match `^[A-Za-z0-9_.:/\\@+=,-]+$` (no `%`, `!`, `^`, quotes, spaces, `&`, `|`, `<`, `>`).
 - The **resolved wrapper path** (e.g. `C:\work\app\gradlew.bat`) and the working directory passed to `cmd.exe` must contain no `%`, `!`, `^`, `"`, `&`, `|`, `<`, `>` or control characters. Spaces are allowed, because the path is quoted. CMD expands `%NAME%` even inside double quotes, so expansion-sensitive paths are refused outright, suggesting the project be moved to a plain path.
 - These checks are **not overridable by `--force`**.
@@ -148,7 +148,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 - **Structure:** `version: 1`, a non-empty `steps` array, unknown fields as errors, `op` in the catalog, required params, types, closed enums, value patterns.
 - **Semantics:**
   - duplicate ids, unknown or misspelled deps, self-dependencies, cycles;
-  - device op without a claim (and no session lease), platform mismatch, `claim` on a step that uses no device, `reuse` of a non-ancestor or of a claim-less step;
+  - device op without a claim (when the session holds zero or multiple leases on that platform), platform mismatch, `claim` on a step that uses no device, `reuse` of a non-ancestor or of a claim-less step, physical device claim on a virtual-only/simulator-only op or `android.prop.set` without `allowPhysicalPropSet`;
   - `buildOnly` with device tasks;
   - `cwd` missing; build wrapper / workspace marker missing;
   - host OS and Windows transport violations.

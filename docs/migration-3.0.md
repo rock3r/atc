@@ -13,8 +13,8 @@ flowchart LR
     subgraph After["3.0"]
         direction TB
         a2["agent asks for an op<br/>atc exec android install app.apk"] --> v2["validated against the catalog"]
-        v2 --> r2["atc builds the exact argv<br/>and runs it under lease/slot/lock"]
-        v2 --> x2["or: rejected with every problem<br/>+ how to fix it (exit 7)"]
+        v2 -->|"valid"| r2["atc builds the exact argv<br/>and runs it under lease/slot/lock"]
+        v2 -->|"invalid"| x2["rejected with every problem<br/>+ how to fix it (exit 7)"]
     end
 ```
 
@@ -61,6 +61,8 @@ flowchart LR
 | `atc exec -- xcrun simctl launch booted com.ex.App` | `atc exec ios launch com.ex.App` |
 | `atc exec -- xcrun simctl privacy booted grant camera com.ex.App` | `atc exec ios privacy --bundle-id com.ex.App --service camera --action grant` |
 | `atc snapshot save clean` | unchanged, or `atc exec snapshot save clean` |
+
+When passing program arguments that start with `--` to `bazel run` or `ios launch` on the CLI, use `=` (`--run-arg=--out=x` or `--launch-arg=--uitesting`) so the parser treats the value as an argument rather than an `atc exec` flag.
 
 Operations that are not in the catalog (for example `adb shell input`, `screenrecord`, `devicectl`) are refused with a link to request them at <https://github.com/rock3r/atc/issues>. Until they exist, keep the lease and run the tool yourself against the leased serial/UDID (shown by `atc claim` and `atc status --json`); ATC will not intercept it, but it also cannot coordinate it.
 

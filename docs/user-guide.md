@@ -36,11 +36,12 @@ atc status
 
 ```text
 Host Capacity: 16735 MB RAM avail · 29989 MB disk free · emu slots: 0/2 · sim slots: 0/4 · build slots: 0/2
-  Running (2): adb-2A191FDH3007B7, 00008120-000464CE2E44C01E
-  Offline (40): Opus_API37, Pixel_9, Wear_OS_Small_Round, iPhone 16 Pro, ...
+  Running (2): Pixel_9 (emulator-5554), adb-2A191FDH3007B7 (adb-2A191FDH3007B7)
+  Offline (40): Opus_API37, Wear_OS_Small_Round, iPhone 16 Pro, ...
   Leases  (0): none
   Queue   (0): none
   Builds  (0): none
+  BQueue  (0): none
 ```
 
 Install the optional agent plugin so your coding agent loads the `atc` skill, the MCP server, and the session hooks automatically. The hooks only record your agent's session identity and free your leases when the session ends; they never read or block shell commands.
@@ -62,10 +63,10 @@ Install the optional agent plugin so your coding agent loads the `atc` skill, th
 | System | Operations |
 |---|---|
 | `gradle` | `tasks` (any task names/paths, one wrapper invocation; clean is just `tasks clean`) |
-| `bazel` | `build`, `test`, `coverage`, `run` (needs `timeoutSec`), `series` (batch/MCP), `clean` (`--expunge`) |
+| `bazel` | `build`, `test`, `coverage`, `run` (needs `--timeout-sec` / `timeoutSec`), `series` (batch/MCP), `clean` (`--expunge`) |
 | `xcode` | `build`, `test`, `build-for-testing`, `test-without-building`, `archive`, `clean`, `actions` |
 | `android` | `install`, `uninstall`, `launch`, `clear-data`, `permission`, `logcat` (dump), `screenshot`, `prop get`, `prop set` |
-| `ios` | `install`, `uninstall`, `launch`, `terminate`, `open-url`, `screenshot`, `privacy` |
+| `ios` | `install`, `uninstall`, `launch`, `terminate`, `open-url`, `screenshot`, `privacy` (simulators only) |
 | `snapshot` | `list`, `save`, `load`, `delete` (emulators and simulators) |
 
 ```bash
@@ -163,7 +164,7 @@ atc free
 
 ## Batch plans describe multi-step work as a validated DAG
 
-Anything with ceremony (several steps, dependencies, per-step `cwd` or `env`, claims, timeouts) goes into a JSON plan. `atc batch` validates the whole plan first and runs nothing if any step is invalid. Steps run sequentially in dependency order; a failed step skips its dependents.
+Multi-step workflows, dependencies, per-step `cwd` or `env`, scoped claims, and timeouts go into a JSON plan. `atc batch` validates the whole plan first and runs nothing if any step is invalid. Steps run sequentially in dependency order; a failed step skips its dependents.
 
 ```json
 {
@@ -217,15 +218,15 @@ When all device slots are busy, `atc claim --wait 300` places the caller into `s
 ```mermaid
 flowchart LR
     subgraph Host["Host Slot (1/1 Used)"]
-        P9["Pixel_9 (API 36)\nWarm Emulator"]
+        P9["Pixel_9 (API 36)<br/>Warm Emulator"]
     end
 
     subgraph Queue["Wait Queue (reorderWindowSec = 120s)"]
-        T1["Ticket #1: Agent B\nNeeds cold Wear_OS (waited 10s)"]
-        T2["Ticket #2: Agent C\nMatches warm Pixel_9"]
+        T1["Ticket #1: Agent B<br/>Needs cold Wear_OS (waited 10s)"]
+        T2["Ticket #2: Agent C<br/>Matches warm Pixel_9"]
     end
 
-    P9 -- "1. Agent A runs atc free" --> Check{"Has Ticket #1\nwaited >= 120s?"}
+    P9 -- "1. Agent A runs atc free" --> Check{"Has Ticket #1<br/>waited >= 120s?"}
     Check -- "No (< 120s)" --> T2
     T2 -- "Reuses warm Pixel_9 in < 20ms" --> P9
     Check -- "Yes (Priority #0 freeze)" --> T1
@@ -269,12 +270,12 @@ When a leased virtual device drops from `adb` or `simctl`, `atc` holds an offlin
 ```mermaid
 flowchart TD
     Drop["Leased Device Drops from adb / simctl / devicectl"] --> Kind{"Device kind?"}
-    Kind -- "Virtual (AVD / Simulator)" --> VGrace["Hold 45s Offline Reservation\n(clear serial, block device ops/renew/snapshot)"]
-    VGrace -- "Owner re-claims within 45s" --> VBoot["Reboot in place outside lock\nKeep original leaseId & expiresAtMs"]
+    Kind -- "Virtual (AVD / Simulator)" --> VGrace["Hold 45s Offline Reservation<br/>(clear serial, block device ops/renew/snapshot)"]
+    VGrace -- "Owner re-claims within 45s" --> VBoot["Reboot in place outside lock<br/>Keep original leaseId & expiresAtMs"]
     VGrace -- "45s expires" --> VFree["Release reservation & reopen slot"]
 
     Kind -- "Physical (Android USB/Wi-Fi or iPhone)" --> PGrace["Hold 15s Cable-Glitch Window"]
-    PGrace -- "Owner re-claims or > 15s elapsed" --> PTomb["Fail fast (Exit Code 1)\nRecord disconnectedPhysicalLeases tombstone"]
+    PGrace -- "Owner re-claims or > 15s elapsed" --> PTomb["Fail fast (Exit Code 1)<br/>Record disconnectedPhysicalLeases tombstone"]
 ```
 
 | Failure mode | Grace window | What device ops do | What `atc claim` does |
@@ -284,7 +285,7 @@ flowchart TD
 
 ## Snapshots reset emulator and simulator state in under two seconds
 
-Tests often leave dirty login tokens, permissions, or database rows on a device. `atc` supports instant checkpoints on both Android emulators (via QEMU snapshots) and iOS Simulators (via APFS copy-on-write `cp -cR` clones in `~/.atc-snapshots/<udid>/<name>`).
+Tests often leave dirty login tokens, permissions, or database rows on a device. `atc` supports instant checkpoints on both Android emulators (via QEMU snapshots) and iOS Simulators (via APFS copy-on-write `cp -cR` clones in `<stateDir>/ios-snapshots/<udid>/<name>`).
 
 | Operation | Command | Android emulator action | iOS Simulator action |
 |---|---|---|---|
@@ -336,9 +337,9 @@ flowchart LR
     Crash["Agent A exits without calling atc free"] --> Hook{"Did Stop hook run?"}
     Hook -- "Yes" --> Free["Lease freed at turn end"]
     Hook -- "No (SIGKILL / crash)" --> Next["Agent B runs atc claim"]
-    Next --> Probe["atc checks kill(anchorPid, 0)\nand workerPgids under atc.lock"]
+    Next --> Probe["atc checks kill(anchorPid, 0)<br/>and workerPgids under atc.lock"]
     Probe -- "PID dead or TTL expired" --> Reclaim["Orphan lease reaped in < 20ms"]
-    Reclaim --> Clean["Agent B passes --snapshot-load or --reset-app\nto discard Agent A's device state"]
+    Reclaim --> Clean["Agent B passes --snapshot-load or --reset-app<br/>to discard Agent A's device state"]
 ```
 
 ### Why does `atc` run without a background daemon?
@@ -363,7 +364,7 @@ To target a physical phone on purpose, pass its identifier or `--kind physical`:
 # Physical Android phone
 atc claim --serial adb-2A191FDH3007B7-SAhkP3._adb-tls-connect._tcp
 
-# Physical iPhone (via Xcode CoreDevice / devicectl)
+# Physical iPhone (via Xcode CoreDevice / devicectl; ios.* and xcode test ops are simulator-only)
 atc claim --ios --kind physical --udid 00008120-000464CE2E44C01E
 
 # Optional: forbid all physical device claims on this machine
@@ -377,7 +378,7 @@ Android emulators boot full QEMU virtual machines with dedicated guest RAM, whil
 | Pool | Config key & default | Admission check |
 |---|---|---|
 | Android QEMU emulators | `maxRunningEmulators = 2` | Available host RAM must cover `ramSizeMb + 1024 MB overhead + minFreeRamMb (2048 MB)`, plus `2048 MB` free disk. |
-| iOS Simulators (macOS) | `maxRunningSimulators = 4` | Target volume must have at least `minFreeDiskMb (2048 MB)` free disk space. |
+| iOS Simulators (macOS) | `maxRunningSimulators = 4` | Available host RAM must cover `simOverheadRamMb (1280 MB) + minFreeRamMb (2048 MB)`, and the target volume must have the boot/clone footprint plus `minFreeDiskMb (2048 MB)` free disk. |
 | Physical devices | Unlimited (`0` virtual slots) | Must be online in `adb devices` or `xcrun devicectl list devices`. |
 | Builds | `maxConcurrentBuilds = "auto"` (+1 burst slot for device holders) | One build per workspace key at a time; RAM reservation (`buildRamEstimateMb`, or the project's Gradle heap / `ramMb`) must fit. |
 
