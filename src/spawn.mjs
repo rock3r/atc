@@ -8,6 +8,7 @@ import {
   getKnownWindowsTreeDescendants,
   getPosixProcessStartToken,
   hasAliveProcessInGroup,
+  isAtcLockHeld,
   isProcessGroupAlive,
   killProcessGroupTree,
   seedPosixPgidStartTokens,
@@ -256,7 +257,14 @@ export function buildSpawnConfig(command, args = [], options = {}) {
   };
 }
 
+export function assertOutsideAtcLock(what) {
+  if (isAtcLockHeld()) {
+    throw new Error(`Internal lock-boundary violation: ${what} attempted while holding atc.lock.`);
+  }
+}
+
 export function runCommandSync(command, args = [], options = {}) {
+  if (process.env.ATC_ASSERT_LOCK_BOUNDARY === "1") assertOutsideAtcLock(`runCommandSync(${command})`);
   if (options.detached) {
     let cfg;
     try {
@@ -425,6 +433,7 @@ export function prepareOpChildInvocation(invocation, { lease = null, sessionId =
 }
 
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
+  assertOutsideAtcLock(`spawn(${cmd})`);
   const invocation = options.prepared
     ? options.prepared
     : prepareOpChildInvocation(

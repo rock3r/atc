@@ -1,27 +1,31 @@
 # Agent Traffic Control (`atc`)
 
-Coordinate exclusive Android and iOS device leases across concurrent coding agents without a daemon.
+Coordinate builds and exclusive Android and iOS device leases across concurrent coding agents, without a daemon and without ever running shell commands.
 
 - **User Guide (with diagrams & Q&A):** [`docs/user-guide.md`](./docs/user-guide.md)
 - **Architecture:** [`docs/architecture.md`](./docs/architecture.md)
+- **Scope & design decisions for 3.0:** [`docs/scope.md`](./docs/scope.md)
+- **Migrating from 2.x:** [`docs/migration-3.0.md`](./docs/migration-3.0.md)
 - **Design Specification:** [https://specs.sebastiano.dev/atc/](https://specs.sebastiano.dev/atc/) ([`DESIGN.md`](./DESIGN.md))
 - **License:** Apache-2.0
 
 ## Overview
 
-When two coding agents share a machine, they collide on Android emulators, iOS Simulators, and USB phones. `atc` serializes access through a user-private `state.json` file under an atomic directory lock (`atc.lock`) with `<20 ms` in-memory critical sections and zero npm dependencies.
+When several coding agents share a machine, they collide on Android emulators, iOS Simulators, USB phones, and heavy builds. `atc` serializes access through a user-private `state.json` file under an atomic directory lock (`atc.lock`) with `<20 ms` in-memory critical sections and zero npm dependencies.
 
-Agents claim a device by hardware/OS profile, run `adb`, `./gradlew connected*`, `android` CLI, `xcrun simctl`, `xcrun devicectl`, or `xcodebuild` commands inside `atc exec` with a 15-second heartbeat, restore QEMU or APFS copy-on-write snapshots, and free the lease when done.
+`atc` handles exactly two domains: **devices** (emulators, simulators, physical devices) and **builds** (Gradle, Bazel, Xcode). Agents never hand `atc` a shell command. They ask for an **allowlisted, typed operation**, and `atc` validates every value, builds the literal argv itself, and runs it under the right lease, build slot, and workspace lock.
 
-| Component | What it does |
+| Entry point | Use it for |
 |---|---|
-| `atc` CLI | Discovers running, offline, and creatable Android & iOS devices; manages TTL leases (including dual-lease Kotlin Multiplatform / KMP sessions) and a 120-second warm-affinity wait queue; injects target flags in `atc exec`; and manages QEMU and APFS snapshots. |
-| `atc` skill & hooks | Agent skill (`skills/atc/SKILL.md`) plus `PreToolUse` and `Stop` hooks (`hooks.json`, `hooks/hooks.json`, `com.github.copilot/hooks/hooks.json`, `.cursor/hooks.json`, `extensions/atc/index.ts`) that block unscoped device access and rewrite commands into `atc exec`. |
-| `atc mcp` | Optional stdio JSON-RPC 2.0 MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`). |
+| `atc exec <system> <op> …` | One simple operation, e.g. `atc exec gradle tasks :app:assembleDebug` or `atc exec android install app.apk`. |
+| `atc batch` | Anything with ceremony: several steps, dependencies, per-step `cwd`/`env`, claims, timeouts. A JSON plan (DAG) of the same typed ops. |
+| `atc mcp` | The same ops as MCP tools (`atc_gradle`, `atc_bazel`, `atc_xcode`, `atc_android`, `atc_ios`, `atc_batch`, plus `atc_claim`, `atc_free`, `atc_renew`, `atc_snapshot`, `atc_status`, `atc_guide`). |
+
+Invalid requests are rejected before anything runs, with **all** problems listed at once (`{path, code, message, hint}`). Unsupported things are refused with the supported alternative and a link to request them: <https://github.com/rock3r/atc/issues>.
 
 ## Requirements and install
 
-Requires Node.js >= 20 on macOS, Linux, or Windows, plus the Android SDK (`adb`, `emulator`, `android` CLI) and/or Xcode (`xcrun simctl`, `xcrun devicectl`) on macOS.
+Requires Node.js >= 20 on macOS, Linux, or Windows, plus the Android SDK (`adb`, `emulator`, `android` CLI) and/or Xcode (`xcrun simctl`, `xcodebuild`) on macOS.
 
 ```bash
 npm install -g @rock3r/atc
@@ -36,26 +40,54 @@ atc status
 | Antigravity | Symlink or copy package root into `~/.gemini/config/plugins/atc` (loads `plugin.json`, `skills/atc`, `hooks.json`, and `mcp_config.json`) |
 | Gemini CLI | Copy `skills/atc` into `~/.gemini/skills/atc` and wire `atc hook pre-tool-use` + `atc hook stop` |
 | Cursor | Copy `.cursor/hooks.json` into `.cursor/hooks.json` (and optional `.mcp.json`) |
-| Pi | Load `extensions/atc/index.ts` |
+| Pi | Load `extensions/atc/index.ts` (releases leases on session end) |
+
+The hooks only record your agent's session identity, inject it into `atc_*` MCP calls, and free leases when a session ends. They never read, block, or rewrite shell commands.
 
 ## Quick start
 
 ```bash
-atc status                                              # inspect RAM/disk, emu/sim slots, and fleet
-atc guide                                               # read the workflow guide and rules
+atc status                                                   # RAM/disk, emu/sim/build slots, fleet
+atc guide                                                    # workflow guide and rules
+atc exec --help                                              # the full operation catalog
 
-# Android emulator workflow
-atc claim --type phone --api ">=35" --play --wait 300   # claim a warm or offline Play Store phone
-atc exec -- adb shell getprop ro.product.model          # run adb pinned to leased serial + 15s heartbeat
-atc exec -- android layout --pretty                     # inspect UI hierarchy (--device injected)
-atc exec -- ./gradlew connectedDebugAndroidTest         # run tests without lease expiration
-atc free                                                # release lease (leaves emulator warm)
+# Pure build (build slot + per-workspace lock, no device held)
+atc exec gradle tasks :app:assembleDebug :app:assembleDebugAndroidTest --brief
 
-# iOS Simulator workflow (macOS)
-atc claim --ios --type phone --os ">=18.0" --wait 300   # claim a warm or offline iPhone Simulator
-atc exec -- xcrun simctl launch booted com.example.app  # rewrites "booted" to your leased UDID
-atc snapshot save clean_state                           # save APFS copy-on-write (cp -cR) clone
+# Android emulator
+atc claim --type phone --api ">=35" --play --wait 300
+atc exec android install app/build/outputs/apk/debug/app-debug.apk --replace
+atc exec android launch --package com.example.app --activity .MainActivity
+atc exec gradle tasks :app:connectedDebugAndroidTest         # device-coupled build under your lease
+atc exec android screenshot out/home.png
 atc free
+
+# iOS Simulator (macOS)
+atc claim --ios --type phone --os ">=18.0" --wait 300
+atc exec xcode build-for-testing --scheme App --project App.xcodeproj
+atc exec xcode test-without-building --scheme App --project App.xcodeproj
+atc exec snapshot save clean_state
+atc free
+```
+
+For multi-step flows, write a plan and let `atc` run it (validate first with `--validate`):
+
+```json
+{
+  "version": 1,
+  "steps": [
+    { "id": "assemble", "op": "gradle.tasks", "tasks": [":app:assembleDebug"] },
+    { "id": "install", "op": "android.install", "apk": "app/build/outputs/apk/debug/app-debug.apk",
+      "dependsOn": ["assemble"], "claim": { "platform": "android", "type": "phone", "api": ">=35" } },
+    { "id": "launch", "op": "android.launch", "package": "com.example.app", "activity": ".MainActivity",
+      "dependsOn": ["install"], "claim": { "reuse": "install" } }
+  ]
+}
+```
+
+```bash
+atc batch --file plan.json --validate   # prints the exact argv of every step, runs nothing
+atc batch --file plan.json
 ```
 
 ## Commands
@@ -63,17 +95,17 @@ atc free
 | Command | What it does |
 |---|---|
 | `atc guide [topic]` | Built-in guides: `workflow` (default), `profiles`, `snapshots`, `multi-agent`, `traps` (`--json` supported). |
-| `atc status [--ios\|--android] [--type <type>] [--api\|--os <spec>] [--json]` | Host RAM/disk capacity, `emu slots`, `sim slots`, `running` devices, `offline` AVDs/Simulators, `creatable` profiles, `leases`, and `queue`. |
-| `atc claim [flags]` | Claim a lease by `--ios`/`--android`, `--type` (`phone`, `tablet`, `foldable`, `desktop`, `watch`/`wear`, `xr`, `tv`), `--api`/`--os`, `--play`/`--no-play`, `--avd`, `--udid`, or `--serial`. |
-| `atc exec [--ios\|--android] [--serial <id>] -- <cmd> [args...]` | Run a command with target env/flags (`ANDROID_SERIAL`, `--device`, `ATC_IOS_UDID`, `booted` -> `<udid>`), process-group tracking, and a 15 s heartbeat. |
-| `atc renew [<target>] [--ios\|--android] [--ttl <sec>]` | Extend an active lease's TTL expiration. |
-| `atc snapshot <list\|save\|load\|delete> [<name>] [--ios\|--android]` | List, save, restore, or delete QEMU snapshots (Android) or APFS copy-on-write snapshots (iOS Simulator). |
+| `atc status [--ios\|--android] [--type <type>] [--api\|--os <spec>] [--forced] [--json]` | Host RAM/disk, emulator/simulator/build slots, devices, leases, queues; `--forced` lists audited `--force` runs. |
+| `atc claim [flags]` | Claim a lease by `--ios`/`--android`, `--type`, `--api`/`--os`, `--play`/`--no-play`, `--avd`, `--udid`, or `--serial`. |
+| `atc exec <system> <op> [args] [--options]` | Run one typed operation. Systems: `gradle`, `bazel`, `xcode`, `android`, `ios`, `snapshot`. `atc exec --help` lists every op and option. |
+| `atc batch [--file <plan.json> \| -] [--validate] [--json]` | Run a JSON plan (DAG) of typed ops sequentially in dependency order. |
+| `atc renew [<target>] [--ios\|--android] [--ttl <sec>]` | Extend an active lease's TTL. |
+| `atc snapshot <list\|save\|load\|delete> [<name>] [--ios\|--android]` | QEMU snapshots (Android) or APFS copy-on-write snapshots (iOS Simulator). Same as `atc exec snapshot …`. |
 | `atc free [<target>] [--ios\|--android] [--snapshot-save <name>] [--stop]` | Release one or all leases held by the caller session. |
-| `atc config <get\|set> [key] [val]` | Read or update settings (`maxRunningEmulators`, `maxRunningSimulators`, `minFreeRamMb`, `allowPhysicalDevices`). |
+| `atc config <get\|set> [key] [val]` | Read or update settings (`maxRunningEmulators`, `maxConcurrentBuilds`, `allowPhysicalDevices`, `allowPhysicalPropSet`, …). |
 | `atc gc` | Prune expired leases, dead anchor/worker PIDs, and stale queue tickets. |
-| `atc guard [--format=json] <command>` | Check whether a shell command is allowed, blocked, or rewritten under `atc`. |
-| `atc hook <pre-tool-use\|stop>` | Lifecycle hook handler for Claude Code, Codex, GitHub Copilot CLI, Gemini CLI, Antigravity, and Cursor. |
-| `atc mcp` | Start the stdio MCP server (`atc_status`, `atc_claim`, `atc_renew`, `atc_snapshot`, `atc_free`, `atc_guide`). |
+| `atc hook <pre-tool-use\|stop>` | Session bookkeeping hook for Claude Code, Codex, GitHub Copilot CLI, Gemini CLI, Antigravity, and Cursor. |
+| `atc mcp` | Start the stdio MCP server. |
 
 ## Development
 

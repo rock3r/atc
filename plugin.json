@@ -2,8 +2,8 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "atc",
   "displayName": "Agent Traffic Control",
-  "version": "2.1.0",
-  "description": "Coordinate exclusive Android emulator (AVD), iOS Simulator, and physical device leases across concurrent coding agents with the atc CLI, PreToolUse/SessionEnd hooks, and stdio MCP server.",
+  "version": "3.0.0",
+  "description": "Coordinate exclusive Android emulator (AVD), iOS Simulator, and physical device leases across concurrent coding agents and coordinate Gradle/Bazel/Xcode builds through typed operations (CLI, batch plans, stdio MCP) plus session hooks. ATC never runs shell commands.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Claim an API 36 phone emulator and an iOS 18 simulator, then run KMP verification.",
@@ -32,7 +32,7 @@
       "interface": {
         "displayName": "Agent Traffic Control",
         "shortDescription": "Exclusive Android & iOS device leases",
-        "longDescription": "Coordinate exclusive Android Virtual Device (AVD), iOS Simulator, and physical USB/Wi-Fi device leases across concurrent coding agents with profile matching, QEMU and APFS snapshots, bounded-window warm-affinity queueing, host RAM/disk guardrails, and scoped atc exec heartbeats.",
+        "longDescription": "Coordinate exclusive Android Virtual Device (AVD), iOS Simulator, and physical USB/Wi-Fi device leases across concurrent coding agents with profile matching, QEMU and APFS snapshots, bounded-window warm-affinity queueing, host RAM/disk guardrails, build slots and workspace locks, and typed build/device operations (never shell).",
         "developerName": "Sebastiano Poggi",
         "category": "Developer Tools",
         "websiteURL": "https://specs.sebastiano.dev/atc/",
@@ -42,7 +42,7 @@
           "Claim and release exclusive Android and iOS emulator, simulator, or physical device leases",
           "Run adb, simctl, devicectl, xcodebuild, Gradle, and android CLI commands with lease heartbeats",
           "Save, restore, and reset QEMU and APFS device snapshots",
-          "Enforce multi-agent guardrails and warm-affinity queueing"
+          "Typed build and device operations with warm-affinity queueing"
         ],
         "composerIcon": "./assets/icon.svg",
         "logo": "./assets/logo.svg",

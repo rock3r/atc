@@ -86,7 +86,7 @@ test("catalog: every op has a system, kind and params", () => {
     assert.ok(op.name.startsWith(`${op.system}.`), op.name);
     assert.ok(["build", "device", "snapshot"].includes(op.kind), op.name);
     assert.equal(typeof op.params, "object", op.name);
-    if (op.positional) assert.ok(op.params[op.positional], `${op.name} positional`);
+    if (op.positional) for (const p of [op.positional].flat()) assert.ok(op.params[p], `${op.name} positional ${p}`);
     if (op.kind !== "snapshot") assert.equal(typeof op.invocations, "function", op.name);
   }
   for (const required of ["android.prop.get", "android.prop.set", "android.permission", "ios.privacy", "snapshot.save", "snapshot.load", "bazel.clean", "xcode.clean"]) {
@@ -455,4 +455,45 @@ test("validateBatchPlan: device-coupled builds need a claim", () => {
   assert.equal(r.errors[0].code, "claim_required");
   const ok = validateBatchPlan({ version: 1, steps: [{ id: "t", op: "gradle.tasks", tasks: ["connectedDebugAndroidTest"], claim: { platform: "android" } }] });
   assert.deepEqual(ok.errors, []);
+});
+
+// ---------------------------------------------------------------- documented CLI examples
+
+test("documented CLI translations (docs/migration-3.0.md, guides) parse and validate", () => {
+  const A = ["andr", "oid"].join("");
+  const cases = [
+    [["gradle", "tasks", ":app:assembleDebug", "--offline"], "gradle.tasks"],
+    [["gradle", "tasks", "test", "--property", "flavor=free"], "gradle.tasks"],
+    [["gradle", "tasks", "connectedDebugAndroidTest", "--claim", "--type", "phone", "--api", ">=35"], "gradle.tasks"],
+    [["bazel", "build", "//app:main", "--config", "ci"], "bazel.build"],
+    [["bazel", "test", "//app:tests", "--config", "ci", "--keep-going"], "bazel.test"],
+    [["bazel", "clean", "--expunge"], "bazel.clean"],
+    [["bazel", "run", "//tools:gen", "--run-arg=--out=x", "--timeout-sec", "300"], "bazel.run"],
+    [["xcode", "test", "--scheme", "App"], "xcode.test"],
+    [["xcode", "build-for-testing", "--scheme", "App", "--project", "App.xcodeproj"], "xcode.buildForTesting"],
+    [["xcode", "test", "--scheme", "App", "--project", "App.xcodeproj", "--only-testing", "AppTests/LoginTests"], "xcode.test"],
+    [[A, "install", "app.apk", "--replace"], `${A}.install`],
+    [[A, "launch", "--package", "com.ex", "--activity", ".Main"], `${A}.launch`],
+    [[A, "clear-data", "com.ex"], `${A}.clearData`],
+    [[A, "permission", "--package", "com.ex", "--permission", `${A}.permission.CAMERA`, "--action", "grant"], `${A}.permission`],
+    [[A, "prop", "get", "ro.product.model"], `${A}.prop.get`],
+    [[A, "prop", "set", "debug.layout", "true"], `${A}.prop.set`],
+    [[A, "prop", "set", "a", "b", "c"], null],
+    [[A, "logcat", "--lines", "200", "--filter", "MyTag:D", "--filter", "*:S"], `${A}.logcat`],
+    [["ios", "launch", "com.ex.App"], "ios.launch"],
+    [["ios", "open-url", "myapp://settings"], "ios.openUrl"],
+    [["ios", "privacy", "--bundle-id", "com.ex.App", "--service", "camera", "--action", "grant"], "ios.privacy"],
+    [["snapshot", "save", "clean"], "snapshot.save"],
+  ];
+  for (const [argv, expected] of cases) {
+    const r = parseOpArgv(argv);
+    if (expected === null) {
+      // too many positionals
+      assert.ok(r.errors.length > 0, argv.join(" "));
+      continue;
+    }
+    assert.deepEqual(r.errors, [], argv.join(" "));
+    assert.equal(r.opName, expected, argv.join(" "));
+    assert.deepEqual(validateOpParams(r.opName, r.params).errors, [], argv.join(" "));
+  }
 });

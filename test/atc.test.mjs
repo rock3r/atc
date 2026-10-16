@@ -59,15 +59,10 @@ import {
   readLocalAvdMetadata,
 } from "../src/android.mjs";
 import { handleMcpRequest } from "../src/mcp.mjs";
-import {
-  classifySegment,
-  evaluateCommandGuard,
-  splitShellSegments,
-} from "../src/guard.mjs";
 import { handlePreToolUseHook, handleStopHook } from "../src/hook.mjs";
 import {
-  buildChildInvocation,
   buildSpawnConfig,
+  prepareOpChildInvocation,
   resolveExecutable,
   runCommandSync,
 } from "../src/spawn.mjs";
@@ -81,7 +76,6 @@ import {
   cmdStatus,
   cmdConfig,
   cmdGc,
-  cmdGuard,
   cmdGuide,
   parseCliArgs,
   runCli,
@@ -90,6 +84,24 @@ import {
 
 function makeTempStateDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "atc-test-"));
+}
+
+// Writes fake tool scripts (e.g. { adb: "exit 0" }) into <rootDir>/fake-bin and returns an env
+// whose PATH resolves them first, for driving typed `atc exec` ops without real devices.
+// On Windows only plain `exit N` bodies are supported (emitted as `<name>.cmd`).
+function makeFakeToolEnv(rootDir, tools) {
+  const binDir = path.join(rootDir, "fake-bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  for (const [name, body] of Object.entries(tools)) {
+    fs.writeFileSync(path.join(binDir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    const exitOnly = /^exit (\d+)$/.exec(body.trim());
+    if (exitOnly) {
+      fs.writeFileSync(path.join(binDir, `${name}.cmd`), `@exit /b ${exitOnly[1]}\r\n`);
+    }
+  }
+  return process.platform === "win32"
+    ? { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || process.env.Path || ""}` }
+    : { ...process.env, PATH: `${binDir}:/usr/bin:/bin` };
 }
 
 test("lock: acquire, verify nonce, and release", () => {
@@ -345,101 +357,6 @@ test("android: parsers and resource admission with recently-activated RAM projec
   assert.equal(creatable[1].profile.deviceType, "tablet");
 });
 
-test("guard: fast-path, compound splitting, precedence rules, and serial validation", () => {
-  // Fast-path non-Android command
-  const fast = evaluateCommandGuard("git status && npm test");
-  assert.equal(fast.allowed, true);
-  assert.equal(fast.fastPath, true);
-
-  // Compound shell split
-  const segments = splitShellSegments("echo hello && adb -s emulator-5554 shell wm size");
-  assert.equal(segments.length, 2);
-
-  // Precedence: deny_lifecycle beats read_only in compound command
-  const lifecycle = evaluateCommandGuard("adb devices && emulator -avd Pixel_8_API_35");
-  assert.equal(lifecycle.allowed, false);
-  assert.match(lifecycle.reason, /Direct emulator launch is disabled/);
-
-  // Read-only commands allowed without lease
-  const ro = evaluateCommandGuard("adb devices -l");
-  assert.equal(ro.allowed, true);
-
-  // Device action without lease -> denied
-  const deniedNoLease = evaluateCommandGuard("./gradlew connectedDebugAndroidTest", {
-    sessionId: "sess-1",
-    activeLeases: [],
-  });
-  assert.equal(deniedNoLease.allowed, false);
-  assert.match(deniedNoLease.reason, /holds no active device lease/);
-
-  // Device action with active lease -> allowed, renews lease, and rewrites to atc exec for lifetime heartbeat
-  const allowedWithLease = evaluateCommandGuard("./gradlew connectedDebugAndroidTest", {
-    sessionId: "sess-1",
-    activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-    runningCount: 1,
-    platform: "linux",
-  });
-  assert.equal(allowedWithLease.allowed, true);
-  assert.equal(allowedWithLease.renewLease, true);
-  assert.equal(
-    allowedWithLease.rewrittenCommand,
-    "ATC_SESSION_ID=sess-1 atc exec --serial emulator-5554 -- ./gradlew connectedDebugAndroidTest",
-  );
-
-  // Device action targeting another agent's serial -> denied
-  const wrongSerial = evaluateCommandGuard("adb -s emulator-5556 shell input keyevent 82", {
-    sessionId: "sess-1",
-    activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-    runningCount: 2,
-  });
-  assert.equal(wrongSerial.allowed, false);
-  assert.match(wrongSerial.reason, /emulator-5556/);
-
-  // Wrapped Android commands (`sudo`, `bash -c`, custom wrappers) fail closed without a lease
-  const sudoWrap = evaluateCommandGuard("sudo adb shell pm list packages", {
-    sessionId: "sess-1",
-    activeLeases: [],
-  });
-  assert.equal(sudoWrap.allowed, false);
-
-  const bashWrap = evaluateCommandGuard("bash -c 'adb shell pm list packages'", {
-    sessionId: "sess-1",
-    activeLeases: [],
-  });
-  assert.equal(bashWrap.allowed, false);
-
-  const bashLifecycle = evaluateCommandGuard("bash -c 'emulator -avd Pixel_8_API_35'", {
-    sessionId: "sess-1",
-    activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-  });
-  assert.equal(bashLifecycle.allowed, false);
-  assert.match(bashLifecycle.reason, /Direct emulator launch is disabled/);
-
-  // adb kill-server is denied as a host-wide lifecycle command
-  const killServer = evaluateCommandGuard("adb kill-server", {
-    sessionId: "sess-1",
-    activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-  });
-  assert.equal(killServer.allowed, false);
-  assert.match(killServer.reason, /adb kill-server/);
-
-  // Compound ATC commands export ATC_SESSION_ID across all segments
-  const compoundAtc = evaluateCommandGuard(
-    "atc claim --type phone && atc exec -- ./gradlew connectedCheck",
-    {
-      sessionId: "sess-compound",
-      anchorPid: 12345,
-      activeLeases: [],
-      platform: "linux",
-    }
-  );
-  assert.equal(compoundAtc.allowed, true);
-  assert.match(
-    compoundAtc.rewrittenCommand,
-    /^export ATC_SESSION_ID=sess-compound ATC_ANCHOR_PID=12345; /
-  );
-});
-
 test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
   const dir = makeTempStateDir();
   try {
@@ -452,38 +369,21 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
     assert.equal(viewAllow.exitCode, 0);
     assert.equal(viewAllow.stdout, "");
 
-    // Unleased adb is denied with Copilot's permissionDecision shape (toolArgs as JSON string)
-    const deny = handlePreToolUseHook(
-      dir,
-      JSON.stringify({
-        sessionId: "cp-1",
-        cwd: process.cwd(),
-        toolName: "bash",
-        toolArgs: JSON.stringify({ command: "adb shell pm list packages" }),
-      }),
-      { ppid: process.pid }
-    );
-    assert.equal(deny.exitCode, 2);
-    const denyOut = JSON.parse(deny.stdout);
-    assert.equal(denyOut.permissionDecision, "deny");
-    assert.match(denyOut.permissionDecisionReason, /atc/);
-    assert.equal(denyOut.hookSpecificOutput, undefined);
-
-    // `atc claim` is rewritten via modifiedArgs, preserving other tool args (toolArgs as object)
-    const rewrite = handlePreToolUseHook(
-      dir,
-      JSON.stringify({
-        sessionId: "cp-1",
-        toolName: "bash",
-        toolArgs: { command: "atc claim --type phone", description: "claim" },
-      }),
-      { ppid: process.pid }
-    );
-    assert.equal(rewrite.exitCode, 0);
-    const rewriteOut = JSON.parse(rewrite.stdout);
-    assert.equal(rewriteOut.permissionDecision, "allow");
-    assert.equal(rewriteOut.modifiedArgs.description, "claim");
-    assert.match(rewriteOut.modifiedArgs.command, /(?:ATC_SESSION_ID=cp-1|--session cp-1)/);
+    // v3: shell tool calls are never inspected; they are always allowed (empty stdout for Copilot,
+    // toolArgs as JSON string or object) and only record the session for this agent's anchor PID
+    for (const toolArgs of [
+      JSON.stringify({ command: "adb shell pm list packages" }),
+      { command: "atc claim --type phone", description: "claim" },
+    ]) {
+      const shellAllow = handlePreToolUseHook(
+        dir,
+        JSON.stringify({ sessionId: "cp-1", cwd: process.cwd(), toolName: "bash", toolArgs }),
+        { ppid: process.pid }
+      );
+      assert.equal(shellAllow.exitCode, 0);
+      assert.equal(shellAllow.stdout, "");
+    }
+    assert.equal(readState(dir).hookSessions[String(process.pid)]?.sessionId, "cp-1");
 
     // Concurrent Copilot chats sharing a single long-lived MCP process get isolated session IDs
     const mcpInventory = {
@@ -691,350 +591,12 @@ test("hook: PreToolUse handles GitHub Copilot CLI native format", () => {
   }
 });
 
-test("guard: tool names embedded in paths or longer words do not fail closed", () => {
-  const opts = { sessionId: "sess-unleased", activeLeases: [], runningCount: 1 };
-  // A tool name glued into a path, filename, or package spec is not a nested device command
-  for (const cmd of [
-    "sed -n 430,470p test/atc.test.mjs",
-    "sed -n 1,20p bin/atc.mjs",
-    "node --test test/atc.test.mjs",
-    "node --check bin/atc.mjs",
-    "copilot plugin install atc@atc",
-    `node -e 'require("/repo/atc/com.github.copilot/hooks/hooks.json")'`,
-    "node /plugins/review/scripts/render-html.mjs /work/my-android-app/review.json",
-    "python3 render.py --root /work/my-android-app",
-    "bin/search --scope project:my-android-app notes",
-    "node scripts/build.mjs --out dist/gradle-report.html",
-    "node script.mjs 'a\\\ndb shell'",
-    `node -e 'process.stdout.write("ok")' # a\\\ndb kill-server`,
-    `node -e 'process.stdout.write("ok")' # adb kill-server`,
-    "cat <<'EOF'\na\\\ndb shell\nEOF",
-    "cat <<EOF\na\\\ndb shell\nEOF",
-    "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
-    "tee /tmp/script <<EOF\nadb kill-server\nEOF",
-  ]) {
-    assert.equal(evaluateCommandGuard(cmd, opts).allowed, true, cmd);
-  }
-  // Standalone tool words inside interpreters and executable-passive tools still fail closed
-  for (const cmd of [
-    `node -e 'require("child_process").execSync("adb shell pm clear com.x")'`,
-    `node -e 'require("child_process").execSync("/opt/sdk/platform-tools/adb shell pm clear com.x")'`,
-    `node -e 'require("child_process").execSync("a""db shell pm clear com.x")'`,
-    `python3 -c "import os; os.system('adb shell pm clear com.x')"`,
-    `python3 -c "import subprocess; subprocess.run(['adb','shell','pm','clear','com.x'])"`,
-    `sed -n 'e adb shell pm clear com.x' /dev/null`,
-    `perl -e 'system("adb.exe shell input tap 1 1")'`,
-    "node -e 'spawn(...[adb,shell,input])'",
-    "ruby -e 'system(%w{adb shell input tap 1 1})'",
-    `python3 -c "import subprocess; subprocess.run([r'C:\\sdk\\platform-tools\\adb.exe','shell','input','keyevent','82'])"`,
-    `node -e 'require("child_process").execSync("C:\\\\sdk\\\\platform-tools\\\\a\\"\\"db.exe shell pm clear com.x")'`,
-    `node -e 'require("child_process").execSync("adb</dev/null shell input keyevent 82")'`,
-    `node -e 'require("child_process").execSync("adb>/dev/null shell input keyevent 82")'`,
-    "perl -e 'qx!adb shell pm clear com.x!'",
-    "perl -e 'qx/adb shell pm clear com.x/'",
-    "ruby -e '%x+adb shell pm clear com.x+'",
-    "ruby -e 'system(*%w-adb shell input tap 1 1-)'",
-    `"/opt/Android SDK (tools)/platform-tools/adb" shell getprop`,
-    `"C:\\\\Program Files (x86)\\\\Android\\\\android-sdk\\\\platform-tools\\\\adb.exe" shell getprop`,
-    `"/tmp/s h" -c 'adb shell pm clear com.x'`,
-    "node scripts/adb.js shell pm clear com.x",
-    "python3 scripts/adb.py shell pm clear com.x",
-    "perl scripts/adb.pl shell pm clear com.x",
-    "ruby scripts/adb.rb shell pm clear com.x",
-    "bash scripts/adb.command shell pm clear com.x",
-    "python3 scripts/adb.txt shell getprop",
-    "python3 scripts/adb.foo.bar shell getprop",
-    "./adb.log shell getprop",
-    "./adb.foo-bar shell getprop",
-    "./adb.foo.bar shell getprop",
-    "adb\\\n shell getprop",
-    "sh <<EOF\na\\\ndb shell\nEOF",
-    "sh <<'EOF'\na\\\ndb shell\nEOF",
-    "cat <<EOF | sh\na\\\ndb shell\nEOF",
-    "@adb shell pm clear com.x",
-    "npx adb@1.0.0 shell pm clear com.x",
-    "npm exec -- @scope/adb@2 shell pm clear com.x",
-    "npm exec -c 'adb shell getprop'",
-    "npx --call='adb shell getprop'",
-    "npm exec --package adb@2 -- adb shell getprop",
-    "pnpm dlx -c adb kill-server",
-    "pnpm -C adb@2 exec adb kill-server",
-    'cmd.exe /d /s /c "echo # & adb kill-server"',
-    "cmd /c echo # & adb kill-server",
-    `node --check --import 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' main.js`,
-    "node --check -r ./adb.js main.js",
-    "NODE_OPTIONS='--require ./adb.js' node --check main.js",
-    `node --test --test-reporter='data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
-    `node --test --test-reporter 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
-  ]) {
-    assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
-  }
-  const leasedOpts = {
-    sessionId: "sess-leased",
-    activeLeases: [{ serial: "emulator-5554", platform: "android" }],
-    runningCount: 1,
-  };
-  for (const cmd of [
-    `xargs "/opt/Android SDK/platform-tools/adb" kill-server </dev/null`,
-    "perl -e 'qx!adb kill-server!'",
-    "ruby -e 'system(*%w-adb kill-server-)'",
-    "python3 scripts/adb.py kill-server",
-    "python3 scripts/adb.json kill-server",
-    "python3 scripts/adb.foo.bar kill-server",
-    "./adb.foo-bar kill-server",
-    "./adb.foo.bar kill-server",
-    "@adb kill-server",
-    'cmd.exe /c "@adb kill-server"',
-    'cmd.exe /d /s /c "echo # & adb kill-server"',
-    "cmd /c echo # & adb kill-server",
-    `node --check --import 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' main.js`,
-    `NODE_OPTIONS='--import "data:text/javascript,import(\\"node:child_process\\").then(cp=>cp.execSync(\\"adb kill-server\\"))"' node --check main.js`,
-    `node --test --test-reporter='data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
-    `node --test --test-reporter 'data:text/javascript,import("node:child_process").then(cp=>cp.execSync("adb kill-server"))' test/atc.test.mjs`,
-    "npx adb@1.0.0 kill-server",
-    "npx @scope/adb@2 kill-server",
-    "npm exec -c 'adb kill-server'",
-    "npx --call='adb kill-server'",
-    "npm exec --package adb@2 -- adb kill-server",
-    "npx -p adb@2 -- adb kill-server",
-    "pnpm dlx -c adb kill-server",
-    "pnpm -C adb@2 exec adb kill-server",
-    "sh <<'EOF'\na\\\ndb kill-server\nEOF",
-    `node -e 'require("child_process").spawnSync(process.argv[2],process.argv.slice(3))' -- --title adb kill-server`,
-    `node --title adb -e 'require("node:child_process").execSync(process.title+" kill-server")'`,
-    `node --title=adb -e 'require("node:child_process").execSync(process.title+" kill-server")'`,
-    "cat <<$'EOF'\nbody\nEOF\nadb kill-server",
-    'cat <<$"EOF"\nbody\nEOF\nadb kill-server',
-    "cat <<$'\\e'\n\x1b\nadb kill-server",
-    "cat <<EOF\nbody\nE\\\nOF\nadb kill-server",
-    "cat <<EOF\n$\\\n(adb kill-server)\nEOF",
-    "cat >/tmp/x <<'EOF'\nadb kill-server\nEOF\nsh /tmp/x",
-    "env --chdir /tmp/cat sh <<'EOF'\nadb kill-server\nEOF",
-    "patch x <<'EOF'\n--- /dev/null\n+++ x\n@@ -0,0 +1 @@\n+adb kill-server\nEOF\nsh x",
-    "./adb-wrapper kill-server",
-    "./adb_wrapper kill-server",
-    "./my-adb kill-server",
-    "./wrapper.adb kill-server",
-    "./adb@wrapper kill-server",
-    "./wrapper@adb kill-server",
-    "./shim+adb-wrapper kill-server",
-    "python3 scripts/adb-wrapper.py kill-server",
-    "cat <<EOF > >(sh)\nadb kill-server\nEOF",
-    "cat <<'EOF' > >(sh)\na\\\ndb kill-server\nEOF",
-  ]) {
-    assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, false, cmd);
-  }
-  for (const cmd of [
-    "cat <<$'EOF'\nbody\nEOF\nadb shell getprop",
-    'cat <<$"EOF"\nbody\nEOF\nadb shell getprop',
-    "cat <<$'\\e'\n\x1b\nadb shell getprop",
-    "cat <<EOF\nbody\nE\\\nOF\nadb shell getprop",
-    "cat <<EOF\n$\\\n(adb shell getprop)\nEOF",
-    "cat >/tmp/x <<'EOF'\nadb shell getprop\nEOF\nsh /tmp/x",
-    "env --chdir /tmp/cat sh <<'EOF'\nadb shell getprop\nEOF",
-    "patch x <<'EOF'\n--- /dev/null\n+++ x\n@@ -0,0 +1 @@\n+adb shell getprop\nEOF\nsh x",
-    "./adb-wrapper shell getprop",
-    "./adb_wrapper shell getprop",
-    "./wrapper.adb shell getprop",
-    "./adb@wrapper shell getprop",
-    "./wrapper@adb shell getprop",
-    "./shim+adb-wrapper shell getprop",
-    `node --title adb -e 'require("node:child_process").execSync(process.title+" shell getprop")'`,
-    "python3 scripts/adb-wrapper.py shell getprop",
-    "cat <<EOF > >(sh)\nadb shell getprop\nEOF",
-  ]) {
-    assert.equal(evaluateCommandGuard(cmd, opts).allowed, false, cmd);
-  }
-  for (const cmd of [
-    "perl -e 'print q!adb kill-server!'",
-    "ruby -e 'puts %q!adb kill-server!'",
-    `node -e 'process.stdout.write("ok")' # a\\\ndb kill-server`,
-    `node -e 'process.stdout.write("ok")' # adb kill-server`,
-    "cat <<'EOF'\na\\\ndb shell\nEOF",
-    "cat <<EOF\na\\\ndb shell\nEOF",
-    "cat <<$'EOF'\nadb kill-server\nEOF",
-    'cat <<$"EOF"\nadb kill-server\nEOF',
-    "tee /tmp/script <<EOF\na\\\ndb kill-server\nEOF",
-    "tee /tmp/script <<EOF\nadb kill-server\nEOF",
-    `node -e 'console.log("android-app is cool")'`,
-  ]) {
-    assert.equal(evaluateCommandGuard(cmd, leasedOpts).allowed, true, cmd);
-  }
-  const wrapperLeasedRes = evaluateCommandGuard("./adb-wrapper shell getprop", {
-    ...leasedOpts,
-    platform: "linux",
-  });
-  assert.equal(wrapperLeasedRes.allowed, true);
-  assert.equal(
-    wrapperLeasedRes.rewrittenCommand,
-    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb-wrapper shell getprop",
-  );
-  const dotWrapperLeasedRes = evaluateCommandGuard("./wrapper.adb shell getprop", {
-    ...leasedOpts,
-    platform: "linux",
-  });
-  assert.equal(dotWrapperLeasedRes.allowed, true);
-  assert.equal(
-    dotWrapperLeasedRes.rewrittenCommand,
-    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./wrapper.adb shell getprop",
-  );
-  const atWrapperLeasedRes = evaluateCommandGuard("./adb@wrapper shell getprop", {
-    ...leasedOpts,
-    platform: "linux",
-  });
-  assert.equal(atWrapperLeasedRes.allowed, true);
-  assert.equal(
-    atWrapperLeasedRes.rewrittenCommand,
-    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./adb@wrapper shell getprop",
-  );
-  const plusWrapperLeasedRes = evaluateCommandGuard("./shim+adb-wrapper shell getprop", {
-    ...leasedOpts,
-    platform: "linux",
-  });
-  assert.equal(plusWrapperLeasedRes.allowed, true);
-  assert.equal(
-    plusWrapperLeasedRes.rewrittenCommand,
-    "ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- ./shim+adb-wrapper shell getprop",
-  );
-  const heredocFileExecRes = evaluateCommandGuard(
-    "cat >/tmp/x <<'EOF'\nadb shell getprop\nEOF\nsh /tmp/x",
-    { ...leasedOpts, platform: "linux" },
-  );
-  assert.equal(heredocFileExecRes.allowed, true);
-  assert.equal(
-    heredocFileExecRes.rewrittenCommand,
-    "cat >/tmp/x <<'EOF'\nATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop\nEOF\nsh /tmp/x",
-  );
-  const heredocSubRes = evaluateCommandGuard(
-    "cat <<EOF\n$(adb shell getprop ro.build.version.release)\nEOF",
-    { ...leasedOpts, platform: "linux" },
-  );
-  assert.equal(heredocSubRes.allowed, true);
-  assert.equal(
-    heredocSubRes.rewrittenCommand,
-    "cat <<EOF\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF",
-  );
-  const heredocContSubRes = evaluateCommandGuard(
-    "cat <<EOF\n$\\\n(adb shell getprop ro.build.version.release)\nEOF",
-    { ...leasedOpts, platform: "linux" },
-  );
-  assert.equal(heredocContSubRes.allowed, true);
-  assert.equal(
-    heredocContSubRes.rewrittenCommand,
-    "cat <<EOF\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF",
-  );
-  const heredocSingleQuoteSubRes = evaluateCommandGuard(
-    "cat <<EOF\n'$(adb shell getprop ro.build.version.release)'\nEOF",
-    { ...leasedOpts, platform: "linux" },
-  );
-  assert.equal(heredocSingleQuoteSubRes.allowed, true);
-  assert.equal(
-    heredocSingleQuoteSubRes.rewrittenCommand,
-    "cat <<EOF\n'$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)'\nEOF",
-  );
-  const multiHeredocSubRes = evaluateCommandGuard(
-    "cat <<EOF1 <<'EOF2'\n$(adb shell getprop ro.build.version.release)\nEOF1\n$(adb shell getprop ro.build.version.sdk)\nEOF2",
-    { ...leasedOpts, platform: "linux" },
-  );
-  assert.equal(multiHeredocSubRes.allowed, true);
-  assert.equal(
-    multiHeredocSubRes.rewrittenCommand,
-    "cat <<EOF1 <<'EOF2'\n$(ATC_SESSION_ID=sess-leased atc exec --serial emulator-5554 -- adb shell getprop ro.build.version.release)\nEOF1\n$(adb shell getprop ro.build.version.sdk)\nEOF2",
-  );
-  const atcRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "linux" });
-  assert.equal(atcRes.allowed, true);
-  assert.match(atcRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
-  const atcNpxRes = evaluateCommandGuard("npx @rock3r/atc@2 free", {
-    ...opts,
-    platform: "linux",
-  });
-  assert.equal(atcNpxRes.allowed, true);
-  assert.match(atcNpxRes.rewrittenCommand || "", /ATC_SESSION_ID=sess-unleased/);
-  const atcNpxWinRes = evaluateCommandGuard("npx @rock3r/atc@2 free", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcNpxWinRes.allowed, true);
-  assert.equal(atcNpxWinRes.rewrittenCommand, "npx @rock3r/atc@2 free --session sess-unleased");
-  const atcNpxCallWinRes = evaluateCommandGuard("npx --call='atc free'", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcNpxCallWinRes.allowed, true);
-  assert.equal(
-    atcNpxCallWinRes.rewrittenCommand,
-    "npx --call='atc free --session sess-unleased'",
-  );
-  const atcNpmPkgWinRes = evaluateCommandGuard("npm exec --package @rock3r/atc@2 -- atc free", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcNpmPkgWinRes.allowed, true);
-  assert.equal(
-    atcNpmPkgWinRes.rewrittenCommand,
-    "npm exec --package @rock3r/atc@2 -- atc free --session sess-unleased",
-  );
-  const atcNpmWsWinRes = evaluateCommandGuard("npm exec --workspace atc -- atc free", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcNpmWsWinRes.allowed, true);
-  assert.equal(
-    atcNpmWsWinRes.rewrittenCommand,
-    "npm exec --workspace atc -- atc free --session sess-unleased",
-  );
-  const atcExecEchoWinRes = evaluateCommandGuard("atc exec -- echo atc", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcExecEchoWinRes.allowed, true);
-  assert.equal(
-    atcExecEchoWinRes.rewrittenCommand,
-    "atc exec --session sess-unleased -- echo atc",
-  );
-  const sshAtcWinRes = evaluateCommandGuard("ssh atc", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(sshAtcWinRes.allowed, true);
-  assert.equal(sshAtcWinRes.rewrittenCommand, "ssh atc");
-  const atcWinRes = evaluateCommandGuard("node bin/atc.mjs free", { ...opts, platform: "win32" });
-  assert.equal(atcWinRes.allowed, true);
-  assert.match(atcWinRes.rewrittenCommand || "", /--session sess-unleased/);
-  const atcWinOptRes = evaluateCommandGuard("node bin/atc.mjs --anchor-pid 42 free", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcWinOptRes.allowed, true);
-  assert.equal(
-    atcWinOptRes.rewrittenCommand,
-    "node bin/atc.mjs --session sess-unleased --anchor-pid 42 free",
-  );
-  const atcWinTitleRes = evaluateCommandGuard("node --title=atc.exe bin/atc.mjs free", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcWinTitleRes.allowed, true);
-  assert.equal(
-    atcWinTitleRes.rewrittenCommand,
-    "node --title=atc.exe bin/atc.mjs free --session sess-unleased",
-  );
-  const atcWinSepTitleRes = evaluateCommandGuard("node --title atc.exe bin/atc.mjs free", {
-    ...opts,
-    platform: "win32",
-  });
-  assert.equal(atcWinSepTitleRes.allowed, true);
-  assert.equal(
-    atcWinSepTitleRes.rewrittenCommand,
-    "node --title atc.exe bin/atc.mjs free --session sess-unleased",
-  );
-});
-
 test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex formats", () => {
   const dir = makeTempStateDir();
   try {
-    // 1. PreToolUse denies unleased adb shell in Antigravity format (exitCode 0 + decision: "deny" so Antigravity parses stdout instead of ignoring ExitError)
-    const preDeny = handlePreToolUseHook(
+    // 1. v3: PreToolUse never inspects shell commands; Antigravity run_command is always allowed
+    // with decision: "allow" and the session + tool-args cwd are recorded in hookSessions
+    const preShell = handlePreToolUseHook(
       dir,
       JSON.stringify({
         conversationId: "conv-123",
@@ -1046,36 +608,10 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
       }),
       { ppid: process.pid }
     );
-    assert.equal(preDeny.exitCode, 0);
-    const preDenyOut = JSON.parse(preDeny.stdout);
-    assert.equal(preDenyOut.decision, "deny");
-    assert.match(preDenyOut.reason, /atc claim/);
+    assert.equal(preShell.exitCode, 0);
+    assert.deepEqual(JSON.parse(preShell.stdout), { decision: "allow" });
+    assert.equal(readState(dir).hookSessions[String(process.pid)]?.sessionId, "conv-123");
     assert.equal(readState(dir).hookSessions[String(process.pid)]?.cwd, "/workspace/from-tool-args");
-
-    // 1b. PreToolUse rewrites `atc claim` in Antigravity format with decision: "allow" + overwrite.CommandLine
-    const antigravityRewrite = handlePreToolUseHook(
-      dir,
-      JSON.stringify({
-        conversationId: "conv-123",
-        workspacePaths: ["/workspace/from-antigravity"],
-        toolCall: {
-          name: "run_command",
-          args: { CommandLine: "atc claim --type phone" },
-        },
-      }),
-      { ppid: process.pid }
-    );
-    assert.equal(antigravityRewrite.exitCode, 0);
-    const antigravityRewriteOut = JSON.parse(antigravityRewrite.stdout);
-    assert.equal(antigravityRewriteOut.decision, "allow");
-    assert.match(
-      antigravityRewriteOut.overwrite.CommandLine,
-      /(?:ATC_SESSION_ID=conv-123|--session conv-123)/
-    );
-    assert.equal(
-      readState(dir).hookSessions[String(process.pid)]?.cwd,
-      "/workspace/from-antigravity"
-    );
 
     // 1c. PreToolUse injects session into Antigravity MCP tool calls with decision: "allow" + overwrite
     const antigravityMcp = handlePreToolUseHook(
@@ -1152,8 +688,8 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
     assert.equal(antigravityFastAllow.exitCode, 0);
     assert.deepEqual(JSON.parse(antigravityFastAllow.stdout), { decision: "allow" });
 
-    // 2. PreToolUse rewrites `atc claim` to inject ATC_SESSION_ID in Claude/Codex format
-    const preRewrite = handlePreToolUseHook(
+    // 2. Claude/Codex shell calls are allowed with empty stdout and never rewritten
+    const preClaude = handlePreToolUseHook(
       dir,
       JSON.stringify({
         session_id: "claude-sess-1",
@@ -1162,14 +698,25 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
       }),
       { ppid: process.pid }
     );
-    assert.equal(preRewrite.exitCode, 0);
-    const rewriteOut = JSON.parse(preRewrite.stdout);
-    assert.match(
-      rewriteOut.hookSpecificOutput.updatedInput.command,
-      /(?:ATC_SESSION_ID=claude-sess-1|--session claude-sess-1)/
-    );
+    assert.equal(preClaude.exitCode, 0);
+    assert.equal(preClaude.stdout, "");
+    assert.equal(readState(dir).hookSessions[String(process.pid)]?.sessionId, "claude-sess-1");
 
-    // 3. Multi-device ambiguity is enforced when two sessions hold leases
+    // Cursor shell calls are allowed with permission: "allow"
+    const preCursor = handlePreToolUseHook(
+      dir,
+      JSON.stringify({
+        conversation_id: "cursor-sess-1",
+        hook_event_name: "beforeShellExecution",
+        command: "adb shell wm size",
+        cwd: process.cwd(),
+      }),
+      { ppid: process.pid }
+    );
+    assert.equal(preCursor.exitCode, 0);
+    assert.deepEqual(JSON.parse(preCursor.stdout), { permission: "allow" });
+
+    // 3. Two sessions holding leases: shell calls are still allowed (no command inspection)
     const mockInventory = {
       host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
       running: [
@@ -1212,8 +759,8 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
         runner: () => ({ status: 0, stdout: "List of devices attached\n", stderr: "" }),
       }
     );
-    assert.equal(unscopedPre.exitCode, 2);
-    assert.match(unscopedPre.stderr, /multiple devices are connected or leased/);
+    assert.equal(unscopedPre.exitCode, 0);
+    assert.equal(unscopedPre.stdout, "");
 
     // 4. Stop hook executes deferred snapshotSaveOnFree before releasing lease
     const runnerCalls = [];
@@ -1233,20 +780,6 @@ test("hook: PreToolUse and Stop hooks handle Antigravity and Claude/Codex format
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("spawn: buildChildInvocation injects ANDROID_SERIAL and --device for android CLI", () => {
-  const inv = buildChildInvocation(
-    "android",
-    ["run", "com.example.app"],
-    { serial: "emulator-5554", leaseId: "lease-123" },
-    "sess-1",
-    {}
-  );
-  assert.equal(inv.env.ANDROID_SERIAL, "emulator-5554");
-  assert.equal(inv.env.ATC_LEASE_ID, "lease-123");
-  assert.equal(inv.env.ATC_SESSION_ID, "sess-1");
-  assert.deepEqual(inv.args, ["run", "--device=emulator-5554", "com.example.app"]);
 });
 
 test("cli: claim, status, renew, exec, and free end-to-end with mock fleet", async () => {
@@ -1302,17 +835,26 @@ test("cli: claim, status, renew, exec, and free end-to-end with mock fleet", asy
     const renewRes = cmdRenew(dir, claimRes.lease.leaseId, { session: "sess-test", ttl: 1200 });
     assert.equal(renewRes.exitCode, 0);
 
-    // 4. Exec a child process with ANDROID_SERIAL injected
-    const execRes = await cmdExec(
-      dir,
-      [
-        process.execPath,
-        "-e",
-        "if (process.env.ANDROID_SERIAL !== 'emulator-5554') process.exit(42);",
-      ],
-      { session: "sess-test" }
-    );
-    assert.equal(execRes.exitCode, 0);
+    // 4. Exec a typed op: the fake adb sees the lease serial via -s and ANDROID_SERIAL/ATC_* env
+    if (process.platform !== "win32") {
+      const binDir = path.join(dir, "bin");
+      fs.mkdirSync(binDir, { recursive: true });
+      const envLog = path.join(dir, "adb-env.log");
+      fs.writeFileSync(
+        path.join(binDir, "adb"),
+        `#!/bin/sh\necho "$1 $2 ANDROID_SERIAL=$ANDROID_SERIAL ATC_LEASE_ID=$ATC_LEASE_ID ATC_SESSION_ID=$ATC_SESSION_ID" > ${envLog}\n[ "$ANDROID_SERIAL" = "emulator-5554" ] || exit 42\n`,
+        { mode: 0o755 }
+      );
+      const execRes = await cmdExec(dir, ["android", "logcat", "--session", "sess-test", "--json"], {
+        env: { ...process.env, PATH: `${binDir}:/usr/bin:/bin` },
+        inventory: mockInventory,
+      });
+      assert.equal(execRes.exitCode, 0, execRes.error);
+      assert.equal(
+        fs.readFileSync(envLog, "utf8").trim(),
+        `-s emulator-5554 ANDROID_SERIAL=emulator-5554 ATC_LEASE_ID=${claimRes.lease.leaseId} ATC_SESSION_ID=sess-test`
+      );
+    }
 
     // 5. Free the lease
     const freeRes = cmdFree(dir, claimRes.lease.leaseId, { session: "sess-test" });
@@ -1430,23 +972,8 @@ test("cli: error propagation for resetApp, boot serial discovery, free actions, 
     );
     assert.equal(busyNoWait.exitCode, 2);
 
-    // 6. Standalone cmdGuard probes live devices via adb devices and blocks unscoped commands when >1 device is online
+    // 6. Re-claim for the idempotency check below
     cmdClaim(dir, { session: "sess-1", api: "35" }, { inventory: mockInventory });
-    const guardMulti = cmdGuard(
-      dir,
-      "adb shell wm size",
-      { session: "sess-1" },
-      {
-        runner: () => ({
-          status: 0,
-          stdout:
-            "List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n",
-          stderr: "",
-        }),
-      }
-    );
-    assert.equal(guardMulti.exitCode, 2);
-    assert.equal(guardMulti.allowed, false);
 
     // 7. Idempotent re-claim with --reset-app and --snapshot-save-on-free executes pm clear and persists saveSnapshotOnFree
     const resetCalls = [];
@@ -1620,19 +1147,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.ok(createCalls.includes("android emulator create medium_phone"));
     assert.ok(createCalls.includes("android emulator start Medium_Phone_API_36"));
 
-    // Backtick and process substitutions are inspected by guard
-    const backtickGuard = evaluateCommandGuard("echo `adb shell pm clear com.example`", {
-      sessionId: "sess-unleased",
-      activeLeases: [],
-    });
-    assert.equal(backtickGuard.allowed, false);
-
-    const procSubGuard = evaluateCommandGuard("cat <(adb shell pm clear com.example)", {
-      sessionId: "sess-unleased",
-      activeLeases: [],
-    });
-    assert.equal(procSubGuard.allowed, false);
-
     // matchesProfile rejects online and offline emulators lacking requested snapshot
     assert.equal(
       matchesProfile(
@@ -1702,21 +1216,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(snapBySerial.exitCode, 0);
     assert.deepEqual(snapBySerial.snapshots, ["clean-base"]);
 
-    // Standalone cmdGuard renews lease on allowed device_action
-    const shortExpiry = Date.now() + 10_000;
-    withStateTransaction(dir, (state) => {
-      state.leases["avd:Medium_Phone_API_36"].expiresAtMs = shortExpiry;
-      return { mutated: true };
-    });
-    const guardRenew = cmdGuard(
-      dir,
-      "adb -s emulator-5556 shell wm size",
-      { session: "sess-create" },
-      { runningCount: 1 }
-    );
-    assert.equal(guardRenew.exitCode, 0);
-    assert.ok(readState(dir).leases["avd:Medium_Phone_API_36"].expiresAtMs > shortExpiry + 100_000);
-
     // Names-only --list-profiles output does not fabricate API/services/ABI
     const namesOnly = parseCreatableProfilesOutput("medium_phone\nmedium_tablet\n");
     assert.equal(namesOnly.length, 2);
@@ -1726,7 +1225,8 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(namesOnly[0].profile.playStore, null);
     assert.equal(namesOnly[0].profile.abi, null);
 
-    // Multi-lease session: targetless cmdRenew is rejected as ambiguous, and PreToolUse hook renews only targeted serial
+    // Multi-lease session: targetless cmdRenew is rejected as ambiguous
+    const shortExpiry = Date.now() + 10_000;
     withStateTransaction(dir, (state, { now }) => {
       state.leases["avd:Pixel_8_API_35"] = {
         leaseId: "lease-second",
@@ -1749,28 +1249,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(ambigRenew.exitCode, 1);
     assert.match(ambigRenew.error, /holds 2 active leases/);
 
-    const hookTargeted = handlePreToolUseHook(
-      dir,
-      JSON.stringify({
-        session_id: "sess-create",
-        tool_name: "Bash",
-        tool_input: { command: "adb -s emulator-5554 shell wm size" },
-      }),
-      { ppid: process.pid, runningCount: 2 }
-    );
-    assert.equal(hookTargeted.exitCode, 0);
-    const afterHookState = readState(dir);
-    assert.ok(afterHookState.leases["avd:Pixel_8_API_35"].expiresAtMs > shortExpiry + 100_000);
-    assert.equal(afterHookState.leases["avd:Medium_Phone_API_36"].expiresAtMs, shortExpiry);
-
-    // sudo -n does not consume the wrapped command
-    const sudoNonInteractive = evaluateCommandGuard("sudo -n adb kill-server", {
-      sessionId: "sess-create",
-      activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-    });
-    assert.equal(sudoNonInteractive.allowed, false);
-    assert.match(sudoNonInteractive.reason, /adb kill-server/);
-
     // Explicit --session without ATC_ANCHOR_PID leaves anchorPid null so ephemeral shell exit does not GC lease
     const explicitId = resolveSessionIdentity({
       flags: { session: "explicit-builder" },
@@ -1780,19 +1258,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     });
     assert.equal(explicitId.sessionId, "explicit-builder");
     assert.equal(explicitId.anchorPid, null);
-
-    // find -exec and variable-expanded commands are inspected by guard
-    const findExecGuard = evaluateCommandGuard("find . -exec adb shell pm clear com.example \\;", {
-      sessionId: "sess-unleased",
-      activeLeases: [],
-    });
-    assert.equal(findExecGuard.allowed, false);
-
-    const varExpandedGuard = evaluateCommandGuard('tool=adb; "$tool" shell pm clear com.example', {
-      sessionId: "sess-unleased",
-      activeLeases: [],
-    });
-    assert.equal(varExpandedGuard.allowed, false);
 
     const ambientId = resolveSessionIdentity({
       flags: {},
@@ -1891,36 +1356,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
     assert.equal(matchesProfile(physDev, { kind: "physical", apiSpec: "35", play: true }), true);
     assert.equal(matchesProfile(physDev, { kind: "physical", apiSpec: "36" }), false);
 
-    // Pipelines feeding commands into shell interpreters or xargs are inspected by guard
-    const pipeShGuard = evaluateCommandGuard("echo 'adb shell pm clear com.example' | sh", {
-      sessionId: "sess-unleased",
-      activeLeases: [],
-    });
-    assert.equal(pipeShGuard.allowed, false);
-
-    const pipeBashLifecycle = evaluateCommandGuard(
-      "printf '%s\\n' 'emulator -avd Pixel_8_API_35' | bash",
-      {
-        sessionId: "sess-create",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      }
-    );
-    assert.equal(pipeBashLifecycle.allowed, false);
-    assert.match(pipeBashLifecycle.reason, /Direct emulator launch is disabled/);
-
-    // cmdGuard with --session and ATC_ANCHOR_PID retains anchorPid in rewritten command
-    const piGuard = cmdGuard(
-      dir,
-      "atc claim --type phone",
-      { session: "pi-1234" },
-      { env: { ATC_ANCHOR_PID: "4242" } }
-    );
-    assert.equal(piGuard.allowed, true);
-    assert.match(
-      piGuard.rewrittenCommand,
-      /(?:ATC_SESSION_ID=pi-1234 ATC_ANCHOR_PID=4242|--session pi-1234 --anchor-pid 4242)/
-    );
-
     // Windows emulator lifecycle uses `emulator -avd` and `adb -s <serial> emu kill`
     const winDir = makeTempStateDir();
     try {
@@ -2010,26 +1445,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(statusFiltered.fleet.creatable.length, 1);
       assert.equal(statusFiltered.fleet.creatable[0].deviceName, "wearos_small_round");
 
-      // buildChildInvocation and evaluateCommandGuard reject conflicting explicit device selectors in atc exec
-      assert.throws(
-        () =>
-          buildChildInvocation(
-            "adb",
-            ["-s", "emulator-5556", "shell", "wm", "size"],
-            { serial: "emulator-5554", leaseId: "lease-1" },
-            "sess-1"
-          ),
-        /Conflicting device selector/
-      );
-      const execWrongSerialGuard = evaluateCommandGuard(
-        "atc exec -- adb -s emulator-5556 shell wm size",
-        {
-          sessionId: "sess-1",
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        }
-      );
-      assert.equal(execWrongSerialGuard.allowed, false);
-
       // cmdConfig rejects bootTimeoutSec / stopTimeoutSec below minimum threshold and maxTtlSec < 10
       const shortBootCfg = cmdConfig(winDir, "set", "bootTimeoutSec", "2");
       assert.equal(shortBootCfg.exitCode, 1);
@@ -2038,37 +1453,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       const shortMaxTtl = cmdConfig(winDir, "set", "maxTtlSec", "5");
       assert.equal(shortMaxTtl.exitCode, 1);
       assert.match(shortMaxTtl.error, /at least 10 seconds/);
-
-      // Non-Android child commands can pass unrelated -s flags in buildChildInvocation
-      const nodeInv = buildChildInvocation(
-        "node",
-        ["tool.mjs", "-s", "smoke"],
-        { serial: "emulator-5554", leaseId: "lease-1" },
-        "sess-1"
-      );
-      assert.deepEqual(nodeInv.args, ["tool.mjs", "-s", "smoke"]);
-
-      // Lifecycle commands inside buildChildInvocation are rejected
-      assert.throws(
-        () =>
-          buildChildInvocation(
-            "adb",
-            ["kill-server"],
-            { serial: "emulator-5554", leaseId: "lease-1" },
-            "sess-1"
-          ),
-        /adb kill-server/
-      );
-
-      // Executable command substitutions preserve outer arguments in guard
-      const cmdSubExecGuard = evaluateCommandGuard(
-        "$(command -v adb) shell pm clear com.example",
-        {
-          sessionId: "sess-unleased",
-          activeLeases: [],
-        }
-      );
-      assert.equal(cmdSubExecGuard.allowed, false);
 
       // Cursor native beforeShellExecution hook format
       const cursorFastAllow = handlePreToolUseHook(
@@ -2083,7 +1467,8 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(cursorFastAllow.exitCode, 0);
       assert.equal(JSON.parse(cursorFastAllow.stdout).permission, "allow");
 
-      const cursorDeny = handlePreToolUseHook(
+      // v3: device-tool shell commands are no longer inspected; Cursor still gets permission: "allow"
+      const cursorAdbAllow = handlePreToolUseHook(
         winDir,
         JSON.stringify({
           conversation_id: "cursor-conv-1",
@@ -2092,68 +1477,8 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         }),
         { ppid: process.pid }
       );
-      assert.equal(cursorDeny.exitCode, 2);
-      assert.equal(JSON.parse(cursorDeny.stdout).permission, "deny");
-
-      // Wrapped ANDROID_SERIAL overrides in cmdExec are rejected before spawning
-      withStateTransaction(winDir, (state, { now }) => {
-        state.leases["avd:Pixel_8_API_35"] = {
-          leaseId: "lease-exec-wrap",
-          deviceKey: "avd:Pixel_8_API_35",
-          avd: "Pixel_8_API_35",
-          serial: "emulator-5554",
-          kind: "emulator",
-          state: "active",
-          sessionId: "exec-wrap-sess",
-          anchorPid: null,
-          claimedAtMs: now,
-          renewedAtMs: now,
-          expiresAtMs: now + 60_000,
-        };
-        return { mutated: true };
-      });
-      const wrappedExecConflict = await cmdExec(
-        winDir,
-        ["env", "ANDROID_SERIAL=emulator-5556", "adb", "shell", "pm", "clear", "com.example"],
-        { session: "exec-wrap-sess" }
-      );
-      assert.equal(wrappedExecConflict.exitCode, 3);
-      assert.match(wrappedExecConflict.error, /Conflicting device selector "emulator-5556"/);
-
-      // Non-serial ADB target selectors (-d, -e, -t) and global Android flags before emulator lifecycle are rejected
-      assert.throws(
-        () =>
-          buildChildInvocation(
-            "adb",
-            ["-d", "shell", "pm", "clear", "com.example"],
-            { serial: "emulator-5554", leaseId: "lease-1" },
-            "sess-1"
-          ),
-        /Non-serial adb device selector "-d"/
-      );
-      assert.throws(
-        () =>
-          buildChildInvocation(
-            "android",
-            ["--sdk=/tmp/sdk", "emulator", "stop", "emulator-5554"],
-            { serial: "emulator-5554", leaseId: "lease-1" },
-            "sess-1"
-          ),
-        /Direct "android emulator stop" is disabled/
-      );
-      const adbDashDGuard = evaluateCommandGuard("adb -d shell pm clear com.example", {
-        sessionId: "sess-1",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      });
-      assert.equal(adbDashDGuard.allowed, false);
-      const androidGlobalFlagStopGuard = evaluateCommandGuard(
-        "android --sdk=/tmp/sdk emulator stop emulator-5554",
-        {
-          sessionId: "sess-1",
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        }
-      );
-      assert.equal(androidGlobalFlagStopGuard.allowed, false);
+      assert.equal(cursorAdbAllow.exitCode, 0);
+      assert.equal(JSON.parse(cursorAdbAllow.stdout).permission, "allow");
 
       // computeUsedEmulatorSlots counts active emulator leases during transient inventory gaps
       assert.equal(
@@ -2222,23 +1547,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(emuSelection.priority, 1);
       assert.equal(emuSelection.candidate.avd, "Pixel_8_API_35");
 
-      // Gradle install/uninstall tasks are guarded as device actions while installDist is ignored
-      const gradleInstallGuard = evaluateCommandGuard("./gradlew :app:installDebug", {
-        sessionId: "sess-unleased",
-        activeLeases: [],
-      });
-      assert.equal(gradleInstallGuard.allowed, false);
-      const gradleUninstallGuard = evaluateCommandGuard("./gradlew uninstallAll", {
-        sessionId: "sess-unleased",
-        activeLeases: [],
-      });
-      assert.equal(gradleUninstallGuard.allowed, false);
-      const gradleInstallDistGuard = evaluateCommandGuard("./gradlew installDist", {
-        sessionId: "sess-unleased",
-        activeLeases: [],
-      });
-      assert.equal(gradleInstallDistGuard.allowed, true);
-
       // Terminal session fallback anchors to parent PID
       const termIdentity = resolveSessionIdentity({
         flags: {},
@@ -2281,22 +1589,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       );
       assert.equal(blockedOffline.priority, null);
 
-      // env -i ANDROID_SERIAL=... selector is parsed and rejected when conflicting
-      const envIgnoreGuard = evaluateCommandGuard(
-        "env -i ANDROID_SERIAL=emulator-5556 adb shell pm clear com.example",
-        {
-          sessionId: "sess-1",
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        }
-      );
-      assert.equal(envIgnoreGuard.allowed, false);
-      const envIgnoreExec = await cmdExec(
-        winDir,
-        ["env", "-i", "ANDROID_SERIAL=emulator-5556", "adb", "shell", "pm", "clear", "com.example"],
-        { session: "exec-wrap-sess" }
-      );
-      assert.equal(envIgnoreExec.exitCode, 3);
-
       // resolveAvdHome honors ANDROID_USER_HOME and ANDROID_EMULATOR_HOME
       assert.equal(resolveAvdHome({ ANDROID_USER_HOME: "/custom/user" }), path.join("/custom/user", "avd"));
       assert.equal(
@@ -2319,28 +1611,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       });
       assert.notEqual(detachedMissing.status, 0);
       assert.match(detachedMissing.stderr, /ENOENT/);
-
-      // sudo without -E or explicit selector is rejected in atc exec, while sudo -E or -s <serial> is allowed
-      const sudoNoPreserveGuard = evaluateCommandGuard("atc exec -- sudo adb shell pm clear com.example", {
-        sessionId: "sess-1",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      });
-      assert.equal(sudoNoPreserveGuard.allowed, false);
-      const sudoPreserveGuard = evaluateCommandGuard("atc exec -- sudo -E adb shell pm clear com.example", {
-        sessionId: "sess-1",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      });
-      assert.equal(sudoPreserveGuard.allowed, true);
-
-      // Failed adb devices probe on unscoped device action fails closed in hook and cmdGuard
-      const failedProbeGuard = cmdGuard(
-        winDir,
-        "adb shell wm size",
-        { session: "exec-wrap-sess" },
-        { runner: () => ({ status: 1, stdout: "", stderr: "adb server error" }) }
-      );
-      assert.equal(failedProbeGuard.exitCode, 2);
-      assert.equal(failedProbeGuard.allowed, false);
 
       // Multi-lease cmdFree accumulates snapshot disk requirements across all matched leases
       withStateTransaction(winDir, (state, { now }) => {
@@ -2406,44 +1676,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       reconcileOfflineLeases(unmappedLeaseState, schedInventory, "sess-other", schedNow);
       assert.equal(unmappedLeaseState.leases["serial:emulator-5554"], undefined);
       assert.equal(unmappedLeaseState.leases["avd:Pixel_8_API_35"].leaseId, "lease-unmapped-serial");
-
-      // adb -L <socket> lifecycle commands are denied even with an active lease
-      const adbDashLKill = evaluateCommandGuard("adb -L tcp:localhost:5037 kill-server", {
-        sessionId: "sess-1",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      });
-      assert.equal(adbDashLKill.allowed, false);
-      const adbDashLEmuKill = evaluateCommandGuard("adb -L tcp:localhost:5037 emu kill", {
-        sessionId: "sess-1",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      });
-      assert.equal(adbDashLEmuKill.allowed, false);
-
-      // android screen capture injects --device after capture, while screen resolve is read-only
-      const screenCaptureInv = buildChildInvocation(
-        "android",
-        ["screen", "capture", "--output=out.png"],
-        { leaseId: "lease-1", serial: "emulator-5554" },
-        "sess-1",
-      );
-      assert.deepEqual(screenCaptureInv.args, [
-        "screen",
-        "capture",
-        "--device=emulator-5554",
-        "--output=out.png",
-      ]);
-      const screenResolveInv = buildChildInvocation(
-        "android",
-        ["screen", "resolve", "A1", "--file=out.png"],
-        { leaseId: "lease-1", serial: "emulator-5554" },
-        "sess-1",
-      );
-      assert.deepEqual(screenResolveInv.args, ["screen", "resolve", "A1", "--file=out.png"]);
-      const screenResolveGuard = evaluateCommandGuard(
-        "android screen resolve A1 --file=out.png",
-        { sessionId: "sess-1", activeLeases: [] },
-      );
-      assert.equal(screenResolveGuard.allowed, true);
 
       // Multiple MCP servers under the same parent PID get distinct default session IDs and cannot hijack each other's lease
       const multiMcpDir = makeTempStateDir();
@@ -2552,24 +1784,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(byteAvdMeta.ramSizeMb, 2048);
       assert.equal(byteAvdMeta.dataDiskMb, 6144 + 512);
 
-      // Shell payloads that unset or export -n ANDROID_SERIAL are rejected by guard and atc exec
-      const unsetInShellGuard = evaluateCommandGuard(
-        "atc exec -- sh -c 'unset ANDROID_SERIAL; adb shell wm size'",
-        {
-          sessionId: "sess-1",
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        },
-      );
-      assert.equal(unsetInShellGuard.allowed, false);
-      const exportNInShellGuard = evaluateCommandGuard(
-        "atc exec -- bash -c 'export -n ANDROID_SERIAL; adb shell wm size'",
-        {
-          sessionId: "sess-1",
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        },
-      );
-      assert.equal(exportNInShellGuard.allowed, false);
-
       // parseAndroidEmulatorListOutput checks the status column rather than substring "online" in AVD name
       const parsedOnlineNamedAvd = parseAndroidEmulatorListOutput(
         "AVD                 Status    Serial          API\nOnline_Test_API_35  offline   -               android-35\n",
@@ -2577,33 +1791,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.equal(parsedOnlineNamedAvd.length, 1);
       assert.equal(parsedOnlineNamedAvd[0].avd, "Online_Test_API_35");
       assert.equal(parsedOnlineNamedAvd[0].online, false);
-
-      // Bare `adb disconnect` and mismatched `adb disconnect <target>` are rejected in both buildChildInvocation and guard
-      assert.throws(
-        () =>
-          buildChildInvocation(
-            "adb",
-            ["disconnect"],
-            { leaseId: "lease-1", serial: "emulator-5554" },
-            "sess-1",
-          ),
-        /Bare "adb disconnect" is disabled/,
-      );
-      assert.throws(
-        () =>
-          buildChildInvocation(
-            "adb",
-            ["disconnect", "192.168.1.50:5555"],
-            { leaseId: "lease-1", serial: "emulator-5554" },
-            "sess-1",
-          ),
-        /Conflicting device selector/,
-      );
-      const bareDisconnectGuard = evaluateCommandGuard("adb disconnect", {
-        sessionId: "sess-1",
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-      });
-      assert.equal(bareDisconnectGuard.allowed, false);
 
       // GC preserves active lease while an in-flight exec workerPid is alive even if anchorPid exited
       const execAliveState = createDefaultState();
@@ -2626,35 +1813,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
       assert.ok(execAliveState.leases["avd:Pixel_8_API_35"]);
       runGarbageCollection(execAliveState, null, nowExec, () => false);
       assert.equal(execAliveState.leases["avd:Pixel_8_API_35"], undefined);
-
-      // Windows hook rewrites omit POSIX env prefixes and sh -c
-      const winSimpleRewrite = evaluateCommandGuard("adb shell wm size", {
-        sessionId: "win-sess",
-        anchorPid: 1234,
-        activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        runningCount: 1,
-        platform: "win32",
-      });
-      assert.equal(winSimpleRewrite.allowed, true);
-      assert.equal(
-        winSimpleRewrite.rewrittenCommand,
-        "atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell wm size",
-      );
-      const winCompoundRewrite = evaluateCommandGuard(
-        'adb shell "echo hi" && adb shell input keyevent 3',
-        {
-          sessionId: "win-sess",
-          anchorPid: 1234,
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-          runningCount: 1,
-          platform: "win32",
-        },
-      );
-      assert.equal(winCompoundRewrite.allowed, true);
-      assert.equal(
-        winCompoundRewrite.rewrittenCommand,
-        'atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell "echo hi" && atc exec --session win-sess --anchor-pid 1234 --serial emulator-5554 -- adb shell input keyevent 3',
-      );
 
       // Device commands invalidate loadedSnapshot, and idempotent re-claim with --snapshot-load reloads the snapshot
       const snapReloadDir = makeTempStateDir();
@@ -2691,14 +1849,17 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         assert.equal(c1.exitCode, 0);
         assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, "clean-base");
 
-        // Mutating device command via cmdGuard invalidates loadedSnapshot
-        cmdGuard(
-          snapReloadDir,
-          "adb -s emulator-5554 shell pm clear com.example.app",
-          { session: "snap-sess" },
-          { runningCount: 1 },
-        );
-        assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, null);
+        // A mutating typed device op (android clearData) invalidates loadedSnapshot
+        if (process.platform !== "win32") {
+          const clearEnv = makeFakeToolEnv(snapReloadDir, { adb: "exit 0" });
+          const clearRes = await cmdExec(
+            snapReloadDir,
+            ["android", "clearData", "com.example.app", "--session", "snap-sess", "--json"],
+            { env: clearEnv, inventory: snapInv },
+          );
+          assert.equal(clearRes.exitCode, 0, clearRes.error);
+          assert.equal(readState(snapReloadDir).leases["avd:Pixel_8_API_35"].loadedSnapshot, null);
+        }
 
         // Re-claiming with --snapshot-load restores the snapshot again
         snapCalls.length = 0;
@@ -3031,69 +2192,18 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
         assert.deepEqual(freeThrown.freed, []);
         assert.equal(readState(npxDir).leases["avd:Pixel_8_API_35"].state, "active");
 
-        // `adb wait-for-*` prefixes are unwrapped before lifecycle checks in guard and buildChildInvocation
-        const waitKillServerGuard = evaluateCommandGuard("adb wait-for-device kill-server", {
-          sessionId: "ppid-5050",
-          activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-        });
-        assert.equal(waitKillServerGuard.allowed, false);
-        assert.match(waitKillServerGuard.reason, /adb kill-server/);
-        assert.throws(
-          () =>
-            buildChildInvocation(
-              "adb",
-              ["wait-for-device", "kill-server"],
-              { serial: "emulator-5554", leaseId: "lease-1" },
-              "ppid-5050",
-            ),
-          /adb kill-server/,
+        // Typed-op child invocations get the lease serial injected as ANDROID_SERIAL (argv untouched)
+        const npxLease = readState(npxDir).leases["avd:Pixel_8_API_35"];
+        const npxPrepared = prepareOpChildInvocation(
+          { cmd: "adb", args: ["-s", npxLease.serial, "get-state"] },
+          { lease: npxLease, sessionId: "ppid-5050", baseEnv: { ATC_BUILD_OP_ID: "stale" } },
         );
-        assert.throws(
-          () =>
-            buildChildInvocation(
-              "adb",
-              ["wait-for-device", "emu", "kill"],
-              { serial: "emulator-5554", leaseId: "lease-1" },
-              "ppid-5050",
-            ),
-          /adb emu kill/,
-        );
-
-        // `atc exec -- sh -c 'adb -s "$ANDROID_SERIAL" shell get-state'` expands injected ANDROID_SERIAL
-        const guardExecSerialVar = evaluateCommandGuard(
-          'atc exec -- sh -c \'adb -s "$ANDROID_SERIAL" shell get-state\'',
-          {
-            sessionId: "ppid-5050",
-            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-          },
-        );
-        assert.equal(guardExecSerialVar.allowed, true);
-
-        const execSerialVarRes = await cmdExec(
-          npxDir,
-          [process.execPath, "-e", 'if (process.env.ANDROID_SERIAL !== "emulator-5554") process.exit(43);'],
-          { session: "ppid-5050" },
-          { livenessCheck: () => true },
-        );
-        assert.equal(execSerialVarRes.exitCode, 0);
-
-        const execShellSerialVarRes = await cmdExec(
-          npxDir,
-          [
-            process.execPath,
-            "-e",
-            "if (process.env.ANDROID_SERIAL !== 'emulator-5554') process.exit(44);",
-            "--",
-            "adb",
-            "-s",
-            "$ANDROID_SERIAL",
-            "shell",
-            "get-state",
-          ],
-          { session: "ppid-5050" },
-          { livenessCheck: () => true },
-        );
-        assert.equal(execShellSerialVarRes.exitCode, 0);
+        assert.equal(npxPrepared.env.ANDROID_SERIAL, "emulator-5554");
+        assert.equal(npxPrepared.env.ATC_DEVICE_SERIAL, "emulator-5554");
+        assert.equal(npxPrepared.env.ATC_LEASE_ID, npxLease.leaseId);
+        assert.equal(npxPrepared.env.ATC_SESSION_ID, "ppid-5050");
+        assert.equal(npxPrepared.env.ATC_BUILD_OP_ID, undefined);
+        assert.deepEqual(npxPrepared.args, ["-s", "emulator-5554", "get-state"]);
 
         // Cold restart of online emulator honors configured stopTimeoutSec on both POSIX and Windows
         const stopTimeoutDir = makeTempStateDir();
@@ -3146,42 +2256,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(capturedStopTimeoutMs, 95_000);
             cmdFree(stopTimeoutDir, coldRestartRes.lease.leaseId, { session: `cold-sess-${testPlatform}` });
           }
-
-          // 1. Reject ADB detach/attach targeting another serial
-          assert.throws(
-            () =>
-              buildChildInvocation(
-                "adb",
-                ["detach", "R58N999999Z"],
-                { serial: "emulator-5554", leaseId: "lease-1" },
-                "ppid-5050",
-              ),
-            /Conflicting device selector "R58N999999Z"/,
-          );
-          const detachOtherGuard = evaluateCommandGuard("atc exec -- adb detach R58N999999Z", {
-            sessionId: "ppid-5050",
-            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-          });
-          assert.equal(detachOtherGuard.allowed, false);
-          assert.match(detachOtherGuard.reason, /R58N999999Z/);
-
-          // 2. Reject untracked remote-device lifecycle commands (`android device remote remove ...`)
-          const remoteRemoveGuard = evaluateCommandGuard("android device remote remove res-123", {
-            sessionId: "ppid-5050",
-            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-          });
-          assert.equal(remoteRemoveGuard.allowed, false);
-          assert.match(remoteRemoveGuard.reason, /android device remote remove/);
-          assert.throws(
-            () =>
-              buildChildInvocation(
-                "android",
-                ["device", "remote", "remove", "res-123"],
-                { serial: "emulator-5554", leaseId: "lease-1" },
-                "ppid-5050",
-              ),
-            /android device remote remove/,
-          );
 
           // 3. Preserve destination lease if another session concurrently reserves the created AVD key during key migration
           const collisionDir = makeTempStateDir();
@@ -3413,34 +2487,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
           );
           assert.equal(offlineWorkerState.leases["phys:R58N123456A"], undefined);
 
-          // 9. Compound POSIX device commands rewrite only the device segment so caller shell syntax (`[[ ... ]]`) is preserved
-          const bashCompoundGuard = evaluateCommandGuard("[[ -f app.apk ]] && adb install app.apk", {
-            sessionId: "bash-sess",
-            anchorPid: 4321,
-            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-            runningCount: 1,
-            platform: "linux",
-          });
-          assert.equal(bashCompoundGuard.allowed, true);
-          assert.equal(
-            bashCompoundGuard.rewrittenCommand,
-            "[[ -f app.apk ]] && ATC_SESSION_ID=bash-sess ATC_ANCHOR_PID=4321 atc exec --serial emulator-5554 -- adb install app.apk",
-          );
-
-          // 10. Shell control structures (`if ...; then ...; fi`, `for ...; do ...; done`) keep control keywords outside `atc exec --`
-          const ifControlGuard = evaluateCommandGuard("if adb shell get-state; then echo ok; fi", {
-            sessionId: "bash-sess",
-            anchorPid: 4321,
-            activeLeases: [{ leaseId: "lease-1", serial: "emulator-5554" }],
-            runningCount: 1,
-            platform: "linux",
-          });
-          assert.equal(ifControlGuard.allowed, true);
-          assert.equal(
-            ifControlGuard.rewrittenCommand,
-            "if ATC_SESSION_ID=bash-sess ATC_ANCHOR_PID=4321 atc exec --serial emulator-5554 -- adb shell get-state ; then echo ok ; fi",
-          );
-
           // 11. parseAndroidEmulatorListOutput skips `AVD ID  AVD Name  API Level  Status  Serial` long-list header
           const longHeaderParsed = parseAndroidEmulatorListOutput(
             "AVD ID              AVD Name            API Level  Status    Serial\nPixel_8_API_35      Pixel 8 API 35      35         offline   -\n",
@@ -3495,54 +2541,14 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             });
             assert.equal(renewLong.exitCode, 0);
             const longExpiresAt = renewLong.lease.expiresAtMs;
+            const fakeAdbEnv = makeFakeToolEnv(coldRediscoverDir, { adb: "exit 0" });
             const execLongRes = await cmdExec(
               coldRediscoverDir,
-              [process.execPath, "-e", "process.exit(0);"],
-              { session: "cold-rediscover" },
+              ["android", "logcat", "--session", "cold-rediscover", "--json"],
+              { env: fakeAdbEnv },
             );
-            assert.equal(execLongRes.exitCode, 0);
+            assert.equal(execLongRes.exitCode, 0, execLongRes.error);
             assert.ok(readState(coldRediscoverDir).leases["avd:Pixel_8_API_35"].expiresAtMs >= longExpiresAt);
-
-            // 14. Host-wide `adb reconnect offline` and `adb --one-device` are rejected in guard and buildChildInvocation
-            const guardReconnectOffline = evaluateCommandGuard("adb reconnect offline", {
-              sessionId: "cold-rediscover",
-              activeLeases: [coldRediscoverRes.lease],
-            });
-            assert.equal(guardReconnectOffline.allowed, false);
-            assert.match(guardReconnectOffline.reason, /adb reconnect offline/);
-
-            const guardOneDevice = evaluateCommandGuard(
-              "adb --one-device emulator-5558 start-server",
-              {
-                sessionId: "cold-rediscover",
-                activeLeases: [coldRediscoverRes.lease],
-              },
-            );
-            assert.equal(guardOneDevice.allowed, false);
-            assert.match(guardOneDevice.reason, /adb --one-device/);
-
-            assert.throws(
-              () => buildChildInvocation("adb", ["reconnect", "offline"], coldRediscoverRes.lease),
-              /adb reconnect offline/,
-            );
-            assert.throws(
-              () =>
-                buildChildInvocation(
-                  "adb",
-                  ["--one-device", "emulator-5558", "start-server"],
-                  coldRediscoverRes.lease,
-                ),
-              /adb --one-device/,
-            );
-            assert.throws(
-              () =>
-                buildChildInvocation(
-                  "adb",
-                  ["--one-device=emulator-5558", "shell", "id"],
-                  coldRediscoverRes.lease,
-                ),
-              /adb --one-device/,
-            );
 
             // 15. Unknown options (e.g., --wipe-dtaa, --snapshot-laod, --stpo) are rejected instead of silently ignored
             const badClaimFlag1 = cmdClaim(coldRediscoverDir, {
@@ -3595,9 +2601,9 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             let worker999Checks = 0;
             const execFinishRes = await cmdExec(
               coldRediscoverDir,
-              [process.execPath, "-e", "process.exit(0);"],
-              { session: "cold-rediscover" },
+              ["android", "logcat", "--session", "cold-rediscover", "--json"],
               {
+                env: fakeAdbEnv,
                 platform: "darwin",
                 avdHome,
                 host: { freeDiskMb: 16384 },
@@ -3613,7 +2619,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 },
               },
             );
-            assert.equal(execFinishRes.exitCode, 0);
+            assert.equal(execFinishRes.exitCode, 0, execFinishRes.error);
             assert.ok(
               deferredCalls.some((c) => c === "adb -s emulator-5558 emu avd snapshot save deferred-snap"),
               `Expected deferred snapshot save, got: ${JSON.stringify(deferredCalls)}`,
@@ -3755,46 +2761,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(missingAvdSnap.exitCode, 1);
             assert.match(missingAvdSnap.error, /No emulator found matching AVD "Does_Not_Exist_AVD"/);
 
-            // 21. `android device remote --project ... remove` and `android device remote extend` are rejected in guard and buildChildInvocation
-            const guardRemoteProjectRemove = evaluateCommandGuard(
-              "android device remote --project my-project remove victim-res",
-              {
-                sessionId: "target-sess",
-                activeLeases: [l2.lease],
-              },
-            );
-            assert.equal(guardRemoteProjectRemove.allowed, false);
-            assert.match(guardRemoteProjectRemove.reason, /android device remote remove/);
-
-            const guardRemoteExtend = evaluateCommandGuard(
-              "android device remote extend res-1 --duration=30",
-              {
-                sessionId: "target-sess",
-                activeLeases: [l2.lease],
-              },
-            );
-            assert.equal(guardRemoteExtend.allowed, false);
-            assert.match(guardRemoteExtend.reason, /android device remote extend/);
-
-            assert.throws(
-              () =>
-                buildChildInvocation(
-                  "android",
-                  ["device", "remote", "--project", "my-project", "remove", "victim-res"],
-                  l2.lease,
-                ),
-              /android device remote remove/,
-            );
-            assert.throws(
-              () =>
-                buildChildInvocation(
-                  "android",
-                  ["device", "remote", "extend", "res-1", "--duration=30"],
-                  l2.lease,
-                ),
-              /android device remote extend/,
-            );
-
             // 22. `atc renew` without `--ttl` preserves an existing later deadline on a long-TTL lease
             const renewSetLong = cmdRenew(coldRediscoverDir, l2.lease.leaseId, {
               session: "target-sess",
@@ -3834,9 +2800,9 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             let worker999002Checks = 0;
             const execDeferredFailRes = await cmdExec(
               coldRediscoverDir,
-              [process.execPath, "-e", "process.exit(0);"],
-              { session: "target-sess" },
+              ["android", "logcat", "--session", "target-sess", "--json"],
               {
+                env: fakeAdbEnv,
                 platform: "darwin",
                 avdHome,
                 host: { freeDiskMb: 16384 },
@@ -3849,77 +2815,11 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 runner: () => ({ status: 1, stdout: "", stderr: "KO: snapshot save failed" }),
               },
             );
-            assert.equal(execDeferredFailRes.exitCode, 0);
+            assert.equal(execDeferredFailRes.exitCode, 0, execDeferredFailRes.error);
             const preservedLease = readState(coldRediscoverDir).leases["avd:Pixel_9_API_36"];
             assert.ok(preservedLease, "Lease should be preserved when deferred snapshot save fails");
             assert.equal(preservedLease.state, "active");
             assert.equal(preservedLease.releaseOnWorkerExit, false);
-
-            // 24. Inline interpreter lifecycle commands are rejected by both guard and cmdExec
-            const inlineKillGuard = evaluateCommandGuard(
-              `atc exec -- python -c 'import os; os.system("adb kill-server")'`,
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5556" }],
-              },
-            );
-            assert.equal(inlineKillGuard.allowed, false);
-            assert.match(inlineKillGuard.reason, /adb kill-server/);
-
-            const inlineKillExec = await cmdExec(
-              coldRediscoverDir,
-              ["python", "-c", 'import os; os.system("adb kill-server")'],
-              { session: "target-sess" },
-            );
-            assert.equal(inlineKillExec.exitCode, 3);
-            assert.match(inlineKillExec.error, /adb kill-server/);
-
-            const inlineListKillExec = await cmdExec(
-              coldRediscoverDir,
-              ["python", "-c", "import subprocess; subprocess.run(['adb', 'kill-server'])"],
-              { session: "target-sess" },
-            );
-            assert.equal(inlineListKillExec.exitCode, 3);
-            assert.match(inlineListKillExec.error, /adb kill-server/);
-
-            const inlineWrongSerialExec = await cmdExec(
-              coldRediscoverDir,
-              ["python", "-c", 'import os; os.system("adb -s emulator-5554 shell wm size")'],
-              { session: "target-sess" },
-            );
-            assert.equal(inlineWrongSerialExec.exitCode, 3);
-            assert.match(inlineWrongSerialExec.error, /Conflicting device selector "emulator-5554"/);
-
-            // 25. POSIX case ... in ... ;; ... esac blocks preserve ;; separators, pattern arms, and esac
-            const caseRewrite = evaluateCommandGuard(
-              'case "$x" in foo) adb shell get-state ;; *) echo no ;; esac',
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5556" }],
-                runningCount: 1,
-                platform: "linux",
-              },
-            );
-            assert.equal(caseRewrite.allowed, true);
-            assert.equal(
-              caseRewrite.rewrittenCommand,
-              'case "$x" in foo) ATC_SESSION_ID=target-sess atc exec --serial emulator-5556 -- adb shell get-state ;; *) echo no ;; esac',
-            );
-
-            const casePipePatternRewrite = evaluateCommandGuard(
-              'case "$x" in foo|bar) adb shell get-state ;; *) echo "adb skipped" ;; esac',
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5556" }],
-                runningCount: 1,
-                platform: "linux",
-              },
-            );
-            assert.equal(casePipePatternRewrite.allowed, true);
-            assert.equal(
-              casePipePatternRewrite.rewrittenCommand,
-              'case "$x" in foo|bar) ATC_SESSION_ID=target-sess atc exec --serial emulator-5556 -- adb shell get-state ;; *) echo "adb skipped" ;; esac',
-            );
 
             // 26. Invalid --ttl in cmdClaim/cmdRenew and omitted config set values are rejected
             const invalidRenewTtl = cmdRenew(coldRediscoverDir, l2.lease.leaseId, {
@@ -4177,8 +3077,8 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(postStopFailLease.serial, null);
             const execWithoutSerial = await cmdExec(
               coldRediscoverDir,
-              ["adb", "shell", "getprop"],
-              { session: "target-sess" },
+              ["android", "prop", "get", "ro.build.version.sdk", "--session", "target-sess", "--json"],
+              { env: fakeAdbEnv },
             );
             assert.equal(execWithoutSerial.exitCode, 3);
             assert.match(execWithoutSerial.error, /has no active adb serial/);
@@ -4427,48 +3327,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               "lease_reconciled_winner",
             );
 
-            // 40. Dynamically assembled tool names (variable expansion, quotes, backslashes) do not bypass guard fast-path
-            const dynKillVar = evaluateCommandGuard("x=ad; ${x}b kill-server", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(dynKillVar.allowed, false);
-            assert.match(dynKillVar.reason, /adb kill-server/);
-
-            const dynEmuVar = evaluateCommandGuard("x=emul; ${x}ator -avd Evil", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(dynEmuVar.allowed, false);
-            assert.match(dynEmuVar.reason, /Direct emulator launch is disabled/);
-
-            const dynQuotedKill = evaluateCommandGuard('"ad"b kill-server', {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(dynQuotedKill.allowed, false);
-            assert.match(dynQuotedKill.reason, /adb kill-server/);
-
-            const dynEscapedKill = evaluateCommandGuard("a\\db kill-server", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(dynEscapedKill.allowed, false);
-            assert.match(dynEscapedKill.reason, /adb kill-server/);
-
-            const dynDeviceRewrite = evaluateCommandGuard("x=ad; ${x}b shell getprop", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              runningCount: 1,
-              platform: "darwin",
-            });
-            assert.equal(dynDeviceRewrite.allowed, true);
-            assert.equal(dynDeviceRewrite.fastPath, false);
-            assert.equal(
-              dynDeviceRewrite.rewrittenCommand,
-              "x=ad ; ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop",
-            );
-
             // 41. cmdSnapshot("load") transitions the lease to "starting" during restoration and restores "active" afterward
             withStateTransaction(coldRediscoverDir, (s) => {
               if (s.leases["avd:Pixel_9_API_36"]) {
@@ -4627,76 +3485,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
             assert.equal(idempotentPreserveTtl.idempotent, true);
             assert.ok(idempotentPreserveTtl.lease.expiresAtMs >= laterExpiryBefore);
 
-            // 44. Command substitutions in assignments and shell functions/subshells rewrite cleanly without losing caller-shell scope or breaking syntax
-            const cmdSubAssignRewrite = evaluateCommandGuard(
-              'value=$(adb shell getprop foo); echo "$value"',
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-                runningCount: 1,
-                platform: "darwin",
-              },
-            );
-            assert.equal(cmdSubAssignRewrite.allowed, true);
-            assert.equal(
-              cmdSubAssignRewrite.rewrittenCommand,
-              'value=$(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop foo) ; echo "$value"',
-            );
-
-            const funcDefRewrite = evaluateCommandGuard("f() { adb shell getprop; }; f", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              runningCount: 1,
-              platform: "darwin",
-            });
-            assert.equal(funcDefRewrite.allowed, true);
-            assert.equal(
-              funcDefRewrite.rewrittenCommand,
-              "f() { ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop ; } ; f",
-            );
-
-            const subshellRewrite = evaluateCommandGuard(
-              "(adb shell getprop; echo ok) && (echo pre; adb shell getprop)",
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-                runningCount: 1,
-                platform: "darwin",
-              },
-            );
-            assert.equal(subshellRewrite.allowed, true);
-            assert.equal(
-              subshellRewrite.rewrittenCommand,
-              "(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop ; echo ok) && (echo pre ; ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop)",
-            );
-
-            // 45. Nested command substitutions are parsed with balanced parentheses for both policy enforcement and rewriting
-            const nestedSubDenied = evaluateCommandGuard(
-              "value=$(echo $(adb shell getprop foo))",
-              {
-                sessionId: "unleased-sess",
-                activeLeases: [],
-                runningCount: 1,
-                platform: "darwin",
-              },
-            );
-            assert.equal(nestedSubDenied.allowed, false);
-
-            const nestedSubRewrite = evaluateCommandGuard(
-              'value=$(echo $(adb shell getprop foo)); echo "$value"',
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-                runningCount: 1,
-                platform: "darwin",
-              },
-            );
-            assert.equal(nestedSubRewrite.allowed, true);
-            assert.equal(
-              nestedSubRewrite.rewrittenCommand,
-              'value=$(echo $(ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- adb shell getprop foo)) ; echo "$value"',
-            );
-
             // 46. `atc free` rejects extra positional targets instead of ignoring them
             const extraFreeExit = await runCli(["free", "lease-a", "lease-b"], {
               ...process.env,
@@ -4739,7 +3527,7 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 });
                 assert.notEqual(hookRun.status, 99);
                 assert.equal(hookRun.stderr.includes("EVIL_NODE_EXECUTED"), false);
-                assert.equal(hookRun.status, 2);
+                assert.equal(hookRun.status, 0);
 
                 const agHooksCfg = JSON.parse(
                   fs.readFileSync(new URL("../hooks.json", import.meta.url), "utf8"),
@@ -4765,78 +3553,11 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
                 });
                 assert.equal(agHookRun.status, 0);
                 const agOut = JSON.parse(agHookRun.stdout);
-                assert.equal(agOut.decision, "deny");
-                assert.match(agOut.reason, /atc claim/);
+                assert.deepEqual(agOut, { decision: "allow" });
               } finally {
                 fs.rmSync(evilWorkDir, { recursive: true, force: true });
               }
             }
-
-            // 48. Command-substitution executable assembly (`$(printf ad)b`, `$(printf emul)ator`) is caught by fast-path and guard
-            const subPrintfKill = evaluateCommandGuard("$(printf ad)b kill-server", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(subPrintfKill.allowed, false);
-            assert.match(subPrintfKill.reason, /adb kill-server/);
-
-            const subPrintfEmu = evaluateCommandGuard("$(printf emul)ator -avd Evil", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(subPrintfEmu.allowed, false);
-            assert.match(subPrintfEmu.reason, /Direct emulator launch is disabled/);
-
-            const subPrintfAssignKill = evaluateCommandGuard("x=$(printf ad); ${x}b kill-server", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-            });
-            assert.equal(subPrintfAssignKill.allowed, false);
-            assert.match(subPrintfAssignKill.reason, /adb kill-server/);
-
-            const subPrintfDeviceRewrite = evaluateCommandGuard("$(printf ad)b shell getprop", {
-              sessionId: "target-sess",
-              activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              runningCount: 1,
-              platform: "darwin",
-            });
-            assert.equal(subPrintfDeviceRewrite.allowed, true);
-            assert.equal(subPrintfDeviceRewrite.fastPath, false);
-            assert.equal(
-              subPrintfDeviceRewrite.rewrittenCommand,
-              '__atc_flags="$-" ATC_SESSION_ID=target-sess atc exec --serial emulator-5558 -- sh -c \'case $__atc_flags in *f*) set -f;; esac; $(printf ad)b shell getprop\'',
-            );
-
-            const subPrintfHexKill = evaluateCommandGuard(
-              "$(printf '%b' '\\x61\\x64\\x62') kill-server",
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              },
-            );
-            assert.equal(subPrintfHexKill.allowed, false);
-            assert.match(subPrintfHexKill.reason, /adb kill-server/);
-
-            const subPrintfOctalKill = evaluateCommandGuard(
-              "$(printf '\\141\\144\\142') kill-server",
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              },
-            );
-            assert.equal(subPrintfOctalKill.allowed, false);
-            assert.match(subPrintfOctalKill.reason, /adb kill-server/);
-
-            // 49. Non-static command substitution in executable position fails closed (`$(python -c ...) kill-server`)
-            const nonStaticCmdSubKill = evaluateCommandGuard(
-              "$(python -c 'print(chr(97)+chr(100)+chr(98))') kill-server",
-              {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              },
-            );
-            assert.equal(nonStaticCmdSubKill.allowed, false);
-            assert.match(nonStaticCmdSubKill.reason, /Opaque command substitution/);
 
             // 50. Stale warm candidate in cached inventory is revalidated when concurrent `free --stop` stops the emulator before lock acquisition
             let discoverCalls = 0;
@@ -4932,30 +3653,6 @@ test("cli: offline wipeData/snapshotLoad and createIfMissing use supported andro
               assert.ok(discoverCalls >= 2);
             } finally {
               fs.rmSync(staleRaceDir, { recursive: true, force: true });
-            }
-
-            // 51. Parameter-expansion executables (`${x:2}`, `${x#xx}`, `${x%xx}`, `${x/x/}`, `${!p}`) and printf/sh -c positional forms are caught and blocked
-            for (const cmd of [
-              "x=xxadb; ${x:2} kill-server",
-              "x=xxadb; ${x#xx} kill-server",
-              "x=adbxx; ${x%xx} kill-server",
-              "x=xadb; ${x/x/} kill-server",
-              "x=ADB; ${x,,} kill-server",
-              "${x:-adb} kill-server",
-              "p=x; x=adb; ${!p} kill-server",
-              "$(printf '%.*s' 3 adb) kill-server",
-              "$(printf '%x' 173)b kill-server",
-              "sh -c '$0 kill-server' adb",
-              "sh -c '$1 kill-server' _ adb",
-              "sh -c '\"$@\"' _ adb kill-server",
-              "sh -c '$0$1 kill-server' ad b",
-              "atc exec -- sh -c '$0 kill-server' adb",
-            ]) {
-              const res = evaluateCommandGuard(cmd, {
-                sessionId: "target-sess",
-                activeLeases: [{ leaseId: l2.lease.leaseId, serial: "emulator-5558" }],
-              });
-              assert.equal(res.allowed, false, `Expected ${cmd} to be blocked`);
             }
 
             // 52. Deferred release (`free --force`) during boot activation completes release instead of returning an active lease
@@ -5274,42 +3971,6 @@ test("regression: Astra review hardening (rollback stopping state, stale lock br
       fs.rmSync(winShutdownDir, { recursive: true, force: true });
       fs.rmSync(relocatedRoot, { recursive: true, force: true });
     }
-
-    // 5. ADB payload arguments (-s after subcommand) are not mistaken for device selectors
-    const guardLsDashS = evaluateCommandGuard("adb shell ls -s /sdcard", {
-      sessionId: "sess-ls",
-      activeLeases: [{ leaseId: "lease-ls", serial: "emulator-5554" }],
-      runningCount: 1,
-      platform: "darwin",
-    });
-    assert.equal(guardLsDashS.allowed, true);
-
-    const guardInstallDashS = evaluateCommandGuard("adb install -r -s app.apk", {
-      sessionId: "sess-ls",
-      activeLeases: [{ leaseId: "lease-ls", serial: "emulator-5554" }],
-      runningCount: 1,
-      platform: "darwin",
-    });
-    assert.equal(guardInstallDashS.allowed, true);
-
-    const execLsDashS = buildChildInvocation(
-      "adb",
-      ["shell", "ls", "-s", "/sdcard"],
-      { serial: "emulator-5554", leaseId: "lease-ls" },
-      "sess-ls",
-    );
-    assert.deepEqual(execLsDashS.args, ["shell", "ls", "-s", "/sdcard"]);
-
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "adb",
-          ["-s", "emulator-5556", "shell", "ls", "-s", "/sdcard"],
-          { serial: "emulator-5554", leaseId: "lease-ls" },
-          "sess-ls",
-        ),
-      /Conflicting device selector "emulator-5556"/,
-    );
 
     // 6. Real-world physical getprop `nosdcard` is not misclassified as `automotive`, and wrapped `android emulator list --long` lines do not emit phantom "Offline" AVDs
     assert.equal(inferDeviceType("Pixel 7 Pro", "nosdcard", "nosdcard"), "phone");
@@ -6705,9 +5366,9 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
       fs.rmSync(reconcileDir, { recursive: true, force: true });
     }
 
-    // 5. Finding #5: cmdExec tracks child process group and waits for backgrounded subchildren
-    // 5. Finding #5: spawnWithHeartbeat and lease worker liveness track child process group (POSIX and Windows)
-    {
+    // 5. Finding #5: typed-op execution (spawnWithHeartbeat) tracks the child process group and waits for
+    // backgrounded subchildren before releasing lease worker registrations (POSIX: fake adb backgrounds a job)
+    if (process.platform !== "win32") {
       const execDir = makeTempStateDir();
       try {
         withStateTransaction(execDir, (s, { now }) => {
@@ -6726,19 +5387,17 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
           return { mutated: true };
         });
         const markerFile = path.join(execDir, "bg-done.txt");
+        const pgEnv = makeFakeToolEnv(execDir, {
+          adb: `(sleep 0.35; echo done > "${markerFile}") >/dev/null 2>&1 </dev/null &\nexit 0`,
+        });
         const t0 = Date.now();
         const execRes = await cmdExec(
           execDir,
-          [
-            process.execPath,
-            "-e",
-            `const { spawn } = require("node:child_process"); const c = spawn(process.execPath, ["-e", "setTimeout(() => { require('node:fs').writeFileSync(process.argv[1], 'done'); }, 350)", process.argv[1]], { detached: process.platform === "win32", stdio: "ignore", windowsHide: true }); c.once("spawn", () => { c.unref(); process.exit(0); });`,
-            markerFile,
-          ],
-          { session: "exec-pg-sess" },
+          ["android", "logcat", "--session", "exec-pg-sess", "--json"],
+          { env: pgEnv },
         );
         const elapsedMs = Date.now() - t0;
-        assert.equal(execRes.exitCode, 0);
+        assert.equal(execRes.exitCode, 0, execRes.error);
         assert.ok(
           fs.existsSync(markerFile),
           `Expected spawnWithHeartbeat to wait for background process group member to exit (elapsed=${elapsedMs}ms)`,
@@ -6797,53 +5456,6 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
     } finally {
       fs.rmSync(partialBootDir, { recursive: true, force: true });
     }
-
-    // 7. Finding #7 & #8: Wrapped ADB duplicate selectors and piped shell/xargs command rewrites
-    const wrappedDupClass = classifySegment(
-      "env FOO=1 adb -s emulator-5554 -s emulator-5556 shell getprop ro.build.version.sdk",
-    );
-    assert.equal(wrappedDupClass.targetSerial, "emulator-5554,emulator-5556");
-
-    const wrappedDupGuard = evaluateCommandGuard(
-      "env FOO=1 adb -s emulator-5554 -s emulator-5556 shell getprop ro.build.version.sdk",
-      {
-        sessionId: "guard-sess",
-        activeLeases: [
-          {
-            leaseId: "lease_guard_1",
-            deviceKey: "avd:Pixel_1",
-            serial: "emulator-5554",
-            state: "active",
-            sessionId: "guard-sess",
-          },
-        ],
-        runningCount: 2,
-      },
-    );
-    assert.equal(wrappedDupGuard.allowed, false);
-    assert.match(wrappedDupGuard.reason, /Multiple device selectors|emulator-5556/i);
-
-    const pipedShGuard = evaluateCommandGuard(
-      "printf '%s\\n' 'adb -s emulator-5554 shell getprop ro.build.version.sdk' | sh",
-      {
-        sessionId: "guard-sess",
-        activeLeases: [
-          {
-            leaseId: "lease_guard_1",
-            deviceKey: "avd:Pixel_1",
-            serial: "emulator-5554",
-            state: "active",
-            sessionId: "guard-sess",
-          },
-        ],
-        runningCount: 2,
-      },
-    );
-    assert.equal(pipedShGuard.allowed, true);
-    assert.match(
-      pipedShGuard.rewrittenCommand || "",
-      /\|\s*(?:ATC_SESSION_ID=guard-sess\s+)?atc exec(?:\s+--session\s+guard-sess)?\s+--serial emulator-5554 -- sh\b/,
-    );
 
     // 8. Finding #9: Windows discoverFleet falls back to emulator -list-avds when android emulator list is unavailable
     const winAvdDir = path.join(avdHome, "Pixel_Win_Fallback.avd");
@@ -7257,55 +5869,6 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         assert.equal(restartedSerialClaim.exitCode, 0);
         assert.equal(restartedSerialClaim.lease.serial, "emulator-5568");
 
-        // Astra #22 Finding 2: Bare `adb reconnect` is denied while `adb reconnect device` is allowed
-        const bareReconnectGuard = evaluateCommandGuard("adb reconnect", {
-          sessionId: "reconn-sess",
-          activeLeases: [{ leaseId: "lease_reconn", serial: "emulator-5554" }],
-        });
-        assert.equal(bareReconnectGuard.allowed, false);
-        assert.match(bareReconnectGuard.reason, /adb reconnect/);
-        const execBareReconnectGuard = evaluateCommandGuard("atc exec -- adb reconnect", {
-          sessionId: "reconn-sess",
-          activeLeases: [{ leaseId: "lease_reconn", serial: "emulator-5554" }],
-        });
-        assert.equal(execBareReconnectGuard.allowed, false);
-        assert.throws(
-          () =>
-            buildChildInvocation(
-              "adb",
-              ["reconnect"],
-              { leaseId: "lease_reconn", serial: "emulator-5554", avd: "Pixel_8_API_35" },
-              "reconn-sess",
-              {},
-            ),
-          /Bare "adb reconnect" is disabled under ATC/,
-        );
-        const deviceReconnectGuard = evaluateCommandGuard("adb reconnect device", {
-          sessionId: "reconn-sess",
-          activeLeases: [{ leaseId: "lease_reconn", serial: "emulator-5554" }],
-        });
-        assert.equal(deviceReconnectGuard.allowed, true);
-        assert.match(deviceReconnectGuard.rewrittenCommand, /atc exec.*adb reconnect device/);
-        const deviceReconnectInv = buildChildInvocation(
-          "adb",
-          ["reconnect", "device"],
-          { leaseId: "lease_reconn", serial: "emulator-5554", avd: "Pixel_8_API_35" },
-          "reconn-sess",
-          {},
-        );
-        assert.equal(deviceReconnectInv.cmd, "adb");
-
-        // Astra #22 Finding 3: Background separator `&` rewrites subsequent device stages with `atc exec`
-        const bgGuard = evaluateCommandGuard("echo ready & adb shell pm clear com.example", {
-          sessionId: "bg-sess",
-          activeLeases: [{ leaseId: "lease_bg", serial: "emulator-5554" }],
-        });
-        assert.equal(bgGuard.allowed, true);
-        assert.match(
-          bgGuard.rewrittenCommand,
-          /^echo ready & .*atc exec(?: --session bg-sess)? --serial emulator-5554 -- adb shell pm clear com\.example$/,
-        );
-
         // Astra #22 Finding 5: Cold reclaim without explicit --ttl preserves a longer existing lease expiration
         const longExpiryMs = Date.now() + 3_000_000;
         withStateTransaction(r21Dir, (s, { now }) => {
@@ -7452,22 +6015,6 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
           }
         }
 
-        // Astra #23 Finding 2: Command rewriting preserves single-quoted and backslash-escaped $ literals
-        const singleQuotedVarGuard = evaluateCommandGuard("FILE=other.apk; adb install '$FILE'", {
-          sessionId: "sq-var-sess",
-          activeLeases: [{ leaseId: "lease_sq", serial: "emulator-5554" }],
-        });
-        assert.equal(singleQuotedVarGuard.allowed, true);
-        assert.doesNotMatch(singleQuotedVarGuard.rewrittenCommand, /adb install.*other\.apk/);
-        assert.match(singleQuotedVarGuard.rewrittenCommand, /\$FILE/);
-        const escapedVarGuard = evaluateCommandGuard("FILE=other.apk; adb install \\$FILE", {
-          sessionId: "sq-var-sess",
-          activeLeases: [{ leaseId: "lease_sq", serial: "emulator-5554" }],
-        });
-        assert.equal(escapedVarGuard.allowed, true);
-        assert.doesNotMatch(escapedVarGuard.rewrittenCommand, /adb install.*other\.apk/);
-        assert.match(escapedVarGuard.rewrittenCommand, /\\\$FILE/);
-
         // Astra #23 Finding 3: Windows resolveExecutable honors ANDROID_HOME / ANDROID_SDK_ROOT before default %LOCALAPPDATA%\Android\Sdk
         const winCustomSdkDir = makeTempStateDir();
         try {
@@ -7524,17 +6071,17 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
           };
           return { mutated: true };
         });
+        if (process.platform !== "win32") {
         let rekeyStopCalled = false;
-        const rekeyExecRes = await cmdExec(
-          r21Dir,
-          [
-            process.execPath,
-            "-e",
+        // The fake adb execs node (same PID) to rekey its own lease while the typed op is in flight
+        const rekeyScript = path.join(r21Dir, "rekey-child.cjs");
+        fs.writeFileSync(
+          rekeyScript,
             `
             const fs = require("node:fs");
             const path = require("node:path");
-            const statePath = path.join(process.argv[1], "state.json");
-            const lockPath = path.join(process.argv[1], "atc.lock");
+            const statePath = path.join(process.argv[2], "state.json");
+            const lockPath = path.join(process.argv[2], "atc.lock");
             const deadline = Date.now() + 3000;
             let st;
             while (Date.now() < deadline) {
@@ -7559,10 +6106,15 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
               fs.writeFileSync(statePath, JSON.stringify(st, null, 2));
             }
             `,
-            r21Dir,
-          ],
-          { session: "rekey-defer-sess" },
+        );
+        const rekeyEnv = makeFakeToolEnv(r21Dir, {
+          adb: `exec "${process.execPath}" "${rekeyScript}" "${r21Dir}"`,
+        });
+        const rekeyExecRes = await cmdExec(
+          r21Dir,
+          ["android", "logcat", "--session", "rekey-defer-sess", "--json"],
           {
+            env: rekeyEnv,
             platform: "linux",
             runner: (cmd, args) => {
               if (cmd === "android" && args[0] === "emulator" && args[1] === "stop") {
@@ -7573,30 +6125,10 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
             },
           },
         );
-        assert.equal(rekeyExecRes.exitCode, 0);
+        assert.equal(rekeyExecRes.exitCode, 0, rekeyExecRes.error);
         assert.equal(rekeyStopCalled, true, "Deferred stop must execute even after lease is rekeyed");
         assert.equal(readState(r21Dir).leases["avd:Pixel_Rekeyed"], undefined);
-
-        // Astra #24 Finding 3: Shell builtin wrapper `command adb ...` is wrapped in `sh -c` on POSIX and unwrapped in buildChildInvocation
-        const builtinCmdGuard = evaluateCommandGuard("command adb shell getprop", {
-          sessionId: "builtin-sess",
-          activeLeases: [{ leaseId: "lease_builtin", serial: "emulator-5554" }],
-          platform: "linux",
-        });
-        assert.equal(builtinCmdGuard.allowed, true);
-        assert.equal(
-          builtinCmdGuard.rewrittenCommand,
-          "ATC_SESSION_ID=builtin-sess atc exec --serial emulator-5554 -- sh -c 'command adb shell getprop'",
-        );
-        const unwrappedInv = buildChildInvocation(
-          "command",
-          ["--", "android", "run", "com.example.app"],
-          { leaseId: "lease_builtin", serial: "emulator-5554", avd: "Pixel_8_API_35" },
-          "builtin-sess",
-          {},
-        );
-        assert.equal(unwrappedInv.cmd, "android");
-        assert.ok(unwrappedInv.args.includes("--device=emulator-5554"));
+        }
 
         // Astra #25 Finding 1: queryWindowsProcessGroups defaults to alive (true) when PowerShell fails or returns invalid JSON
         const winFailedQuery = queryWindowsProcessGroups([424242], () => ({
@@ -7648,32 +6180,6 @@ test("regression: Astra review #20 hardening (offline lock safety, state I/O vs 
         } finally {
           fs.rmSync(winLocalTrapDir, { recursive: true, force: true });
         }
-
-        // Astra #25 Finding 3: Command rewriting keeps unknown command-substitution variables symbolic instead of emitting __atc_cmd_sub__
-        const cmdSubApkGuard = evaluateCommandGuard(
-          "APK=$(find app/build -name '*.apk' | head -1); adb install \"$APK\"",
-          {
-            sessionId: "apk-sub-sess",
-            activeLeases: [{ leaseId: "lease_apk", serial: "emulator-5554" }],
-            platform: "linux",
-          },
-        );
-        assert.equal(cmdSubApkGuard.allowed, true);
-        assert.doesNotMatch(cmdSubApkGuard.rewrittenCommand, /__atc_cmd_sub__/);
-        assert.match(
-          cmdSubApkGuard.rewrittenCommand,
-          /ATC_SESSION_ID=apk-sub-sess atc exec --serial emulator-5554 -- adb install "\$APK"$/,
-        );
-        const loopApkGuard = evaluateCommandGuard("for apk in *.apk; do adb install \"$apk\"; done", {
-          sessionId: "apk-loop-sess",
-          activeLeases: [{ leaseId: "lease_apk", serial: "emulator-5554" }],
-          platform: "linux",
-        });
-        assert.equal(loopApkGuard.allowed, true);
-        assert.equal(
-          loopApkGuard.rewrittenCommand,
-          'for apk in *.apk ; do ATC_SESSION_ID=apk-loop-sess atc exec --serial emulator-5554 -- adb install "$apk" ; done',
-        );
 
         // Astra #25 Finding 4: Relocated AVD disk admission and per-filesystem reservation aggregation
         const relocatedState = createDefaultState();
@@ -7902,7 +6408,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
           repoRootPath,
         );
         assert.equal(agPreRes.status, 0);
-        assert.equal(JSON.parse(agPreRes.stdout).decision, "deny");
+        assert.deepEqual(JSON.parse(agPreRes.stdout), { decision: "allow" });
 
         const agMcpRes = execHookManifestCmd(
           antigravityHooks.atc.PreToolUse[0].hooks[0].command,
@@ -8003,7 +6509,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
 
         // Claude Code & OpenAI Codex & Gemini CLI (hooks/hooks.json)
         const stdHooks = JSON.parse(fs.readFileSync(new URL("hooks/hooks.json", rootDir), "utf8"));
-        const claudeDenyRes = execHookManifestCmd(
+        const claudeShellRes = execHookManifestCmd(
           stdHooks.hooks.PreToolUse[0].hooks[0].command,
           {
             session_id: "claude-e2e",
@@ -8012,11 +6518,8 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
           },
           { CLAUDE_PLUGIN_ROOT: repoRootPath },
         );
-        assert.equal(claudeDenyRes.status, 2);
-        assert.equal(
-          JSON.parse(claudeDenyRes.stdout).hookSpecificOutput.permissionDecision,
-          "deny",
-        );
+        assert.equal(claudeShellRes.status, 0);
+        assert.equal(claudeShellRes.stdout, "");
 
         const codexMcpRes = execHookManifestCmd(
           stdHooks.hooks.PreToolUse[0].hooks[0].command,
@@ -8044,7 +6547,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
         const cursorHooks = JSON.parse(
           fs.readFileSync(new URL(".cursor/hooks.json", rootDir), "utf8"),
         );
-        const cursorDenyRes = execHookManifestCmd(
+        const cursorShellRes = execHookManifestCmd(
           cursorHooks.hooks.beforeShellExecution[0].command,
           {
             hook_event_name: "beforeShellExecution",
@@ -8053,14 +6556,14 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
           },
           { CURSOR_PLUGIN_ROOT: repoRootPath },
         );
-        assert.equal(cursorDenyRes.status, 2);
-        assert.equal(JSON.parse(cursorDenyRes.stdout).permission, "deny");
+        assert.equal(cursorShellRes.status, 0);
+        assert.deepEqual(JSON.parse(cursorShellRes.stdout), { permission: "allow" });
 
         // GitHub Copilot CLI (com.github.copilot/hooks/hooks.json)
         const copilotHooks = JSON.parse(
           fs.readFileSync(new URL("com.github.copilot/hooks/hooks.json", rootDir), "utf8"),
         );
-        const copilotDenyRes = execHookManifestCmd(
+        const copilotShellRes = execHookManifestCmd(
           copilotHooks.hooks.preToolUse[0].command,
           {
             sessionId: "copilot-e2e",
@@ -8069,8 +6572,8 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
           },
           { CLAUDE_PLUGIN_ROOT: repoRootPath },
         );
-        assert.equal(copilotDenyRes.status, 2);
-        assert.equal(JSON.parse(copilotDenyRes.stdout).permissionDecision, "deny");
+        assert.equal(copilotShellRes.status, 0);
+        assert.equal(copilotShellRes.stdout, "");
       } finally {
         fs.rmSync(fakeWs, { recursive: true, force: true });
       }
@@ -8083,7 +6586,7 @@ test("guide, docs, skill, and plugin manifests: built-in guide topics, MCP atc_g
   }
 });
 
-test("post-MVP hardening: Windows multi-hop detached grandchild tracking, CreationDate PID-reuse guard, stale AVD dead-PID lock cleanup, and compound loop rewriting", async () => {
+test("post-MVP hardening: Windows multi-hop detached grandchild tracking, CreationDate PID-reuse guard, stale AVD dead-PID lock cleanup", async () => {
   const dir = makeTempStateDir();
   const avdHome = makeTempStateDir();
   const rootPgid = 710001;
@@ -8418,187 +6921,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       false,
     );
 
-    // 3. Generalized Compound Shell Loop Rewriting in `src/guard.mjs`
-    const activeLeases = [{ leaseId: "lease_loop", serial: "emulator-5554" }];
-
-    // 3a. Multi-variable `while read -r a b; do ...; done` pipeline (both simple and sh -c wrapped stages)
-    const multiReadSimple = evaluateCommandGuard(
-      'printf "com.example.one .MainActivity\\ncom.example.two .HomeActivity\\n" | while read -r pkg act; do adb shell am start -n "$pkg/$act"; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(multiReadSimple.allowed, true);
-    assert.doesNotMatch(multiReadSimple.rewrittenCommand, /__atc_cmd_sub__/);
-    assert.equal(
-      multiReadSimple.rewrittenCommand,
-      'printf "com.example.one .MainActivity\\ncom.example.two .HomeActivity\\n" | while read -r pkg act ; do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- adb shell am start -n "$pkg/$act" ; done',
-    );
-
-    // Multi-variable `while IFS=, read -r -u 3 pkg out; do ... > "$out"; done` where `pkg` and `out` had prior static assignments
-    const multiReadRedir = evaluateCommandGuard(
-      'pkg=static_pkg; out=/tmp/static.txt; while IFS=, read -r -u 3 pkg out; do adb shell pm path "$pkg" > "$out"; done 3< pairs.csv',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(multiReadRedir.allowed, true);
-    assert.doesNotMatch(multiReadRedir.rewrittenCommand, /__atc_cmd_sub__/);
-    assert.doesNotMatch(
-      multiReadRedir.rewrittenCommand,
-      /pm path "static_pkg"/,
-      "Loop read variable pkg must override prior static shell variable inside loop body",
-    );
-    assert.match(
-      multiReadRedir.rewrittenCommand,
-      /do pkg="\$pkg" out="\$out" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell pm path "\$pkg" > "\$out"'/,
-    );
-
-    // Bare `while read -r; do ... "$REPLY" ...; done` preserves implicit REPLY variable
-    const bareReadReply = evaluateCommandGuard(
-      'adb shell pm list packages | while read -r; do adb shell pm path "$REPLY" > /tmp/paths.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(bareReadReply.allowed, true);
-    assert.match(
-      bareReadReply.rewrittenCommand,
-      /do REPLY="\$REPLY" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell pm path "\$REPLY" > \/tmp\/paths\.txt'/,
-    );
-
-    // 3b. Nested `for` / `while` / `until` compound blocks
-    const nestedForFor = evaluateCommandGuard(
-      'a=outer_init; b=inner_init; for a in 1 2; do for b in x y; do adb shell "echo $a $b" > "/tmp/${a}_${b}.txt"; done; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(nestedForFor.allowed, true);
-    assert.doesNotMatch(nestedForFor.rewrittenCommand, /outer_init.*inner_init.*\/tmp\/outer_init/);
-    assert.match(
-      nestedForFor.rewrittenCommand,
-      /do a="\$a" b="\$b" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell "echo \$a \$b" > "\/tmp\/\$\{a\}_\$\{b\}\.txt"'/,
-    );
-
-    const nestedForWhileRead = evaluateCommandGuard(
-      'for suite in smoke full; do while read -r pkg runner; do adb shell am instrument -w "$pkg/$runner" > "/tmp/${suite}_${pkg}.log"; done < suites.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(nestedForWhileRead.allowed, true);
-    assert.match(
-      nestedForWhileRead.rewrittenCommand,
-      /do suite="\$suite" pkg="\$pkg" runner="\$runner" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell am instrument -w "\$pkg\/\$runner" > "\/tmp\/\$\{suite\}_\$\{pkg\}\.log"'/,
-    );
-
-    // 3c. C-style arithmetic `for (( i = 0; i < 3; i++ ))` and loop-mutated counter `i=0; while ...; do ...; i=$((i+1)); done`
-    const arithForLoop = evaluateCommandGuard(
-      'for (( i = 0; i < 3; i++ )); do adb shell input keyevent 24 > "/tmp/vol_$i.log"; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(arithForLoop.allowed, true);
-    assert.match(
-      arithForLoop.rewrittenCommand,
-      /^for \(\( i = 0; i < 3; i\+\+ \)\) ; do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell input keyevent 24 > "\/tmp\/vol_\$i\.log"' ; done$/,
-    );
-
-    const mutatedWhileLoop = evaluateCommandGuard(
-      'i=0; until [ "$i" -ge 3 ]; do adb shell echo "$i" > "/tmp/iter_$i.txt"; i=$((i + 1)); done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(mutatedWhileLoop.allowed, true);
-    assert.doesNotMatch(
-      mutatedWhileLoop.rewrittenCommand,
-      /iter_0\.txt/,
-      "Loop-mutated counter i must not be statically inlined to initial value 0 inside loop body",
-    );
-    assert.match(
-      mutatedWhileLoop.rewrittenCommand,
-      /do i="\$i" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$i" > "\/tmp\/iter_\$i\.txt"' ; i=\$\(\(i \+ 1\)\) ; done$/,
-    );
-
-    // 3d. `read -ra parts` array subscript preservation across `sh -c` rewrites
-    const readArrayRedir = evaluateCommandGuard(
-      'while read -ra parts; do adb shell echo "${parts[1]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readArrayRedir.allowed, true);
-    assert.doesNotMatch(
-      readArrayRedir.rewrittenCommand,
-      /\bparts="\$parts"/,
-      "Array variable from read -ra must not be flattened into scalar parts=\"$parts\"",
-    );
-    assert.match(
-      readArrayRedir.rewrittenCommand,
-      /do __atc_arr_parts_1="\$\{parts\[1\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_1\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
-    );
-
-    const readWholeArrayRedir = evaluateCommandGuard(
-      'while read -ra parts; do adb install-multiple "${parts[@]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readWholeArrayRedir.allowed, true);
-    assert.match(
-      readWholeArrayRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
-    );
-
-    const readArrayKeysAtRedir = evaluateCommandGuard(
-      'while read -ra parts; do adb shell echo "${!parts[@]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readArrayKeysAtRedir.allowed, true);
-    assert.match(
-      readArrayKeysAtRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
-    );
-
-    const readArrayKeysStarRedir = evaluateCommandGuard(
-      'while read -ra parts; do adb shell echo "${!parts[*]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readArrayKeysStarRedir.allowed, true);
-    assert.match(
-      readArrayKeysStarRedir.rewrittenCommand,
-      /do __atc_arr_parts_keys="\$\{!parts\[\*\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_keys\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
-    );
-
     // 1f. Tombstoned root identity when initial Windows snapshot misses already-exited root PID
     const missedRootPgid = 730001;
     clearKnownWindowsTreeDescendants(missedRootPgid);
@@ -8833,35 +7155,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     assert.equal(fs.existsSync(raceLockFile), true);
     assert.equal(fs.readFileSync(raceLockFile, "utf8").trim(), "99222");
 
-    // 3e. Unquoted ${parts[*]} and ${!parts[*]} forward outer IFS and array elements into bash -c without reusing $@
-    const readUnquotedStarRedir = evaluateCommandGuard(
-      "IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} > /tmp/out.txt; done < rows.txt",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readUnquotedStarRedir.allowed, true);
-    assert.match(
-      readUnquotedStarRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb install-multiple \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" ; done < rows\.txt$/,
-    );
-
-    const readUnquotedKeysStarRedir = evaluateCommandGuard(
-      "IFS=,; while read -ra parts; do adb shell echo ${!parts[*]} > /tmp/out.txt; done < rows.txt",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readUnquotedKeysStarRedir.allowed, true);
-    assert.match(
-      readUnquotedKeysStarRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
-    );
-
     // 1i. cmdGc and cmdFree on Windows reap orphaned grandchildren even when exited group leader PID is reused by an unrelated process
     const reusedLeaderPgid = 760001;
     clearKnownWindowsTreeDescendants(reusedLeaderPgid);
@@ -8987,41 +7280,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       clearKnownWindowsTreeDescendants(nullTokenPgid);
     }
 
-    // 3f. Multi-array unquoted expansions use collision-free length framing (no in-band sentinel)
-    const multiUnquotedArraysRedir = evaluateCommandGuard(
-      'IFS=,; while read -ra parts; do adb install-multiple ${parts[*]} "${!parts[@]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(multiUnquotedArraysRedir.allowed, true);
-    assert.doesNotMatch(
-      multiUnquotedArraysRedir.rewrittenCommand,
-      /__atc_end_arr_/,
-      "Multi-array forwarding must use length framing rather than an in-band sentinel",
-    );
-    assert.match(
-      multiUnquotedArraysRedir.rewrittenCommand,
-      /bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$\{#parts\[@\]\}" "\$\{!parts\[@\]\}" ; done < rows\.txt$/,
-    );
-
-    // 3g. Bash scalar parameter modifiers (${x^^}, ${x:0:2}, ${#x}) are evaluated in the outer shell so /bin/sh (dash) does not fail with Bad substitution
-    const bashScalarModRedir = evaluateCommandGuard(
-      'for x in foo; do adb shell echo "${x^^}" "${x:0:2}" "${#x}" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(bashScalarModRedir.allowed, true);
-    assert.match(
-      bashScalarModRedir.rewrittenCommand,
-      /do __atc_var_x_0="\$\{x\^\^\}" __atc_var_x_1="\$\{x:0:2\}" __atc_var_x_len="\$\{#x\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_var_x_0\}" "\$\{__atc_var_x_1\}" "\$\{__atc_var_x_len\}" > \/tmp\/out\.txt' ; done$/,
-    );
-
     // 1k. POSIX killProcessGroupTree does not report pgid in terminatedPgids when kill(-pgid) fails with EPERM and group remains alive
     const posixEpermPgid = 780001;
     const posixEpermRes = killProcessGroupTree(posixEpermPgid, "SIGKILL", {
@@ -9052,21 +7310,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       posixEpermRes.terminatedPgids,
       [],
       "POSIX killProcessGroupTree must not confirm termination when kill(-pgid) returns EPERM and group remains alive",
-    );
-
-    // 3h. Unquoted modified scalar expansion (${x^^}) preserves outer IFS inside sh -c
-    const unquotedScalarModIfs = evaluateCommandGuard(
-      "IFS=,; for x in 'a b,c'; do adb shell echo ${x^^} > /tmp/out.txt; done",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(unquotedScalarModIfs.allowed, true);
-    assert.match(
-      unquotedScalarModIfs.rewrittenCommand,
-      /do __atc_var_x_0="\$\{x\^\^\}" __atc_flags="\$-\" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$\{__atc_var_x_0\} > \/tmp\/out\.txt' ; done$/,
     );
 
     // 1l. Exited tracked intermediate PID is not traversed for new children after unobserved PID reuse + exit
@@ -9162,35 +7405,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       clearKnownWindowsTreeDescendants(nullInitialPgid);
     }
 
-    // 3i. Bash prefix-name expansions ("${!x@}" and unquoted ${!x*}) preserve multi-word positional arguments
-    const prefixNameAtRedir = evaluateCommandGuard(
-      'for x in ignored; do adb shell printf "%s\\n" "${!x@}" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(prefixNameAtRedir.allowed, true);
-    assert.match(
-      prefixNameAtRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!x@\}" "--" ; done$/,
-    );
-
-    const prefixNameUnquotedStarRedir = evaluateCommandGuard(
-      'for x in ignored; do adb shell printf "%s\\n" ${!x*} > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(prefixNameUnquotedStarRedir.allowed, true);
-    assert.match(
-      prefixNameUnquotedStarRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$1" \]; then IFS=\$2; else unset IFS; fi; shift 2; __atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell printf "%s\\n" \$\{__atc_arr_at_0\[\*\]\} > \/tmp\/out\.txt' bash "\$\{IFS\+1\}" "\$\{IFS-\}" "\$\{!x@\}" "--" ; done$/,
-    );
-
     // 1n. POSIX killProcessGroupTree does not signal positive childPid when kill(-childPid) returns ESRCH
     const posixEsrchPgid = 810001;
     const posixSignaledTargets = [];
@@ -9210,65 +7424,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
     );
     assert.deepEqual(posixEsrchRes, []);
     assert.deepEqual(posixEsrchRes.terminatedPgids, [posixEsrchPgid]);
-
-    // 3j. Unquoted ordinary dynamic variables ($x and ${x}) preserve outer IFS inside sh -c
-    const unquotedPlainVarIfs = evaluateCommandGuard(
-      "IFS=,; for x in 'a b,c'; do adb shell echo $x > /tmp/out.txt; done",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(unquotedPlainVarIfs.allowed, true);
-    assert.match(
-      unquotedPlainVarIfs.rewrittenCommand,
-      /do __atc_flags="\$-\" __atc_ifs_set="\$\{IFS\+1\}" __atc_ifs="\$\{IFS-\}" x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_ifs_set" \]; then IFS=\$__atc_ifs; else unset IFS; fi; adb shell echo \$x > \/tmp\/out\.txt' ; done$/,
-    );
-
-    // 3k. Bare arithmetic variables ($((x + 1))) and array subscripts ($((parts[1] + 1))) are forwarded into rewritten shells
-    const bareArithVarRedir = evaluateCommandGuard(
-      "for x in 1 2; do adb shell echo $((x + 1)) > /tmp/out.txt; done",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(bareArithVarRedir.allowed, true);
-    assert.match(
-      bareArithVarRedir.rewrittenCommand,
-      /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x \+ 1\)\) > \/tmp\/out\.txt' ; done$/,
-    );
-
-    // 3l. mapfile / readarray loop destination arrays (and default MAPFILE) are tracked and forwarded
-    const mapfileNamedRedir = evaluateCommandGuard(
-      'while mapfile -t -n 1 parts; do adb shell echo "${parts[0]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(mapfileNamedRedir.allowed, true);
-    assert.match(
-      mapfileNamedRedir.rewrittenCommand,
-      /do __atc_arr_parts_0="\$\{parts\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_parts_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
-    );
-
-    const readarrayDefaultRedir = evaluateCommandGuard(
-      'while readarray -t -n 1; do adb shell echo "${MAPFILE[0]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(readarrayDefaultRedir.allowed, true);
-    assert.match(
-      readarrayDefaultRedir.rewrittenCommand,
-      /do __atc_arr_MAPFILE_0="\$\{MAPFILE\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_MAPFILE_0\}" > \/tmp\/out\.txt' ; done < rows\.txt$/,
-    );
 
     // 1o. Windows process-group generation archiving isolates reused leader PID across worker generations
     {
@@ -9377,35 +7532,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       }
     }
 
-    // 3m. `printf -v` scalar and array-element destinations in loop bodies are tracked and forwarded
-    const printfVLoopRedir = evaluateCommandGuard(
-      'for x in a b; do printf -v y "%s" "$x"; adb shell echo "$y" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(printfVLoopRedir.allowed, true);
-    assert.match(
-      printfVLoopRedir.rewrittenCommand,
-      /y="\$y" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$y" > \/tmp\/out\.txt' ; done$/,
-    );
-
-    const printfVArrayLoopRedir = evaluateCommandGuard(
-      'for x in a b; do printf -v "arr[0]" "%s" "$x"; adb shell echo "${arr[0]}" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(printfVArrayLoopRedir.allowed, true);
-    assert.match(
-      printfVArrayLoopRedir.rewrittenCommand,
-      /__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt' ; done$/,
-    );
-
     // 1p. Cross-lease reused Windows leader PID disassociates bare PGID from the previous lease
     {
       const crossLeaderPgid = 830001;
@@ -9506,50 +7632,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
         clearKnownWindowsTreeDescendants(genAArchiveKey);
       }
     }
-
-    // 3n. `getopts` loop variable and `OPTARG` are tracked and forwarded
-    const getoptsLoopRedir = evaluateCommandGuard(
-      'while getopts "s:" opt; do adb shell echo "$opt:$OPTARG" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(getoptsLoopRedir.allowed, true);
-    assert.match(
-      getoptsLoopRedir.rewrittenCommand,
-      /OPTARG="\$OPTARG" opt="\$opt" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$opt:\$OPTARG" > \/tmp\/out\.txt' ; done$/,
-    );
-
-    // 3o. Redirected loop stages using Bash syntax (brace expansion, process substitution) preserve `bash -c`
-    const bashBraceLoopRedir = evaluateCommandGuard(
-      'for x in 1; do adb shell echo {a,b} > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(bashBraceLoopRedir.allowed, true);
-    assert.match(
-      bashBraceLoopRedir.rewrittenCommand,
-      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell echo \{a,b\} > \/tmp\/out\.txt' ; done$/,
-    );
-
-    const bashProcSubLoopRedir = evaluateCommandGuard(
-      'for x in 1; do adb shell cat <(printf foo) > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(bashProcSubLoopRedir.allowed, true);
-    assert.match(
-      bashProcSubLoopRedir.rewrittenCommand,
-      /ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'adb shell cat <\(printf foo\) > \/tmp\/out\.txt' ; done$/,
-    );
 
     // 1q. Tombstoned-root generation (`creationDate: "__exited__"`) is archived under a synthetic generation key when root PID is reused
     {
@@ -9861,150 +7943,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       }
     }
 
-    // 3p. Loop variables (including `mapfile` arrays) are propagated into recursive `$(...)` and backtick command substitutions
-    const forCmdSubLoop = evaluateCommandGuard(
-      'while read -r x; do echo "$(adb shell echo "$x" > /tmp/out.txt)"; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(forCmdSubLoop.allowed, true);
-    assert.match(
-      forCmdSubLoop.rewrittenCommand,
-      /^while read -r x ; do echo "\$\(x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'\)" ; done$/,
-    );
-
-    const mapfileCmdSubLoop = evaluateCommandGuard(
-      'while mapfile -t arr; do echo "$(adb shell echo "${arr[0]}" > /tmp/out.txt)"; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(mapfileCmdSubLoop.allowed, true);
-    assert.match(
-      mapfileCmdSubLoop.rewrittenCommand,
-      /echo "\$\(__atc_arr_arr_0="\$\{arr\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$\{__atc_arr_arr_0\}" > \/tmp\/out\.txt'\)" ; done$/,
-    );
-
-    const backtickCmdSubLoop = evaluateCommandGuard(
-      'for x in a b; do echo `adb shell echo "$x" > /tmp/out.txt`; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(backtickCmdSubLoop.allowed, true);
-    assert.match(
-      backtickCmdSubLoop.rewrittenCommand,
-      /^for x in a b ; do echo `x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$x" > \/tmp\/out\.txt'` ; done$/,
-    );
-
-    // 3q. Extended-glob alternation (`@(foo|bar)`) is not split as a pipeline and uses `bash -O extglob -c`, whereas arithmetic `$((a*(b+1)))` stays on `sh -c`
-    const extglobLoopRedir = evaluateCommandGuard(
-      'for x in 1; do adb shell echo @(foo|bar) > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(extglobLoopRedir.allowed, true);
-    assert.match(
-      extglobLoopRedir.rewrittenCommand,
-      /__atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -O extglob -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb shell echo @\(foo\|bar\) > \/tmp\/out\.txt' ; done$/,
-    );
-
-    const arithMultLoopRedir = evaluateCommandGuard(
-      'for x in 1; do adb shell echo $((x*(x+1))) > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(arithMultLoopRedir.allowed, true);
-    assert.match(
-      arithMultLoopRedir.rewrittenCommand,
-      /do x="\$x" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo \$\(\(x\*\(x\+1\)\)\) > \/tmp\/out\.txt' ; done$/,
-    );
-
-    // 3r. Positional parameters ($0, $1, $@, ${!#}) inside functions or after `set --` are forwarded into rewritten shells and not clobbered by array transport
-    const funcZeroParamLoopRedir = evaluateCommandGuard(
-      'for x in 1; do adb shell echo "$0" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(funcZeroParamLoopRedir.allowed, true);
-    assert.match(
-      funcZeroParamLoopRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'adb shell echo "\$0" > \/tmp\/out\.txt' "\$0" ; done$/,
-    );
-
-    const funcPositionalLoopRedir = evaluateCommandGuard(
-      'f() { for x in 1; do adb shell echo "$1" "${!#}" > /tmp/out.txt; done; }; f expected',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(funcPositionalLoopRedir.allowed, true);
-    assert.match(
-      funcPositionalLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell echo "\$1" "\$\{!#\}" > \/tmp\/out\.txt' bash "\$@" ; done ; \} ; f expected$/,
-    );
-
-    const funcArrayAndPositionalLoopRedir = evaluateCommandGuard(
-      'f() { while read -ra parts; do adb shell echo "$0" "$1" "${X:-${parts[@]}}" > /tmp/out.txt; done < rows.txt; }; f expected',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(funcArrayAndPositionalLoopRedir.allowed, true);
-    assert.match(
-      funcArrayAndPositionalLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; case \$__atc_flags in \*u\*\) set -u;; esac; adb shell echo "\$0" "\$1" "\$\{X:-\$\{__atc_arr_at_0\[@\]\}\}" > \/tmp\/out\.txt' "\$0" "\$\{#parts\[@\]\}" "\$\{parts\[@\]\}" "\$@" ; done < rows\.txt ; \} ; f expected$/,
-    );
-
-    // 3s. Array alias names do not collide when distinct array/subscript pairs flatten to the same prefix (${a_b[c]} vs ${a[b_c]}) or with reserved __atc_arr_at_<idx> (${at[0]})
-    const collidingArrayAliasesRedir = evaluateCommandGuard(
-      'while read -ra a_b && read -ra a && read -ra at; do adb shell echo "${a_b[c]}" "${a[b_c]}" "${at[0]}" "${a[@]}" > /tmp/out.txt; done < rows.txt',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(collidingArrayAliasesRedir.allowed, true);
-    assert.match(
-      collidingArrayAliasesRedir.rewrittenCommand,
-      /do __atc_arr_a_b_c="\$\{a_b\[c\]\}" __atc_arr_a_b_c_0="\$\{a\[b_c\]\}" __atc_arr_at_0_1="\$\{at\[0\]\}" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_n=\$1; shift; __atc_arr_at_0=\("\$\{@:1:\$__atc_n\}"\); shift "\$__atc_n"; adb shell echo "\$\{__atc_arr_a_b_c\}" "\$\{__atc_arr_a_b_c_0\}" "\$\{__atc_arr_at_0_1\}" "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{#a\[@\]\}" "\$\{a\[@\]\}" ; done < rows\.txt$/,
-    );
-
-    const prefixSubstrLoopRedir = evaluateCommandGuard(
-      'for prefix_var in 1; do adb shell echo "${!pre@}" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(prefixSubstrLoopRedir.allowed, true);
-    assert.match(
-      prefixSubstrLoopRedir.rewrittenCommand,
-      /do ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c '__atc_arr_at_0=\(\); while \[ "\$#" -gt 0 \] && \[ "\$1" != "--" \]; do __atc_arr_at_0\+=\("\$1"\); shift; done; \[ "\$#" -gt 0 \] && shift; adb shell echo "\$\{__atc_arr_at_0\[@\]\}" > \/tmp\/out\.txt' bash "\$\{!pre@\}" "--" ; done$/,
-    );
-
     // 1s. Windows root identity captured at spawn protects against PID reuse before the first full tree snapshot
     {
       const fastExitRootPgid = 860001;
@@ -10170,63 +8108,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       }
     }
 
-    // 3t. `set -f` / `set -o noglob`, `set -u` / `set -o nounset`, `shopt` glob options, `$?`, and caller-shell `$-` state are preserved across `sh -c` / `bash -c` loop stage rewrites
-    const noglobExplicitLoopRedir = evaluateCommandGuard(
-      "set -f; for x in 1; do adb install *.apk > /tmp/out.txt; done",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(noglobExplicitLoopRedir.allowed, true);
-    assert.match(
-      noglobExplicitLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
-    );
-
-    const noglobCallerGlobLoopRedir = evaluateCommandGuard(
-      "for x in 1; do adb install *.apk > /tmp/out.txt; done",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(noglobCallerGlobLoopRedir.allowed, true);
-    assert.match(
-      noglobCallerGlobLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" __atc_globignore="\$\{GLOBIGNORE-\}" __atc_shopts="\$\(shopt -p nullglob failglob dotglob nocaseglob extglob 2>\/dev\/null; shopt -p globstar 2>\/dev\/null; shopt -p globasciiranges 2>\/dev\/null\)" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- bash -c 'case \$__atc_flags in \*f\*\) set -f;; esac; if \[ -n "\$__atc_globignore" \]; then GLOBIGNORE=\$__atc_globignore; else unset GLOBIGNORE; fi; eval "\$__atc_shopts" 2>\/dev\/null; adb install \*\.apk > \/tmp\/out\.txt' ; done$/,
-    );
-
-    const noglobOptionLoopRedir = evaluateCommandGuard(
-      "set -o noglob; for x in 1; do adb shell echo ok > /tmp/out.txt; done",
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(noglobOptionLoopRedir.allowed, true);
-    assert.match(
-      noglobOptionLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*f\*\) set -f;; esac; adb shell echo ok > \/tmp\/out\.txt' ; done$/,
-    );
-
-    const nounsetExplicitLoopRedir = evaluateCommandGuard(
-      'set -u; for x in 1; do adb shell rm -rf "$MISSING" > /tmp/out.txt; done',
-      {
-        sessionId: "loop-sess",
-        activeLeases,
-        platform: "linux",
-      },
-    );
-    assert.equal(nounsetExplicitLoopRedir.allowed, true);
-    assert.match(
-      nounsetExplicitLoopRedir.rewrittenCommand,
-      /do __atc_flags="\$-\" ATC_SESSION_ID=loop-sess atc exec --serial emulator-5554 -- sh -c 'case \$__atc_flags in \*u\*\) set -u;; esac; adb shell rm -rf "\$MISSING" > \/tmp\/out\.txt' ; done$/,
-    );
-
     // Concurrent lease renewal between cmdGc unlocked read (or after gcReapingAtMs marker while powershell runs) and beforeKill recheck prevents killing active detached group
     const concurrentRenewPgid = 890001;
     clearKnownWindowsTreeDescendants(concurrentRenewPgid);
@@ -10315,221 +8196,6 @@ test("post-MVP hardening: Windows multi-hop detached grandchild tracking, Creati
       });
     } finally {
       clearKnownWindowsTreeDescendants(concurrentRenewPgid);
-    }
-
-    if (process.platform !== "win32") {
-      const noglobExecDir = makeTempStateDir();
-      try {
-        fs.writeFileSync(path.join(noglobExecDir, "sample.apk"), "dummy", "utf8");
-        fs.writeFileSync(path.join(noglobExecDir, "skip.apk"), "dummy", "utf8");
-        const stubBinDir = path.join(noglobExecDir, "bin");
-        fs.mkdirSync(stubBinDir, { recursive: true });
-        fs.writeFileSync(
-          path.join(stubBinDir, "atc"),
-          '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ "$1" = "--" ] && shift\nexec "$@"\n',
-          { mode: 0o755 },
-        );
-        fs.writeFileSync(
-          path.join(stubBinDir, "adb"),
-          '#!/bin/sh\nprintf "%s\\n" "$*"\n',
-          { mode: 0o755 },
-        );
-        const outWithNoglob = path.join(noglobExecDir, "out-noglob.txt");
-        const outAfterUnsetNoglob = path.join(noglobExecDir, "out-glob.txt");
-        const rewrittenNoglobExec = evaluateCommandGuard(
-          `set -f; for x in 1; do adb install *.apk > "${outWithNoglob}"; done; set +f; for x in 1; do adb install *.apk > "${outAfterUnsetNoglob}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenNoglobExec.allowed, true);
-        const execRes = spawnSync("sh", ["-c", rewrittenNoglobExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(execRes.status, 0, execRes.stderr);
-        assert.equal(fs.readFileSync(outWithNoglob, "utf8").trim(), "install *.apk");
-        assert.equal(fs.readFileSync(outAfterUnsetNoglob, "utf8").trim(), "install sample.apk skip.apk");
-
-        const outGlobignore = path.join(noglobExecDir, "out-globignore.txt");
-        const rewrittenGlobignoreExec = evaluateCommandGuard(
-          `GLOBIGNORE=skip.apk; for x in 1; do adb install *.apk > "${outGlobignore}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenGlobignoreExec.allowed, true);
-        const globignoreRes = spawnSync("bash", ["-c", rewrittenGlobignoreExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(globignoreRes.status, 0, globignoreRes.stderr);
-        assert.equal(
-          fs.readFileSync(outGlobignore, "utf8").trim(),
-          "install sample.apk",
-          "GLOBIGNORE must be forwarded into wrapped glob stage to exclude matching filenames",
-        );
-
-        const outRandom = path.join(noglobExecDir, "out-random.txt");
-        const expectedRandomRes = spawnSync("bash", ["-c", 'RANDOM=42; printf "%s" "$RANDOM"'], {
-          encoding: "utf8",
-        });
-        const rewrittenRandomExec = evaluateCommandGuard(
-          `RANDOM=42; for x in 1; do adb shell echo "$RANDOM" > "${outRandom}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenRandomExec.allowed, true);
-        const randomRes = spawnSync("bash", ["-c", rewrittenRandomExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(randomRes.status, 0, randomRes.stderr);
-        assert.equal(
-          fs.readFileSync(outRandom, "utf8").trim(),
-          `shell echo ${expectedRandomRes.stdout.trim()}`,
-          "Bash special variable $RANDOM must be preserved across wrapped stage",
-        );
-
-        const outPipestatus = path.join(noglobExecDir, "out-pipestatus.txt");
-        const rewrittenPipestatusExec = evaluateCommandGuard(
-          `false | true; for x in 1; do adb shell echo "\${PIPESTATUS[*]}" "\${PIPESTATUS[@]}" "\${PIPESTATUS[0]}" "$PIPESTATUS" > "${outPipestatus}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenPipestatusExec.allowed, true);
-        const pipestatusRes = spawnSync("bash", ["-c", rewrittenPipestatusExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(pipestatusRes.status, 0, pipestatusRes.stderr);
-        assert.equal(
-          fs.readFileSync(outPipestatus, "utf8").trim(),
-          "shell echo 1 0 1 0 1 1",
-          "Caller PIPESTATUS array must be forwarded into wrapped stage",
-        );
-
-        const outNullglob = path.join(noglobExecDir, "out-nullglob.txt");
-        const rewrittenNullglobExec = evaluateCommandGuard(
-          `shopt -s nullglob; for x in 1; do adb install *.missing_apk > "${outNullglob}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenNullglobExec.allowed, true);
-        const nullglobRes = spawnSync("bash", ["-c", rewrittenNullglobExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(nullglobRes.status, 0, nullglobRes.stderr);
-        assert.equal(
-          fs.readFileSync(outNullglob, "utf8").trim(),
-          "install",
-          "shopt -s nullglob must expand non-matching *.missing_apk to empty argument list inside wrapped stage",
-        );
-
-        const outExitStatus = path.join(noglobExecDir, "out-exit-status.txt");
-        const rewrittenExitStatusExec = evaluateCommandGuard(
-          `for x in 1; do false; adb shell echo "$?" > "${outExitStatus}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenExitStatusExec.allowed, true);
-        const exitStatusRes = spawnSync("sh", ["-c", rewrittenExitStatusExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(exitStatusRes.status, 0, exitStatusRes.stderr);
-        assert.equal(
-          fs.readFileSync(outExitStatus, "utf8").trim(),
-          "shell echo 1",
-          "Caller last exit status ($?) must be forwarded into wrapped stage",
-        );
-
-        const outNounset = path.join(noglobExecDir, "out-nounset.txt");
-        const rewrittenNounsetExec = evaluateCommandGuard(
-          `set -u; for x in 1; do adb shell rm -rf "$MISSING" > "${outNounset}"; done`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenNounsetExec.allowed, true);
-        const nounsetRes = spawnSync("sh", ["-c", rewrittenNounsetExec.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.notEqual(nounsetRes.status, 0, "set -u must abort when $MISSING is unset inside rewritten sh -c");
-        assert.equal(
-          fs.existsSync(outNounset) ? fs.readFileSync(outNounset, "utf8").trim() : "",
-          "",
-          "adb command must not execute when $MISSING is unset under set -u",
-        );
-
-        const outNounsetDefault = path.join(noglobExecDir, "out-nounset-default.txt");
-        const rewrittenCondDefault = evaluateCommandGuard(
-          `set -u; if false; then X=$(echo hi); fi; adb shell "\${X:-none}" > "${outNounsetDefault}"`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenCondDefault.allowed, true);
-        const condDefaultRes = spawnSync("sh", ["-c", rewrittenCondDefault.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.equal(condDefaultRes.status, 0, condDefaultRes.stderr);
-        assert.equal(fs.readFileSync(outNounsetDefault, "utf8").trim(), "shell none");
-
-        const outNounsetCondFail = path.join(noglobExecDir, "out-nounset-cond-fail.txt");
-        const rewrittenCondFail = evaluateCommandGuard(
-          `set -u; if false; then X=$(echo hi); fi; adb shell "$X" > "${outNounsetCondFail}"`,
-          {
-            sessionId: "loop-sess",
-            activeLeases,
-            platform: "linux",
-          },
-        );
-        assert.equal(rewrittenCondFail.allowed, true);
-        const condFailRes = spawnSync("sh", ["-c", rewrittenCondFail.rewrittenCommand], {
-          cwd: noglobExecDir,
-          env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH || ""}` },
-          encoding: "utf8",
-        });
-        assert.notEqual(
-          condFailRes.status,
-          0,
-          "set -u must abort when conditionally assigned dynamic variable $X remains unset",
-        );
-      } finally {
-        fs.rmSync(noglobExecDir, { recursive: true, force: true });
-      }
     }
   } finally {
     clearKnownWindowsTreeDescendants(rootPgid);
@@ -10645,7 +8311,7 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     assert.ok(statusOffline.leases["avd:Pixel_9"].firstSeenOfflineAtMs);
     assert.equal(statusOffline.leases["avd:Pixel_9"].serial, null);
 
-    // Offline reservation rejects renew, snapshot, exec, and guard
+    // Offline reservation rejects renew, snapshot, and typed device ops
     const renewOffline = cmdRenew(dir, null, { session: "sess-recover" });
     assert.equal(renewOffline.exitCode, 3);
     assert.match(renewOffline.error, /currently offline/);
@@ -10654,11 +8320,13 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     assert.equal(snapOffline.exitCode, 3);
     assert.match(snapOffline.error, /currently offline/);
 
-    const guardOffline = cmdGuard(dir, "adb shell getprop ro.build.version.sdk", {
-      session: "sess-recover",
-    });
-    assert.equal(guardOffline.exitCode, 2);
-    assert.match(guardOffline.reason, /crashed or went offline/);
+    const execOffline = await cmdExec(
+      dir,
+      ["android", "prop", "get", "ro.build.version.sdk", "--session", "sess-recover", "--wait", "0", "--json"],
+      { env: makeFakeToolEnv(dir, { adb: "exit 0" }) },
+    );
+    assert.notEqual(execOffline.exitCode, 0);
+    assert.match(execOffline.error, /crashed or went offline/);
 
     // Owner re-claims within 45s recovery window -> reboots in-place and preserves original expiresAtMs
     const recoverClaim = cmdClaim(
@@ -10800,7 +8468,7 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     );
     assert.equal(readState(dir).disconnectedPhysicalLeases["lease-phys-2"], undefined);
 
-    // 4. Multiplatform iOS resolution, parsing, diagnostics, lifecycle, snapshots, exec, and guard
+    // 4. Multiplatform iOS resolution, parsing, diagnostics, lifecycle, snapshots, and typed-op env
     assert.equal(resolveTargetPlatform({ ios: true }), "ios");
     assert.equal(resolveTargetPlatform({ android: true }), "android");
     assert.equal(resolveTargetPlatform({ udid: "D9746857-E328-43FF-A79B-42CDE3AD9D71" }), "ios");
@@ -10905,7 +8573,7 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
       /xcodebuild -downloadPlatform watchOS/,
     );
 
-    // Claim warm iOS Simulator, save/load/delete APFS snapshot, guard & exec
+    // Claim warm iOS Simulator, save/load/delete APFS snapshot, typed-op env injection
     const iosInv = {
       host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 12 },
       queriedPlatforms: ["ios"],
@@ -10967,74 +8635,27 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     const snapDelRes = cmdSnapshot(dir, "delete", "clean_ios", { session: "sess-ios" });
     assert.equal(snapDelRes.exitCode, 0);
 
-    // iOS buildChildInvocation rewrites "booted" -> simUdid and injects SIMULATOR_UDID & ATC_PLATFORM=ios
-    const iosChildInv = buildChildInvocation(
-      "xcrun",
-      ["simctl", "launch", "booted", "com.example.App"],
-      iosClaim.lease,
-      "sess-ios",
-      {},
+    // iOS typed-op child invocations keep argv untouched and inject SIMULATOR_UDID & ATC_PLATFORM=ios
+    const iosChildInv = prepareOpChildInvocation(
+      { cmd: "xcrun", args: ["simctl", "launch", simUdid, "com.example.App"] },
+      { lease: iosClaim.lease, sessionId: "sess-ios", baseEnv: {} },
     );
     assert.deepEqual(iosChildInv.args, ["simctl", "launch", simUdid, "com.example.App"]);
     assert.equal(iosChildInv.env.ATC_PLATFORM, "ios");
     assert.equal(iosChildInv.env.SIMULATOR_UDID, simUdid);
     assert.equal(iosChildInv.env.ATC_DEVICE_SERIAL, simUdid);
+    assert.equal(iosChildInv.env.ANDROID_SERIAL, undefined);
 
-    const iosDevctlInv = buildChildInvocation(
-      "xcrun",
-      ["devicectl", "device", "info", "details"],
-      { ...iosClaim.lease, kind: "physical", serial: "00008120-000464CE2E44C01E", udid: "00008120-000464CE2E44C01E" },
-      "sess-ios",
-      {},
-    );
-    assert.deepEqual(iosDevctlInv.args, [
-      "devicectl",
-      "device",
-      "info",
-      "details",
-      "--device",
-      "00008120-000464CE2E44C01E",
-    ]);
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "xcrun",
-          ["devicectl", "device", "info", "details", "--device", "OTHER-UDID"],
-          { ...iosClaim.lease, kind: "physical", serial: "00008120-000464CE2E44C01E", udid: "00008120-000464CE2E44C01E" },
-          "sess-ios",
-          {},
-        ),
-      /Conflicting device selector "OTHER-UDID"/,
-    );
-
-    // iOS guard rules: block lifecycle commands, allow & rewrite device actions with active iOS lease
-    const guardSimBoot = evaluateCommandGuard(`xcrun simctl boot ${simUdid}`, {
-      sessionId: "sess-ios",
-      activeLeases: [iosClaim.lease],
-    });
-    assert.equal(guardSimBoot.allowed, false);
-    assert.match(guardSimBoot.reason, /xcrun simctl boot.*disabled under ATC/);
-
-    const guardXcodeTestNoLease = evaluateCommandGuard(
-      "xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16 Pro'",
-      { sessionId: "sess-none", activeLeases: [] },
-    );
-    assert.equal(guardXcodeTestNoLease.allowed, false);
-
-    const guardSimLaunchAllowed = evaluateCommandGuard(
-      "xcrun simctl launch booted com.example.App",
+    const iosPhysicalInv = prepareOpChildInvocation(
+      { cmd: "xcrun", args: ["devicectl", "device", "info", "details", "--device", "00008120-000464CE2E44C01E"] },
       {
+        lease: { ...iosClaim.lease, kind: "physical", serial: "00008120-000464CE2E44C01E" },
         sessionId: "sess-ios",
-        activeLeases: [iosClaim.lease],
-        runningCount: 1,
-        platform: "darwin",
+        baseEnv: {},
       },
     );
-    assert.equal(guardSimLaunchAllowed.allowed, true);
-    assert.match(
-      guardSimLaunchAllowed.rewrittenCommand,
-      new RegExp(`atc exec --serial ${simUdid} -- xcrun simctl launch booted com.example.App`),
-    );
+    assert.equal(iosPhysicalInv.env.SIMULATOR_UDID, undefined);
+    assert.equal(iosPhysicalInv.env.ATC_DEVICE_SERIAL, "00008120-000464CE2E44C01E");
 
     // 7. KMP dual-lease session (1 Android lease + 1 iOS lease in the same session)
     const kmpAndroidInv = {
@@ -11085,25 +8706,6 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     const kmpRenewAndroid = cmdRenew(dir, null, { session: "sess-ios", android: true, ttl: 500 });
     assert.equal(kmpRenewAndroid.exitCode, 0);
     assert.equal(kmpRenewAndroid.lease.platform, "android");
-
-    // Compound KMP command guard with 1 Android + 1 iOS lease and per-platform runningCountByPlatform
-    const kmpCompoundGuard = evaluateCommandGuard(
-      "adb -s emulator-5554 install app.apk && xcrun simctl install booted iosApp.app",
-      {
-        sessionId: "sess-ios",
-        activeLeases: [kmpAndroidClaim.lease, iosClaim.lease],
-        runningCount: 2,
-        runningCountByPlatform: { android: 2, ios: 1 },
-        platform: "darwin",
-      },
-    );
-    assert.equal(kmpCompoundGuard.allowed, true);
-    assert.match(
-      kmpCompoundGuard.rewrittenCommand,
-      new RegExp(
-        `atc exec --serial emulator-5554 -- adb -s emulator-5554 install app\\.apk && .*atc exec --serial ${simUdid} -- xcrun simctl install booted iosApp\\.app`,
-      ),
-    );
 
     // Platform-scoped free in a dual-lease KMP session
     const kmpFreeAndroid = cmdFree(dir, null, { session: "sess-ios", android: true });

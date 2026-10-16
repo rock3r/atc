@@ -8,7 +8,7 @@ import { FEATURE_REQUEST_URL, WINDOWS_BATCH_ARG_RE, WINDOWS_BATCH_PATH_FORBIDDEN
 import { resolveOpBuildRequirements } from "./ops/requirements.mjs";
 import { formatErrors, parseOpArgv, validateOpParams } from "./validate.mjs";
 
-export const EXIT_INVALID = 2;
+export const EXIT_INVALID = 7;
 export const EXIT_POLICY = 3;
 
 const MAX_CAPTURE_BYTES = 256 * 1024;
@@ -371,9 +371,10 @@ export function execHelp(system = null) {
     lines.push(`${sys}:`);
     for (const op of listOps(sys)) {
       const verb = op.name.slice(sys.length + 1).replace(/\./g, " ").replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
-      const pos = op.positional ? ` <${op.positional}${/\[\]$/.test(op.params[op.positional].type) ? "..." : ""}>` : "";
+      const posList = Array.isArray(op.positional) ? op.positional : op.positional ? [op.positional] : [];
+      const pos = posList.map((p) => ` <${p}${/\[\]$/.test(op.params[p].type) ? "..." : ""}>`).join("");
       const opts = Object.entries(op.params)
-        .filter(([k]) => k !== op.positional)
+        .filter(([k]) => !posList.includes(k))
         .map(([k, s]) => {
           const flag = `--${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
           const req = s.required ? "" : "?";

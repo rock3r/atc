@@ -2319,6 +2319,13 @@ export function releaseLock(lockHandle) {
   sweepStaleLockClaims(stateDir, lockName);
 }
 
+// Process-wide depth of held atc.lock sections (see AGENTS.md: never spawn subprocesses while
+// holding atc.lock). spawn.mjs consults this to fail loudly on lock-boundary violations.
+let atcLockDepth = 0;
+export function isAtcLockHeld() {
+  return atcLockDepth > 0;
+}
+
 export function withLock(
   stateDir,
   fn,
@@ -2328,9 +2335,12 @@ export function withLock(
   options = {},
 ) {
   const handle = acquireLock(stateDir, timeoutMs, lockName, staleLockMs, options);
+  const isAtcLock = lockName === "atc.lock";
+  if (isAtcLock) atcLockDepth++;
   try {
     return fn(handle);
   } finally {
+    if (isAtcLock) atcLockDepth--;
     releaseLock(handle);
   }
 }

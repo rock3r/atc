@@ -4,7 +4,7 @@
   "owner": {
     "name": "Sebastiano Poggi"
   },
-  "description": "Agent Traffic Control for coding agents: exclusive Android emulator, iOS Simulator, and physical device leases, warm-affinity queueing, and multi-agent guardrails.",
+  "description": "Agent Traffic Control for coding agents: exclusive Android emulator, iOS Simulator, and physical device leases, warm-affinity queueing, and coordinated builds through typed operations.",
   "plugins": [
     {
       "name": "atc",

@@ -1,7 +1,7 @@
 {
   "name": "@rock3r/atc",
-  "version": "2.1.0",
-  "description": "Daemonless Agent Traffic Control for Android emulators, iOS Simulators, physical devices, and Gradle/Bazel/Xcode builds — leases, co-scheduling, bounded-window warm-affinity wait queue, snapshots, crash recovery, and multi-agent guardrails.",
+  "version": "3.0.0",
+  "description": "Daemonless Agent Traffic Control for Android emulators, iOS Simulators, physical devices, and Gradle/Bazel/Xcode builds — leases, co-scheduling, bounded-window warm-affinity wait queue, snapshots, crash recovery, and typed build/device operations (no shell).",
   "license": "Apache-2.0",
   "author": "Sebastiano Poggi <me@sebastiano.dev>",
   "homepage": "https://specs.sebastiano.dev/atc/",
@@ -67,7 +67,7 @@
   ],
   "scripts": {
     "test": "node --test --test-concurrency=1",
-    "check": "node -e \"import('node:fs').then(async({readdirSync})=>{const{spawnSync}=await import('node:child_process');for(const d of['bin','src','scripts','test'])for(const f of readdirSync(d))if(f.endsWith('.mjs')){const r=spawnSync(process.execPath,['--check',d+'/'+f],{stdio:'inherit'});if(r.status!==0)process.exit(r.status)}})\" && node --test --test-concurrency=1",
+    "check": "node -e \"import('node:fs').then(async({readdirSync})=>{const{spawnSync}=await import('node:child_process');for(const d of['bin','src','src/ops','scripts','test'])for(const f of readdirSync(d))if(f.endsWith('.mjs')){const r=spawnSync(process.execPath,['--check',d+'/'+f],{stdio:'inherit'});if(r.status!==0)process.exit(r.status)}})\" && node --test --test-concurrency=1",
     "package:smoke": "node scripts/package-smoke.mjs",
     "release:verify": "node scripts/verify-release-version.mjs",
     "prepack": "npm run release:verify"

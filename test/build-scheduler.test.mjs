@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 
 import {
   canonicalizeBuildPath,
-  classifyBuildCommand,
   resolveBuildResources,
   computeEffectiveMaxBuilds,
   computeBuildPoolSnapshot,
@@ -18,41 +18,17 @@ import {
   computeDefaultBazelOutputBases,
   probeWarmBuildDaemons,
   computeColdBuildRamDemandMb,
+  doBuildResourceKeysConflict,
+  extractBuildResourceKeyInfo,
+  isGradleDeviceTaskName,
 } from "../src/build.mjs";
-import {
-  resolveAuditLogPath,
-  logAuditEvent,
-  flushAuditEvents,
-  readRecentAuditEvents,
-} from "../src/logger.mjs";
+import { flushAuditEvents, readRecentAuditEvents } from "../src/logger.mjs";
 import { checkResourceAdmission } from "../src/android.mjs";
-import { evaluateCommandGuard } from "../src/guard.mjs";
-import { handlePreToolUseHook } from "../src/hook.mjs";
-import { buildChildInvocation } from "../src/spawn.mjs";
-import {
-  createDefaultState,
-  readState,
-  commitState,
-  withStateTransaction,
-} from "../src/state.mjs";
-import {
-  cmdBatch,
-  cmdClaim,
-  cmdExec,
-  cmdFree,
-  cmdGuard,
-  cmdStatus,
-  cmdConfig,
-  parseCliArgs,
-} from "../src/cli.mjs";
-import {
-  detectUnparseableShellConstructs,
-  joinBackslashContinuations,
-  parseEnvWrapperArgs,
-  parseJavaProperties,
-  parseShellQuote,
-  splitShellWords,
-} from "../src/parsers.mjs";
+import { prepareOpChildInvocation } from "../src/spawn.mjs";
+import { createDefaultState, readState } from "../src/state.mjs";
+import { cmdBatch, cmdClaim, cmdExec } from "../src/cli.mjs";
+import { planOp } from "../src/exec.mjs";
+import { joinBackslashContinuations, parseJavaProperties, splitRcWords } from "../src/parsers.mjs";
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "atc-build-test-"));
@@ -65,223 +41,394 @@ delete process.env.GRADLE_HOME;
 delete process.env.JAVA_OPTS;
 delete process.env.GRADLE_USER_HOME;
 
-test("classifyBuildCommand & resolveBuildResources handle gradle, bazel, xcodebuild, and build-brief wrappers", () => {
+const posix = process.platform !== "win32";
+const realpath = (p) => (fs.realpathSync.native || fs.realpathSync)(p);
+
+function script(file, body) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `#!/bin/sh\n${body}\n`);
+  fs.chmodSync(file, 0o755);
+  return file;
+}
+
+// Temp project with a fake Gradle wrapper; ops resolve the wrapper from cwd.
+function setupProject({ gradlew = "exit 0" } = {}) {
+  const root = makeTempDir();
+  const stateDir = path.join(root, "state");
+  const bin = path.join(root, "bin");
+  const proj = path.join(root, "proj");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, "settings.gradle"), "rootProject.name = 'app'\n");
+  script(path.join(proj, "gradlew"), gradlew);
+  const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin`, ATC_STATE_DIR: stateDir };
+  delete env.ATC_LOG_DIR;
+  delete env.ATC_BUILD_OP_ID;
+  delete env.ATC_BUILD_OP_NONCE;
+  return {
+    root,
+    stateDir,
+    bin,
+    proj,
+    env,
+    writeState(mutate) {
+      const st = readState(stateDir);
+      mutate(st);
+      fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(st, null, 2));
+    },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+function hostInventory(overrides = {}, running = []) {
+  return {
+    host: {
+      cpuCores: 8,
+      totalRamMb: 32768,
+      availableRamMb: 16384,
+      freeDiskMb: 50000,
+      sampledAtMs: Date.now(),
+      ...overrides,
+    },
+    running,
+    offline: [],
+    creatable: [],
+  };
+}
+
+const PIXEL_35 = {
+  deviceKey: "avd:Pixel_8_API_35",
+  avd: "Pixel_8_API_35",
+  serial: "emulator-5554",
+  kind: "emulator",
+  online: true,
+  ramSizeMb: 2048,
+  requiredRamMb: 3072,
+  dataDiskMb: 6656,
+  snapshots: [],
+  profile: { deviceType: "phone", deviceName: "pixel_8", apiLevel: "android-35", services: "google_apis", playStore: false, abi: "arm64-v8a" },
+};
+
+function busyBuildLease(id, resourceKeys, extra = {}) {
+  const now = Date.now();
+  return {
+    buildId: id,
+    sessionId: "sess-holder",
+    workerPid: process.pid,
+    workerPgid: null,
+    opId: `op_${id}`,
+    opNonce: `nonce_${id}`,
+    tool: "gradle",
+    workspaceRoot: "/other-workspace",
+    resourceKeys,
+    requiresWorkspaceLock: true,
+    requiresHeavySlot: true,
+    pinnedDeviceLeaseId: null,
+    state: "active",
+    createdAtMs: now,
+    updatedAtMs: now,
+    expiresAtMs: now + 60_000,
+    drainingUntilMs: null,
+    maxDrainingAtMs: null,
+    reservedRamMb: 0,
+    ramReservationUntilMs: 0,
+    ...extra,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Build requirement resolution (direct literal argv; device coupling comes from the op)
+// ---------------------------------------------------------------------------
+
+test("resolveBuildResources classifies direct gradle, bazel and xcodebuild argv as serialized pure builds", () => {
   const tmp = makeTempDir();
-  const wsDir = path.join(tmp, "repo");
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(wsDir, "settings.gradle.kts"), "rootProject.name = 'demo'\n");
+  try {
+    const wsDir = path.join(tmp, "repo");
+    fs.mkdirSync(wsDir, { recursive: true });
+    fs.writeFileSync(path.join(wsDir, "settings.gradle.kts"), "rootProject.name = 'demo'\n");
+    const canonicalWs = canonicalizeBuildPath(wsDir);
 
-  const pureGradle = resolveBuildResources(
-    "build-brief",
-    ["./gradlew", "assembleDebug", "--stacktrace"],
-    wsDir,
-  );
-  assert.equal(pureGradle.kind, "pure_build");
-  assert.equal(pureGradle.tool, "gradle");
-  assert.equal(pureGradle.requiresWorkspaceLock, true);
-  assert.equal(pureGradle.requiresHeavySlot, true);
-  assert.deepEqual(pureGradle.resourceKeys, [`gradle:${canonicalizeBuildPath(wsDir)}`]);
+    for (const args of [["assembleDebug", "--stacktrace"], ["tasks", "--all"], ["connectedDebugAndroidTest"]]) {
+      const res = resolveBuildResources("./gradlew", args, wsDir);
+      assert.equal(res.kind, "pure_build", `gradle ${args.join(" ")}`);
+      assert.equal(res.tool, "gradle");
+      assert.equal(res.requiresDevice, false, "device coupling is decided by the op, not argv");
+      assert.equal(res.requiresWorkspaceLock, true);
+      assert.equal(res.requiresHeavySlot, true);
+      assert.deepEqual(res.resourceKeys, [`gradle:${canonicalWs}`]);
+      assert.equal(res.workspaceRoot, canonicalWs);
+    }
+    assert.deepEqual(resolveBuildResources("./gradlew", ["build"], wsDir).tasks, ["build"]);
 
-  const wsOnlyGradle = resolveBuildResources("./gradlew", ["tasks", "--all"], wsDir);
-  assert.equal(wsOnlyGradle.kind, "workspace_only");
-  assert.equal(wsOnlyGradle.requiresWorkspaceLock, true);
-  assert.equal(wsOnlyGradle.requiresHeavySlot, false);
+    // Absolute wrapper path and -p / --project-dir resolve the Gradle root
+    const subRepoDir = path.join(tmp, "sub-repo");
+    fs.mkdirSync(subRepoDir, { recursive: true });
+    fs.writeFileSync(path.join(subRepoDir, "settings.gradle"), "rootProject.name = 'sub'\n");
+    const canonicalSub = canonicalizeBuildPath(subRepoDir);
+    assert.deepEqual(resolveBuildResources("./gradlew", ["-p", "sub-repo", "build"], tmp).resourceKeys, [`gradle:${canonicalSub}`]);
+    assert.deepEqual(resolveBuildResources("./gradlew", ["--project-dir=sub-repo", "build"], tmp).resourceKeys, [`gradle:${canonicalSub}`]);
+    const subWrapper = script(path.join(subRepoDir, "gradlew"), "exit 0");
+    assert.deepEqual(resolveBuildResources(subWrapper, ["build"], tmp).resourceKeys, [`gradle:${canonicalSub}`]);
 
-  const readOnlyGradle = resolveBuildResources("./gradlew", ["--version"], wsDir);
-  assert.equal(readOnlyGradle.kind, "read_only");
-  assert.equal(readOnlyGradle.requiresWorkspaceLock, false);
-  assert.equal(readOnlyGradle.requiresHeavySlot, false);
+    // Literal argv is never re-split: quoted separators stay inside one argument
+    const literal = resolveBuildResources("./gradlew", ["build", "-Pfilter=a|b;c&&d"], wsDir);
+    assert.deepEqual(literal.tasks, ["build"]);
+    assert.deepEqual(literal.resourceKeys, [`gradle:${canonicalWs}`]);
 
-  const stopGradle = resolveBuildResources("./gradlew", ["--stop"], wsDir);
-  assert.equal(stopGradle.kind, "deny_lifecycle");
+    // Bazel: every subcommand (including clean/run, which are now allowed typed ops) is serialized
+    fs.writeFileSync(path.join(wsDir, "MODULE.bazel"), "");
+    for (const args of [["build", "//app:main"], ["query", "//..."], ["clean", "--expunge"], ["run", "//tools:gen"]]) {
+      const res = resolveBuildResources("bazel", args, wsDir, { systemBazelrcPath: null });
+      assert.equal(res.kind, "pure_build", `bazel ${args.join(" ")}`);
+      assert.equal(res.tool, "bazel");
+      assert.equal(res.subcommand, args[0]);
+      assert.equal(res.requiresWorkspaceLock, true);
+      assert.equal(res.requiresHeavySlot, true);
+      assert.ok(res.resourceKeys.includes(`bazel:ws:${canonicalWs}`));
+    }
+    assert.equal(resolveBuildResources("bazelisk", ["build", "//..."], wsDir).tool, "bazel");
+    assert.equal(resolveBuildResources("/opt/bin/bazelw", ["build", "//..."], wsDir).tool, "bazel");
 
-  const contGradle = resolveBuildResources("./gradlew", ["test", "--continuous"], wsDir);
-  assert.equal(contGradle.kind, "reject_long_running");
-
-  const devGradle = resolveBuildResources("./gradlew", ["connectedDebugAndroidTest"], wsDir);
-  assert.equal(devGradle.kind, "device_coupled_build");
-  assert.equal(devGradle.requiresDevice, true);
-  assert.equal(devGradle.requiresWorkspaceLock, true);
-  assert.equal(devGradle.requiresHeavySlot, true);
-
-  const bazelShut = resolveBuildResources("bazel", ["shutdown"], wsDir);
-  assert.equal(bazelShut.kind, "deny_lifecycle");
-
-  const bazelExpunge = resolveBuildResources("bazelisk", ["clean", "--expunge_async"], wsDir);
-  assert.equal(bazelExpunge.kind, "deny_lifecycle");
-
-  const bazelQuery = resolveBuildResources("bazel", ["query", "//..."], wsDir);
-  assert.equal(bazelQuery.kind, "workspace_only");
-  assert.equal(bazelQuery.requiresWorkspaceLock, true);
-  assert.equal(bazelQuery.requiresHeavySlot, false);
-
-  const bazelRunMobile = resolveBuildResources("bazel", ["mobile-install", "//app:bin"], wsDir);
-  assert.equal(bazelRunMobile.kind, "device_coupled_build");
-  assert.equal(bazelRunMobile.requiresDevice, true);
-
-  const xcodeSimTest = resolveBuildResources(
-    "xcodebuild",
-    ["test", "-scheme", "App", "-destination", "platform=iOS Simulator,id=11111111-2222-3333-4444-555555555555"],
-    wsDir,
-  );
-  assert.equal(xcodeSimTest.kind, "device_coupled_build");
-  assert.equal(xcodeSimTest.targetPlatform, "ios");
-
-  const xcodeMacBuild = resolveBuildResources(
-    "xcodebuild",
-    ["build", "-scheme", "MacTool", "-destination", "generic/platform=macOS"],
-    wsDir,
-  );
-  assert.equal(xcodeMacBuild.kind, "pure_build");
-  assert.equal(xcodeMacBuild.requiresDevice, false);
-  assert.equal(xcodeMacBuild.requiresWorkspaceLock, true);
-  assert.equal(xcodeMacBuild.requiresHeavySlot, true);
-
-  const shellMultiTool = resolveBuildResources(
-    "sh",
-    ["-c", "./gradlew assembleDebug; bazel build //app:main"],
-    wsDir,
-  );
-  assert.equal(shellMultiTool.kind, "pure_build");
-  assert.ok(shellMultiTool.resourceKeys.includes(`gradle:${canonicalizeBuildPath(wsDir)}`));
-  assert.ok(shellMultiTool.resourceKeys.includes(`bazel:ws:${canonicalizeBuildPath(wsDir)}`));
-
-  const xcrunWrapped = resolveBuildResources(
-    "xcrun",
-    [
+    // xcodebuild: project discovery and -derivedDataPath keys
+    const xcRoot = path.join(tmp, "ios");
+    fs.mkdirSync(path.join(xcRoot, "App.xcodeproj"), { recursive: true });
+    fs.mkdirSync(path.join(xcRoot, "Sources"), { recursive: true });
+    const canonicalXc = canonicalizeBuildPath(xcRoot);
+    const xcBuild = resolveBuildResources("xcodebuild", ["-scheme", "App", "build"], path.join(xcRoot, "Sources"));
+    assert.equal(xcBuild.kind, "pure_build");
+    assert.equal(xcBuild.tool, "xcodebuild");
+    assert.equal(xcBuild.requiresDevice, false);
+    assert.deepEqual(xcBuild.resourceKeys, [`xcode:${canonicalXc}`]);
+    const ddPath = path.join(tmp, "dd");
+    const xcDerived = resolveBuildResources(
       "xcodebuild",
-      "test",
-      "-scheme",
-      "App",
-      "-destination",
-      "platform=iOS Simulator,id=11111111-2222-3333-4444-555555555555",
-    ],
-    wsDir,
-  );
-  assert.equal(xcrunWrapped.kind, "device_coupled_build");
-  assert.equal(xcrunWrapped.tool, "xcodebuild");
-  assert.equal(xcrunWrapped.requiresWorkspaceLock, true);
+      ["-project", path.join(xcRoot, "App.xcodeproj"), "-scheme", "App", "-derivedDataPath", ddPath, "test"],
+      tmp,
+    );
+    assert.deepEqual(xcDerived.resourceKeys, [`xcode:${canonicalXc}`, `xcode:dd:${canonicalizeBuildPath(ddPath)}`]);
 
-  const subRepoDir = path.join(tmp, "sub-repo");
-  fs.mkdirSync(subRepoDir, { recursive: true });
-  fs.writeFileSync(path.join(subRepoDir, "settings.gradle"), "rootProject.name = 'sub'\n");
-  const cdShellGradle = resolveBuildResources(
-    "sh",
-    ["-c", "cd sub-repo && ./gradlew assembleDebug"],
-    tmp,
-  );
-  assert.deepEqual(cdShellGradle.resourceKeys, [`gradle:${canonicalizeBuildPath(subRepoDir)}`]);
+    // Anything that is not a direct build tool is not classified (no wrapper / shell peeling)
+    for (const [cmd, args] of [
+      ["sh", ["-c", "./gradlew assembleDebug"]],
+      ["build-brief", ["./gradlew", "assembleDebug"]],
+      ["xcrun", ["xcodebuild", "test", "-scheme", "App"]],
+      ["env", ["FOO=1", "./gradlew", "build"]],
+      ["node", ["-e", "process.exit(0)"]],
+    ]) {
+      const res = resolveBuildResources(cmd, args, wsDir);
+      assert.equal(res.kind, "not_build_tool", `${cmd} must not be peeled`);
+      assert.deepEqual(res.resourceKeys, []);
+      assert.equal(res.requiresWorkspaceLock, false);
+    }
 
-  fs.rmSync(tmp, { recursive: true, force: true });
+    // Explicit workspace adds generic workspace:<root> keys next to the tool key
+    const dirA = path.join(tmp, "a");
+    const subNested = path.join(dirA, "sub", "nested");
+    fs.mkdirSync(subNested, { recursive: true });
+    fs.writeFileSync(path.join(dirA, "settings.gradle"), "rootProject.name = 'a'\n");
+    const canonicalDirA = canonicalizeBuildPath(dirA);
+    const explicitWs = resolveBuildResources("./gradlew", ["build"], tmp, { workspace: subNested });
+    assert.ok(explicitWs.resourceKeys.includes(`workspace:${canonicalDirA}`));
+    assert.ok(explicitWs.resourceKeys.includes(`gradle:${canonicalDirA}`));
+    assert.ok(explicitWs.resourceKeys.includes(`workspace:${canonicalizeBuildPath(subNested)}`));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
-test("buildChildInvocation blocks daemon-killing commands and sanitizes ATC_BUILD_OP_* env", () => {
-  assert.throws(
-    () => buildChildInvocation("./gradlew", ["--stop"], null, "sess-1", {}),
-    /disabled under ATC/,
-  );
-  assert.throws(
-    () => buildChildInvocation("bazel", ["shutdown"], null, "sess-1", {}),
-    /disabled under ATC/,
-  );
+test("typed build ops derive device coupling, platform and workspace keys from the op", () => {
+  const tmp = makeTempDir();
+  try {
+    const wsDir = path.join(tmp, "repo");
+    fs.mkdirSync(wsDir, { recursive: true });
+    fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'demo'\n");
+    script(path.join(wsDir, "gradlew"), "exit 0");
+    fs.writeFileSync(path.join(wsDir, "MODULE.bazel"), "");
+    const canonicalWs = canonicalizeBuildPath(wsDir);
 
-  const inv = buildChildInvocation(
-    "./gradlew",
-    ["assembleDebug"],
-    null,
-    "sess-1",
+    const pure = planOp("gradle.tasks", { tasks: [":app:assembleDebug"] }, { cwd: wsDir });
+    assert.deepEqual(pure.errors, []);
+    assert.equal(pure.buildReqs.kind, "pure_build");
+    assert.equal(pure.buildReqs.requiresDevice, false);
+    assert.equal(pure.buildReqs.requiresHeavySlot, true);
+    assert.equal(pure.buildReqs.requiresWorkspaceLock, true);
+    assert.ok(pure.buildReqs.resourceKeys.includes(`gradle:${canonicalWs}`));
+    assert.ok(pure.buildReqs.resourceKeys.includes(`workspace:${canonicalWs}`));
+
+    const coupled = planOp("gradle.tasks", { tasks: [":app:connectedDebugAndroidTest"] }, { cwd: wsDir });
+    assert.equal(coupled.buildReqs.kind, "device_coupled_build");
+    assert.equal(coupled.buildReqs.requiresDevice, true);
+    assert.equal(coupled.buildReqs.targetPlatform, "android");
+
+    const mixed = planOp("gradle.tasks", { tasks: ["assembleDebug", "installDebug"] }, { cwd: wsDir });
+    assert.equal(mixed.buildReqs.kind, "device_coupled_build");
+    assert.equal(mixed.notices.length, 1, "mixed device/pure tasks produce a split-the-step notice");
+
+    const buildOnlyDevice = planOp("gradle.tasks", { tasks: ["connectedCheck"], buildOnly: true }, { cwd: wsDir });
+    assert.equal(buildOnlyDevice.errors[0].code, "build_only_device");
+
+    const ramHint = planOp("gradle.tasks", { tasks: ["build"], ramMb: 6144 }, { cwd: wsDir });
+    assert.equal(ramHint.buildReqs.requestedHeapMb, 6144);
+    assert.equal(computeColdBuildRamDemandMb(ramHint.buildReqs, 3072), 6144);
+    assert.equal(computeColdBuildRamDemandMb(pure.buildReqs, 3072), 3072);
+
+    for (const [opName, params] of [
+      ["bazel.build", { targets: ["//app:main"] }],
+      ["bazel.clean", { expunge: true }],
+      ["bazel.run", { target: "//tools:gen", timeoutSec: 30 }],
+    ]) {
+      const p = planOp(opName, params, { cwd: wsDir });
+      assert.deepEqual(p.errors, [], opName);
+      assert.equal(p.buildReqs.kind, "pure_build", opName);
+      assert.equal(p.buildReqs.tool, "bazel");
+      assert.ok(p.buildReqs.resourceKeys.includes(`bazel:ws:${canonicalWs}`), opName);
+    }
+
+    const xcTest = planOp("xcode.test", { scheme: "App" }, { cwd: wsDir, platform: "darwin" });
+    assert.equal(xcTest.buildReqs.kind, "device_coupled_build");
+    assert.equal(xcTest.buildReqs.targetPlatform, "ios");
+    assert.equal(xcTest.buildReqs.tool, "xcodebuild");
+    const xcMacTest = planOp("xcode.test", { scheme: "App", testDestination: "macos" }, { cwd: wsDir, platform: "darwin" });
+    assert.equal(xcMacTest.buildReqs.kind, "pure_build");
+    const xcBuild = planOp("xcode.build", { scheme: "App" }, { cwd: wsDir, platform: "darwin" });
+    assert.equal(xcBuild.buildReqs.kind, "pure_build");
+    assert.equal(xcBuild.buildReqs.requiresDevice, false);
+
+    // Gradle device task-name heuristics used by the op
+    for (const name of ["connectedDebugAndroidTest", "connectedCheck", "installDebug", "uninstallAll", "cC", "iD"]) {
+      assert.equal(isGradleDeviceTaskName(name), true, name);
+    }
+    for (const name of ["assembleDebug", "installDist", "installShadowDist", "publishToMavenLocal", "iDist", "lint"]) {
+      assert.equal(isGradleDeviceTaskName(name), false, name);
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("prepareOpChildInvocation appends per-build caps, injects lease env and sanitizes ATC_BUILD_OP_* env", () => {
+  const plain = prepareOpChildInvocation({ cmd: "/repo/gradlew", args: ["assembleDebug"], cwd: "/repo" }, { baseEnv: {} });
+  assert.deepEqual(plain.args, ["assembleDebug"], "no build lease → argv untouched");
+  assert.equal(plain.cwd, "/repo");
+
+  const inv = prepareOpChildInvocation(
+    { cmd: "/repo/gradlew", args: ["assembleDebug", "-Pfilter=a|b;c&&d", "-Pnote=-Dorg.gradle.workers.max=99"] },
     {
-      ATC_BUILD_OP_ID: "stale_op",
-      ATC_BUILD_OP_NONCE: "stale_nonce",
-      PATH: process.env.PATH,
-    },
-    {
-      buildId: "build_123",
-      opId: "op_fresh",
-      opNonce: "nonce_fresh",
-      reservedRamMb: 3072,
+      sessionId: "sess-1",
+      baseEnv: { ATC_BUILD_OP_ID: "stale_op", ATC_BUILD_OP_NONCE: "stale_nonce", ATC_BUILD_ID: "stale_build", PATH: "/usr/bin" },
+      buildLease: { buildId: "build_123", opId: "op_fresh", opNonce: "nonce_fresh", jobsLimit: 4, reservedRamMb: 3072 },
+      tool: "gradle",
     },
   );
+  assert.deepEqual(inv.args, [
+    "assembleDebug",
+    "-Pfilter=a|b;c&&d",
+    "-Pnote=-Dorg.gradle.workers.max=99",
+    "-Dorg.gradle.workers.max=4",
+  ]);
   assert.equal(inv.env.ATC_BUILD_OP_ID, "op_fresh");
   assert.equal(inv.env.ATC_BUILD_OP_NONCE, "nonce_fresh");
-  assert.ok(inv.args.some((a) => String(a).startsWith("-Dorg.gradle.workers.max=")));
-
-  const bazelInv = buildChildInvocation("bazel", ["build", "//app:main"], null, "sess-1", {}, {
-    reservedRamMb: 4096,
-  });
-  assert.ok(bazelInv.args.some((a) => String(a).startsWith("--jobs=")));
-  assert.ok(bazelInv.args.includes("--local_ram_resources=4096"));
   assert.equal(inv.env.ATC_BUILD_ID, "build_123");
+  assert.equal(inv.env.ATC_SESSION_ID, "sess-1");
+  assert.equal(inv.env.PATH, "/usr/bin");
 
-  const shInv = buildChildInvocation(
-    "sh",
-    ["-c", "./gradlew assembleDebug; bazel build //app:main"],
-    null,
-    "sess-1",
-    {},
-    { reservedRamMb: 4096 },
+  const stale = prepareOpChildInvocation(
+    { cmd: "adb", args: ["devices"] },
+    { baseEnv: { ATC_BUILD_OP_ID: "stale_op", ATC_BUILD_OP_NONCE: "stale_nonce", ATC_BUILD_ID: "b" } },
   );
-  assert.match(shInv.args[1], /-Dorg\.gradle\.workers\.max=\d+/);
-  assert.match(shInv.args[1], /--jobs=\d+ --local_ram_resources=4096/);
+  assert.equal(stale.env.ATC_BUILD_OP_ID, undefined, "inherited build op identity never leaks into children");
+  assert.equal(stale.env.ATC_BUILD_OP_NONCE, undefined);
+  assert.equal(stale.env.ATC_BUILD_ID, undefined);
+
+  const caps = { jobsLimit: 4, reservedRamMb: 4096 };
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "bazel", args: ["build", "//app:main"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
+    ["build", "--jobs=4", "--local_ram_resources=4096", "//app:main"],
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "bazel", args: ["run", "//tools:gen", "--", "--flag"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
+    ["run", "--jobs=4", "--local_ram_resources=4096", "//tools:gen", "--", "--flag"],
+    "resource flags stay before the run args separator",
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "bazel", args: ["clean", "--expunge"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
+    ["clean", "--expunge"],
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "bazel", args: ["query", "//..."] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
+    ["query", "//..."],
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "xcodebuild", args: ["-scheme", "App", "test"] }, { baseEnv: {}, buildLease: caps, tool: "xcodebuild" }).args,
+    ["-scheme", "App", "test", "-jobs", "4"],
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "xcodebuild", args: ["-scheme", "App", "clean"] }, { baseEnv: {}, buildLease: caps, tool: "xcodebuild" }).args,
+    ["-scheme", "App", "clean"],
+  );
+  const minCaps = prepareOpChildInvocation({ cmd: "bazel", args: ["test", "//..."] }, { baseEnv: {}, buildLease: { jobsLimit: 1, reservedRamMb: 10 }, tool: "bazel" });
+  assert.deepEqual(minCaps.args, ["test", "--jobs=2", "--local_ram_resources=1024", "//..."], "caps are clamped to sane minimums");
+
+  const android = prepareOpChildInvocation(
+    { cmd: "/repo/gradlew", args: ["connectedCheck"] },
+    { baseEnv: {}, lease: { leaseId: "lease_1", platform: "android", kind: "emulator", serial: "emulator-5554" } },
+  );
+  assert.equal(android.env.ANDROID_SERIAL, "emulator-5554");
+  assert.equal(android.env.ATC_PLATFORM, "android");
+  assert.equal(android.env.ATC_DEVICE_SERIAL, "emulator-5554");
+  assert.equal(android.env.ATC_LEASE_ID, "lease_1");
+
+  const ios = prepareOpChildInvocation(
+    { cmd: "xcodebuild", args: ["test", "-destination", "id=SIM-UDID-999"] },
+    { baseEnv: {}, lease: { leaseId: "lease_ios", platform: "ios", kind: "emulator", serial: "SIM-UDID-999" } },
+  );
+  assert.equal(ios.env.SIMULATOR_UDID, "SIM-UDID-999");
+  assert.equal(ios.env.ANDROID_SERIAL, undefined);
+  assert.equal(ios.env.ATC_PLATFORM, "ios");
 });
 
-test("evaluateCommandGuard respects coordinateBuilds toggle and always guards lifecycle & device-coupled builds", () => {
-  const stopGuard = evaluateCommandGuard("./gradlew --stop", {
-    sessionId: "sess-a",
-    activeLeases: [],
-    coordinateBuilds: false,
-  });
-  assert.equal(stopGuard.allowed, false);
-  assert.match(stopGuard.reason, /shared Gradle daemons/);
+// ---------------------------------------------------------------------------
+// Scheduler primitives
+// ---------------------------------------------------------------------------
 
-  const pureDisabled = evaluateCommandGuard("build-brief ./gradlew assembleDebug", {
-    sessionId: "sess-a",
-    activeLeases: [],
-    coordinateBuilds: false,
-  });
-  assert.equal(pureDisabled.allowed, true);
-  assert.equal(pureDisabled.rewrittenCommand, null);
+test("computeEffectiveMaxBuilds, pool snapshots and resource key conflicts", () => {
+  assert.equal(computeEffectiveMaxBuilds({ maxConcurrentBuilds: 3 }, { cpuCores: 2, totalRamMb: 4096 }), 3);
+  assert.equal(computeEffectiveMaxBuilds({ maxConcurrentBuilds: "2" }, null), 2);
+  assert.equal(computeEffectiveMaxBuilds({ maxConcurrentBuilds: 0 }, { cpuCores: 16, totalRamMb: 65536 }), 3);
+  assert.equal(computeEffectiveMaxBuilds({}, { cpuCores: 8, totalRamMb: 16384 }), 1, "<24 GB RAM → 1 build");
+  assert.equal(computeEffectiveMaxBuilds({}, { cpuCores: 8, totalRamMb: 32768 }), 2);
+  assert.equal(computeEffectiveMaxBuilds({}, { cpuCores: 4, totalRamMb: 131072 }), 1, "CPU-bound");
+  assert.equal(computeEffectiveMaxBuilds({}, { cpuCores: 64, totalRamMb: 262144 }), 4, "capped at 4");
 
-  const pureEnabled = evaluateCommandGuard("build-brief ./gradlew assembleDebug", {
-    sessionId: "sess-a",
-    anchorPid: 4242,
-    activeLeases: [],
-    coordinateBuilds: true,
-    platform: "darwin",
-  });
-  assert.equal(pureEnabled.allowed, true);
-  assert.match(
-    pureEnabled.rewrittenCommand,
-    /^ATC_SESSION_ID=sess-a ATC_ANCHOR_PID=4242 atc exec --build -- build-brief \.\/gradlew assembleDebug$/,
-  );
+  const state = createDefaultState();
+  state.config.maxConcurrentBuilds = 2;
+  state.buildLeases.b1 = { buildId: "b1", state: "active", requiresHeavySlot: true, resourceKeys: ["gradle:/ws-a"] };
+  state.buildLeases.b2 = { buildId: "b2", state: "draining", requiresHeavySlot: false, resourceKeys: ["bazel:ws:/ws-b"] };
+  state.buildLeases.b3 = { buildId: "b3", state: "released", requiresHeavySlot: true, resourceKeys: ["gradle:/ws-c"] };
+  const snap = computeBuildPoolSnapshot(state, { cpuCores: 8, totalRamMb: 32768 });
+  assert.equal(snap.activeHeavyBuilds, 1);
+  assert.equal(snap.activeTotalBuilds, 2);
+  assert.equal(snap.baseMaxBuilds, 2);
+  assert.equal(snap.burstBuilds, 1);
+  assert.equal(snap.totalCapacity, 3);
+  assert.deepEqual([...snap.activeWorkspaces].sort(), ["bazel:ws:/ws-b", "gradle:/ws-a"]);
 
-  const pureEnabledWin = evaluateCommandGuard("build-brief ./gradlew assembleDebug", {
-    sessionId: "sess-a",
-    anchorPid: 4242,
-    activeLeases: [],
-    coordinateBuilds: true,
-    platform: "win32",
-  });
-  assert.equal(pureEnabledWin.allowed, true);
-  assert.match(
-    pureEnabledWin.rewrittenCommand,
-    /^atc exec --session sess-a --anchor-pid 4242 --build -- build-brief \.\/gradlew assembleDebug$/,
-  );
+  // Resource key formats
+  assert.deepEqual(extractBuildResourceKeyInfo("gradle:/ws-a"), { prefix: "gradle", path: "/ws-a" });
+  assert.deepEqual(extractBuildResourceKeyInfo("bazel:ws:/ws-a"), { prefix: "bazel:ws", path: "/ws-a" });
+  assert.deepEqual(extractBuildResourceKeyInfo("bazel:out:/tmp/out"), { prefix: "bazel:out", path: "/tmp/out" });
+  assert.deepEqual(extractBuildResourceKeyInfo("xcode:dd:/dd"), { prefix: "xcode:dd", path: "/dd" });
+  assert.deepEqual(extractBuildResourceKeyInfo("workspace:/ws"), { prefix: "workspace", path: "/ws" });
 
-  const unleasedCoupled = evaluateCommandGuard("./gradlew connectedDebugAndroidTest", {
-    sessionId: "sess-a",
-    activeLeases: [],
-    coordinateBuilds: false,
-  });
-  assert.equal(unleasedCoupled.allowed, false);
-  assert.match(unleasedCoupled.reason, /atc exec --claim --/);
-
-  const explicitCoAlloc = evaluateCommandGuard("atc exec --claim -- ./gradlew connectedDebugAndroidTest", {
-    sessionId: "sess-a",
-    activeLeases: [],
-    coordinateBuilds: false,
-  });
-  assert.equal(explicitCoAlloc.allowed, true);
+  assert.equal(doBuildResourceKeysConflict("gradle:/ws-a", "gradle:/ws-a"), true);
+  assert.equal(doBuildResourceKeysConflict("gradle:/ws-a", "gradle:/ws-b"), false);
+  assert.equal(doBuildResourceKeysConflict("gradle:/ws-a", "bazel:ws:/ws-a"), false, "different tools in one dir do not conflict by tool key");
+  assert.equal(doBuildResourceKeysConflict("workspace:/ws-a", "gradle:/ws-a"), true);
+  assert.equal(doBuildResourceKeysConflict("workspace:/ws-a", "bazel:ws:/ws-a/sub"), true, "generic workspace keys conflict with nested roots");
+  assert.equal(doBuildResourceKeysConflict("workspace:/ws-a", "gradle:/ws-ab"), false, "path-component boundary");
+  assert.equal(doBuildResourceKeysConflict("bazel:out:C:\\Shared\\Out", "bazel:out:c:/shared/out"), true, "Windows paths compare case-insensitively");
+  assert.equal(doBuildResourceKeysConflict(null, "gradle:/ws-a"), false);
 });
 
 test("3-tier priority build queue, workspace lock, and starvation protection invariants", () => {
@@ -346,6 +493,22 @@ test("3-tier priority build queue, workspace lock, and starvation protection inv
   queue[0].starvationDeadlineMs = now - 1_000;
   const starvedSel = pruneAndSelectNextBuildTicket(queue, stateView, now);
   assert.equal(queue[starvedSel.chosenIdx]?.ticketId, "bq_pure", "Starved pure build must promote to Tier 0");
+
+  // Workspace lock: a ticket whose key is already held is never chosen
+  const lockedSel = pruneAndSelectNextBuildTicket(
+    [{ ...queue[0], starvationDeadlineMs: now + 100_000 }],
+    { ...stateView, activeWorkspaces: new Set(["gradle:/ws-a"]), maxHostBuilds: 4 },
+    now,
+  );
+  assert.equal(lockedSel.chosenIdx, -1, "same workspace key must serialize");
+
+  // Max concurrent builds: a full pool admits nothing (no burst for pure builds that are not starved)
+  const fullSel = pruneAndSelectNextBuildTicket(
+    [{ ...queue[0], starvationDeadlineMs: now + 100_000 }],
+    { ...stateView, activeWorkspaces: new Set(["gradle:/ws-z"]), activeHeavyBuilds: 1, maxHostBuilds: 1, burstBuilds: 1 },
+    now,
+  );
+  assert.equal(fullSel.chosenIdx, -1, "full build pool must queue pure builds");
 });
 
 test("reconcileBuildLease transitions aborted builds to draining and blocks workspace until cooldown", () => {
@@ -422,201 +585,6 @@ test("Unified RAM admission accounts for recently started builds across emulator
 
   const buildRam = checkUnifiedRamAdmission(state, host, 3072, now);
   assert.equal(buildRam.allowed, false);
-});
-
-test("cmdExec --build coordinates pure builds and writes structured JSONL audit logs", async () => {
-  const stateDir = makeTempDir();
-  const wsDir = path.join(stateDir, "workspace");
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
-
-  const fakeInventory = {
-    host: {
-      cpuCores: 8,
-      totalRamMb: 32768,
-      availableRamMb: 16384,
-      freeDiskMb: 50000,
-      sampledAtMs: Date.now(),
-    },
-    running: [],
-    offline: [],
-    creatable: [],
-  };
-
-  const execRes = await cmdExec(
-    stateDir,
-    ["node", "-e", "process.exit(0)"],
-    { build: true, session: "sess-1" },
-    {
-      cwd: wsDir,
-      inventory: fakeInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-1" },
-    },
-  );
-  assert.equal(execRes.exitCode, 0);
-
-  const afterState = readState(stateDir);
-  assert.deepEqual(afterState.buildLeases, {});
-  assert.deepEqual(afterState.buildQueue, []);
-
-  const events = readRecentAuditEvents(stateDir, { limit: 20 });
-  const eventNames = events.map((e) => e.event);
-  assert.ok(eventNames.includes("build_admit"), `Expected build_admit in ${JSON.stringify(eventNames)}`);
-  assert.ok(eventNames.includes("build_release"), `Expected build_release in ${JSON.stringify(eventNames)}`);
-
-  for (const ev of events) {
-    assert.equal(ev.schemaVersion, 1, "audit record must include schemaVersion: 1");
-    assert.equal(typeof ev.epochMs, "number", "audit record must include numeric epochMs");
-    assert.equal(ev.category, "build", "build_admit / build_release must have category 'build'");
-  }
-
-  fs.rmSync(stateDir, { recursive: true, force: true });
-});
-
-test("cmdExec --claim performs atomic device + build co-allocation without holding device while build slot is busy", async () => {
-  const stateDir = makeTempDir();
-  const wsDir = path.join(stateDir, "workspace");
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
-
-  const fakeInventory = {
-    host: {
-      cpuCores: 8,
-      totalRamMb: 32768,
-      availableRamMb: 16384,
-      freeDiskMb: 50000,
-      sampledAtMs: Date.now(),
-    },
-    running: [
-      {
-        deviceKey: "Pixel_7_API_35",
-        serial: "emulator-5554",
-        avd: "Pixel_7_API_35",
-        platform: "android",
-        kind: "emulator",
-        profile: {
-          deviceType: "phone",
-          apiLevel: 35,
-          playStore: true,
-        },
-        state: "online",
-      },
-    ],
-    offline: [],
-    creatable: [],
-  };
-
-  const fakeGradlew = path.join(wsDir, "gradlew");
-  fs.writeFileSync(
-    fakeGradlew,
-    `#!/usr/bin/env node\nif (process.env.ANDROID_SERIAL !== "emulator-5554") process.exit(2);\nprocess.exit(0);\n`,
-    { mode: 0o755 },
-  );
-  fs.writeFileSync(
-    path.join(wsDir, "gradlew.cmd"),
-    `@node "%~dp0gradlew" %*\r\n`,
-    { mode: 0o755 },
-  );
-
-  const parsedSelector = parseCliArgs([
-    "exec",
-    "--claim",
-    "--type phone --api >=35",
-    "--",
-    "./gradlew",
-    "connectedDebugAndroidTest",
-  ]);
-  assert.equal(parsedSelector.flags.claim, true);
-  assert.equal(parsedSelector.flags.type, "phone");
-  assert.equal(parsedSelector.flags.api, ">=35");
-
-  const res = await cmdExec(
-    stateDir,
-    [fakeGradlew, "connectedDebugAndroidTest"],
-    { claim: "--type phone --api >=35", session: "sess-coalloc" },
-    {
-      cwd: wsDir,
-      inventory: fakeInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-coalloc" },
-    },
-  );
-  assert.equal(res.exitCode, 0);
-
-  const afterState = readState(stateDir);
-  assert.deepEqual(
-    afterState.leases,
-    {},
-    "One-shot cmdExec --claim must release the co-allocated device lease on exit",
-  );
-  assert.deepEqual(afterState.buildLeases, {});
-
-  const events = readRecentAuditEvents(stateDir, { limit: 20 }).map((e) => e.event);
-  assert.ok(events.includes("device_claim"));
-  assert.ok(events.includes("build_co_alloc_admit"));
-  assert.ok(events.includes("build_release"));
-  assert.ok(events.includes("device_free"));
-
-  // Pre-existing session lease must NOT be released when running cmdExec --claim
-  const preClaim = cmdClaim(
-    stateDir,
-    { type: "phone", api: ">=35", session: "sess-preexisting" },
-    { inventory: fakeInventory, env: { ...process.env, ATC_SESSION_ID: "sess-preexisting" } },
-  );
-  assert.equal(preClaim.exitCode, 0);
-
-  const preExec = await cmdExec(
-    stateDir,
-    [fakeGradlew, "connectedDebugAndroidTest"],
-    { claim: true, session: "sess-preexisting" },
-    {
-      cwd: wsDir,
-      inventory: fakeInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-preexisting" },
-    },
-  );
-  assert.equal(preExec.exitCode, 0);
-  const afterPreState = readState(stateDir);
-  assert.equal(
-    Object.keys(afterPreState.leases).length,
-    1,
-    "Pre-existing session lease must remain active after cmdExec --claim",
-  );
-
-  // Also verify buildChildInvocation injects -destination id=<udid> and -jobs for xcodebuild test under iOS lease
-  const iosXb = buildChildInvocation(
-    "xcodebuild",
-    ["test", "-scheme", "App"],
-    {
-      leaseId: "lease_ios_1",
-      platform: "ios",
-      kind: "emulator",
-      serial: "D9746857-ABCD-4321-9999-111122223333",
-    },
-    "sess-ios",
-    {},
-  );
-  assert.ok(iosXb.args.includes("-destination"));
-  assert.ok(iosXb.args.includes("id=D9746857-ABCD-4321-9999-111122223333"));
-  assert.ok(iosXb.args.includes("-jobs"));
-
-  assert.throws(
-    () =>
-      buildChildInvocation(
-        "xcodebuild",
-        ["test", "-scheme", "App", "-destination", "platform=iOS Simulator,name=iPhone 16"],
-        {
-          leaseId: "lease_ios_1",
-          platform: "ios",
-          kind: "emulator",
-          serial: "D9746857-ABCD-4321-9999-111122223333",
-        },
-        "sess-ios",
-        {},
-      ),
-    /Conflicting device selector/,
-  );
-
-  fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
 test("evaluateNestedBuildAdmission allows same-workspace re-entrant builds (including cross-tool KMP delta keys) and fails fast on cross-workspace deadlock", () => {
@@ -794,92 +762,7 @@ test("pruneAndSelectNextBuildTicket evaluates per-ticket device availability so 
   );
 });
 
-test("cmdExec --build --wait 0 admits immediately when slot is free and exits with code 2 when slot is busy", async () => {
-  const stateDir = makeTempDir();
-  const wsDir = path.join(stateDir, "workspace");
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
-
-  const fakeInventory = {
-    host: {
-      cpuCores: 8,
-      totalRamMb: 32768,
-      availableRamMb: 16384,
-      freeDiskMb: 50000,
-      sampledAtMs: Date.now(),
-    },
-    running: [],
-    offline: [],
-    creatable: [],
-  };
-
-  // 1. Free slot -> --wait 0 succeeds immediately
-  const freeRes = await cmdExec(
-    stateDir,
-    ["node", "-e", "process.exit(0)"],
-    { build: true, wait: "0", session: "sess-wait0-free" },
-    {
-      cwd: wsDir,
-      inventory: fakeInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-wait0-free" },
-    },
-  );
-  assert.equal(freeRes.exitCode, 0);
-
-  // Verify audit log preserves top-level fields (buildId, opId, resourceKeys, exitCode)
-  const events = readRecentAuditEvents(stateDir, { limit: 20 });
-  const admitEv = events.find((e) => e.event === "build_admit");
-  const releaseEv = events.find((e) => e.event === "build_release");
-  assert.ok(admitEv?.buildId, "build_admit event must preserve top-level buildId");
-  assert.ok(admitEv?.opId, "build_admit event must preserve top-level opId");
-  assert.ok(Array.isArray(admitEv?.resourceKeys), "build_admit event must preserve top-level resourceKeys");
-  assert.equal(releaseEv?.exitCode, 0, "build_release event must preserve top-level exitCode");
-
-  // 2. Busy workspace slot -> --wait 0 fails immediately with exitCode 2
-  const state = readState(stateDir);
-  const resolvedWs = canonicalizeBuildPath(wsDir);
-  state.config.maxConcurrentBuilds = 1;
-  state.buildLeases.build_busy = {
-    buildId: "build_busy",
-    sessionId: "sess-holder",
-    workerPid: process.pid,
-    workerPgid: null,
-    opId: "op_busy",
-    opNonce: "nonce_busy",
-    tool: "gradle",
-    workspaceRoot: resolvedWs,
-    resourceKeys: [`gradle:${resolvedWs}`, `workspace:${resolvedWs}`],
-    requiresWorkspaceLock: true,
-    requiresHeavySlot: true,
-    pinnedDeviceLeaseId: null,
-    state: "active",
-    createdAtMs: Date.now(),
-    updatedAtMs: Date.now(),
-    expiresAtMs: Date.now() + 60_000,
-    drainingUntilMs: null,
-    maxDrainingAtMs: null,
-    reservedRamMb: 0,
-    ramReservationUntilMs: 0,
-  };
-  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(state, null, 2));
-
-  const busyRes = await cmdExec(
-    stateDir,
-    ["node", "-e", "process.exit(0)"],
-    { build: true, wait: "0", session: "sess-wait0-busy" },
-    {
-      cwd: wsDir,
-      inventory: fakeInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-wait0-busy" },
-    },
-  );
-  assert.equal(busyRes.exitCode, 2);
-  assert.match(busyRes.error, /currently busy \(wait timeout reached\)/);
-
-  fs.rmSync(stateDir, { recursive: true, force: true });
-});
-
-test("starved pure builds can use burst slots, default burst capacity is 1, low-RAM fails fast with exitCode 5, and cmdGuard audits decisions", async () => {
+test("starved pure builds can use burst slots, default burst capacity is 1, and audit logs rotate across 3 files", () => {
   const defaultState = createDefaultState();
   assert.equal(defaultState.config.maxDeviceHolderBurstBuilds, 1, "Default maxDeviceHolderBurstBuilds must be 1");
 
@@ -917,173 +800,22 @@ test("starved pure builds can use burst slots, default burst capacity is 1, low-
   );
   assert.equal(sel.chosenIdx, 0, "Starved pure build must be admitted into burst slot");
 
-  // Low-RAM host with 0 active heavy builds and 0 active device leases fails fast with exitCode 5 even when wait > 0
-  const stateDir = makeTempDir();
-  const wsDir = path.join(stateDir, "workspace");
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
-
-  const stLowRam = readState(stateDir);
-  stLowRam.leases["serial:usb-phone-1"] = {
-    leaseId: "lease_phys_1",
-    deviceKey: "serial:usb-phone-1",
-    platform: "android",
-    kind: "physical",
-    serial: "usb-phone-1",
-    sessionId: "sess-other-phys",
-    state: "active",
-    claimedAtMs: Date.now(),
-    renewedAtMs: Date.now(),
-    expiresAtMs: Date.now() + 600_000,
-    firstSeenOfflineAtMs: null,
-  };
-  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(stLowRam, null, 2));
-
-  const lowRamInventory = {
-    host: {
-      cpuCores: 8,
-      totalRamMb: 8192,
-      availableRamMb: 1024, // < 2048 floor + 3072 build RAM
-      freeDiskMb: 50000,
-      sampledAtMs: Date.now(),
-    },
-    running: [],
-    offline: [],
-    creatable: [],
-  };
-
-  const lowRamRes = await cmdExec(
-    stateDir,
-    ["node", "-e", "process.exit(0)"],
-    { build: true, wait: "600", session: "sess-low-ram" },
-    {
-      cwd: wsDir,
-      inventory: lowRamInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-low-ram" },
-    },
-  );
-  assert.equal(lowRamRes.exitCode, 5, "Unrecoverable host RAM shortfall must fail fast with exitCode 5");
-  assert.match(lowRamRes.error, /Insufficient host RAM/);
-
-  // Standalone cmdGuard records guard_deny and guard_rewrite in audit log
-  cmdConfig(stateDir, "set", "coordinateBuilds", "true");
-  const denyRes = cmdGuard(
-    stateDir,
-    "adb shell input tap 1 1",
-    { session: "sess-guard" },
-    { runningCount: 2, platform: "darwin" },
-  );
-  assert.equal(denyRes.allowed, false);
-
-  const rewriteRes = cmdGuard(
-    stateDir,
-    "./gradlew assembleDebug",
-    { session: "sess-guard" },
-    { runningCount: 0, platform: "darwin" },
-  );
-  assert.equal(rewriteRes.allowed, true);
-  assert.ok(rewriteRes.rewrittenCommand);
-
-  const guardEvents = readRecentAuditEvents(stateDir, { category: "guard", limit: 10 });
-  const guardEventNames = guardEvents.map((e) => e.event);
-  assert.ok(guardEventNames.includes("guard_deny"), "cmdGuard must emit guard_deny audit event");
-  assert.ok(guardEventNames.includes("guard_rewrite"), "cmdGuard must emit guard_rewrite audit event");
-
   // Verify bounded 3-file audit log rotation (.1 -> .2 -> .3)
-  const rotDir = path.join(stateDir, "rot-logs");
-  for (let i = 1; i <= 4; i++) {
-    flushAuditEvents(
-      [{ event: "build_admit", sessionId: `rot-${i}`, buildId: `b_${i}` }],
-      { env: { ATC_LOG_DIR: rotDir }, maxFileBytes: 10, maxFiles: 3 },
-    );
+  const rotDir = path.join(makeTempDir(), "rot-logs");
+  try {
+    for (let i = 1; i <= 4; i++) {
+      flushAuditEvents(
+        [{ event: "build_admit", sessionId: `rot-${i}`, buildId: `b_${i}` }],
+        { env: { ATC_LOG_DIR: rotDir }, maxFileBytes: 10, maxFiles: 3 },
+      );
+    }
+    assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.jsonl")));
+    assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.1.jsonl")));
+    assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.2.jsonl")));
+    assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.3.jsonl")));
+  } finally {
+    fs.rmSync(path.dirname(rotDir), { recursive: true, force: true });
   }
-  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.jsonl")));
-  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.1.jsonl")));
-  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.2.jsonl")));
-  assert.ok(fs.existsSync(path.join(rotDir, "atc-audit.3.jsonl")));
-
-  fs.rmSync(stateDir, { recursive: true, force: true });
-});
-
-test("cmdExec --claim does not claim or boot a device when the build pool is full", async () => {
-  const stateDir = makeTempDir();
-  const wsDir = path.join(stateDir, "workspace");
-  fs.mkdirSync(wsDir, { recursive: true });
-  fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
-
-  const now = Date.now();
-  const state = readState(stateDir);
-  state.config.maxConcurrentBuilds = 1;
-  state.config.maxDeviceHolderBurstBuilds = 0;
-  state.buildLeases.build_active = {
-    buildId: "build_active",
-    sessionId: "sess-other-builder",
-    workerPid: process.pid,
-    workerPgid: null,
-    opId: "op_active",
-    opNonce: "nonce_active",
-    tool: "gradle",
-    workspaceRoot: "/other-workspace",
-    resourceKeys: ["gradle:/other-workspace"],
-    requiresWorkspaceLock: true,
-    requiresHeavySlot: true,
-    pinnedDeviceLeaseId: null,
-    state: "active",
-    createdAtMs: now,
-    updatedAtMs: now,
-    expiresAtMs: now + 60_000,
-    drainingUntilMs: null,
-    maxDrainingAtMs: null,
-    reservedRamMb: 0,
-    ramReservationUntilMs: 0,
-  };
-  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify(state, null, 2));
-
-  const fakeInventory = {
-    host: {
-      cpuCores: 8,
-      totalRamMb: 32768,
-      availableRamMb: 16384,
-      freeDiskMb: 50000,
-      sampledAtMs: now,
-    },
-    running: [
-      {
-        deviceKey: "Pixel_7_API_35",
-        serial: "emulator-5554",
-        avd: "Pixel_7_API_35",
-        platform: "android",
-        kind: "emulator",
-        profile: {
-          deviceType: "phone",
-          apiLevel: 35,
-          playStore: true,
-        },
-        state: "online",
-      },
-    ],
-    offline: [],
-    creatable: [],
-  };
-
-  const blockedRes = await cmdExec(
-    stateDir,
-    ["./gradlew", "connectedDebugAndroidTest"],
-    { claim: true, wait: "0", session: "sess-blocked-coalloc" },
-    {
-      cwd: wsDir,
-      inventory: fakeInventory,
-      env: { ...process.env, ATC_SESSION_ID: "sess-blocked-coalloc" },
-    },
-  );
-  assert.equal(blockedRes.exitCode, 2);
-  assert.match(blockedRes.error, /currently busy \(wait timeout reached\)/);
-
-  // Verify the device was NEVER claimed because the build slot was full!
-  const afterState = readState(stateDir);
-  assert.deepEqual(afterState.leases, {}, "Device must not be claimed while build slot is unavailable");
-
-  fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
 test("computeUnaccountedBuildRamMb keeps preparingDevice build RAM reserved even after initial 30s window", () => {
@@ -1110,121 +842,139 @@ test("computeUnaccountedBuildRamMb keeps preparingDevice build RAM reserved even
   );
 });
 
-test("resolveBuildResources and buildChildInvocation handle quoted shell paths, shell xcodebuild destinations, and Bazel startup flags with subcommand names", () => {
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "atc-round5-"));
+// ---------------------------------------------------------------------------
+// Gradle: gradle.properties heap/daemon detection and warm daemon probing
+// ---------------------------------------------------------------------------
+
+test("Gradle heap/daemon detection from gradle.properties, JVM option env vars and invocation env", () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-gradle-props-"));
+  try {
+    const dirB = path.join(wsDir, "b");
+    fs.mkdirSync(dirB, { recursive: true });
+    fs.writeFileSync(path.join(dirB, "settings.gradle"), "rootProject.name = 'b'\n");
+    const subAppDir = path.join(wsDir, "app");
+    fs.mkdirSync(subAppDir, { recursive: true });
+    fs.writeFileSync(path.join(subAppDir, "settings.gradle"), "rootProject.name = 'subapp'\n");
+
+    // gradle.properties org.gradle.jvmargs supplies the heap hint
+    fs.writeFileSync(path.join(subAppDir, "gradle.properties"), "org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n");
+    const subAppGradleReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
+    assert.equal(subAppGradleReqs.requestedHeapMb, 2048);
+    assert.equal(subAppGradleReqs.disablesDaemon, false);
+
+    // Java .properties parser supports ':' separator and backslash line continuation in gradle.properties
+    fs.writeFileSync(
+      path.join(subAppDir, "gradle.properties"),
+      "! comment line\norg.gradle.jvmargs : -Xmx4g \\\n  -Dfile.encoding=UTF-8\n",
+    );
+    assert.equal(resolveBuildResources("./gradlew", ["build"], subAppDir).requestedHeapMb, 4096);
+
+    // $GRADLE_USER_HOME/gradle.properties overrides project properties
+    const isolatedGradleHome = path.join(wsDir, "isolated-gradle-home");
+    fs.mkdirSync(isolatedGradleHome, { recursive: true });
+    fs.writeFileSync(path.join(isolatedGradleHome, "gradle.properties"), "org.gradle.jvmargs=-Xmx8g -Dfile.encoding=UTF-8\n");
+    const userHomeOverrideReqs = resolveBuildResources("./gradlew", ["build"], subAppDir, {
+      env: { ...process.env, GRADLE_USER_HOME: isolatedGradleHome },
+    });
+    assert.equal(userHomeOverrideReqs.requestedHeapMb, 8192);
+    assert.equal(userHomeOverrideReqs.gradleUserHomeDir, isolatedGradleHome);
+
+    // gradle/gradle-daemon-jvm.properties marks the build cold
+    fs.mkdirSync(path.join(subAppDir, "gradle"), { recursive: true });
+    fs.writeFileSync(path.join(subAppDir, "gradle", "gradle-daemon-jvm.properties"), "toolchainVersion=21\ntoolchainVendor=temurin\n");
+    assert.equal(resolveBuildResources("./gradlew", ["build"], subAppDir).disablesDaemon, true);
+
+    // Installation-level $GRADLE_HOME/gradle.properties is loaded with lowest precedence
+    const fakeGradleHome = path.join(wsDir, "gradle-dist");
+    const fakeUserHome = path.join(wsDir, "gradle-user");
+    fs.mkdirSync(fakeGradleHome, { recursive: true });
+    fs.mkdirSync(fakeUserHome, { recursive: true });
+    fs.writeFileSync(path.join(fakeGradleHome, "gradle.properties"), "org.gradle.jvmargs=-Xmx3g\norg.gradle.daemon=false\n");
+    const gradleHomeOnlyReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { GRADLE_HOME: fakeGradleHome, GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(gradleHomeOnlyReqs.requestedHeapMb, 3072);
+    assert.equal(gradleHomeOnlyReqs.disablesDaemon, true);
+
+    // Project gradle.properties overrides $GRADLE_HOME/gradle.properties
+    fs.writeFileSync(path.join(dirB, "gradle.properties"), "org.gradle.jvmargs=-Xmx4g\norg.gradle.daemon=true\n");
+    const projectOverridesDistReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { GRADLE_HOME: fakeGradleHome, GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(projectOverridesDistReqs.requestedHeapMb, 4096);
+    assert.equal(projectOverridesDistReqs.disablesDaemon, false);
+
+    // Duplicate heap flags: the last one wins
+    fs.writeFileSync(path.join(dirB, "gradle.properties"), "org.gradle.jvmargs=-Xmx1g -Xmx8g\n");
+    assert.equal(
+      resolveBuildResources("./gradlew", ["assembleDebug"], dirB, { env: { GRADLE_USER_HOME: fakeUserHome } }).requestedHeapMb,
+      8192,
+    );
+    fs.rmSync(path.join(dirB, "gradle.properties"), { force: true });
+
+    // JVM option env vars (_JAVA_OPTIONS, JAVA_OPTS, GRADLE_OPTS, JAVA_TOOL_OPTIONS) override a smaller CLI heap and mark the build cold
+    for (const [key, val, expected] of [
+      ["_JAVA_OPTIONS", "-Xmx16g", 16384],
+      ["JAVA_OPTS", "-Xmx8g", 8192],
+      ["GRADLE_OPTS", "-Xmx6g", 6144],
+      ["JAVA_TOOL_OPTIONS", "-Xmx12g", 12288],
+    ]) {
+      const res = resolveBuildResources("./gradlew", ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"], dirB, {
+        env: { [key]: val, GRADLE_USER_HOME: fakeUserHome },
+      });
+      assert.equal(res.requestedHeapMb, expected, key);
+      assert.equal(res.disablesDaemon, true, key);
+    }
+
+    // Per-invocation env (batch step env) is honoured the same way as the caller env
+    const gradleOptsReqs = resolveBuildResources("./gradlew", ["build"], subAppDir, {
+      inheritedEnvVars: { GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx8g" },
+    });
+    assert.equal(gradleOptsReqs.disablesDaemon, true);
+    assert.equal(gradleOptsReqs.requestedHeapMb, 8192);
+
+    // -Xms initial heap settings also reserve RAM alongside -Xmx
+    const xmsGradleHeap = resolveBuildResources("./gradlew", ["-Dorg.gradle.jvmargs=-Xms8g", "assembleDebug"], dirB, {
+      env: { GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(xmsGradleHeap.requestedHeapMb, 8192);
+    assert.equal(computeColdBuildRamDemandMb(xmsGradleHeap, 3072), 8192);
+
+    // CLI daemon-affecting flags mark the invocation cold
+    for (const flag of ["--no-daemon", "-Dorg.gradle.daemon=false", "--java-home=/jdk", "-Dgradle.user.home=/tmp/x"]) {
+      assert.equal(resolveBuildResources("./gradlew", ["build", flag], dirB, { env: {} }).disablesDaemon, true, flag);
+    }
+
+    // Invocation env overrides and unsets are recorded for warm-daemon matching
+    const javaHomeReqs = resolveBuildResources("./gradlew", ["build"], dirB, { inheritedEnvVars: { JAVA_HOME: "/opt/jdk-21" } });
+    assert.equal(javaHomeReqs.envJavaHome, "/opt/jdk-21");
+    const unsetJavaHomeReqs = resolveBuildResources("./gradlew", ["build"], dirB, { inheritedEnvVars: { JAVA_HOME: null } });
+    assert.equal(unsetJavaHomeReqs.envJavaHomeUnset, true);
+    const isolatedHomeReqs = resolveBuildResources("./gradlew", ["build"], dirB, {
+      env: {},
+      inheritedEnvVars: { GRADLE_USER_HOME: isolatedGradleHome },
+    });
+    assert.equal(isolatedHomeReqs.envGradleUserHome, isolatedGradleHome);
+    assert.equal(isolatedHomeReqs.gradleUserHomeDir, isolatedGradleHome);
+    const clearedHomeReqs = resolveBuildResources("./gradlew", ["build"], dirB, {
+      env: { GRADLE_USER_HOME: isolatedGradleHome },
+      inheritedEnvVars: { GRADLE_USER_HOME: null },
+    });
+    assert.equal(clearedHomeReqs.envGradleUserHomeUnset, true);
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test("probeWarmBuildDaemons matches warm Gradle daemons by version, JVM, user home, JVM args and locale", () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "atc-warm-gradle-"));
   try {
     const spacedAppDir = path.join(tmpRoot, "my app");
     fs.mkdirSync(spacedAppDir, { recursive: true });
     fs.writeFileSync(path.join(spacedAppDir, "settings.gradle.kts"), "");
-
-    const resQuotedCd = resolveBuildResources(
-      "sh",
-      ["-c", 'cd "my app" && ./gradlew test'],
-      tmpRoot,
-      process.env,
-    );
     const canonicalSpacedApp = canonicalizeBuildPath(spacedAppDir);
-    assert.ok(
-      resQuotedCd.resourceKeys.includes(`gradle:${canonicalSpacedApp}`),
-      `Expected gradle:${canonicalSpacedApp} in ${JSON.stringify(resQuotedCd.resourceKeys)}`,
-    );
 
-    const iosLease = {
-      leaseId: "lease-ios-shell",
-      platform: "ios",
-      kind: "emulator",
-      serial: "SIM-UDID-999",
-      udid: "SIM-UDID-999",
-    };
-    const buildLease = {
-      buildId: "bld-shell-1",
-      jobsLimit: 4,
-      reservedRamMb: 3072,
-    };
-
-    const xcShellInv = buildChildInvocation(
-      "sh",
-      ["-c", "xcodebuild test -scheme App"],
-      iosLease,
-      "sess-round5",
-      process.env,
-      buildLease,
-    );
-    assert.match(xcShellInv.args[1], /-jobs 4/);
-    assert.match(xcShellInv.args[1], /-destination id=SIM-UDID-999/);
-
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "sh",
-          ["-c", 'xcodebuild test -scheme App -destination "platform=iOS Simulator,name=iPhone 16"'],
-          iosLease,
-          "sess-round5",
-          process.env,
-          buildLease,
-        ),
-      /Conflicting device selector/,
-    );
-
-    const bazelShellInv = buildChildInvocation(
-      "sh",
-      ["-c", "bazel --output_base=/tmp/build build //app:bin"],
-      null,
-      "sess-round5",
-      process.env,
-      buildLease,
-    );
-    assert.equal(
-      bazelShellInv.args[1],
-      "bazel --output_base=/tmp/build build --jobs=4 --local_ram_resources=3072 //app:bin",
-    );
-
-    // Wrapped xcodebuild (env FOO=1 xcodebuild test / xcrun --sdk iphonesimulator xcodebuild test)
-    const xcEnvInv = buildChildInvocation(
-      "env",
-      ["FOO=1", "xcodebuild", "test", "-scheme", "App"],
-      iosLease,
-      "sess-round6",
-      process.env,
-      buildLease,
-    );
-    assert.ok(xcEnvInv.args.includes("-destination"));
-    assert.ok(xcEnvInv.args.includes("id=SIM-UDID-999"));
-
-    const xcSdkInv = buildChildInvocation(
-      "xcrun",
-      ["--sdk", "iphonesimulator", "xcodebuild", "test", "-scheme", "App"],
-      iosLease,
-      "sess-round6",
-      process.env,
-      buildLease,
-    );
-    assert.ok(xcSdkInv.args.includes("-destination"));
-    assert.ok(xcSdkInv.args.includes("id=SIM-UDID-999"));
-
-    // Multiple -destination flags: second unleased destination must be rejected
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "xcodebuild",
-          [
-            "test",
-            "-scheme",
-            "App",
-            "-destination",
-            "id=SIM-UDID-999",
-            "-destination",
-            "id=UNLEASED-UDID",
-          ],
-          iosLease,
-          "sess-round6",
-          process.env,
-          buildLease,
-        ),
-      /Conflicting device selector "UNLEASED-UDID"/,
-    );
-
-    // probeWarmBuildDaemons detects warm GradleDaemon by matching wrapper version or workspace path unless --no-daemon / --batch
+    // Wrapper version match
     const wrapperDir = path.join(spacedAppDir, "gradle", "wrapper");
     fs.mkdirSync(wrapperDir, { recursive: true });
     fs.writeFileSync(
@@ -1260,11 +1010,7 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
     });
     assert.equal(mismatchedGradle.warm, false);
 
-    const noDaemonReqs = resolveBuildResources(
-      "./gradlew",
-      ["assembleDebug", "--no-daemon"],
-      spacedAppDir,
-    );
+    const noDaemonReqs = resolveBuildResources("./gradlew", ["assembleDebug", "--no-daemon"], spacedAppDir);
     assert.equal(
       probeWarmBuildDaemons(noDaemonReqs, {
         runner: () => ({
@@ -1274,605 +1020,359 @@ test("resolveBuildResources and buildChildInvocation handle quoted shell paths, 
       false,
     );
 
-    // Leading shell variable assignments and Windows cmd /c & pwsh -Command wrappers
-    const shellEnvReqs = resolveBuildResources(
-      "sh",
-      ["-c", "JAVA_HOME=/jdk ./gradlew connectedDebugAndroidTest"],
-      spacedAppDir,
-    );
-    assert.equal(shellEnvReqs.tool, "gradle");
-    assert.equal(shellEnvReqs.requiresDevice, true);
-
-    const winCmdReqs = resolveBuildResources(
-      "cmd",
-      ["/c", "gradlew.bat", "connectedCheck"],
-      spacedAppDir,
-    );
-    assert.equal(winCmdReqs.tool, "gradle");
-    assert.equal(winCmdReqs.requiresDevice, true);
-    assert.ok(winCmdReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
-
-    const winCmdInv = buildChildInvocation(
-      "cmd",
-      ["/c", "gradlew.bat", "assembleDebug"],
-      null,
-      "sess-round8",
-      process.env,
-      buildLease,
-    );
-    assert.match(winCmdInv.args[1], /-Dorg\.gradle\.workers\.max=4/);
-
-    // timeout wrapper peeling
-    const timeoutReqs = resolveBuildResources(
-      "timeout",
-      ["-k", "30s", "10m", "./gradlew", "assembleDebug"],
-      spacedAppDir,
-    );
-    assert.equal(timeoutReqs.tool, "gradle");
-    assert.ok(timeoutReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
-
-    // Single-pipe stage splitting in shell wrapper
-    const pipedGradleInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build | tee build.log"],
-      null,
-      "sess-round7",
-      process.env,
-      buildLease,
-    );
+    // Inventory-provided warm daemons are matched per tool and workspace
     assert.equal(
-      pipedGradleInv.args[1],
-      "./gradlew build -Dorg.gradle.workers.max=4 | tee build.log",
+      probeWarmBuildDaemons(gradleReqs, {
+        inventory: { warmBuildDaemons: [{ tool: "bazel", workspaceRoot: canonicalSpacedApp, pid: 2222 }] },
+      }).warm,
+      false,
     );
-
-    // Shell-wrapped xcodebuild test-without-building pins destination without requiring heavy slot
-    const testWithoutBuildingInv = buildChildInvocation(
-      "sh",
-      ["-c", "xcodebuild test-without-building -scheme App"],
-      iosLease,
-      "sess-round7",
-      process.env,
-      null,
-    );
-    assert.equal(
-      testWithoutBuildingInv.args[1],
-      "xcodebuild test-without-building -scheme App -destination id=SIM-UDID-999",
-    );
-
-    // Quoted shell separators inside arguments are preserved intact
-    const quotedSepInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build -Pfilter='a|b;c&&d'"],
-      null,
-      "sess-round9",
-      process.env,
-      buildLease,
-    );
-    assert.equal(
-      quotedSepInv.args[1],
-      "./gradlew build -Pfilter='a|b;c&&d' -Dorg.gradle.workers.max=4",
-    );
-
-    // Mixed-platform device-coupled shell clauses are denied
-    const mixedDeviceReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew connectedCheck && xcodebuild test -scheme App"],
-      spacedAppDir,
-    );
-    assert.equal(mixedDeviceReqs.kind, "deny_lifecycle");
-    assert.match(mixedDeviceReqs.reason, /Mixed-platform device-coupled build clauses/);
-
-    // Multi-tool warm daemon probe checks every heavy tool in the shell wrapper
-    const multiToolReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew assembleDebug && bazel --nosystem_rc build //app"],
-      spacedAppDir,
-    );
-    const onlyGradleWarm = probeWarmBuildDaemons(multiToolReqs, {
-      inventory: {
-        warmBuildDaemons: [{ tool: "gradle", workspaceRoot: canonicalSpacedApp, pid: 1111 }],
-      },
+    const inventoryWarm = probeWarmBuildDaemons(gradleReqs, {
+      inventory: { warmBuildDaemons: [{ tool: "gradle", workspaceRoot: canonicalSpacedApp, pid: 1111 }] },
     });
-    assert.equal(onlyGradleWarm.warm, false);
-    const bothWarm = probeWarmBuildDaemons(multiToolReqs, {
-      inventory: {
-        warmBuildDaemons: [
-          { tool: "gradle", workspaceRoot: canonicalSpacedApp, pid: 1111 },
-          { tool: "bazel", workspaceRoot: canonicalSpacedApp, pid: 2222 },
-        ],
-      },
-    });
-    assert.equal(bothWarm.warm, true);
-    assert.deepEqual(bothWarm.daemonPids, [1111, 2222]);
-
-    // Grouped shell commands place injected flags inside the closing parenthesis and preserve cd scope
-    const groupedReqs = resolveBuildResources(
-      "sh",
-      ["-c", '(cd "my app" && ./gradlew connectedCheck)'],
-      tmpRoot,
-    );
-    assert.equal(groupedReqs.kind, "device_coupled_build");
-    assert.ok(groupedReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
-    const groupedInv = buildChildInvocation(
-      "sh",
-      ["-c", '(cd "my app" && ./gradlew build)'],
-      null,
-      "sess-round10",
-      process.env,
-      buildLease,
-    );
-    assert.equal(
-      groupedInv.args[1],
-      '(cd "my app" && ./gradlew build -Dorg.gradle.workers.max=4)',
-    );
+    assert.equal(inventoryWarm.warm, true);
+    assert.deepEqual(inventoryWarm.daemonPids, [1111]);
 
     // Invocation JAVA_HOME is honored when matching warm Gradle daemons
-    const javaHomeReqs = resolveBuildResources(
-      "env",
-      ["JAVA_HOME=/opt/jdk-21", "./gradlew", "assembleDebug"],
-      spacedAppDir,
-    );
-    assert.equal(javaHomeReqs.envJavaHome, "/opt/jdk-21");
-    const wrongJavaProbe = probeWarmBuildDaemons(javaHomeReqs, {
-      platform: "darwin",
-      runner: () => ({
-        status: 0,
-        stdout: "54321 /opt/jdk-17/bin/java -Xmx4g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
-      }),
+    const javaHomeReqs = resolveBuildResources("./gradlew", ["assembleDebug"], spacedAppDir, {
+      inheritedEnvVars: { JAVA_HOME: "/opt/jdk-21" },
     });
-    assert.equal(wrongJavaProbe.warm, false);
-    const matchingJavaProbe = probeWarmBuildDaemons(javaHomeReqs, {
-      platform: "darwin",
-      runner: () => ({
-        status: 0,
-        stdout: "54321 /opt/jdk-21/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n",
-      }),
-    });
-    assert.equal(matchingJavaProbe.warm, true);
-
-    // Peel shell exec builtin
-    const execBuiltinReqs = resolveBuildResources(
-      "sh",
-      ["-c", "exec ./gradlew connectedCheck"],
-      spacedAppDir,
-    );
-    assert.equal(execBuiltinReqs.kind, "device_coupled_build");
-    assert.ok(execBuiltinReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
-
-    // Track pushd and popd across shell clauses
-    fs.writeFileSync(path.join(tmpRoot, "settings.gradle.kts"), "");
-    const canonicalTmpRoot = canonicalizeBuildPath(tmpRoot);
-    const pushdPopdReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'pushd "my app" && ./gradlew assembleDebug && popd && ./gradlew test'],
-      tmpRoot,
-    );
-    assert.ok(pushdPopdReqs.resourceKeys.includes(`gradle:${canonicalSpacedApp}`));
-    assert.ok(pushdPopdReqs.resourceKeys.includes(`gradle:${canonicalTmpRoot}`));
-
-    // Quoted > inside arguments is not treated as a shell redirection
-    const quotedRedirInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build -Pfilter='a > b'"],
-      null,
-      "sess-round11",
-      process.env,
-      buildLease,
+    assert.equal(
+      probeWarmBuildDaemons(javaHomeReqs, {
+        platform: "darwin",
+        runner: () => ({ status: 0, stdout: "54321 /opt/jdk-17/bin/java -Xmx4g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n" }),
+      }).warm,
+      false,
     );
     assert.equal(
-      quotedRedirInv.args[1],
-      "./gradlew build -Pfilter='a > b' -Dorg.gradle.workers.max=4",
+      probeWarmBuildDaemons(javaHomeReqs, {
+        platform: "darwin",
+        runner: () => ({ status: 0, stdout: "54321 /opt/jdk-21/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10\n" }),
+      }).warm,
+      true,
     );
 
-    // Bazel separate startup-option value named "build" does not confuse subcommand location
-    const bazelDirectOutBaseInv = buildChildInvocation(
-      "bazel",
-      ["--output_base", "build", "build", "//app"],
-      null,
-      "sess-round11",
-      process.env,
-      buildLease,
-    );
-    assert.deepEqual(bazelDirectOutBaseInv.args, [
-      "--output_base",
-      "build",
-      "build",
-      "--jobs=4",
-      "--local_ram_resources=3072",
-      "//app",
-    ]);
-    const bazelShellOutBaseInv = buildChildInvocation(
-      "sh",
-      ["-c", "bazel --output_base build build //app"],
-      null,
-      "sess-round11",
-      process.env,
-      buildLease,
+    // Unset JAVA_HOME resolves java from PATH
+    const wsDir = path.join(tmpRoot, "ws");
+    fs.mkdirSync(wsDir, { recursive: true });
+    fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
+    const unsetJavaHomeReqs = resolveBuildResources("./gradlew", ["build"], wsDir, { inheritedEnvVars: { JAVA_HOME: null } });
+    const mockJdkHome = path.join(wsDir, "jdk21");
+    const mockJdkBin = path.join(mockJdkHome, "bin");
+    fs.mkdirSync(mockJdkBin, { recursive: true });
+    fs.writeFileSync(path.join(mockJdkBin, process.platform === "win32" ? "java.exe" : "java"), "");
+    const canonicalMockJdkHome = realpath(mockJdkHome);
+    const mockJava = path.join(canonicalMockJdkHome, "bin", "java");
+    assert.equal(
+      probeWarmBuildDaemons(unsetJavaHomeReqs, {
+        env: { JAVA_HOME: "/nonexistent/parent/java", PATH: mockJdkBin },
+        runner: () => ({
+          stdout: `4241 /Library/Java/JDK17/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
+        }),
+      }).warm,
+      false,
     );
     assert.equal(
-      bazelShellOutBaseInv.args[1],
-      "bazel --output_base build build --jobs=4 --local_ram_resources=3072 //app",
+      probeWarmBuildDaemons(unsetJavaHomeReqs, {
+        env: { JAVA_HOME: "/nonexistent/parent/java", PATH: mockJdkBin },
+        runner: () => ({ stdout: `4242 ${mockJava} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n` }),
+      }).warm,
+      true,
+    );
+    assert.equal(
+      probeWarmBuildDaemons(unsetJavaHomeReqs, {
+        env: { JAVA_HOME: "/nonexistent/parent/java", PATH: path.join(wsDir, "no-such-bin") },
+        runner: () => ({ stdout: `4242 ${mockJava} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n` }),
+      }).warm,
+      false,
     );
 
-    // Background & separator splits before echo and marks backgrounded builds as reject_long_running
-    const bgInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build & echo done"],
-      null,
-      "sess-round12",
-      process.env,
-      buildLease,
+    // GRADLE_USER_HOME isolation in warm daemon probe
+    const isolatedGradleHome = path.join(wsDir, "isolated-gradle-home");
+    const gradleUserHomeReqs = resolveBuildResources("./gradlew", ["build"], wsDir, {
+      inheritedEnvVars: { GRADLE_USER_HOME: isolatedGradleHome },
+    });
+    assert.equal(
+      probeWarmBuildDaemons(gradleUserHomeReqs, {
+        env: { JAVA_HOME: canonicalMockJdkHome },
+        runner: () => ({ stdout: `4242 ${mockJava} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${gradleUserHomeReqs.workspaceRoot}\n` }),
+      }).warm,
+      false,
     );
-    assert.equal(bgInv.args[1], "./gradlew build -Dorg.gradle.workers.max=4 & echo done");
-    const bgReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew build & echo done"],
-      spacedAppDir,
+    assert.equal(
+      probeWarmBuildDaemons(gradleUserHomeReqs, {
+        env: { JAVA_HOME: canonicalMockJdkHome },
+        runner: () => ({
+          stdout: `4242 ${mockJava} -Dgradle.user.home=${isolatedGradleHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${gradleUserHomeReqs.workspaceRoot}\n`,
+        }),
+      }).warm,
+      true,
     );
-    assert.equal(bgReqs.kind, "reject_long_running");
 
-    // Absolute cd path replaces prior relative cd path
-    const absCdReqs = resolveBuildResources(
-      "sh",
-      ["-c", `cd fake-sub && cd ${JSON.stringify(spacedAppDir)} && ./gradlew assembleDebug`],
-      tmpRoot,
+    // A cleared invocation GRADLE_USER_HOME does not fall back to the caller's GRADLE_USER_HOME
+    const clearedHomeReqs = resolveBuildResources("./gradlew", ["build"], wsDir, {
+      inheritedEnvVars: { GRADLE_USER_HOME: null, PATH: mockJdkBin },
+    });
+    assert.equal(clearedHomeReqs.envGradleUserHomeUnset, true);
+    assert.equal(
+      probeWarmBuildDaemons(clearedHomeReqs, {
+        env: { GRADLE_USER_HOME: isolatedGradleHome, JAVA_HOME: canonicalMockJdkHome },
+        runner: () => ({
+          stdout: `4242 ${mockJava} -Dgradle.user.home=${isolatedGradleHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${clearedHomeReqs.workspaceRoot}\n`,
+        }),
+      }).warm,
+      false,
     );
-    assert.deepEqual(absCdReqs.resourceKeys, [`gradle:${canonicalSpacedApp}`]);
+
+    // gradle.properties org.gradle.jvmargs compares all daemon-affecting JVM args (including -D properties)
+    const subAppDir = path.join(wsDir, "app");
+    fs.mkdirSync(subAppDir, { recursive: true });
+    fs.writeFileSync(path.join(subAppDir, "settings.gradle"), "rootProject.name = 'subapp'\n");
+    const canonicalSubApp = realpath(subAppDir);
+    fs.writeFileSync(path.join(subAppDir, "gradle.properties"), "org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n");
+    const subAppGradleReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
+    assert.equal(
+      probeWarmBuildDaemons(subAppGradleReqs, {
+        env: { JAVA_HOME: canonicalMockJdkHome },
+        runner: () => ({
+          stdout: `5001 ${mockJava} -Xmx2g -Dfile.encoding=US-ASCII org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+        }),
+      }).warm,
+      false,
+    );
+    assert.equal(
+      probeWarmBuildDaemons(subAppGradleReqs, {
+        env: { JAVA_HOME: canonicalMockJdkHome },
+        runner: () => ({
+          stdout: `5001 ${mockJava} -Xmx2g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+        }),
+      }).warm,
+      true,
+    );
+
+    // $GRADLE_USER_HOME/gradle.properties heap override rejects a daemon started with the stale project heap
+    fs.mkdirSync(isolatedGradleHome, { recursive: true });
+    fs.writeFileSync(path.join(isolatedGradleHome, "gradle.properties"), "org.gradle.jvmargs=-Xmx8g -Dfile.encoding=UTF-8\n");
+    const userHomeOverrideReqs = resolveBuildResources("./gradlew", ["build"], subAppDir, {
+      env: { ...process.env, GRADLE_USER_HOME: isolatedGradleHome },
+    });
+    assert.equal(
+      probeWarmBuildDaemons(userHomeOverrideReqs, {
+        env: { JAVA_HOME: canonicalMockJdkHome, GRADLE_USER_HOME: isolatedGradleHome },
+        runner: () => ({
+          stdout: `5002 ${mockJava} -Dgradle.user.home=${isolatedGradleHome} -Xmx2g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+        }),
+      }).warm,
+      false,
+    );
+
+    // gradle-daemon-jvm.properties prevents warm daemon false positives
+    fs.writeFileSync(path.join(subAppDir, "gradle.properties"), "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8\n");
+    fs.mkdirSync(path.join(subAppDir, "gradle"), { recursive: true });
+    fs.writeFileSync(path.join(subAppDir, "gradle", "gradle-daemon-jvm.properties"), "toolchainVersion=21\n");
+    const daemonCriteriaReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
+    assert.equal(
+      probeWarmBuildDaemons(daemonCriteriaReqs, {
+        env: { JAVA_HOME: canonicalMockJdkHome },
+        runner: () => ({
+          stdout: `5001 ${mockJava} -Xmx4g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
+        }),
+      }).warm,
+      false,
+    );
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
-test("cmdExec enforces matching-platform lease for device builds and keeps device commands from bypassing leases via --build", async () => {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-plat-guard-"));
-  const fakeInventory = {
-    hostResources: {
-      totalMemMb: 32768,
-      freeMemMb: 16384,
-      availableMemMb: 16384,
-      cpus: 8,
-      sampledAtMs: Date.now(),
-    },
-    running: [
-      {
-        deviceKey: "Pixel_7_API_35",
-        serial: "emulator-5554",
-        avd: "Pixel_7_API_35",
-        platform: "android",
-        kind: "emulator",
-        profile: { deviceType: "phone", apiLevel: 35, playStore: true },
-        state: "online",
-      },
-    ],
-    offline: [],
-    creatable: [],
-  };
+test("probeWarmBuildDaemons: default Gradle JVM args, locale, duplicate heap precedence and busy daemon exclusion", () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-warm-default-"));
   try {
-    // 1. atc exec --build -- adb install app.apk must still require a device lease
-    const noLeaseAdbBuild = await cmdExec(
-      stateDir,
-      ["adb", "install", "app.apk"],
-      { build: true, session: "sess-no-lease" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "sess-no-lease" },
-        livenessCheck: () => true,
-      },
-    );
-    assert.equal(noLeaseAdbBuild.exitCode, 3);
-    assert.match(noLeaseAdbBuild.error, /holds no active android device lease/);
+    const dirB = path.join(wsDir, "b");
+    fs.mkdirSync(dirB, { recursive: true });
+    fs.writeFileSync(path.join(dirB, "settings.gradle"), "rootProject.name = 'b'\n");
+    const canonicalDirB = realpath(dirB);
+    const mockJdk = path.join(wsDir, "jdk-def");
+    fs.mkdirSync(path.join(mockJdk, "bin"), { recursive: true });
+    fs.writeFileSync(path.join(mockJdk, "bin", process.platform === "win32" ? "java.exe" : "java"), "");
+    const canonicalMockJdk = realpath(mockJdk);
+    const java = path.join(canonicalMockJdk, "bin", "java");
+    const fakeUserHome = path.join(wsDir, "gradle-user");
+    fs.mkdirSync(fakeUserHome, { recursive: true });
 
-    // 2. Holding only an Android lease must not allow xcodebuild test to proceed without an iOS lease
-    const claimRes = cmdClaim(
-      stateDir,
-      { session: "sess-android-only" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "sess-android-only" },
-        livenessCheck: () => true,
-      },
+    // Default Gradle JVM arguments match warm daemon when org.gradle.jvmargs is unset
+    const plainReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, { env: { HOME: wsDir } });
+    const defaultJvmWarmProbe = probeWarmBuildDaemons(plainReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, HOME: wsDir },
+      runner: () => ({
+        stdout: `7001 ${java} -Xmx512m -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(defaultJvmWarmProbe.warm, true);
+    assert.deepEqual(defaultJvmWarmProbe.daemonPids, [7001]);
+    assert.equal(
+      probeWarmBuildDaemons(plainReqs, {
+        env: { JAVA_HOME: canonicalMockJdk, HOME: wsDir },
+        runner: () => ({
+          stdout: `7002 ${java} -Xmx2g -XX:MaxMetaspaceSize=384m org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+        }),
+      }).warm,
+      false,
+      "non-default heap when org.gradle.jvmargs is unset must not match",
     );
-    assert.equal(claimRes.exitCode, 0);
 
-    const wrongPlatBuild = await cmdExec(
-      stateDir,
-      ["xcodebuild", "test", "-scheme", "App"],
-      { session: "sess-android-only" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "sess-android-only" },
-        livenessCheck: () => true,
-      },
+    // Duplicate JVM heap args: effective (last) value must match the daemon
+    fs.writeFileSync(path.join(dirB, "gradle.properties"), "org.gradle.jvmargs=-Xmx1g -Xmx8g\n");
+    const dupHeapReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+    });
+    assert.equal(dupHeapReqs.requestedHeapMb, 8192);
+    assert.equal(
+      probeWarmBuildDaemons(dupHeapReqs, {
+        env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+        runner: () => ({
+          stdout: `7010 ${java} -Dgradle.user.home=${fakeUserHome} -Xmx8g -Xmx1g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+        }),
+      }).warm,
+      false,
     );
-    assert.equal(wrongPlatBuild.exitCode, 3);
-    assert.match(wrongPlatBuild.error, /holds no active ios device lease/);
+    const matchingEffectiveDaemonProbe = probeWarmBuildDaemons(dupHeapReqs, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+      runner: () => ({
+        stdout: `7011 ${java} -Dgradle.user.home=${fakeUserHome} -Xmx8g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
+      }),
+    });
+    assert.equal(matchingEffectiveDaemonProbe.warm, true);
+    assert.deepEqual(matchingEffectiveDaemonProbe.daemonPids, [7011]);
+    fs.rmSync(path.join(dirB, "gradle.properties"), { force: true });
 
-    // 3. Holding an unrelated Android lease must not satisfy --claim with a different profile selector
-    const mismatchedAvdClaim = await cmdExec(
-      stateDir,
-      ["node", "-e", "process.exit(0)"],
-      { build: true, claim: true, avd: "Pixel_8_API_35", wait: 0, session: "sess-android-only" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "sess-android-only" },
-        livenessCheck: () => true,
-      },
+    // Full default Gradle daemon compatibility set including locale
+    const defaultGradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
+    });
+    const daemonLine = (pid, country, lang) =>
+      `${pid} ${java} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=${country} -Duser.language=${lang} -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`;
+    const baseEnv = { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome };
+    const localeEnv = (lang) => ({ ...baseEnv, LC_ALL: "", LC_MESSAGES: "", LANG: lang });
+
+    const fullDefaultDaemonProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: baseEnv,
+      runner: () => ({ stdout: `${daemonLine(7020, "US", "en")}\n` }),
+    });
+    assert.equal(fullDefaultDaemonProbe.warm, true);
+    assert.deepEqual(fullDefaultDaemonProbe.daemonPids, [7020]);
+    assert.equal(
+      probeWarmBuildDaemons(defaultGradleReqs, { env: localeEnv("en_US.UTF-8"), runner: () => ({ stdout: `${daemonLine(7021, "FR", "fr")}\n` }) }).warm,
+      false,
     );
-    assert.notEqual(mismatchedAvdClaim.exitCode, 0);
+    assert.equal(
+      probeWarmBuildDaemons(defaultGradleReqs, { env: localeEnv("fr_FR.UTF-8"), runner: () => ({ stdout: `${daemonLine(7022, "US", "en")}\n` }) }).warm,
+      false,
+      "non-English host locale rejects English daemon",
+    );
+    assert.equal(
+      probeWarmBuildDaemons(defaultGradleReqs, { env: localeEnv("fr_FR.UTF-8"), runner: () => ({ stdout: `${daemonLine(7023, "FR", "fr")}\n` }) }).warm,
+      true,
+    );
+
+    // Invocation-level LANG override / unset (batch step env) is honoured over the caller env
+    const frInvocationReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: localeEnv("en_US.UTF-8"),
+      inheritedEnvVars: { LANG: "fr_FR.UTF-8" },
+    });
+    assert.equal(
+      probeWarmBuildDaemons(frInvocationReqs, { env: localeEnv("en_US.UTF-8"), runner: () => ({ stdout: `${daemonLine(7024, "US", "en")}\n` }) }).warm,
+      false,
+    );
+    const unsetLangReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
+      env: localeEnv("fr_FR.UTF-8"),
+      inheritedEnvVars: { LANG: null },
+    });
+    assert.equal(
+      probeWarmBuildDaemons(unsetLangReqs, { env: localeEnv("fr_FR.UTF-8"), runner: () => ({ stdout: `${daemonLine(7025, "FR", "fr")}\n` }) }).warm,
+      false,
+    );
+
+    // Busy Gradle daemon is not double-counted as warm for a concurrent Gradle build
+    const otherLease = (claimedDaemonPid) => ({
+      build_other_gradle: {
+        buildId: "build_other_gradle",
+        tool: "gradle",
+        requiresHeavySlot: true,
+        state: "active",
+        preparingDevice: false,
+        claimedDaemonPid,
+      },
+    });
+    const busyGradleProbeSingle = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: baseEnv,
+      activeBuildLeases: otherLease(7020),
+      runner: () => ({ stdout: `${daemonLine(7020, "US", "en")}\n` }),
+    });
+    assert.equal(busyGradleProbeSingle.warm, false);
+    assert.deepEqual(busyGradleProbeSingle.daemonPids, []);
+
+    const incompatibleBusyGradleProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: baseEnv,
+      activeBuildLeases: otherLease(8001),
+      runner: () => ({ stdout: `${daemonLine(7020, "US", "en")}\n` }),
+    });
+    assert.equal(incompatibleBusyGradleProbe.warm, true);
+    assert.deepEqual(incompatibleBusyGradleProbe.daemonPids, [7020]);
+
+    const busyGradleProbeTwoDaemons = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: baseEnv,
+      activeBuildLeases: otherLease(7020),
+      runner: () => ({ stdout: [daemonLine(7020, "US", "en"), daemonLine(7021, "US", "en")].join("\n") }),
+    });
+    assert.equal(busyGradleProbeTwoDaemons.warm, true);
+    assert.deepEqual(busyGradleProbeTwoDaemons.daemonPids, [7021]);
+
+    const busyGradleClientPsProbe = probeWarmBuildDaemons(defaultGradleReqs, {
+      env: baseEnv,
+      runner: () => ({
+        stdout: [`7019 ${java} org.gradle.wrapper.GradleWrapperMain assembleDebug`, daemonLine(7020, "US", "en")].join("\n"),
+      }),
+    });
+    assert.equal(busyGradleClientPsProbe.warm, false);
+    assert.deepEqual(busyGradleClientPsProbe.daemonPids, []);
   } finally {
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    fs.rmSync(wsDir, { recursive: true, force: true });
   }
 });
 
-test("cmdExec --claim releases newly claimed device when pre-spawn validation fails", async () => {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-claim-abort-"));
-  const fakeInventory = {
-    hostResources: {
-      totalMemMb: 32768,
-      freeMemMb: 16384,
-      availableMemMb: 16384,
-      cpus: 8,
-      sampledAtMs: Date.now(),
-    },
-    running: [
-      {
-        deviceKey: "Pixel_7_API_35",
-        serial: "emulator-5554",
-        avd: "Pixel_7_API_35",
-        platform: "android",
-        kind: "emulator",
-        profile: { deviceType: "phone", apiLevel: 35, playStore: true },
-        state: "online",
-      },
-    ],
-    offline: [],
-    creatable: [],
-  };
+// ---------------------------------------------------------------------------
+// Bazel: bazelrc parsing, output bases, version detection and warm server probing
+// ---------------------------------------------------------------------------
+
+test("Bazel output bases and warm server probing require exact workspace identity and default output base", () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-bazel-warm-"));
   try {
-    const res = await cmdExec(
-      stateDir,
-      ["adb", "-s", "emulator-5556", "shell", "echo", "hi"],
-      { claim: true, session: "agent-claim-validation-fail" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "agent-claim-validation-fail" },
-        livenessCheck: () => true,
-      },
-    );
-    assert.equal(res.exitCode, 3);
-    assert.match(res.error, /Conflicting device selector "emulator-5556"/);
-    const stateAfter = readState(stateDir);
-    assert.equal(Object.keys(stateAfter.leases || {}).length, 0);
-
-    const bazelTestArgConflict = await cmdExec(
-      stateDir,
-      ["bazel", "test", "--test_arg=--device=emulator-5556", "//app:test"],
-      { claim: true, session: "agent-claim-validation-fail" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "agent-claim-validation-fail" },
-        livenessCheck: () => true,
-      },
-    );
-    assert.equal(bazelTestArgConflict.exitCode, 3);
-    assert.match(bazelTestArgConflict.error, /Conflicting device selector "emulator-5556"/);
-
-    const bazelRunAfterDashDashConflict = await cmdExec(
-      stateDir,
-      ["bazel", "run", "//app:bin", "--", "--device=emulator-5556"],
-      { claim: true, session: "agent-claim-validation-fail" },
-      {
-        inventory: fakeInventory,
-        env: { ...process.env, ATC_SESSION_ID: "agent-claim-validation-fail" },
-        livenessCheck: () => true,
-      },
-    );
-    assert.equal(bazelRunAfterDashDashConflict.exitCode, 3);
-    assert.match(bazelRunAfterDashDashConflict.error, /Conflicting device selector "emulator-5556"/);
-  } finally {
-    fs.rmSync(stateDir, { recursive: true, force: true });
-  }
-});
-
-test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and inject worker limits", () => {
-  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-ctrl-kw-"));
-  try {
-    fs.writeFileSync(path.join(wsDir, "settings.gradle"), "rootProject.name = 'app'\n");
-    const niceReqs = resolveBuildResources(
-      "nice",
-      ["--adjustment", "5", "./gradlew", "connectedCheck"],
-      wsDir,
-    );
-    assert.equal(niceReqs.kind, "device_coupled_build");
-    assert.equal(niceReqs.tool, "gradle");
-    assert.equal(niceReqs.requiresDevice, true);
-    assert.equal(niceReqs.requiresHeavySlot, true);
-    assert.ok(niceReqs.resourceKeys.some((k) => k.startsWith("gradle:")));
-
-    const niceInv = buildChildInvocation(
-      "nice",
-      ["--adjustment", "5", "./gradlew", "connectedCheck"],
-      { serial: "emulator-5554", leaseId: "lease_1", platform: "android", kind: "emulator" },
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.deepEqual(niceInv.args, [
-      "--adjustment",
-      "5",
-      "./gradlew",
-      "connectedCheck",
-      "-Dorg.gradle.workers.max=4",
-    ]);
-
-    const shellIfReqs = resolveBuildResources(
-      "sh",
-      ["-c", "if test -f settings.gradle; then ./gradlew build; fi"],
-      wsDir,
-      { forceBuild: true },
-    );
-    assert.equal(shellIfReqs.kind, "pure_build");
-    assert.equal(shellIfReqs.tool, "gradle");
-    assert.ok(shellIfReqs.resourceKeys.some((k) => k.startsWith("gradle:")));
-
-    const shellIfInv = buildChildInvocation(
-      "sh",
-      ["-c", "if test -f settings.gradle; then ./gradlew build; else bazel build //app; fi"],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      shellIfInv.args[1],
-      "if test -f settings.gradle; then ./gradlew build -Dorg.gradle.workers.max=4; else bazel build --jobs=4 --local_ram_resources=3072 //app; fi",
-    );
-
-    const substInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build -Pversion=$(git describe; echo suffix)"],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      substInv.args[1],
-      "./gradlew build -Pversion=$(git describe; echo suffix) -Dorg.gradle.workers.max=4",
-    );
-
-    const expandedVarReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'cd "$PROJECT_DIR" && ./gradlew build'],
-      os.tmpdir(),
-      { env: { ...process.env, PROJECT_DIR: wsDir } },
-    );
-    assert.equal(expandedVarReqs.kind, "pure_build");
-    assert.equal(expandedVarReqs.tool, "gradle");
-    const canonicalWs = (fs.realpathSync.native || fs.realpathSync)(wsDir);
-    assert.ok(
-      expandedVarReqs.resourceKeys.some((k) =>
-        k.endsWith(canonicalWs),
-      ),
-    );
-
-    const unresolvedVarReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'cd "$UNSET_PROJECT_DIR_XYZ" && ./gradlew build'],
-      wsDir,
-      { env: {} },
-    );
-    assert.equal(unresolvedVarReqs.kind, "deny_lifecycle");
-    assert.match(unresolvedVarReqs.reason, /Unresolved dynamic directory change/);
-
-    const unsetJavaHomeReqs = resolveBuildResources(
-      "env",
-      ["-u", "JAVA_HOME", "./gradlew", "build"],
-      wsDir,
-    );
-    assert.equal(unsetJavaHomeReqs.envJavaHomeUnset, true);
-    const mockJdkHome = path.join(wsDir, "jdk21");
-    const mockJdkBin = path.join(mockJdkHome, "bin");
-    fs.mkdirSync(mockJdkBin, { recursive: true });
-    fs.writeFileSync(
-      path.join(mockJdkBin, process.platform === "win32" ? "java.exe" : "java"),
-      "",
-    );
-    const canonicalMockJdkHome = (fs.realpathSync.native || fs.realpathSync)(mockJdkHome);
-    const mismatchedJdkWarmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
-      env: { JAVA_HOME: "/nonexistent/parent/java", PATH: mockJdkBin },
-      runner: () => ({
-        stdout: `4241 /Library/Java/JDK17/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
-      }),
-    });
-    assert.equal(mismatchedJdkWarmProbe.warm, false);
-    const warmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
-      env: { JAVA_HOME: "/nonexistent/parent/java", PATH: mockJdkBin },
-      runner: () => ({
-        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
-      }),
-    });
-    assert.equal(warmProbe.warm, true);
-    const unresolvablePathWarmProbe = probeWarmBuildDaemons(unsetJavaHomeReqs, {
-      env: { JAVA_HOME: "/nonexistent/parent/java", PATH: path.join(wsDir, "no-such-bin") },
-      runner: () => ({
-        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${unsetJavaHomeReqs.workspaceRoot}\n`,
-      }),
-    });
-    assert.equal(unresolvablePathWarmProbe.warm, false);
-
     const subAppDir = path.join(wsDir, "app");
     fs.mkdirSync(subAppDir, { recursive: true });
-    fs.writeFileSync(path.join(subAppDir, "settings.gradle"), "rootProject.name = 'subapp'\n");
-    const canonicalSubApp = (fs.realpathSync.native || fs.realpathSync)(subAppDir);
-
-    // Conditional cd in a closed if block makes subsequent cwd ambiguous
-    const condIfAfterFi = resolveBuildResources(
-      "sh",
-      ["-c", "if false; then cd app; fi; ./gradlew build"],
-      wsDir,
-    );
-    assert.equal(condIfAfterFi.kind, "deny_lifecycle");
-    assert.match(condIfAfterFi.reason, /Unresolved dynamic directory change/);
-
-    // Conditional cd inside the same then branch resolves to that branch's directory
-    const condIfInsideThen = resolveBuildResources(
-      "sh",
-      ["-c", "if test -d app; then cd app && ./gradlew build; fi"],
-      wsDir,
-    );
-    assert.equal(condIfInsideThen.kind, "pure_build");
-    assert.deepEqual(condIfInsideThen.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    // Sibling else branch does not inherit then branch's cd
-    const condIfInElse = resolveBuildResources(
-      "sh",
-      ["-c", "if test -d app; then cd app; else ./gradlew build; fi"],
-      wsDir,
-    );
-    assert.equal(condIfInElse.kind, "pure_build");
-    assert.deepEqual(condIfInElse.resourceKeys, [`gradle:${canonicalWs}`]);
-
-    // Short-circuit && or || cd followed by `;` makes subsequent cwd ambiguous
-    const condAndThenSemi = resolveBuildResources(
-      "sh",
-      ["-c", "test -d app && cd app; ./gradlew build"],
-      wsDir,
-    );
-    assert.equal(condAndThenSemi.kind, "deny_lifecycle");
-    assert.match(condAndThenSemi.reason, /Unresolved dynamic directory change/);
-
-    const condOrCd = resolveBuildResources(
-      "sh",
-      ["-c", "test -d app || cd app && ./gradlew build"],
-      wsDir,
-    );
-    assert.equal(condOrCd.kind, "deny_lifecycle");
-    assert.match(condOrCd.reason, /Unresolved dynamic directory change/);
-
-    // Bazel warm daemon probe requires full workspace identity or output base (not basename-only bazel(app))
     fs.writeFileSync(path.join(subAppDir, "MODULE.bazel"), 'module(name = "app")\n');
-    const bazelAppReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir, {
-      bazelMajorVersion: 9,
-    });
-    const otherBasenameProbe = probeWarmBuildDaemons(bazelAppReqs, {
-      runner: () => ({
-        stdout: "9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=/other/work/app\n",
-      }),
-    });
-    assert.equal(otherBasenameProbe.warm, false);
+    const canonicalSubApp = realpath(subAppDir);
 
-    // Custom --output_base server for same workspace must NOT match a default Bazel invocation
-    const customOutputBaseSameWsProbe = probeWarmBuildDaemons(bazelAppReqs, {
-      runner: () => ({
-        stdout: `9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=/tmp/custom-bazel-out --workspace_directory=${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(customOutputBaseSameWsProbe.warm, false);
-
-    const defaultSubAppBazelOut = computeDefaultBazelOutputBases(canonicalSubApp, {
-      bazelMajorVersion: 9,
-    })[0];
+    const bazelAppReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir, { bazelMajorVersion: 9 });
+    assert.equal(bazelAppReqs.workspaceRoot, canonicalSubApp);
+    assert.deepEqual(bazelAppReqs.resourceKeys, [`bazel:ws:${canonicalSubApp}`]);
+    assert.equal(
+      probeWarmBuildDaemons(bazelAppReqs, {
+        runner: () => ({ stdout: "9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=/other/work/app\n" }),
+      }).warm,
+      false,
+      "basename-only bazel(app) match is not enough",
+    );
+    assert.equal(
+      probeWarmBuildDaemons(bazelAppReqs, {
+        runner: () => ({
+          stdout: `9001 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=/tmp/custom-bazel-out --workspace_directory=${canonicalSubApp}\n`,
+        }),
+      }).warm,
+      false,
+      "custom --output_base server must not match a default invocation",
+    );
+    const defaultSubAppBazelOut = computeDefaultBazelOutputBases(canonicalSubApp, { bazelMajorVersion: 9 })[0];
     const exactWorkspaceProbe = probeWarmBuildDaemons(bazelAppReqs, {
       runner: () => ({
         stdout: `9002 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=${defaultSubAppBazelOut} --workspace_directory=${canonicalSubApp}\n`,
@@ -1880,2204 +1380,263 @@ test("nice --adjustment and shell control keywords (then/else/do/if/!) peel and 
     });
     assert.equal(exactWorkspaceProbe.warm, true);
     assert.deepEqual(exactWorkspaceProbe.daemonPids, [9002]);
+    assert.equal(
+      probeWarmBuildDaemons(bazelAppReqs, {
+        runner: () => ({ stdout: `9003 bazel(app2) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}2\n` }),
+      }).warm,
+      false,
+      "path-component boundary (rejects /work/app2 for /work/app)",
+    );
 
     // macOS Bazel 8 vs Bazel 9 default output root + conservative cold fallback when version is ambiguous
-    const ambiguousDarwinReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "build", "//..."],
-      subAppDir,
-      { platform: "darwin" },
+    const ambiguousDarwinReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir, { platform: "darwin" });
+    assert.deepEqual(computeDefaultBazelOutputBases(canonicalSubApp, { platform: "darwin" }), []);
+    assert.equal(
+      probeWarmBuildDaemons(ambiguousDarwinReqs, {
+        platform: "darwin",
+        runner: () => ({
+          stdout: `9003 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=/private/var/tmp/_bazel_alice/0123456789abcdef --workspace_directory=${canonicalSubApp}\n`,
+        }),
+      }).warm,
+      false,
     );
-    assert.deepEqual(
-      computeDefaultBazelOutputBases(canonicalSubApp, { platform: "darwin" }),
-      [],
-    );
-    const lingeringBazel8OnAmbiguousDarwin = probeWarmBuildDaemons(ambiguousDarwinReqs, {
-      platform: "darwin",
-      runner: () => ({
-        stdout: `9003 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --output_base=/private/var/tmp/_bazel_alice/0123456789abcdef --workspace_directory=${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(lingeringBazel8OnAmbiguousDarwin.warm, false);
-
-    const darwinV9Bases = computeDefaultBazelOutputBases(canonicalSubApp, {
-      platform: "darwin",
-      bazelMajorVersion: 9,
-      env: { USER: "alice", HOME: "/Users/alice" },
-    });
     assert.ok(
-      darwinV9Bases.some((p) => p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/")),
+      computeDefaultBazelOutputBases(canonicalSubApp, {
+        platform: "darwin",
+        bazelMajorVersion: 9,
+        env: { USER: "alice", HOME: "/Users/alice" },
+      }).some((p) => p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/")),
     );
-    const darwinV9XdgBases = computeDefaultBazelOutputBases(canonicalSubApp, {
-      platform: "darwin",
-      bazelMajorVersion: 9,
-      env: { USER: "alice", HOME: "/Users/alice", XDG_CACHE_HOME: "/custom/xdg" },
-    });
-    assert.ok(darwinV9XdgBases.some((p) => p.includes("/custom/xdg/bazel/_bazel_alice/")));
-    const darwinV8Bases = computeDefaultBazelOutputBases(canonicalSubApp, {
-      platform: "darwin",
-      bazelMajorVersion: 8,
-      env: { USER: "alice", HOME: "/Users/alice" },
-    });
-    assert.ok(darwinV8Bases.some((p) => p.startsWith("/private/var/tmp/_bazel_alice/")));
+    assert.ok(
+      computeDefaultBazelOutputBases(canonicalSubApp, {
+        platform: "darwin",
+        bazelMajorVersion: 9,
+        env: { USER: "alice", HOME: "/Users/alice", XDG_CACHE_HOME: "/custom/xdg" },
+      }).some((p) => p.includes("/custom/xdg/bazel/_bazel_alice/")),
+    );
+    assert.ok(
+      computeDefaultBazelOutputBases(canonicalSubApp, {
+        platform: "darwin",
+        bazelMajorVersion: 8,
+        env: { USER: "alice", HOME: "/Users/alice" },
+      }).some((p) => p.startsWith("/private/var/tmp/_bazel_alice/")),
+    );
 
     // POSIX username fallback ignores LOGNAME/USERNAME when USER is unset and sanitizes / and \
-    const unsetUserLognameReqs = resolveBuildResources(
-      "env",
-      ["-u", "USER", "LOGNAME=ci", "USERNAME=ci", "bazel", "--nosystem_rc", "build", "//..."],
-      subAppDir,
-      { platform: "linux", env: { USER: "stale", HOME: "/home/acct" } },
-    );
-    const unsetUserBases = computeDefaultBazelOutputBases(canonicalSubApp, {
-      buildReqs: unsetUserLognameReqs,
+    const unsetUserReqs = resolveBuildResources("bazel", ["--nosystem_rc", "build", "//..."], subAppDir, {
       platform: "linux",
-      env: { LOGNAME: "ci", USERNAME: "ci", HOME: "/home/acct" },
+      env: { USER: "stale", HOME: "/home/acct" },
+      inheritedEnvVars: { USER: null, LOGNAME: "ci", USERNAME: "ci" },
     });
     assert.equal(
-      unsetUserBases.some((p) => p.includes("/_bazel_ci/")),
+      computeDefaultBazelOutputBases(canonicalSubApp, {
+        buildReqs: unsetUserReqs,
+        platform: "linux",
+        env: { LOGNAME: "ci", USERNAME: "ci", HOME: "/home/acct" },
+      }).some((p) => p.includes("/_bazel_ci/")),
       false,
-    );
-    const sanitizedUserBases = computeDefaultBazelOutputBases(canonicalSubApp, {
-      platform: "linux",
-      env: { USER: "CORP\\team/alice", HOME: "/home/alice" },
-    });
-    assert.ok(sanitizedUserBases.some((p) => p.includes("/_bazel_CORP_team_alice/")));
-
-    // Boolean-valued Bazel clean --expunge=<value> / --expunge_async=<value>
-    for (const flag of [
-      "--expunge=true",
-      "--expunge=yes",
-      "--expunge=1",
-      "--expunge_async=true",
-      "--expunge_async=1",
-    ]) {
-      const boolExpungeReqs = resolveBuildResources("bazel", ["clean", flag], subAppDir);
-      assert.equal(boolExpungeReqs.kind, "deny_lifecycle");
-    }
-    const disabledExpungeReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "clean", "--expunge=false", "--expunge_async=0"],
-      subAppDir,
-    );
-    assert.equal(disabledExpungeReqs.kind, "workspace_only");
-
-    // BAZELRC environment variable (single or comma-separated) loads startup options between home and CLI rc files
-    const envRc1 = path.join(wsDir, "env1.bazelrc");
-    const envRc2 = path.join(wsDir, "env2.bazelrc");
-    const envOutBase = path.join(wsDir, "bazel-env-out");
-    fs.writeFileSync(envRc1, `startup --output_base=${envOutBase}\n`);
-    fs.writeFileSync(envRc2, "startup --host_jvm_args=-Xmx6g\n");
-    const bazelrcEnvReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "build", "//..."],
-      subAppDir,
-      { env: { ...process.env, BAZELRC: `${envRc1},${envRc2}` } },
     );
     assert.ok(
-      bazelrcEnvReqs.resourceKeys.some((k) => k.startsWith("bazel:out:") && k.endsWith("bazel-env-out")),
-    );
-    assert.equal(bazelrcEnvReqs.requestedHeapMb, 6144);
-    assert.equal(bazelrcEnvReqs.disablesDaemon, true);
-
-    const unsetBazelrcEnvReqs = resolveBuildResources(
-      "env",
-      ["-u", "BAZELRC", "bazel", "--nosystem_rc", "--nohome_rc", "build", "//..."],
-      subAppDir,
-      { env: { ...process.env, BAZELRC: `${envRc1},${envRc2}` } },
-    );
-    assert.equal(
-      unsetBazelrcEnvReqs.resourceKeys.some((k) => k.startsWith("bazel:out:")),
-      false,
-    );
-    assert.equal(unsetBazelrcEnvReqs.requestedHeapMb, 0);
-
-    // BAZELRC=/dev/null sentinel stops processing subsequent comma-separated entries
-    const envRcIgnored = path.join(wsDir, "env-ignored.bazelrc");
-    const envOutIgnored = path.join(wsDir, "bazel-env-ignored-out");
-    fs.writeFileSync(envRcIgnored, `startup --output_base=${envOutIgnored}\n`);
-    const bazelrcNullSentinelReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "build", "//..."],
-      subAppDir,
-      { env: { ...process.env, BAZELRC: `${envRc1},/dev/null,${envRcIgnored}` } },
-    );
-    assert.ok(
-      bazelrcNullSentinelReqs.resourceKeys.some((k) => k.endsWith("bazel-env-out")),
-    );
-    assert.equal(
-      bazelrcNullSentinelReqs.resourceKeys.some((k) => k.endsWith("bazel-env-ignored-out")),
-      false,
+      computeDefaultBazelOutputBases(canonicalSubApp, {
+        platform: "linux",
+        env: { USER: "CORP\\team/alice", HOME: "/home/alice" },
+      }).some((p) => p.includes("/_bazel_CORP_team_alice/")),
     );
 
-    // Command-specific .bazelrc options (clean --expunge, test --ios_simulator_device, run --norun) apply to classification
-    const cmdRcFile = path.join(wsDir, "cmd-options.bazelrc");
-    fs.writeFileSync(
-      cmdRcFile,
-      [
-        "clean --expunge",
-        "test --@rules_apple//apple/build_settings:ios_simulator_device=iPhone\\ 16",
-        "run --norun",
-      ].join("\n") + "\n",
-    );
-    const rcCleanExpungeReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "clean"],
-      subAppDir,
-    );
-    assert.equal(rcCleanExpungeReqs.kind, "deny_lifecycle");
-
-    const rcCleanNoExpungeOverrideReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "clean", "--noexpunge"],
-      subAppDir,
-    );
-    assert.equal(rcCleanNoExpungeOverrideReqs.kind, "workspace_only");
-
-    const rcIosTestReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "test", "//app:tests"],
-      subAppDir,
-    );
-    assert.equal(rcIosTestReqs.kind, "device_coupled_build");
-    assert.equal(rcIosTestReqs.requiresDevice, true);
-    assert.equal(rcIosTestReqs.targetPlatform, "ios");
-    assert.equal(rcIosTestReqs.targetSerial, "iPhone 16");
-
-    const rcIosMismatchGuard = evaluateCommandGuard(
-      `bazel --nosystem_rc --nohome_rc --bazelrc=${cmdRcFile} test //app:tests`,
-      {
-        sessionId: "sess-rc-ios",
-        activeLeases: [
-          {
-            leaseId: "lease_ios_rc",
-            sessionId: "sess-rc-ios",
-            platform: "ios",
-            serial: "11111111-2222-3333-4444-555555555555",
-            udid: "11111111-2222-3333-4444-555555555555",
-            state: "active",
-          },
-        ],
-      },
-    );
-    assert.equal(rcIosMismatchGuard.allowed, false);
-
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "bazel",
-          ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "test", "//app:tests"],
-          {
-            leaseId: "lease_ios_rc",
-            platform: "ios",
-            serial: "11111111-2222-3333-4444-555555555555",
-            udid: "11111111-2222-3333-4444-555555555555",
-          },
-          "sess-rc-ios",
-          process.env,
-          null,
-        ),
-      /Conflicting device selector "iPhone 16"/,
-    );
-
-    // Repeated bazelrc imports outside a cycle are reprocessed in place
-    const sharedImportRc = path.join(wsDir, "shared-import.bazelrc");
-    const repeatParentRc = path.join(wsDir, "repeat-parent.bazelrc");
-    const actualRepeatOut = path.join(wsDir, "bazel-repeat-actual-out");
-    const middleRepeatOut = path.join(wsDir, "bazel-repeat-middle-out");
-    fs.writeFileSync(sharedImportRc, `startup --output_base=${actualRepeatOut}\n`);
-    fs.writeFileSync(
-      repeatParentRc,
-      [
-        `import ${sharedImportRc.replace(/\\/g, "/")}`,
-        `startup --output_base=${middleRepeatOut}`,
-        `import ${sharedImportRc.replace(/\\/g, "/")}`,
-      ].join("\n") + "\n",
-    );
-    const repeatImportReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${repeatParentRc}`, "build", "//..."],
-      subAppDir,
-    );
-    assert.ok(
-      repeatImportReqs.resourceKeys.some((k) => k.endsWith("bazel-repeat-actual-out")),
-    );
-    assert.equal(
-      repeatImportReqs.resourceKeys.some((k) => k.endsWith("bazel-repeat-middle-out")),
-      false,
-    );
-
-    const rcBoundedRunReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "run", "//app:bin"],
-      subAppDir,
-    );
-    assert.equal(rcBoundedRunReqs.kind, "pure_build");
-
-    const rcGuardClean = evaluateCommandGuard(
-      `bazel --nosystem_rc --nohome_rc --bazelrc=${cmdRcFile} clean`,
-      { sessionId: "sess-rc", activeLeases: [] },
-    );
-    assert.equal(rcGuardClean.allowed, false);
-
-    assert.throws(() =>
-      buildChildInvocation(
-        "bazel",
-        ["--nosystem_rc", "--nohome_rc", `--bazelrc=${cmdRcFile}`, "clean"],
-        null,
-        "sess-rc",
-        process.env,
-        null,
-      ),
-    );
-
-    // Trailing shell comments preserve comment text and insert injected flags before `#`
-    const commentGradleInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build # note; not a command"],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      commentGradleInv.args[1],
-      "./gradlew build -Dorg.gradle.workers.max=4 # note; not a command",
-    );
-
-    const commentXcodeInv = buildChildInvocation(
-      "sh",
-      ["-c", "xcodebuild test -scheme App # note"],
-      { serial: "SIM-UDID-123", leaseId: "lease_ios_1", platform: "ios", kind: "emulator" },
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      commentXcodeInv.args[1],
-      "xcodebuild test -scheme App -jobs 4 -destination id=SIM-UDID-123 # note",
-    );
-
-    // Heredoc bodies mentioning build commands are opaque and neither require a lease nor get rewritten
-    const heredocScript = "cat <<EOF\n./gradlew connectedCheck\nEOF";
-    const heredocReqs = resolveBuildResources("sh", ["-c", heredocScript], wsDir);
-    assert.equal(heredocReqs.kind, "not_build_tool");
-    assert.equal(heredocReqs.requiresDevice, false);
-    const heredocInv = buildChildInvocation(
-      "sh",
-      ["-c", heredocScript],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(heredocInv.args[1], heredocScript);
-
-    // Shell-expanded project path flags (-p "$PROJECT_DIR") resolve before locking and reject unset vars
-    const expandedFlagReqs = resolveBuildResources(
-      "sh",
-      ["-c", './gradlew -p "$PROJECT_DIR" build'],
-      wsDir,
-      { env: { ...process.env, PROJECT_DIR: subAppDir } },
-    );
-    assert.equal(expandedFlagReqs.kind, "pure_build");
-    assert.deepEqual(expandedFlagReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    const unresolvedFlagReqs = resolveBuildResources(
-      "sh",
-      ["-c", './gradlew -p "$UNSET_PROJECT_DIR" build'],
-      wsDir,
-      { env: {} },
-    );
-    assert.equal(unresolvedFlagReqs.kind, "deny_lifecycle");
-
-    // Windows cmd `cd /d` and PowerShell `Set-Location` / `Push-Location` / `Pop-Location`
-    const cmdCdDReqs = resolveBuildResources(
-      "cmd",
-      ["/c", "cd /d app && gradlew.bat build"],
-      wsDir,
-    );
-    assert.equal(cmdCdDReqs.kind, "pure_build");
-    assert.deepEqual(cmdCdDReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    const pwshSetLocReqs = resolveBuildResources(
-      "pwsh",
-      ["-Command", "Set-Location app; .\\gradlew.bat build"],
-      wsDir,
-    );
-    assert.equal(pwshSetLocReqs.kind, "pure_build");
-    assert.deepEqual(pwshSetLocReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    const pwshPushPopReqs = resolveBuildResources(
-      "pwsh",
-      ["-Command", "Push-Location -Path app; .\\gradlew.bat build; Pop-Location; .\\gradlew.bat test"],
-      wsDir,
-    );
-    assert.equal(pwshPushPopReqs.kind, "pure_build");
-    assert.ok(pwshPushPopReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
-    assert.ok(pwshPushPopReqs.resourceKeys.includes(`gradle:${canonicalWs}`));
-
-    // Single-quoted path tokens preserve literal `$VAR` without expanding environment variables
-    const literalDollarDir = path.join(wsDir, "$PROJECT_DIR");
-    fs.mkdirSync(literalDollarDir, { recursive: true });
-    fs.writeFileSync(path.join(literalDollarDir, "settings.gradle"), 'rootProject.name = "literal"\n');
-    const canonicalLiteralDollar = (fs.realpathSync.native || fs.realpathSync)(literalDollarDir);
-    const singleQuotedFlagReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew -p '$PROJECT_DIR' build"],
-      wsDir,
-      { env: { ...process.env, PROJECT_DIR: subAppDir } },
-    );
-    assert.equal(singleQuotedFlagReqs.kind, "pure_build");
-    assert.deepEqual(singleQuotedFlagReqs.resourceKeys, [`gradle:${canonicalLiteralDollar}`]);
-
-    // Conditional environment assignments taint subsequent expansions of that variable
-    const condEnvReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'if false; then export PROJECT_DIR=/wrong; fi; ./gradlew -p "$PROJECT_DIR" build'],
-      wsDir,
-      { env: { ...process.env, PROJECT_DIR: subAppDir } },
-    );
-    assert.equal(condEnvReqs.kind, "deny_lifecycle");
-    assert.match(condEnvReqs.reason, /Unresolved dynamic directory change/);
-
-    // Mixed workspace-only + heavy build wrapper probes the sole heavy clause (`bazel`), not `gradle`
-    fs.writeFileSync(path.join(wsDir, "MODULE.bazel"), 'module(name = "root")\n');
-    const mixedWrapperReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew tasks && bazel --nosystem_rc build //..."],
-      wsDir,
-      { bazelMajorVersion: 9 },
-    );
-    assert.equal(mixedWrapperReqs.clauseBuildReqs.length, 1);
-    assert.equal(mixedWrapperReqs.clauseBuildReqs[0].tool, "bazel");
-    const warmGradleOnlyProbe = probeWarmBuildDaemons(mixedWrapperReqs, {
-      runner: () => ({
-        stdout: `9101 java org.gradle.launcher.daemon.bootstrap.GradleDaemon -Duser.dir=${canonicalWs}\n`,
-      }),
-    });
-    assert.equal(warmGradleOnlyProbe.warm, false);
-    const defaultRootBazelOut = computeDefaultBazelOutputBases(canonicalWs, {
-      bazelMajorVersion: 9,
-    })[0];
-    const warmBazelProbe = probeWarmBuildDaemons(mixedWrapperReqs, {
-      runner: () => ({
-        stdout: `9102 bazel(root) -XX:+HeapDumpOnOutOfMemoryError --output_base=${defaultRootBazelOut} --workspace_directory=${canonicalWs}\n`,
-      }),
-    });
-    assert.equal(warmBazelProbe.warm, true);
-    assert.deepEqual(warmBazelProbe.daemonPids, [9102]);
-
-    // Command-local prefix assignments do not alter parameter expansion of that same command's arguments
-    const prefixAssignReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'PROJECT_DIR=/wrong ./gradlew -p "$PROJECT_DIR" build'],
-      wsDir,
-      { env: { ...process.env, PROJECT_DIR: subAppDir } },
-    );
-    assert.equal(prefixAssignReqs.kind, "pure_build");
-    assert.deepEqual(prefixAssignReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    // POSIX `&` runs the backgrounded clause in a subshell (restoring cwd), whereas Windows `cmd` `&` is sequential
-    const posixBgCdReqs = resolveBuildResources(
-      "sh",
-      ["-c", "cd app & ./gradlew build"],
-      wsDir,
-    );
-    assert.equal(posixBgCdReqs.kind, "pure_build");
-    assert.deepEqual(posixBgCdReqs.resourceKeys, [`gradle:${canonicalWs}`]);
-
-    const cmdAmpSeqReqs = resolveBuildResources(
-      "cmd",
-      ["/c", "cd app & gradlew.bat build & echo done"],
-      wsDir,
-    );
-    assert.equal(cmdAmpSeqReqs.kind, "pure_build");
-    assert.deepEqual(cmdAmpSeqReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    // Worker limit injection checks standalone tokens, not substrings inside `-Pnote=...`
-    const propSubstringInv = buildChildInvocation(
-      "sh",
-      ["-c", "./gradlew build -Pnote='-Dorg.gradle.workers.max=99'"],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      propSubstringInv.args[1],
-      "./gradlew build -Pnote='-Dorg.gradle.workers.max=99' -Dorg.gradle.workers.max=4",
-    );
-
-    // Unverified `cd /missing; ./gradlew build` marks subsequent cwd unresolved
-    const missingCdSemiReqs = resolveBuildResources(
-      "sh",
-      ["-c", "cd /nonexistent-dir-atc-xyz; ./gradlew build"],
-      wsDir,
-    );
-    assert.equal(missingCdSemiReqs.kind, "deny_lifecycle");
-    assert.match(missingCdSemiReqs.reason, /Unresolved dynamic directory change/);
-
-    // Sourced shell scripts (`source` / `.`) taint cwd and environment state
-    const sourcedScriptReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'source vars.sh; ./gradlew -p "$PROJECT_DIR" build'],
-      wsDir,
-      { env: { ...process.env, PROJECT_DIR: subAppDir } },
-    );
-    assert.equal(sourcedScriptReqs.kind, "deny_lifecycle");
-    assert.match(sourcedScriptReqs.reason, /Unresolved dynamic directory change/);
-
-    // Shell `+=` append assignments update tracked variable values before path expansion
-    const appendAssignReqs = resolveBuildResources(
-      "bash",
-      ["-c", 'A=ap; A+=p; ./gradlew -p "$A" build'],
-      wsDir,
-    );
-    assert.equal(appendAssignReqs.kind, "pure_build");
-    assert.deepEqual(appendAssignReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    // Command substitutions `$(...)` containing build invocations are classified and rewritten
-    const cmdSubReqs = resolveBuildResources(
-      "sh",
-      ["-c", "echo $(./gradlew build)"],
-      wsDir,
-    );
-    assert.equal(cmdSubReqs.kind, "pure_build");
-    assert.deepEqual(cmdSubReqs.resourceKeys, [`gradle:${canonicalWs}`]);
-
-    const cmdSubInv = buildChildInvocation(
-      "sh",
-      ["-c", "echo $(./gradlew build)"],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      cmdSubInv.args[1],
-      "echo $(./gradlew build -Dorg.gradle.workers.max=4)",
-    );
-
-    // Assignment-only clauses storing build executables are preserved while subsequent expanded invocations receive injected flags
-    const toolVarReqs = resolveBuildResources(
-      "sh",
-      ["-c", 'TOOL=./gradlew; "$TOOL" build'],
-      wsDir,
-    );
-    assert.equal(toolVarReqs.kind, "pure_build");
-    assert.deepEqual(toolVarReqs.resourceKeys, [`gradle:${canonicalWs}`]);
-
-    const toolVarInv = buildChildInvocation(
-      "sh",
-      ["-c", 'TOOL=./gradlew; "$TOOL" build'],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      toolVarInv.args[1],
-      'TOOL=./gradlew; "$TOOL" build -Dorg.gradle.workers.max=4',
-    );
-
-    // Conditional assignments taint build-tool variables in both classifier and rewriter
-    const condToolReqs = resolveBuildResources(
-      "bash",
-      ["-c", 'if false; then TOOL=./gradlew; fi; "$TOOL" build'],
-      wsDir,
-      { env: { ...process.env, TOOL: "./bazel" } },
-    );
-    assert.equal(condToolReqs.kind, "deny_lifecycle");
-    assert.match(condToolReqs.reason, /Unresolved dynamic directory change/);
-
-    const condToolInv = buildChildInvocation(
-      "bash",
-      ["-c", 'if false; then TOOL=./gradlew; fi; "$TOOL" build'],
-      null,
-      "sess_1",
-      { ...process.env, TOOL: "./bazel" },
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      condToolInv.args[1],
-      'if false; then TOOL=./gradlew; fi; "$TOOL" build',
-    );
-
-    // Bash/Zsh function declarations (`function name { ...; }`) are classified and rewritten
-    const bashFnReqs = resolveBuildResources(
-      "bash",
-      ["-c", "function run_build { ./gradlew build; }; run_build"],
-      wsDir,
-    );
-    assert.equal(bashFnReqs.kind, "pure_build");
-    assert.deepEqual(bashFnReqs.resourceKeys, [`gradle:${canonicalWs}`]);
-
-    const bashFnInv = buildChildInvocation(
-      "bash",
-      ["-c", "function run_build { ./gradlew build; }; run_build"],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      bashFnInv.args[1],
-      "function run_build { ./gradlew build -Dorg.gradle.workers.max=4; }; run_build",
-    );
-
-    // Function bodies are evaluated at their call-site cwd and environment
-    const fnCallCwdReqs = resolveBuildResources(
-      "bash",
-      ["-c", "f(){ ./gradlew build; }; cd app; f"],
-      wsDir,
-    );
-    assert.equal(fnCallCwdReqs.kind, "pure_build");
-    assert.deepEqual(fnCallCwdReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    const fnCallEnvReqs = resolveBuildResources(
-      "bash",
-      ["-c", 'f(){ "$TOOL" -p "$1" build; }; TOOL=./gradlew; f app'],
-      wsDir,
-    );
-    assert.equal(fnCallEnvReqs.kind, "pure_build");
-    assert.deepEqual(fnCallEnvReqs.resourceKeys, [`gradle:${canonicalSubApp}`]);
-
-    const fnCallEnvInv = buildChildInvocation(
-      "bash",
-      ["-c", 'f(){ "$TOOL" -p "$1" build; }; TOOL=./gradlew; f app'],
-      null,
-      "sess_1",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      fnCallEnvInv.args[1],
-      'f(){ "$TOOL" -p "$1" build -Dorg.gradle.workers.max=4; }; TOOL=./gradlew; f app',
-    );
-
-    // Function-local variable declarations do not leak into caller scope
-    const fnLocalReqs = resolveBuildResources(
-      "bash",
-      ["-c", 'f(){ local TOOL=./gradlew; }; f; "$TOOL" build'],
-      wsDir,
-      { env: { ...process.env, TOOL: "./bazel" } },
-    );
-    assert.equal(fnLocalReqs.kind, "pure_build");
-    assert.deepEqual(fnLocalReqs.resourceKeys, [`bazel:ws:${canonicalWs}`]);
-
-    const fnLocalInv = buildChildInvocation(
-      "bash",
-      ["-c", 'f(){ local TOOL=./gradlew; }; f; "$TOOL" build'],
-      null,
-      "sess_1",
-      { ...process.env, TOOL: "./bazel" },
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      fnLocalInv.args[1],
-      'f(){ local TOOL=./gradlew; }; f; "$TOOL" build --jobs=4 --local_ram_resources=3072',
-    );
-
-    // Parameter-expanded build executable fallback (${GRADLE:-./gradlew}) and fail-closed on unresolved --build
-    const paramFallbackReqs = resolveBuildResources(
-      "sh",
-      ["-c", "${GRADLE:-./gradlew} build"],
-      wsDir,
-      { env: {}, forceBuild: true },
-    );
-    assert.equal(paramFallbackReqs.kind, "pure_build");
-    assert.deepEqual(paramFallbackReqs.resourceKeys, [`gradle:${canonicalWs}`]);
-
-    const paramFallbackInv = buildChildInvocation(
-      "sh",
-      ["-c", "${GRADLE:-./gradlew} build"],
-      null,
-      "sess_1",
-      {},
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(paramFallbackInv.args[1], "${GRADLE:-./gradlew} build -Dorg.gradle.workers.max=4");
-
-    const paramUnresolvedForceReqs = resolveBuildResources(
-      "sh",
-      ["-c", "${GRADLE:?missing} build"],
-      wsDir,
-      { env: {}, forceBuild: true },
-    );
-    assert.equal(paramUnresolvedForceReqs.kind, "deny_lifecycle");
-
-    // GRADLE_USER_HOME isolation in warm daemon probe
-    const isolatedGradleHome = path.join(wsDir, "isolated-gradle-home");
-    const gradleUserHomeReqs = resolveBuildResources(
-      "env",
-      [`GRADLE_USER_HOME=${isolatedGradleHome}`, "./gradlew", "build"],
-      wsDir,
-    );
-    assert.equal(gradleUserHomeReqs.envGradleUserHome, isolatedGradleHome);
-    const defaultHomeWarmProbe = probeWarmBuildDaemons(gradleUserHomeReqs, {
-      env: { JAVA_HOME: canonicalMockJdkHome },
-      runner: () => ({
-        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${gradleUserHomeReqs.workspaceRoot}\n`,
-      }),
-    });
-    assert.equal(defaultHomeWarmProbe.warm, false);
-    const matchingHomeWarmProbe = probeWarmBuildDaemons(gradleUserHomeReqs, {
-      env: { JAVA_HOME: canonicalMockJdkHome },
-      runner: () => ({
-        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} -Dgradle.user.home=${isolatedGradleHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${gradleUserHomeReqs.workspaceRoot}\n`,
-      }),
-    });
-    assert.equal(matchingHomeWarmProbe.warm, true);
-
-    // Bazel warm daemon probe requires path-component boundary (rejects /work/app2 for /work/app)
-    const prefixCollisionProbe = probeWarmBuildDaemons(bazelAppReqs, {
-      runner: () => ({
-        stdout: `9003 bazel(app2) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}2\n`,
-      }),
-    });
-    assert.equal(prefixCollisionProbe.warm, false);
-
-    // Bazel --output_user_root derives output_base and does not match default-root servers
+    // --output_user_root derives an output base and does not match default-root servers
     const isolatedBazelRoot = path.join(wsDir, "bazel-user-root");
     fs.mkdirSync(isolatedBazelRoot, { recursive: true });
-    const bazelUserRootReqs = resolveBuildResources(
-      "bazel",
-      [`--output_user_root=${isolatedBazelRoot}`, "build", "//..."],
-      subAppDir,
-    );
+    const bazelUserRootReqs = resolveBuildResources("bazel", [`--output_user_root=${isolatedBazelRoot}`, "build", "//..."], subAppDir);
     assert.ok(bazelUserRootReqs.resourceKeys.some((k) => k.startsWith("bazel:out:")));
-    const defaultRootBazelProbe = probeWarmBuildDaemons(bazelUserRootReqs, {
-      runner: () => ({
-        stdout: `9004 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(defaultRootBazelProbe.warm, false);
-
-    // env -i clears inherited GRADLE_USER_HOME so warm probe does not fall back to caller's GRADLE_USER_HOME
-    const envIgnoreGradleHomeReqs = resolveBuildResources(
-      "env",
-      ["-i", `PATH=${mockJdkBin}`, "./gradlew", "build"],
-      wsDir,
+    assert.equal(
+      probeWarmBuildDaemons(bazelUserRootReqs, {
+        runner: () => ({ stdout: `9004 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n` }),
+      }).warm,
+      false,
     );
-    assert.equal(envIgnoreGradleHomeReqs.envGradleUserHomeUnset, true);
-    const inheritedHomeLeakProbe = probeWarmBuildDaemons(envIgnoreGradleHomeReqs, {
-      env: { GRADLE_USER_HOME: isolatedGradleHome, JAVA_HOME: canonicalMockJdkHome },
-      runner: () => ({
-        stdout: `4242 ${path.join(canonicalMockJdkHome, "bin", "java")} -Dgradle.user.home=${isolatedGradleHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${envIgnoreGradleHomeReqs.workspaceRoot}\n`,
-      }),
-    });
-    assert.equal(inheritedHomeLeakProbe.warm, false);
 
-    // command/builtin-wrapped cd updates active shell directory for subsequent build invocations
-    const commandCdReqs = resolveBuildResources(
-      "sh",
-      ["-c", "command cd app; ./gradlew build"],
-      wsDir,
-    );
-    assert.ok(commandCdReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
-
-    const builtinCdReqs = resolveBuildResources(
-      "bash",
-      ["-c", "builtin cd app; ./gradlew build"],
-      wsDir,
-    );
-    assert.ok(builtinCdReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
-
-    // gradle.properties org.gradle.jvmargs compares all daemon-affecting JVM args (including -D properties)
-    fs.writeFileSync(
-      path.join(subAppDir, "gradle.properties"),
-      "org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n",
-    );
-    const subAppGradleReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
-    assert.equal(subAppGradleReqs.requestedHeapMb, 2048);
-    const mismatchedSysPropProbe = probeWarmBuildDaemons(subAppGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdkHome },
-      runner: () => ({
-        stdout: `5001 ${path.join(canonicalMockJdkHome, "bin", "java")} -Xmx2g -Dfile.encoding=US-ASCII org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(mismatchedSysPropProbe.warm, false);
-    const matchingSysPropProbe = probeWarmBuildDaemons(subAppGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdkHome },
-      runner: () => ({
-        stdout: `5001 ${path.join(canonicalMockJdkHome, "bin", "java")} -Xmx2g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(matchingSysPropProbe.warm, true);
-
-    // Bazel server-changing startup options (--host_jvm_args=-Xmx8g) mark invocation cold and record requestedHeapMb
-    const bazelHostJvmReqs = resolveBuildResources(
-      "bazel",
-      ["--host_jvm_args=-Xmx8g", "build", "//..."],
-      subAppDir,
-    );
+    // Server-changing startup options (--host_jvm_args) mark the invocation cold and record requestedHeapMb
+    const bazelHostJvmReqs = resolveBuildResources("bazel", ["--host_jvm_args=-Xmx8g", "build", "//..."], subAppDir);
     assert.equal(bazelHostJvmReqs.disablesDaemon, true);
     assert.equal(bazelHostJvmReqs.requestedHeapMb, 8192);
-    const bazelHostJvmProbe = probeWarmBuildDaemons(bazelHostJvmReqs, {
-      runner: () => ({
-        stdout: `9005 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(bazelHostJvmProbe.warm, false);
-
-    // Namespaced @rules_apple//apple/build_settings:ios_simulator_device requires iOS lease and binds UDID
-    const rulesAppleSimReqs = resolveBuildResources(
-      "bazel",
-      ["test", "//app:tests", "--@rules_apple//apple/build_settings:ios_simulator_device=iPhone 16"],
-      subAppDir,
+    assert.equal(
+      probeWarmBuildDaemons(bazelHostJvmReqs, {
+        runner: () => ({ stdout: `9005 bazel(app) -XX:+HeapDumpOnOutOfMemoryError --workspace_directory=${canonicalSubApp}\n` }),
+      }).warm,
+      false,
     );
-    assert.equal(rulesAppleSimReqs.kind, "device_coupled_build");
-    assert.equal(rulesAppleSimReqs.targetPlatform, "ios");
-    assert.equal(rulesAppleSimReqs.requiresDevice, true);
+    const xmsBazelHeap = resolveBuildResources("bazel", ["--nosystem_rc", "--host_jvm_args=-Xms6g", "build", "//..."], subAppDir);
+    assert.equal(xmsBazelHeap.requestedHeapMb, 6144);
 
-    const rulesAppleUnboundGuard = evaluateCommandGuard(
-      "bazel test //app:tests --@rules_apple//apple/build_settings:ios_simulator_device='iPhone 16'",
-      {
-        sessionId: "sess-ios",
-        activeLeases: [
-          {
-            leaseId: "lease_ios_sim",
-            sessionId: "sess-ios",
-            platform: "ios",
-            serial: "11111111-2222-3333-4444-555555555555",
-            udid: "11111111-2222-3333-4444-555555555555",
-            state: "active",
-          },
-        ],
-      },
-    );
-    assert.equal(rulesAppleUnboundGuard.allowed, false);
-
-    // $GRADLE_USER_HOME/gradle.properties overrides project properties for heap and warm daemon probe
-    fs.mkdirSync(isolatedGradleHome, { recursive: true });
-    fs.writeFileSync(
-      path.join(isolatedGradleHome, "gradle.properties"),
-      "org.gradle.jvmargs=-Xmx8g -Dfile.encoding=UTF-8\n",
-    );
-    const userHomeOverrideReqs = resolveBuildResources("./gradlew", ["build"], subAppDir, {
-      env: { ...process.env, GRADLE_USER_HOME: isolatedGradleHome },
-    });
-    assert.equal(userHomeOverrideReqs.requestedHeapMb, 8192);
-    const staleProjectHeapProbe = probeWarmBuildDaemons(userHomeOverrideReqs, {
-      env: { JAVA_HOME: canonicalMockJdkHome, GRADLE_USER_HOME: isolatedGradleHome },
-      runner: () => ({
-        stdout: `5002 ${path.join(canonicalMockJdkHome, "bin", "java")} -Dgradle.user.home=${isolatedGradleHome} -Xmx2g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(staleProjectHeapProbe.warm, false);
-
-    // .bazelrc startup options (--output_base and --host_jvm_args) are loaded into resourceKeys and requestedHeapMb
-    const sharedBazelOut = path.join(wsDir, "shared-bazel-out");
-    fs.mkdirSync(sharedBazelOut, { recursive: true });
-    const canonicalSharedBazelOut = (fs.realpathSync.native || fs.realpathSync)(sharedBazelOut);
-    fs.writeFileSync(
-      path.join(subAppDir, ".bazelrc"),
-      `startup --output_base=${canonicalSharedBazelOut}\nstartup --host_jvm_args=-Xmx6g\n`,
-    );
-    const bazelrcReqs = resolveBuildResources("bazel", ["build", "//..."], subAppDir);
-    assert.ok(bazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
-    assert.equal(bazelrcReqs.disablesDaemon, true);
-    assert.equal(bazelrcReqs.requestedHeapMb, 6144);
-
-    // env --chdir=DIR, -CDIR, -iCDIR (via util.parseArgs) resolve workspace, and unknown env flags fail closed
-    const envAttachedChdirReqs = resolveBuildResources(
-      "env",
-      ["--chdir=app", "./gradlew", "build"],
-      wsDir,
-    );
-    assert.ok(envAttachedChdirReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
-
-    const envShortAttachedChdirReqs = resolveBuildResources(
-      "env",
-      ["-Capp", "./gradlew", "build"],
-      wsDir,
-    );
-    assert.ok(envShortAttachedChdirReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
-
-    const envBundledChdirReqs = resolveBuildResources(
-      "env",
-      ["-iCapp", `PATH=${mockJdkBin}`, "./gradlew", "build"],
-      wsDir,
-    );
-    assert.ok(envBundledChdirReqs.resourceKeys.includes(`gradle:${canonicalSubApp}`));
-    assert.equal(envBundledChdirReqs.envGradleUserHomeUnset, true);
-
-    const envUnknownFlagReqs = resolveBuildResources(
-      "env",
-      ["--split-string=./gradlew build"],
-      wsDir,
-    );
-    assert.equal(envUnknownFlagReqs.kind, "deny_lifecycle");
-
-    // Java .properties parser supports ':' separator and backslash line continuation in gradle.properties
-    fs.writeFileSync(
-      path.join(subAppDir, "gradle.properties"),
-      "! comment line\norg.gradle.jvmargs : -Xmx4g \\\n  -Dfile.encoding=UTF-8\n",
-    );
-    const contPropsReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
-    assert.equal(contPropsReqs.requestedHeapMb, 4096);
-
-    // GRADLE_OPTS supplies JVM heap settings and marks invocation cold
-    const gradleOptsReqs = resolveBuildResources(
-      "env",
-      ["GRADLE_OPTS=-Dorg.gradle.jvmargs=-Xmx8g", "./gradlew", "build"],
-      subAppDir,
-    );
-    assert.equal(gradleOptsReqs.disablesDaemon, true);
-    assert.equal(gradleOptsReqs.requestedHeapMb, 8192);
-
-    // rules_apple ios_simulator_version without bound UDID is rejected by guard
-    const rulesAppleVerGuard = evaluateCommandGuard(
-      "bazel test //app:tests --@rules_apple//apple/build_settings:ios_simulator_version=18.0",
-      {
-        sessionId: "sess-ios",
-        activeLeases: [
-          {
-            leaseId: "lease_ios_sim",
-            sessionId: "sess-ios",
-            platform: "ios",
-            serial: "11111111-2222-3333-4444-555555555555",
-            udid: "11111111-2222-3333-4444-555555555555",
-            state: "active",
-          },
-        ],
-      },
-    );
-    assert.equal(rulesAppleVerGuard.allowed, false);
-
-    // --bazelrc=/dev/null stops processing subsequent --bazelrc flags
-    const rcX = path.join(wsDir, "x.rc");
-    const rcZ = path.join(wsDir, "z.rc");
-    const ignoredBazelOut = path.join(wsDir, "ignored-bazel-out");
-    fs.mkdirSync(ignoredBazelOut, { recursive: true });
-    const canonicalIgnoredBazelOut = (fs.realpathSync.native || fs.realpathSync)(ignoredBazelOut);
-    fs.writeFileSync(rcX, `startup --output_base=${canonicalSharedBazelOut}\n`);
-    fs.writeFileSync(rcZ, `startup --output_base=${canonicalIgnoredBazelOut}\n`);
-    const nullSentinelBazelrcReqs = resolveBuildResources(
-      "bazel",
-      [
-        "--noworkspace_rc",
-        `--bazelrc=${rcX}`,
-        "--bazelrc=/dev/null",
-        `--bazelrc=${rcZ}`,
-        "build",
-        "//...",
-      ],
-      subAppDir,
-    );
-    assert.ok(nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
-    assert.ok(!nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalIgnoredBazelOut}`));
-
-    // gradle/gradle-daemon-jvm.properties marks build cold and prevents warm daemon false positives
-    const daemonCriteriaDir = path.join(subAppDir, "gradle");
-    fs.mkdirSync(daemonCriteriaDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(daemonCriteriaDir, "gradle-daemon-jvm.properties"),
-      "toolchainVersion=21\ntoolchainVendor=temurin\n",
-    );
-    const daemonCriteriaReqs = resolveBuildResources("./gradlew", ["build"], subAppDir);
-    assert.equal(daemonCriteriaReqs.disablesDaemon, true);
-    const daemonCriteriaProbe = probeWarmBuildDaemons(daemonCriteriaReqs, {
-      env: { JAVA_HOME: canonicalMockJdkHome },
-      runner: () => ({
-        stdout: `5001 ${path.join(canonicalMockJdkHome, "bin", "java")} -Xmx4g -Dfile.encoding=UTF-8 org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalSubApp}\n`,
-      }),
-    });
-    assert.equal(daemonCriteriaProbe.warm, false);
+    // Nonexistent Windows shared output_base normalizes case-insensitively
+    const winOutUpper = resolveBuildResources("bazel", ["--nosystem_rc", "--output_base=C:\\Shared\\Out", "build", "//..."], subAppDir, { platform: "win32" });
+    const winOutLower = resolveBuildResources("bazel", ["--nosystem_rc", "--output_base=c:\\shared\\out", "build", "//..."], wsDir, { platform: "win32" });
+    assert.ok(winOutUpper.resourceKeys.includes("bazel:out:c:\\shared\\out"));
+    assert.ok(winOutLower.resourceKeys.includes("bazel:out:c:\\shared\\out"));
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
 });
 
-test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit flags (--workspace, --phase, --ram-mb), cmdBatch DAG, and parser fuzzing", async () => {
-  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-battle-plan-v3-"));
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-battle-state-v3-"));
+test("bazelrc parsing: workspace/system/env/explicit rc files, imports, version-gated imports and startup:<os>", () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-bazelrc-"));
   try {
+    const subAppDir = path.join(wsDir, "app");
+    fs.mkdirSync(subAppDir, { recursive: true });
+    fs.writeFileSync(path.join(subAppDir, "MODULE.bazel"), 'module(name = "app")\n');
     const dirA = path.join(wsDir, "a");
-    const dirB = path.join(wsDir, "b");
     fs.mkdirSync(dirA, { recursive: true });
-    fs.mkdirSync(dirB, { recursive: true });
-    fs.writeFileSync(path.join(dirA, "settings.gradle"), "rootProject.name = 'a'\n");
-    fs.writeFileSync(path.join(dirB, "settings.gradle"), "rootProject.name = 'b'\n");
-    const canonicalDirB = (fs.realpathSync.native || fs.realpathSync)(dirB);
+    fs.writeFileSync(path.join(dirA, "MODULE.bazel"), 'module(name = "a")\n');
+    const canonicalDirA = realpath(dirA);
 
-    // 1. Repeated `env -C a -C b` resolves each `-C` relative to original entry cwd (not stacked)
-    const repeatedEnvC = resolveBuildResources(
-      "env",
-      ["-C", "a", "-C", "b", "./gradlew", "assembleDebug"],
-      wsDir,
-      { env: { HOME: wsDir } },
-    );
-    assert.equal(repeatedEnvC.kind, "pure_build");
-    assert.equal(repeatedEnvC.workspaceRoot, canonicalDirB);
-    assert.ok(repeatedEnvC.resourceKeys.includes(`gradle:${canonicalDirB}`));
+    // Workspace .bazelrc startup options (--output_base and --host_jvm_args) are loaded into resourceKeys and requestedHeapMb
+    const sharedBazelOut = path.join(wsDir, "shared-bazel-out");
+    fs.mkdirSync(sharedBazelOut, { recursive: true });
+    const canonicalSharedBazelOut = realpath(sharedBazelOut);
+    fs.writeFileSync(path.join(subAppDir, ".bazelrc"), `startup --output_base=${canonicalSharedBazelOut}\nstartup --host_jvm_args=-Xmx6g\n`);
+    const bazelrcReqs = resolveBuildResources("bazel", ["build", "//..."], subAppDir, { systemBazelrcPath: null });
+    assert.ok(bazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
+    assert.equal(bazelrcReqs.disablesDaemon, true);
+    assert.equal(bazelrcReqs.requestedHeapMb, 6144);
+    fs.rmSync(path.join(subAppDir, ".bazelrc"));
 
-    // 2. Default Gradle JVM arguments (-Xmx512m -XX:MaxMetaspaceSize=384m) match warm daemon when org.gradle.jvmargs is unset
-    const mockJdk = path.join(wsDir, "jdk-def");
-    fs.mkdirSync(path.join(mockJdk, "bin"), { recursive: true });
+    // BAZELRC environment variable (single or comma-separated) loads startup options
+    const envRc1 = path.join(wsDir, "env1.bazelrc");
+    const envRc2 = path.join(wsDir, "env2.bazelrc");
+    fs.writeFileSync(envRc1, `startup --output_base=${path.join(wsDir, "bazel-env-out")}\n`);
+    fs.writeFileSync(envRc2, "startup --host_jvm_args=-Xmx6g\n");
+    const bazelrcEnvReqs = resolveBuildResources("bazel", ["--nosystem_rc", "--nohome_rc", "build", "//..."], subAppDir, {
+      env: { ...process.env, BAZELRC: `${envRc1},${envRc2}` },
+    });
+    assert.ok(bazelrcEnvReqs.resourceKeys.some((k) => k.startsWith("bazel:out:") && k.endsWith("bazel-env-out")));
+    assert.equal(bazelrcEnvReqs.requestedHeapMb, 6144);
+    assert.equal(bazelrcEnvReqs.disablesDaemon, true);
+
+    // An invocation-level unset of BAZELRC (step env) wins over the caller env
+    const unsetBazelrcEnvReqs = resolveBuildResources("bazel", ["--nosystem_rc", "--nohome_rc", "build", "//..."], subAppDir, {
+      env: { ...process.env, BAZELRC: `${envRc1},${envRc2}` },
+      inheritedEnvVars: { BAZELRC: null },
+    });
+    assert.equal(unsetBazelrcEnvReqs.resourceKeys.some((k) => k.startsWith("bazel:out:")), false);
+    assert.equal(unsetBazelrcEnvReqs.requestedHeapMb, 0);
+
+    // BAZELRC=/dev/null sentinel stops processing subsequent comma-separated entries
+    const envRcIgnored = path.join(wsDir, "env-ignored.bazelrc");
+    fs.writeFileSync(envRcIgnored, `startup --output_base=${path.join(wsDir, "bazel-env-ignored-out")}\n`);
+    const bazelrcNullSentinelReqs = resolveBuildResources("bazel", ["--nosystem_rc", "--nohome_rc", "build", "//..."], subAppDir, {
+      env: { ...process.env, BAZELRC: `${envRc1},/dev/null,${envRcIgnored}` },
+    });
+    assert.ok(bazelrcNullSentinelReqs.resourceKeys.some((k) => k.endsWith("bazel-env-out")));
+    assert.equal(bazelrcNullSentinelReqs.resourceKeys.some((k) => k.endsWith("bazel-env-ignored-out")), false);
+
+    // Repeated bazelrc imports outside a cycle are reprocessed in place
+    const sharedImportRc = path.join(wsDir, "shared-import.bazelrc");
+    const repeatParentRc = path.join(wsDir, "repeat-parent.bazelrc");
+    fs.writeFileSync(sharedImportRc, `startup --output_base=${path.join(wsDir, "bazel-repeat-actual-out")}\n`);
     fs.writeFileSync(
-      path.join(mockJdk, "bin", process.platform === "win32" ? "java.exe" : "java"),
-      "",
+      repeatParentRc,
+      [
+        `import ${sharedImportRc.replace(/\\/g, "/")}`,
+        `startup --output_base=${path.join(wsDir, "bazel-repeat-middle-out")}`,
+        `import ${sharedImportRc.replace(/\\/g, "/")}`,
+      ].join("\n") + "\n",
     );
-    const canonicalMockJdk = (fs.realpathSync.native || fs.realpathSync)(mockJdk);
-    const defaultJvmWarmProbe = probeWarmBuildDaemons(repeatedEnvC, {
-      env: { JAVA_HOME: canonicalMockJdk, HOME: wsDir },
-      runner: () => ({
-        stdout: `7001 ${path.join(canonicalMockJdk, "bin", "java")} -Xmx512m -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(defaultJvmWarmProbe.warm, true);
-    assert.deepEqual(defaultJvmWarmProbe.daemonPids, [7001]);
+    const repeatImportReqs = resolveBuildResources("bazel", ["--nosystem_rc", "--nohome_rc", `--bazelrc=${repeatParentRc}`, "build", "//..."], subAppDir);
+    assert.ok(repeatImportReqs.resourceKeys.some((k) => k.endsWith("bazel-repeat-actual-out")));
+    assert.equal(repeatImportReqs.resourceKeys.some((k) => k.endsWith("bazel-repeat-middle-out")), false);
 
-    // Non-default heap when org.gradle.jvmargs is unset must NOT match as warm
-    const nonDefaultJvmWarmProbe = probeWarmBuildDaemons(repeatedEnvC, {
-      env: { JAVA_HOME: canonicalMockJdk, HOME: wsDir },
-      runner: () => ({
-        stdout: `7002 ${path.join(canonicalMockJdk, "bin", "java")} -Xmx2g -XX:MaxMetaspaceSize=384m org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(nonDefaultJvmWarmProbe.warm, false);
-
-    // 3. Installation-level $GRADLE_HOME/gradle.properties is loaded with lowest precedence
-    const fakeGradleHome = path.join(wsDir, "gradle-dist");
-    const fakeUserHome = path.join(wsDir, "gradle-user");
-    fs.mkdirSync(fakeGradleHome, { recursive: true });
-    fs.mkdirSync(fakeUserHome, { recursive: true });
-    fs.writeFileSync(
-      path.join(fakeGradleHome, "gradle.properties"),
-      "org.gradle.jvmargs=-Xmx3g\norg.gradle.daemon=false\n",
-    );
-    const gradleHomeOnlyReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
-      env: { GRADLE_HOME: fakeGradleHome, GRADLE_USER_HOME: fakeUserHome },
-    });
-    assert.equal(gradleHomeOnlyReqs.requestedHeapMb, 3072);
-    assert.equal(gradleHomeOnlyReqs.disablesDaemon, true);
-
-    // Project gradle.properties overrides $GRADLE_HOME/gradle.properties
-    fs.writeFileSync(
-      path.join(dirB, "gradle.properties"),
-      "org.gradle.jvmargs=-Xmx4g\norg.gradle.daemon=true\n",
-    );
-    const projectOverridesDistReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
-      env: { GRADLE_HOME: fakeGradleHome, GRADLE_USER_HOME: fakeUserHome },
-    });
-    assert.equal(projectOverridesDistReqs.requestedHeapMb, 4096);
-    assert.equal(projectOverridesDistReqs.disablesDaemon, false);
-
-    // _JAVA_OPTIONS overrides smaller CLI -Dorg.gradle.jvmargs heap (HotSpot precedence)
-    const underscoreJavaHigherHeap = resolveBuildResources(
-      "./gradlew",
-      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
-      dirB,
-      { env: { _JAVA_OPTIONS: "-Xmx16g", GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(underscoreJavaHigherHeap.requestedHeapMb, 16384);
-
-    // -Xms initial heap settings also reserve RAM alongside -Xmx
-    const xmsGradleHeap = resolveBuildResources(
-      "./gradlew",
-      ["-Dorg.gradle.jvmargs=-Xms8g", "assembleDebug"],
-      dirB,
-      { env: { GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(xmsGradleHeap.requestedHeapMb, 8192);
-
-    const xmsBazelHeap = resolveBuildResources(
+    // --bazelrc=/dev/null stops processing subsequent --bazelrc flags
+    const ignoredBazelOut = path.join(wsDir, "ignored-bazel-out");
+    fs.mkdirSync(ignoredBazelOut, { recursive: true });
+    const canonicalIgnoredBazelOut = realpath(ignoredBazelOut);
+    const rcX = path.join(wsDir, "x.rc");
+    const rcZ = path.join(wsDir, "z.rc");
+    fs.writeFileSync(rcX, `startup --output_base=${canonicalSharedBazelOut}\n`);
+    fs.writeFileSync(rcZ, `startup --output_base=${canonicalIgnoredBazelOut}\n`);
+    const nullSentinelBazelrcReqs = resolveBuildResources(
       "bazel",
-      ["--nosystem_rc", "--host_jvm_args=-Xms6g", "build", "//..."],
-      dirA,
+      ["--noworkspace_rc", `--bazelrc=${rcX}`, "--bazelrc=/dev/null", `--bazelrc=${rcZ}`, "build", "//..."],
+      subAppDir,
     );
-    assert.equal(xmsBazelHeap.requestedHeapMb, 6144);
+    assert.ok(nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalSharedBazelOut}`));
+    assert.ok(!nullSentinelBazelrcReqs.resourceKeys.includes(`bazel:out:${canonicalIgnoredBazelOut}`));
 
-    // Nonexistent Windows shared output_base normalizes case-insensitively
-    const winOutUpper = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--output_base=C:\\Shared\\Out", "build", "//..."],
-      dirA,
-      { platform: "win32" },
-    );
-    const winOutLower = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--output_base=c:\\shared\\out", "build", "//..."],
-      dirB,
-      { platform: "win32" },
-    );
-    assert.ok(winOutUpper.resourceKeys.includes("bazel:out:c:\\shared\\out"));
-    assert.ok(winOutLower.resourceKeys.includes("bazel:out:c:\\shared\\out"));
-
-    // Literal single-quoted redirection target >'$(output)' is allowed (not treated as dynamic expansion)
-    const literalRedirReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew assembleDebug >'$(output)'"],
-      dirB,
-      { env: { GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(literalRedirReqs.kind, "pure_build");
-
-    // 4. Windows %ProgramData%\bazel.bazelrc system rc loading
+    // Windows %ProgramData%\bazel.bazelrc system rc loading
     const fakeProgData = path.join(wsDir, "ProgramData");
     const winSysBazelOut = path.join(wsDir, "win-sys-bazel-out");
     fs.mkdirSync(fakeProgData, { recursive: true });
     fs.mkdirSync(winSysBazelOut, { recursive: true });
-    const canonicalWinSysBazelOut = (fs.realpathSync.native || fs.realpathSync)(winSysBazelOut);
-    fs.writeFileSync(
-      path.join(fakeProgData, "bazel.bazelrc"),
-      `startup --output_base=${canonicalWinSysBazelOut}\n`,
-    );
-    fs.writeFileSync(path.join(dirA, "MODULE.bazel"), 'module(name = "a")\n');
-    const winSysRcReqs = resolveBuildResources("bazel", ["build", "//..."], dirA, {
-      platform: "win32",
-      env: { ProgramData: fakeProgData },
-    });
+    const canonicalWinSysBazelOut = realpath(winSysBazelOut);
+    fs.writeFileSync(path.join(fakeProgData, "bazel.bazelrc"), `startup --output_base=${canonicalWinSysBazelOut}\n`);
+    const winSysRcReqs = resolveBuildResources("bazel", ["build", "//..."], dirA, { platform: "win32", env: { ProgramData: fakeProgData } });
     assert.ok(winSysRcReqs.resourceKeys.includes(`bazel:out:${canonicalWinSysBazelOut}`));
 
-    // 5. Fail-closed unparseable shell gate in both resolveBuildResources and buildChildInvocation
-    for (const trickyScript of [
-      'eval "./gradlew connectedCheck"',
-      "./gradlew build <(echo flags)",
-      "./gradlew build >$(echo out.log)",
-      './gradlew build "unclosed quote',
-      "./gradlew build \\",
-    ]) {
-      const gateReqs = resolveBuildResources("sh", ["-c", trickyScript], dirA);
-      assert.equal(gateReqs.kind, "deny_lifecycle", `Expected deny_lifecycle for: ${trickyScript}`);
-      assert.equal(gateReqs.denySubkind, "unparseable_shell");
-      assert.throws(
-        () =>
-          buildChildInvocation("sh", ["-c", trickyScript], null, "sess-gate", process.env, {
-            jobsLimit: 4,
-            reservedRamMb: 3072,
-          }),
-        /cannot be safely analyzed under ATC|Unclosed quote or substitution|Trailing backslash/,
-      );
-    }
-
-    // 6. Explicit --workspace, --phase, and --ram-mb flags on cmdExec
-    const subNested = path.join(dirA, "sub", "nested");
-    fs.mkdirSync(subNested, { recursive: true });
-    const canonicalDirA = (fs.realpathSync.native || fs.realpathSync)(dirA);
-    const explicitWsReqs = resolveBuildResources(
-      process.execPath,
-      ["-e", "process.exit(0)"],
-      wsDir,
-      { forceBuild: true, workspace: subNested },
-    );
-    assert.ok(explicitWsReqs.resourceKeys.includes(`workspace:${canonicalDirA}`));
-
-    // --phase monotonic lattice checks
-    const phaseReadOnlyOnBuild = await cmdExec(
-      stateDir,
-      ["./gradlew", "tasks"],
-      { phase: "read-only", session: "sess-phase" },
-      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
-    );
-    assert.equal(phaseReadOnlyOnBuild.exitCode, 3);
-    assert.match(phaseReadOnlyOnBuild.error, /violates --phase=read-only/);
-
-    const phasePureOnDevice = await cmdExec(
-      stateDir,
-      ["./gradlew", "connectedDebugAndroidTest"],
-      { phase: "pure-build", session: "sess-phase" },
-      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
-    );
-    assert.equal(phasePureOnDevice.exitCode, 3);
-    assert.match(phasePureOnDevice.error, /violates --phase=pure-build/);
-
-    const phasePureWithClaim = await cmdExec(
-      stateDir,
-      ["./gradlew", "assembleDebug"],
-      { phase: "pure-build", claim: true, session: "sess-phase" },
-      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
-    );
-    assert.equal(phasePureWithClaim.exitCode, 3);
-    assert.match(phasePureWithClaim.error, /cannot be combined with --claim/);
-
-    const phaseDeviceTestOnPureBuild = await cmdExec(
-      stateDir,
-      ["./gradlew", "assembleDebug"],
-      { phase: "device-test", session: "sess-phase" },
-      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
-    );
-    assert.equal(phaseDeviceTestOnPureBuild.exitCode, 3);
-    assert.match(phaseDeviceTestOnPureBuild.error, /violates --phase=device-test/);
-
-    const nulEnvBatch = await cmdBatch(
-      stateDir,
-      {
-        steps: [
-          {
-            id: "s1",
-            command: process.execPath,
-            args: ["-e", "process.exit(0)"],
-            env: { BAD_VAL: "abc\0def" },
-          },
-        ],
-      },
-      { session: "sess-batch" },
-      { cwd: dirA },
-    );
-    assert.equal(nulEnvBatch.exitCode, 1);
-    assert.match(nulEnvBatch.error, /NUL bytes/);
-
-    const invalidRam = await cmdExec(
-      stateDir,
-      [process.execPath, "-e", "process.exit(0)"],
-      { phase: "pure-build", ramMb: -5, session: "sess-phase" },
-      { cwd: dirA, env: { ...process.env, ATC_SESSION_ID: "sess-phase" } },
-    );
-    assert.equal(invalidRam.exitCode, 1);
-    assert.match(invalidRam.error, /Invalid --ram-mb/);
-
-    // 7. cmdBatch multi-step DAG runner: cycle detection, pre-flight validation, topological execution
-    const failIfStdinRead = () => {
-      throw new Error("readStdinFn must not be called when batch flags are invalid");
-    };
-    const bogusBatchFlag = await cmdBatch(
-      stateDir,
-      null,
-      { bogus: true },
-      { cwd: dirA, readStdinFn: failIfStdinRead },
-    );
-    assert.equal(bogusBatchFlag.exitCode, 1);
-    assert.match(bogusBatchFlag.error, /Unknown option "--bogus"/);
-
-    const missingFileBatchFlag = await cmdBatch(
-      stateDir,
-      null,
-      { file: true },
-      { cwd: dirA, readStdinFn: failIfStdinRead },
-    );
-    assert.equal(missingFileBatchFlag.exitCode, 1);
-    assert.match(missingFileBatchFlag.error, /Option "--file" requires a (file path|value)/);
-
-    const missingWsBatchFlag = await cmdBatch(
-      stateDir,
-      null,
-      { workspace: true },
-      { cwd: dirA, readStdinFn: failIfStdinRead },
-    );
-    assert.equal(missingWsBatchFlag.exitCode, 1);
-    assert.match(missingWsBatchFlag.error, /Option "--workspace" requires a directory path/);
-
-    const cycleRes = await cmdBatch(
-      stateDir,
-      {
-        steps: [
-          { id: "a", command: process.execPath, args: ["-e", "process.exit(0)"], dependsOn: ["b"] },
-          { id: "b", command: process.execPath, args: ["-e", "process.exit(0)"], dependsOn: ["a"] },
-        ],
-      },
-      { session: "sess-batch" },
-      { cwd: dirA },
-    );
-    assert.equal(cycleRes.exitCode, 1);
-    assert.match(cycleRes.error, /Dependency cycle detected/);
-
-    const markerFile = path.join(wsDir, "step1-ran.txt");
-    const preflightFailRes = await cmdBatch(
-      stateDir,
-      {
-        steps: [
-          {
-            id: "step1",
-            phase: "pure-build",
-            command: process.execPath,
-            args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(markerFile)}, 'ran')`],
-          },
-          {
-            id: "step2",
-            dependsOn: ["step1"],
-            phase: "pure-build",
-            command: "./gradlew",
-            args: ["connectedDebugAndroidTest"],
-          },
-        ],
-      },
-      { session: "sess-batch" },
-      { cwd: dirA },
-    );
-    assert.equal(preflightFailRes.exitCode, 3);
-    assert.match(preflightFailRes.error, /Batch pre-flight failed on step "step2"/);
-    assert.equal(fs.existsSync(markerFile), false, "Step 1 must not run if Step 2 fails pre-flight");
-
-    const orderLog = path.join(wsDir, "dag-order.txt");
-    const fakeBatchInventory = {
-      host: {
-        cpuCores: 8,
-        totalRamMb: 32768,
-        availableRamMb: 16384,
-        freeDiskMb: 50000,
-        sampledAtMs: Date.now(),
-      },
-      running: [],
-      offline: [],
-      creatable: [],
-    };
-    const dagRes = await cmdBatch(
-      stateDir,
-      {
-        steps: [
-          {
-            id: "test-ready",
-            dependsOn: ["compile-lib", "compile-app"],
-            phase: "read-only",
-            command: process.execPath,
-            args: [
-              "-e",
-              `require('node:fs').appendFileSync(${JSON.stringify(orderLog)}, '3\\n')`,
-            ],
-          },
-          {
-            id: "compile-lib",
-            phase: "pure-build",
-            workspace: dirA,
-            ramMb: 1024,
-            command: process.execPath,
-            args: [
-              "-e",
-              `require('node:fs').appendFileSync(${JSON.stringify(orderLog)}, '1\\n')`,
-            ],
-          },
-          {
-            id: "compile-app",
-            dependsOn: ["compile-lib"],
-            phase: "pure-build",
-            workspace: dirA,
-            command: process.execPath,
-            args: [
-              "-e",
-              `require('node:fs').appendFileSync(${JSON.stringify(orderLog)}, '2\\n')`,
-            ],
-          },
-        ],
-      },
-      { session: "sess-batch", json: true },
-      { cwd: dirA, inventory: fakeBatchInventory },
-    );
-    assert.equal(dagRes.exitCode, 0);
-    assert.equal(dagRes.status, "completed");
-    assert.deepEqual(
-      dagRes.steps.map((s) => s.id),
-      ["compile-lib", "compile-app", "test-ready"],
-    );
-    assert.equal(fs.readFileSync(orderLog, "utf8"), "1\n2\n3\n");
-
-    // 8. Differential / property-based fuzzing of vendored parsers (seeded PRNG)
-    let seed = 0x1337beef;
-    const nextRand = () => {
-      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-      return seed / 0x100000000;
-    };
-    const pick = (arr) => arr[Math.floor(nextRand() * arr.length)];
-    for (let i = 0; i < 200; i++) {
-      const k = `org.gradle.${pick(["jvmargs", "java.home", "daemon", "caching", "workers.max"])}`;
-      const v = pick(["-Xmx4g", "C:\\Java\\jdk-21", "/opt/jdk:21", "true", "false", "line1\\\n  line2"]);
-      const sep = pick(["=", ":", " = ", " : ", " "]);
-      const propText = `# comment\n${k}${sep}${v}\n`;
-      const parsedProps = parseJavaProperties(propText);
-      assert.equal(typeof parsedProps.get(k), "string");
-
-      const rcPhase = pick(["startup", "build", "test", "common", "build:ci"]);
-      const rcFlag = pick(["--output_base=/tmp/out", "--jobs=4", "--javabase=/jdk"]);
-      const rcText = `# bazelrc comment\n${rcPhase} \\\n  ${rcFlag}\n`;
-      const rcLines = joinBackslashContinuations(rcText).filter(
-        (l) => l.trim() && !l.trim().startsWith("#"),
-      );
-      assert.equal(rcLines.length, 1);
-      const rcWords = splitShellWords(rcLines[0]);
-      assert.equal(rcWords[0], rcPhase);
-      assert.equal(rcWords[1], rcFlag);
-
-      const safeToks = [
-        pick(["./gradlew", "bazel", "xcodebuild"]),
-        pick(["assembleDebug", "build", "-scheme"]),
-        pick(["'quoted arg'", '"double quoted"', "--flag=val"]),
-      ];
-      const safeCmd = safeToks.join(" ");
-      const sq = parseShellQuote(safeCmd);
-      assert.equal(sq.unclosedQuote, false);
-      const gate = detectUnparseableShellConstructs(safeCmd);
-      assert.equal(gate.unparseable, false);
-    }
-
-    // 9. Executable shell heredoc bodies, duplicate Gradle JVM arg precedence, and gradle --foreground
-    const bashHeredocScript = "bash <<EOF\n./gradlew build\nEOF";
-    const bashHeredocReqs = resolveBuildResources("sh", ["-c", bashHeredocScript], dirB);
-    assert.equal(bashHeredocReqs.kind, "pure_build");
-    assert.equal(bashHeredocReqs.requiresHeavySlot, true);
-    assert.equal(bashHeredocReqs.requiresWorkspaceLock, true);
-
-    const readOnlyHeredocExec = await cmdExec(
-      stateDir,
-      ["sh", "-c", bashHeredocScript],
-      { phase: "read-only", session: "sess-ro-hd" },
-      { cwd: dirB, inventory: fakeBatchInventory },
-    );
-    assert.equal(readOnlyHeredocExec.exitCode, 3);
-    assert.match(readOnlyHeredocExec.error, /Phase conflict/);
-
-    const bashHeredocInv = buildChildInvocation(
-      "sh",
-      ["-c", bashHeredocScript],
-      null,
-      "sess-ro-hd",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      bashHeredocInv.args[1],
-      "bash <<EOF\n./gradlew build -Dorg.gradle.workers.max=4\nEOF",
-    );
-
-    const pipedHeredocScript = "cat <<EOF | bash\n./gradlew build\nEOF";
-    const pipedHeredocReqs = resolveBuildResources("sh", ["-c", pipedHeredocScript], dirB);
-    assert.equal(pipedHeredocReqs.kind, "pure_build");
-    const pipedHeredocInv = buildChildInvocation(
-      "sh",
-      ["-c", pipedHeredocScript],
-      null,
-      "sess-ro-hd",
-      process.env,
-      { jobsLimit: 4, reservedRamMb: 3072 },
-    );
-    assert.equal(
-      pipedHeredocInv.args[1],
-      "cat <<EOF | bash\n./gradlew build -Dorg.gradle.workers.max=4\nEOF",
-    );
-
-    const unquotedDataSubstScript = "cat <<EOF\n$(./gradlew build)\nEOF";
-    const unquotedDataSubstReqs = resolveBuildResources(
-      "sh",
-      ["-c", unquotedDataSubstScript],
-      dirB,
-    );
-    assert.equal(unquotedDataSubstReqs.kind, "pure_build");
-
-    const fileWriteExecHeredoc = "cat > run.sh <<'EOF'\n./gradlew build\nEOF\nsh run.sh";
-    const fileWriteExecReqs = resolveBuildResources("sh", ["-c", fileWriteExecHeredoc], dirB);
-    assert.equal(fileWriteExecReqs.kind, "deny_lifecycle");
-
-    fs.writeFileSync(
-      path.join(dirB, "gradle.properties"),
-      "org.gradle.jvmargs=-Xmx1g -Xmx8g\n",
-    );
-    const dupHeapReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-    });
-    assert.equal(dupHeapReqs.requestedHeapMb, 8192);
-    const reversedDaemonProbe = probeWarmBuildDaemons(dupHeapReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      runner: () => ({
-        stdout: `7010 ${path.join(canonicalMockJdk, "bin", "java")} -Dgradle.user.home=${fakeUserHome} -Xmx8g -Xmx1g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(reversedDaemonProbe.warm, false);
-
-    const matchingEffectiveDaemonProbe = probeWarmBuildDaemons(dupHeapReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      runner: () => ({
-        stdout: `7011 ${path.join(canonicalMockJdk, "bin", "java")} -Dgradle.user.home=${fakeUserHome} -Xmx8g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(matchingEffectiveDaemonProbe.warm, true);
-    assert.deepEqual(matchingEffectiveDaemonProbe.daemonPids, [7011]);
-
-    const fgGradleReqs = resolveBuildResources("./gradlew", ["--foreground"], dirB);
-    assert.equal(fgGradleReqs.kind, "reject_long_running");
-    const fgGradleExec = await cmdExec(
-      stateDir,
-      ["./gradlew", "--foreground"],
-      { session: "sess-fg" },
-      { cwd: dirB, inventory: fakeBatchInventory },
-    );
-    assert.equal(fgGradleExec.exitCode, 3);
-    assert.match(fgGradleExec.error, /gradle --foreground/);
-
-    // 10. Round 45: Bazel child validation from execution cwd, client/env heap max with CLI jvmargs, and full default Gradle daemon compatibility set
-    const bazelStepDir = path.join(wsDir, "bazel-step");
-    fs.mkdirSync(bazelStepDir, { recursive: true });
-    fs.writeFileSync(path.join(bazelStepDir, "MODULE.bazel"), "");
-    fs.writeFileSync(
-      path.join(bazelStepDir, ".bazelrc"),
-      "test --test_arg=--device=emulator-9999\n",
-    );
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "bazel",
-          ["test", "//app:test"],
-          { leaseId: "lease_cwd_bazel", serial: "emulator-5554", platform: "android" },
-          "sess-bazel-cwd",
-          {},
-          null,
-          { cwd: bazelStepDir },
-        ),
-      /Conflicting device selector "emulator-9999"/,
-    );
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "sh",
-          ["-c", "bazel test //app:test"],
-          { leaseId: "lease_cwd_bazel", serial: "emulator-5554", platform: "android" },
-          "sess-bazel-cwd",
-          {},
-          null,
-          { cwd: bazelStepDir },
-        ),
-      /Conflicting device selector "emulator-9999"/,
-    );
-
-    const javaOptsHigherThanCli = resolveBuildResources(
-      "./gradlew",
-      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
-      dirB,
-      { env: { JAVA_OPTS: "-Xmx8g", GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(javaOptsHigherThanCli.requestedHeapMb, 8192);
-
-    const gradleOptsHigherThanCli = resolveBuildResources(
-      "./gradlew",
-      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
-      dirB,
-      { env: { GRADLE_OPTS: "-Xmx6g", GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(gradleOptsHigherThanCli.requestedHeapMb, 6144);
-
-    const javaToolOptsHigherThanCli = resolveBuildResources(
-      "./gradlew",
-      ["-Dorg.gradle.jvmargs=-Xmx1g", "assembleDebug"],
-      dirB,
-      { env: { JAVA_TOOL_OPTIONS: "-Xmx12g", GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(javaToolOptsHigherThanCli.requestedHeapMb, 12288);
-
-    fs.rmSync(path.join(dirB, "gradle.properties"), { force: true });
-    const defaultGradleReqs = resolveBuildResources("./gradlew", ["assembleDebug"], dirB, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-    });
-    const fullDefaultDaemonProbe = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      runner: () => ({
-        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(fullDefaultDaemonProbe.warm, true);
-    assert.deepEqual(fullDefaultDaemonProbe.daemonPids, [7020]);
-
-    const mismatchedDefaultLocaleProbe = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: {
-        JAVA_HOME: canonicalMockJdk,
-        GRADLE_USER_HOME: fakeUserHome,
-        LC_ALL: "",
-        LC_MESSAGES: "",
-        LANG: "en_US.UTF-8",
-      },
-      runner: () => ({
-        stdout: `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(mismatchedDefaultLocaleProbe.warm, false);
-
-    // 11. Round 46: rules_apple ios_simulator_device/version match lease profile metadata, and non-English host locale rejects English daemon
-    const frHostRejectsEnDaemon = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: {
-        JAVA_HOME: canonicalMockJdk,
-        GRADLE_USER_HOME: fakeUserHome,
-        LC_ALL: "",
-        LC_MESSAGES: "",
-        LANG: "fr_FR.UTF-8",
-      },
-      runner: () => ({
-        stdout: `7022 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(frHostRejectsEnDaemon.warm, false);
-
-    const frHostAcceptsFrDaemon = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: {
-        JAVA_HOME: canonicalMockJdk,
-        GRADLE_USER_HOME: fakeUserHome,
-        LC_ALL: "",
-        LC_MESSAGES: "",
-        LANG: "fr_FR.UTF-8",
-      },
-      runner: () => ({
-        stdout: `7023 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(frHostAcceptsFrDaemon.warm, true);
-
-    const wrappedFrGradleReqs = resolveBuildResources(
-      "env",
-      ["LANG=fr_FR.UTF-8", "./gradlew", "assembleDebug"],
-      dirB,
-      {
-        env: {
-          JAVA_HOME: canonicalMockJdk,
-          GRADLE_USER_HOME: fakeUserHome,
-          LC_ALL: "",
-          LC_MESSAGES: "",
-          LANG: "en_US.UTF-8",
-        },
-      },
-    );
-    const wrappedFrRejectsEnDaemon = probeWarmBuildDaemons(wrappedFrGradleReqs, {
-      env: {
-        JAVA_HOME: canonicalMockJdk,
-        GRADLE_USER_HOME: fakeUserHome,
-        LC_ALL: "",
-        LC_MESSAGES: "",
-        LANG: "en_US.UTF-8",
-      },
-      runner: () => ({
-        stdout: `7024 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(wrappedFrRejectsEnDaemon.warm, false);
-
-    const wrappedUnsetLangReqs = resolveBuildResources(
-      "env",
-      ["-u", "LANG", "./gradlew", "assembleDebug"],
-      dirB,
-      {
-        env: {
-          JAVA_HOME: canonicalMockJdk,
-          GRADLE_USER_HOME: fakeUserHome,
-          LC_ALL: "",
-          LC_MESSAGES: "",
-          LANG: "fr_FR.UTF-8",
-        },
-      },
-    );
-    const wrappedUnsetRejectsFrDaemon = probeWarmBuildDaemons(wrappedUnsetLangReqs, {
-      env: {
-        JAVA_HOME: canonicalMockJdk,
-        GRADLE_USER_HOME: fakeUserHome,
-        LC_ALL: "",
-        LC_MESSAGES: "",
-        LANG: "fr_FR.UTF-8",
-      },
-      runner: () => ({
-        stdout: `7025 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=FR -Duser.language=fr -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(wrappedUnsetRejectsFrDaemon.warm, false);
-
-    const iosMatchingLease = {
-      leaseId: "lease_ios_16",
-      sessionId: "sess-ios-match",
-      platform: "ios",
-      kind: "emulator",
-      avd: "iPhone 16",
-      serial: "11111111-2222-3333-4444-555555555555",
-      udid: "11111111-2222-3333-4444-555555555555",
-      state: "active",
-      profile: {
-        platform: "ios",
-        deviceType: "phone",
-        deviceName: "iPhone 16",
-        osVersion: "iOS-18.0",
-        apiLevel: "iOS-18.0",
-      },
-    };
-    const rulesAppleMatchingGuard = evaluateCommandGuard(
-      "bazel test //app:tests --@rules_apple//apple/build_settings:ios_simulator_device='iPhone 16' --@rules_apple//apple/build_settings:ios_simulator_version=18.0",
-      {
-        sessionId: "sess-ios-match",
-        activeLeases: [iosMatchingLease],
-      },
-    );
-    assert.equal(rulesAppleMatchingGuard.allowed, true);
-
-    const rulesAppleChildInv = buildChildInvocation(
-      "bazel",
-      [
-        "test",
-        "//app:tests",
-        "--@rules_apple//apple/build_settings:ios_simulator_device=iPhone 16",
-        "--@rules_apple//apple/build_settings:ios_simulator_version=18.0",
-      ],
-      iosMatchingLease,
-      "sess-ios-match",
-      {},
-      null,
-      { cwd: dirA },
-    );
-    assert.equal(rulesAppleChildInv.cmd, "bazel");
-
-    assert.throws(
-      () =>
-        buildChildInvocation(
-          "bazel",
-          [
-            "test",
-            "//app:tests",
-            "--@rules_apple//apple/build_settings:ios_simulator_device=iPhone 15",
-            "--@rules_apple//apple/build_settings:ios_simulator_version=18.0",
-          ],
-          iosMatchingLease,
-          "sess-ios-match",
-          {},
-          null,
-          { cwd: dirA },
-        ),
-      /Conflicting device selector "iPhone 15"/,
-    );
-
-    // 12. Round 49: BAZELRC version gating (Bazel <= 8 ignores BAZELRC, unknown version forces cold) and top-level rc deduplication
+    // BAZELRC version gating (Bazel <= 8 ignores BAZELRC, unknown version forces cold) and top-level rc deduplication
     const dedupeRcX = path.join(wsDir, "dedupe-x.rc");
     const dedupeRcY = path.join(wsDir, "dedupe-y.rc");
     const dedupeOutX = path.join(wsDir, "dedupe-out-x");
-    const dedupeOutY = path.join(wsDir, "dedupe-out-y");
     fs.writeFileSync(dedupeRcX, `startup --output_base=${dedupeOutX}\n`);
-    fs.writeFileSync(dedupeRcY, `startup --output_base=${dedupeOutY}\n`);
-
-    const bazel8IgnoresBazelrc = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      dirA,
-      { env: { BAZELRC: dedupeRcX }, bazelMajorVersion: 8 },
-    );
-    assert.equal(
-      bazel8IgnoresBazelrc.resourceKeys.some((k) => k.endsWith("dedupe-out-x")),
-      false,
-    );
+    fs.writeFileSync(dedupeRcY, `startup --output_base=${path.join(wsDir, "dedupe-out-y")}\n`);
+    const noRc = ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc"];
+    const bazel8IgnoresBazelrc = resolveBuildResources("bazel", [...noRc, "build", "//..."], dirA, { env: { BAZELRC: dedupeRcX }, bazelMajorVersion: 8 });
+    assert.equal(bazel8IgnoresBazelrc.resourceKeys.some((k) => k.endsWith("dedupe-out-x")), false);
     assert.equal(bazel8IgnoresBazelrc.disablesDaemon, false);
-    const bazel8WrongOutWarmProbe = probeWarmBuildDaemons(bazel8IgnoresBazelrc, {
-      bazelMajorVersion: 8,
-      runner: () => ({
-        stdout: `9501 bazel(a) -XX:+HeapDumpOnOutOfMemoryError --output_base=${dedupeOutX} --workspace_directory=${canonicalDirA}\n`,
-      }),
-    });
-    assert.equal(bazel8WrongOutWarmProbe.warm, false);
-
-    const bazelUnknownVerWithBazelrc = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      dirA,
-      { env: { BAZELRC: dedupeRcX } },
-    );
-    assert.equal(bazelUnknownVerWithBazelrc.disablesDaemon, true);
-    const bazelUnknownVerWarmProbe = probeWarmBuildDaemons(bazelUnknownVerWithBazelrc, {
-      runner: () => ({
-        stdout: `9502 bazel(a) -XX:+HeapDumpOnOutOfMemoryError --output_base=${dedupeOutX} --workspace_directory=${canonicalDirA}\n`,
-      }),
-    });
-    assert.equal(bazelUnknownVerWarmProbe.warm, false);
-
-    const bazel9TopLevelDedupe = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      dirA,
-      { env: { BAZELRC: `${dedupeRcX},${dedupeRcY},${dedupeRcX}` }, bazelMajorVersion: 9 },
-    );
-    assert.ok(bazel9TopLevelDedupe.resourceKeys.some((k) => k.endsWith("dedupe-out-y")));
     assert.equal(
-      bazel9TopLevelDedupe.resourceKeys.some((k) => k.endsWith("dedupe-out-x")),
+      probeWarmBuildDaemons(bazel8IgnoresBazelrc, {
+        bazelMajorVersion: 8,
+        runner: () => ({ stdout: `9501 bazel(a) -XX:+HeapDumpOnOutOfMemoryError --output_base=${dedupeOutX} --workspace_directory=${canonicalDirA}\n` }),
+      }).warm,
       false,
     );
+    const bazelUnknownVerWithBazelrc = resolveBuildResources("bazel", [...noRc, "build", "//..."], dirA, { env: { BAZELRC: dedupeRcX } });
+    assert.equal(bazelUnknownVerWithBazelrc.disablesDaemon, true);
+    assert.equal(
+      probeWarmBuildDaemons(bazelUnknownVerWithBazelrc, {
+        runner: () => ({ stdout: `9502 bazel(a) -XX:+HeapDumpOnOutOfMemoryError --output_base=${dedupeOutX} --workspace_directory=${canonicalDirA}\n` }),
+      }).warm,
+      false,
+    );
+    const bazel9TopLevelDedupe = resolveBuildResources("bazel", [...noRc, "build", "//..."], dirA, {
+      env: { BAZELRC: `${dedupeRcX},${dedupeRcY},${dedupeRcX}` },
+      bazelMajorVersion: 9,
+    });
+    assert.ok(bazel9TopLevelDedupe.resourceKeys.some((k) => k.endsWith("dedupe-out-y")));
+    assert.equal(bazel9TopLevelDedupe.resourceKeys.some((k) => k.endsWith("dedupe-out-x")), false);
     assert.equal(bazel9TopLevelDedupe.disablesDaemon, false);
 
-    // 13. Round 50: try-import-if-bazel-version, startup:<os> filtering & precedence, and here-string phase validation
+    // try-import-if-bazel-version: true / false / ambiguous (ambiguous forces cold)
     const condImportRc = path.join(wsDir, "cond-import.rc");
     const condDeviceRc = path.join(wsDir, "cond-device.rc");
-    const condOut87 = path.join(wsDir, "cond-out-87");
-    fs.writeFileSync(
-      condDeviceRc,
-      [
-        `startup --output_base=${condOut87}`,
-        `test --test_arg=--device=emulator-5554`,
-        `clean --expunge`,
-      ].join("\n") + "\n",
-    );
-    fs.writeFileSync(
-      condImportRc,
-      `try-import-if-bazel-version >=8.7.0 ${condDeviceRc}\n`,
-    );
-
-    const condTrueTest = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "test", "//app:test"],
-      dirA,
-      { bazelVersion: "8.7.0" },
-    );
-    assert.equal(condTrueTest.kind, "device_coupled_build");
-    assert.equal(condTrueTest.requiresDevice, true);
-    assert.equal(condTrueTest.targetSerial, "emulator-5554");
+    fs.writeFileSync(condDeviceRc, `startup --output_base=${path.join(wsDir, "cond-out-87")}\ntest --test_arg=--device=emulator-5554\n`);
+    fs.writeFileSync(condImportRc, `try-import-if-bazel-version >=8.7.0 ${condDeviceRc}\n`);
+    const condArgs = [...noRc, `--bazelrc=${condImportRc}`, "test", "//app:test"];
+    const condTrueTest = resolveBuildResources("bazel", condArgs, dirA, { bazelVersion: "8.7.0" });
+    assert.equal(condTrueTest.kind, "pure_build", "argv never makes a bazel invocation device-coupled; the op does");
     assert.ok(condTrueTest.resourceKeys.some((k) => k.endsWith("cond-out-87")));
     assert.equal(condTrueTest.disablesDaemon, false);
-
-    const condTrueClean = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "clean"],
-      dirA,
-      { bazelVersion: "8.7.0" },
-    );
-    assert.equal(condTrueClean.kind, "deny_lifecycle");
-
-    const condFalseTest = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "test", "//app:test"],
-      dirA,
-      { bazelVersion: "8.6.0" },
-    );
-    assert.equal(condFalseTest.kind, "pure_build");
-    assert.equal(condFalseTest.requiresDevice, false);
-    assert.equal(
-      condFalseTest.resourceKeys.some((k) => k.endsWith("cond-out-87")),
-      false,
-    );
-
-    const condAmbiguousTest = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "test", "//app:test"],
-      dirA,
-    );
-    assert.equal(condAmbiguousTest.kind, "device_coupled_build");
-    assert.equal(condAmbiguousTest.requiresDevice, true);
-    assert.equal(condAmbiguousTest.targetSerial, "emulator-5554");
+    const condFalseTest = resolveBuildResources("bazel", condArgs, dirA, { bazelVersion: "8.6.0" });
+    assert.equal(condFalseTest.resourceKeys.some((k) => k.endsWith("cond-out-87")), false);
+    const condAmbiguousTest = resolveBuildResources("bazel", condArgs, dirA);
     assert.ok(condAmbiguousTest.resourceKeys.some((k) => k.endsWith("cond-out-87")));
     assert.equal(condAmbiguousTest.disablesDaemon, true);
 
+    // startup:<os> filtering & precedence
     const startupOsRc = path.join(wsDir, "startup-os.rc");
-    const macOut = path.join(wsDir, "out-mac");
-    const linuxOut = path.join(wsDir, "out-linux");
-    const defaultOut = path.join(wsDir, "out-default");
     fs.writeFileSync(
       startupOsRc,
       [
-        `startup:macos --output_base=${macOut}`,
-        `startup:linux --output_base=${linuxOut}`,
-        `startup --output_base=${defaultOut}`,
+        `startup:macos --output_base=${path.join(wsDir, "out-mac")}`,
+        `startup:linux --output_base=${path.join(wsDir, "out-linux")}`,
+        `startup --output_base=${path.join(wsDir, "out-default")}`,
       ].join("\n") + "\n",
     );
-    const macStartupRes = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${startupOsRc}`, "build", "//..."],
-      dirA,
-      { platform: "darwin" },
-    );
+    const macStartupRes = resolveBuildResources("bazel", [...noRc, `--bazelrc=${startupOsRc}`, "build", "//..."], dirA, { platform: "darwin" });
     assert.ok(macStartupRes.resourceKeys.some((k) => k.endsWith("out-mac")));
-    assert.equal(
-      macStartupRes.resourceKeys.some((k) => k.endsWith("out-linux")),
-      false,
-    );
-    assert.equal(
-      macStartupRes.resourceKeys.some((k) => k.endsWith("out-default")),
-      false,
-    );
+    assert.equal(macStartupRes.resourceKeys.some((k) => k.endsWith("out-linux")), false);
+    assert.equal(macStartupRes.resourceKeys.some((k) => k.endsWith("out-default")), false);
     assert.equal(macStartupRes.disablesDaemon, false);
 
-    const hereStringBuildReqs = resolveBuildResources(
-      "bash",
-      ["-c", 'bash <<< "./gradlew build"'],
-      dirA,
-    );
-    assert.equal(hereStringBuildReqs.kind, "pure_build");
-    assert.equal(hereStringBuildReqs.requiresHeavySlot, true);
-    assert.equal(hereStringBuildReqs.requiresWorkspaceLock, true);
-
-    const readOnlyHereStringExec = await cmdExec(
-      stateDir,
-      ["bash", "-c", 'bash <<< "./gradlew build"'],
-      { session: "s-round50", phase: "read-only" },
-      { cwd: dirA },
-    );
-    assert.equal(readOnlyHereStringExec.exitCode, 3);
-    assert.match(readOnlyHereStringExec.error, /Phase conflict:.*violates --phase=read-only/);
-
-    const readOnlyHereStringBatch = await cmdBatch(
-      stateDir,
-      {
-        steps: [
-          {
-            id: "herestring-step",
-            phase: "read-only",
-            command: "bash",
-            args: ["-c", 'bash <<< "./gradlew build"'],
-          },
-        ],
-      },
-      { session: "s-round50" },
-      { cwd: dirA },
-    );
-    assert.equal(readOnlyHereStringBatch.exitCode, 3);
-    assert.match(readOnlyHereStringBatch.error, /Phase conflict:.*violates --phase=read-only/);
-
-    // 14. Round 51-52: .bazelversion major version propagation for Bazelisk vs direct bazel, busy/incompatible Gradle daemon exclusion, and Cursor build hook denial
-    const bvDir = path.join(wsDir, "bazel9-ws");
-    fs.mkdirSync(bvDir, { recursive: true });
-    fs.writeFileSync(path.join(bvDir, "MODULE.bazel"), 'module(name = "b9")\n');
-    fs.writeFileSync(path.join(bvDir, ".bazelversion"), "9.0.0\n");
-    const canonicalBvDir = (fs.realpathSync.native || fs.realpathSync)(bvDir);
-
-    const bvDarwinReqs = resolveBuildResources(
-      "bazelisk",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bvDir,
-      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
-    );
-    assert.equal(bvDarwinReqs.bazelMajorVersion, 9);
-    assert.ok(
-      bvDarwinReqs.defaultBazelOutputBases.some((p) =>
-        p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/"),
-      ),
-    );
-    const bvDarwinWarmProbe = probeWarmBuildDaemons(bvDarwinReqs, {
-      platform: "darwin",
-      env: { USER: "alice", HOME: "/Users/alice" },
-      runner: () => ({
-        stdout: `9601 bazel(b9) -XX:+HeapDumpOnOutOfMemoryError --output_base=${bvDarwinReqs.defaultBazelOutputBases[0]} --workspace_directory=${canonicalBvDir}\n`,
-      }),
-    });
-    assert.equal(bvDarwinWarmProbe.warm, true);
-    assert.deepEqual(bvDarwinWarmProbe.daemonPids, [9601]);
-
-    // Direct `/opt/bazel-8/bin/bazel` binary does not read .bazelversion and stays ambiguous on macOS
-    const directBazelDarwinReqs = resolveBuildResources(
-      "/opt/bazel-8/bin/bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bvDir,
-      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
-    );
-    assert.equal(directBazelDarwinReqs.bazelMajorVersion, undefined);
-    assert.deepEqual(directBazelDarwinReqs.defaultBazelOutputBases, []);
-
-    // Bare `bazel` resolved through PATH symlink to `bazelisk` reads .bazelversion, whereas bare `bazel` pointing to standalone binary does not
-    const fakeBazeliskBinDir = path.join(wsDir, "fake-bazelisk-bin");
-    fs.mkdirSync(fakeBazeliskBinDir, { recursive: true });
-    const fakeBazeliskExe = path.join(fakeBazeliskBinDir, "bazelisk");
-    fs.writeFileSync(fakeBazeliskExe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    fs.symlinkSync(fakeBazeliskExe, path.join(fakeBazeliskBinDir, "bazel"));
-
-    const pathSymlinkBazelReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bvDir,
-      {
-        platform: "darwin",
-        env: { USER: "alice", HOME: "/Users/alice", PATH: fakeBazeliskBinDir },
-      },
-    );
-    assert.equal(pathSymlinkBazelReqs.isBazelisk, true);
-    assert.equal(pathSymlinkBazelReqs.bazelMajorVersion, 9);
-    assert.ok(
-      pathSymlinkBazelReqs.defaultBazelOutputBases.some((p) =>
-        p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/"),
-      ),
-    );
-
-    const fakeStandaloneBazelBinDir = path.join(wsDir, "fake-standalone-bazel-bin");
-    fs.mkdirSync(fakeStandaloneBazelBinDir, { recursive: true });
-    fs.writeFileSync(path.join(fakeStandaloneBazelBinDir, "bazel"), "#!/bin/sh\nexit 0\n", {
-      mode: 0o755,
-    });
-    const pathStandaloneBazelReqs = resolveBuildResources(
-      "bazel",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bvDir,
-      {
-        platform: "darwin",
-        env: { USER: "alice", HOME: "/Users/alice", PATH: fakeStandaloneBazelBinDir },
-      },
-    );
-    assert.equal(pathStandaloneBazelReqs.isBazelisk, false);
-    assert.equal(pathStandaloneBazelReqs.bazelMajorVersion, undefined);
-    assert.deepEqual(pathStandaloneBazelReqs.defaultBazelOutputBases, []);
-
-    // .bazeliskrc USE_BAZEL_VERSION takes precedence over .bazelversion, and non-numeric selectors (e.g. last_green) do not fall back to .bazelversion
-    const bazeliskRcWs = path.join(wsDir, "bazeliskrc-ws");
-    fs.mkdirSync(bazeliskRcWs, { recursive: true });
-    fs.writeFileSync(path.join(bazeliskRcWs, "MODULE.bazel"), 'module(name = "brc")\n');
-    fs.writeFileSync(path.join(bazeliskRcWs, ".bazelversion"), "8.2.1\n");
-    fs.writeFileSync(path.join(bazeliskRcWs, ".bazeliskrc"), "USE_BAZEL_VERSION=9.2.0\n");
-    const bazeliskRcReqs = resolveBuildResources(
-      "bazelisk",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bazeliskRcWs,
-      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
-    );
-    assert.equal(bazeliskRcReqs.bazelMajorVersion, 9);
-    assert.ok(
-      bazeliskRcReqs.defaultBazelOutputBases.some((p) =>
-        p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/"),
-      ),
-    );
-
-    const lastGreenEnvReqs = resolveBuildResources(
-      "bazelisk",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bvDir,
-      {
-        platform: "darwin",
-        env: { USER: "alice", HOME: "/Users/alice", USE_BAZEL_VERSION: "last_green" },
-      },
-    );
-    assert.equal(lastGreenEnvReqs.bazelMajorVersion, undefined);
-    assert.deepEqual(lastGreenEnvReqs.defaultBazelOutputBases, []);
-
-    fs.writeFileSync(path.join(bazeliskRcWs, ".bazelversion"), "9.0.0\n");
-    fs.writeFileSync(path.join(bazeliskRcWs, ".bazeliskrc"), "USE_BAZEL_VERSION=last_green\n");
-    const lastGreenRcReqs = resolveBuildResources(
-      "bazelisk",
-      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-      bazeliskRcWs,
-      { platform: "darwin", env: { USER: "alice", HOME: "/Users/alice" } },
-    );
-    assert.equal(lastGreenRcReqs.bazelMajorVersion, undefined);
-    assert.deepEqual(lastGreenRcReqs.defaultBazelOutputBases, []);
-
-    // Busy Gradle daemon is not double-counted as warm for a concurrent Gradle build
-    const busyGradleProbeSingle = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      activeBuildLeases: {
-        build_other_gradle: {
-          buildId: "build_other_gradle",
-          tool: "gradle",
-          requiresHeavySlot: true,
-          state: "active",
-          preparingDevice: false,
-          claimedDaemonPid: 7020,
-        },
-      },
-      runner: () => ({
-        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(busyGradleProbeSingle.warm, false);
-    assert.deepEqual(busyGradleProbeSingle.daemonPids, []);
-
-    // Active Gradle lease holding a known incompatible daemon PID (8001) does not consume compatible idle daemon (7020)
-    const incompatibleBusyGradleProbe = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      activeBuildLeases: {
-        build_other_gradle_jdk: {
-          buildId: "build_other_gradle_jdk",
-          tool: "gradle",
-          requiresHeavySlot: true,
-          state: "active",
-          preparingDevice: false,
-          claimedDaemonPid: 8001,
-        },
-      },
-      runner: () => ({
-        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(incompatibleBusyGradleProbe.warm, true);
-    assert.deepEqual(incompatibleBusyGradleProbe.daemonPids, [7020]);
-
-    const busyGradleProbeTwoDaemons = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      activeBuildLeases: {
-        build_other_gradle: {
-          buildId: "build_other_gradle",
-          tool: "gradle",
-          requiresHeavySlot: true,
-          state: "active",
-          preparingDevice: false,
-          claimedDaemonPid: 7020,
-        },
-      },
-      runner: () => ({
-        stdout: [
-          `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
-          `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
-        ].join("\n"),
-      }),
-    });
-    assert.equal(busyGradleProbeTwoDaemons.warm, true);
-    assert.deepEqual(busyGradleProbeTwoDaemons.daemonPids, [7021]);
-
-    const busyGradleClientPsProbe = probeWarmBuildDaemons(defaultGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      runner: () => ({
-        stdout: [
-          `7019 ${path.join(canonicalMockJdk, "bin", "java")} org.gradle.wrapper.GradleWrapperMain assembleDebug`,
-          `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
-        ].join("\n"),
-      }),
-    });
-    assert.equal(busyGradleClientPsProbe.warm, false);
-    assert.deepEqual(busyGradleClientPsProbe.daemonPids, []);
-
-    // Cursor hook blocks pure build when coordinateBuilds is enabled because Cursor cannot rewrite commands
-    const cursorBuildHookRes = handlePreToolUseHook(
-      stateDir,
-      JSON.stringify({
-        conversation_id: "cursor-conv-build",
-        command: "./gradlew build",
-      }),
-      { coordinateBuilds: true },
-    );
-    assert.equal(cursorBuildHookRes.exitCode, 2);
-    const cursorOut = JSON.parse(cursorBuildHookRes.stdout);
-    assert.equal(cursorOut.permission, "deny");
-    assert.match(cursorOut.agent_message, /atc exec --build -- \.\/gradlew build/);
-
-    // Round 54: non-executable PATH bazel->bazelisk entry is skipped, wrapper unsets (env -u BAZELRC) preserved in guard, and payload cwd threaded through hook Bazel rc evaluation
-    if (process.platform !== "win32") {
-      const nonExecBinDir = path.join(wsDir, "nonexec-bazelisk-bin");
-      fs.mkdirSync(nonExecBinDir, { recursive: true });
-      const nonExecBazelisk = path.join(nonExecBinDir, "bazelisk");
-      fs.writeFileSync(nonExecBazelisk, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
-      fs.symlinkSync(nonExecBazelisk, path.join(nonExecBinDir, "bazel"));
-      const nonExecFallbackReqs = resolveBuildResources(
-        "bazel",
-        ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
-        bvDir,
-        {
-          platform: "darwin",
-          env: {
-            USER: "alice",
-            HOME: "/Users/alice",
-            PATH: `${nonExecBinDir}:${fakeStandaloneBazelBinDir}`,
-          },
-        },
-      );
-      assert.equal(nonExecFallbackReqs.isBazelisk, false);
-      assert.equal(nonExecFallbackReqs.bazelMajorVersion, undefined);
-      assert.deepEqual(nonExecFallbackReqs.defaultBazelOutputBases, []);
-    }
-
-    const guardRcWs = path.join(wsDir, "guard-rc-ws");
-    fs.mkdirSync(guardRcWs, { recursive: true });
-    fs.writeFileSync(path.join(guardRcWs, "MODULE.bazel"), 'module(name = "grc")\n');
-    fs.writeFileSync(path.join(guardRcWs, ".bazelrc"), "clean --expunge\n");
-    const safeRcPath = path.join(guardRcWs, "safe.rc");
-    fs.writeFileSync(safeRcPath, "clean --noexpunge\n");
-
-    const allowedWithSafeRc = evaluateCommandGuard("bazel --nosystem_rc --nohome_rc clean", {
-      cwd: guardRcWs,
-      env: { ...process.env, BAZELRC: safeRcPath },
-    });
-    assert.equal(allowedWithSafeRc.allowed, true);
-
-    const deniedWithEnvUnset = evaluateCommandGuard(
-      "env -u BAZELRC bazel --nosystem_rc --nohome_rc clean",
-      {
-        cwd: guardRcWs,
-        env: { ...process.env, BAZELRC: safeRcPath },
-      },
-    );
-    assert.equal(deniedWithEnvUnset.allowed, false);
-    assert.match(deniedWithEnvUnset.reason, /bazel clean --expunge/);
-
-    const deniedWithShellUnset = evaluateCommandGuard(
-      "unset BAZELRC && bazel --nosystem_rc --nohome_rc clean",
-      {
-        cwd: guardRcWs,
-        env: { ...process.env, BAZELRC: safeRcPath },
-      },
-    );
-    assert.equal(deniedWithShellUnset.allowed, false);
-    assert.match(deniedWithShellUnset.reason, /bazel clean --expunge/);
-
-    const hookPayloadCwdDeny = handlePreToolUseHook(
-      stateDir,
-      JSON.stringify({
-        session_id: "sess-hook-bazel-cwd",
-        cwd: guardRcWs,
-        tool_name: "Bash",
-        tool_input: { command: "bazel --nosystem_rc --nohome_rc clean" },
-      }),
-    );
-    assert.equal(hookPayloadCwdDeny.exitCode, 2);
-    assert.match(hookPayloadCwdDeny.stderr, /bazel clean --expunge/);
-
-    // Round 55: absolute `cd /abs/path` after relative `cd sub` replaces tracked cwd, and repeated `env -C a -C b` resolves each relative chdir against wrapper entry cwd
-    const absCdDeny = evaluateCommandGuard(
-      `cd sub && cd ${JSON.stringify(guardRcWs)} && bazel --nosystem_rc --nohome_rc clean`,
-      { cwd: wsDir },
-    );
-    assert.equal(absCdDeny.allowed, false);
-    assert.match(absCdDeny.reason, /bazel clean --expunge/);
-
-    const multiEnvChdirDeny = evaluateCommandGuard(
-      "env -C fake-bazelisk-bin -C guard-rc-ws bazel --nosystem_rc --nohome_rc clean",
-      { cwd: wsDir },
-    );
-    assert.equal(multiEnvChdirDeny.allowed, false);
-    assert.match(multiEnvChdirDeny.reason, /bazel clean --expunge/);
-
-    // Round 56: concurrently piped build clauses sum RAM demand while sequential chains take max, and warm daemon probing does not double-claim a single daemon across piped stages
-    const pipedHeapReqs = resolveBuildResources(
-      "sh",
-      [
-        "-c",
-        "./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g assembleDebug | ./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g testDebugUnitTest",
-      ],
-      dirB,
-      { env: { GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(pipedHeapReqs.requestedHeapMb, 8192);
-    assert.equal(computeColdBuildRamDemandMb(pipedHeapReqs, 3072), 8192);
-
-    const seqHeapReqs = resolveBuildResources(
-      "sh",
-      [
-        "-c",
-        "./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g assembleDebug && ./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx4g testDebugUnitTest",
-      ],
-      dirB,
-      { env: { GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(seqHeapReqs.requestedHeapMb, 4096);
-    assert.equal(computeColdBuildRamDemandMb(seqHeapReqs, 3072), 4096);
-
-    const pipedDefaultColdReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew --no-daemon assembleDebug | ./gradlew --no-daemon testDebugUnitTest"],
-      dirB,
-      { env: { GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(computeColdBuildRamDemandMb(pipedDefaultColdReqs, 3072), 6144);
-
-    const mixedSeqParHeapReqs = resolveBuildResources(
-      "sh",
-      [
-        "-c",
-        "(./gradlew -Dorg.gradle.jvmargs=-Xmx2g assembleDebug && ./gradlew -Dorg.gradle.jvmargs=-Xmx3g lintDebug) | ./gradlew -Dorg.gradle.jvmargs=-Xmx4g testDebugUnitTest",
-      ],
-      dirB,
-      { env: { GRADLE_USER_HOME: fakeUserHome } },
-    );
-    assert.equal(mixedSeqParHeapReqs.requestedHeapMb, 7168);
-    assert.equal(computeColdBuildRamDemandMb(mixedSeqParHeapReqs, 3072), 7168);
-
-    const pipedWarmGradleReqs = resolveBuildResources(
-      "sh",
-      ["-c", "./gradlew assembleDebug | ./gradlew testDebugUnitTest"],
-      dirB,
-      { env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome } },
-    );
-    const pipedSingleDaemonProbe = probeWarmBuildDaemons(pipedWarmGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      runner: () => ({
-        stdout: `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}\n`,
-      }),
-    });
-    assert.equal(pipedSingleDaemonProbe.warm, false);
-    assert.equal(pipedSingleDaemonProbe.anyWarm, true);
-    assert.equal(pipedSingleDaemonProbe.coldRamMb, 3072);
-    assert.deepEqual(pipedSingleDaemonProbe.claimedDaemonPids, [7020]);
-
-    const pipedTwoDaemonsProbe = probeWarmBuildDaemons(pipedWarmGradleReqs, {
-      env: { JAVA_HOME: canonicalMockJdk, GRADLE_USER_HOME: fakeUserHome },
-      runner: () => ({
-        stdout: [
-          `7020 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
-          `7021 ${path.join(canonicalMockJdk, "bin", "java")} -XX:MaxMetaspaceSize=384m -XX:+HeapDumpOnOutOfMemoryError -Xms256m -Xmx512m -Dfile.encoding=UTF-8 -Duser.country=US -Duser.language=en -Duser.variant -Dgradle.user.home=${fakeUserHome} org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10 ${canonicalDirB}`,
-        ].join("\n"),
-      }),
-    });
-    assert.equal(pipedTwoDaemonsProbe.warm, true);
-    assert.equal(pipedTwoDaemonsProbe.coldRamMb, 0);
-    assert.deepEqual(pipedTwoDaemonsProbe.claimedDaemonPids, [7020, 7021]);
-
-    // Round 57 regressions:
-    // 1. Relative bazelrc import/try-import/try-import-if-bazel-version resolve against invocation cwd (baseCwd)
+    // Relative bazelrc import/try-import-if-bazel-version resolve against the invocation cwd
     const rcCwdSub = path.join(wsDir, "bazel-rc-cwd-test", "sub", "inv");
     const rcConfigDir = path.join(wsDir, "bazel-rc-cwd-test", "configs");
     fs.mkdirSync(path.join(rcCwdSub, "rel"), { recursive: true });
@@ -4087,275 +1646,547 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     const cwdCondImportOutBase = path.join(wsDir, "bazel-cwd-cond-import-out");
     fs.mkdirSync(cwdImportOutBase, { recursive: true });
     fs.mkdirSync(cwdCondImportOutBase, { recursive: true });
-    fs.writeFileSync(
-      path.join(rcCwdSub, "rel", "imported.bazelrc"),
-      `startup --output_base=${cwdImportOutBase}\n`,
-      "utf8",
-    );
-    fs.writeFileSync(
-      path.join(rcCwdSub, "rel", "cond.bazelrc"),
-      `startup --output_base=${cwdCondImportOutBase}\n`,
-      "utf8",
-    );
+    fs.writeFileSync(path.join(rcCwdSub, "rel", "imported.bazelrc"), `startup --output_base=${cwdImportOutBase}\n`, "utf8");
+    fs.writeFileSync(path.join(rcCwdSub, "rel", "cond.bazelrc"), `startup --output_base=${cwdCondImportOutBase}\n`, "utf8");
     const outerRcPath = path.join(rcConfigDir, "outer.bazelrc");
-    fs.writeFileSync(
-      outerRcPath,
-      `import rel/imported.bazelrc\ntry-import-if-bazel-version >=8.0.0 rel/cond.bazelrc\n`,
-      "utf8",
-    );
-    const relImportFromCwdReqs = resolveBuildResources(
-      "bazel",
-      [`--bazelrc=${outerRcPath}`, "build", "//..."],
-      rcCwdSub,
-      { bazelVersion: "8.2.1" },
-    );
+    fs.writeFileSync(outerRcPath, "import rel/imported.bazelrc\ntry-import-if-bazel-version >=8.0.0 rel/cond.bazelrc\n", "utf8");
+    const relImportFromCwdReqs = resolveBuildResources("bazel", [`--bazelrc=${outerRcPath}`, "build", "//..."], rcCwdSub, {
+      bazelVersion: "8.2.1",
+      systemBazelrcPath: null,
+      env: { HOME: rcConfigDir },
+    });
     const canonicalRcWsRoot = canonicalizeBuildPath(path.join(wsDir, "bazel-rc-cwd-test"));
     assert.deepEqual(relImportFromCwdReqs.resourceKeys, [
       `bazel:ws:${canonicalRcWsRoot}`,
       `bazel:out:${canonicalizeBuildPath(cwdCondImportOutBase)}`,
     ]);
 
-    // 2. BAZELRC=/dev/null stops reading remaining BAZELRC entries without ignoring explicit --bazelrc flags
+    // BAZELRC=/dev/null stops reading remaining BAZELRC entries without ignoring explicit --bazelrc flags
     const envBeforeNullRc = path.join(rcConfigDir, "env-before.bazelrc");
     const envAfterNullRc = path.join(rcConfigDir, "env-after.bazelrc");
     const cliAfterEnvNullRc = path.join(rcConfigDir, "cli-after-null.bazelrc");
     const cliAfterNullOutBase = path.join(wsDir, "bazel-cli-after-env-null-out");
-    const ignoredAfterNullOutBase = path.join(wsDir, "bazel-ignored-after-null-out");
     fs.mkdirSync(cliAfterNullOutBase, { recursive: true });
-    fs.mkdirSync(ignoredAfterNullOutBase, { recursive: true });
     fs.writeFileSync(envBeforeNullRc, "build --jobs=2\n", "utf8");
-    fs.writeFileSync(
-      envAfterNullRc,
-      `startup --output_base=${ignoredAfterNullOutBase}\n`,
-      "utf8",
-    );
-    fs.writeFileSync(
-      cliAfterEnvNullRc,
-      `startup --output_base=${cliAfterNullOutBase}\n`,
-      "utf8",
-    );
-    const bazelrcNullThenCliReqs = resolveBuildResources(
-      "bazel",
-      [`--bazelrc=${cliAfterEnvNullRc}`, "build", "//..."],
-      rcCwdSub,
-      {
-        bazelVersion: "9.0.0",
-        env: { BAZELRC: `${envBeforeNullRc},/dev/null,${envAfterNullRc}` },
-      },
-    );
+    fs.writeFileSync(envAfterNullRc, `startup --output_base=${path.join(wsDir, "bazel-ignored-after-null-out")}\n`, "utf8");
+    fs.writeFileSync(cliAfterEnvNullRc, `startup --output_base=${cliAfterNullOutBase}\n`, "utf8");
+    const bazelrcNullThenCliReqs = resolveBuildResources("bazel", [`--bazelrc=${cliAfterEnvNullRc}`, "build", "//..."], rcCwdSub, {
+      bazelVersion: "9.0.0",
+      systemBazelrcPath: null,
+      env: { HOME: rcConfigDir, BAZELRC: `${envBeforeNullRc},/dev/null,${envAfterNullRc}` },
+    });
     assert.deepEqual(bazelrcNullThenCliReqs.resourceKeys, [
       `bazel:ws:${canonicalRcWsRoot}`,
       `bazel:out:${canonicalizeBuildPath(cliAfterNullOutBase)}`,
     ]);
-
-    // 3. Build tools delegated through xargs / parallel / find -exec are classified, guarded, and coordinated
-    // Dynamic xargs input cannot be inspected for lifecycle flags, so Gradle/Bazel fail closed.
-    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "assembleDebug"]).kind, "deny_lifecycle");
-    assert.equal(classifyBuildCommand("xargs", ["./gradlew", "--version"]).kind, "deny_lifecycle");
-    assert.equal(classifyBuildCommand("xargs", ["bazel", "build", "//..."]).kind, "deny_lifecycle");
-    assert.equal(classifyBuildCommand("xargs", ["bazel", "shutdown"]).kind, "deny_lifecycle");
-    assert.equal(classifyBuildCommand("xargs", ["xcodebuild", "build"]).kind, "deny_lifecycle");
-    assert.match(
-      classifyBuildCommand("sh", ["-c", "cat args | xargs xcodebuild"]).reason || "",
-      /device selectors/,
-    );
-    const xargsXcodeGuard = evaluateCommandGuard("cat args | xargs xcodebuild", {
-      sessionId: "sess-xargs-xcode",
-      activeLeases: [],
-      coordinateBuilds: true,
-      cwd: dirB,
-    });
-    assert.equal(xargsXcodeGuard.allowed, false);
-    assert.equal(
-      classifyBuildCommand("sh", ["-c", "echo build | xargs xcodebuild -scheme App"]).kind,
-      "pure_build",
-    );
-    assert.match(
-      classifyBuildCommand("sh", ["-c", "cat args.txt | xargs ./gradlew"]).reason || "",
-      /dynamically through xargs/,
-    );
-    assert.match(
-      classifyBuildCommand("sh", ["-c", "echo assembleDebug | xargs -a extra.txt ./gradlew"]).reason ||
-        "",
-      /dynamically through xargs/,
-    );
-    // Static piped arguments are inspected directly.
-    assert.equal(
-      classifyBuildCommand("sh", ["-c", "printf '%s\\n' --stop | xargs ./gradlew"]).kind,
-      "deny_lifecycle",
-    );
-    assert.equal(
-      classifyBuildCommand("sh", ["-c", "echo connectedDebugAndroidTest | xargs ./gradlew"]).kind,
-      "device_coupled_build",
-    );
-    assert.equal(
-      classifyBuildCommand("sh", ["-c", "echo assembleDebug | xargs ./gradlew"]).kind,
-      "pure_build",
-    );
-    // Parallel fan-out (xargs -P / GNU parallel) cannot be RAM-admitted as one build.
-    assert.match(
-      classifyBuildCommand("sh", ["-c", "printf 'build\\nbuild\\n' | xargs -n1 -P2 ./gradlew"])
-        .reason || "",
-      /Parallel fan-out/,
-    );
-    assert.equal(
-      classifyBuildCommand("sh", ["-c", "echo assembleDebug | xargs -P1 ./gradlew"]).kind,
-      "pure_build",
-    );
-    assert.equal(
-      classifyBuildCommand("parallel", ["-j1", "./gradlew", ":::", "assembleDebug"]).kind,
-      "pure_build",
-    );
-    assert.match(
-      classifyBuildCommand("parallel", ["./gradlew", ":::", "assembleDebug", "lintDebug"]).reason ||
-        "",
-      /Parallel fan-out/,
-    );
-    assert.equal(
-      classifyBuildCommand("find", [".", "-maxdepth", "1", "-exec", "./gradlew", "assembleDebug", ";"]).kind,
-      "pure_build",
-    );
-    assert.equal(
-      classifyBuildCommand("find", [".", "-maxdepth", "1", "-exec", "./gradlew", "--stop", ";"]).kind,
-      "deny_lifecycle",
-    );
-    // Every find execution action is inspected, not just the first.
-    assert.equal(
-      classifyBuildCommand("find", [".", "-exec", "echo", "{}", ";", "-exec", "./gradlew", "build", ";"])
-        .kind,
-      "pure_build",
-    );
-    assert.equal(
-      classifyBuildCommand("find", [
-        ".",
-        "-exec",
-        "./gradlew",
-        "assembleDebug",
-        ";",
-        "-exec",
-        "./gradlew",
-        "--stop",
-        ";",
-      ]).kind,
-      "deny_lifecycle",
-    );
-    assert.equal(
-      classifyBuildCommand("sh", [
-        "-c",
-        "find . -exec echo {} \\; -exec bazel shutdown \\;",
-      ]).kind,
-      "deny_lifecycle",
-    );
-
-    const findGradleReqs = resolveBuildResources(
-      "find",
-      [".", "-maxdepth", "0", "-exec", "echo", "{}", ";", "-exec", "./gradlew", "assembleDebug", ";"],
-      dirB,
-    );
-    assert.equal(findGradleReqs.kind, "pure_build");
-    assert.equal(findGradleReqs.tool, "gradle");
-    assert.deepEqual(findGradleReqs.resourceKeys, [`gradle:${canonicalDirB}`]);
-
-    const xargsBazelGuard = evaluateCommandGuard("xargs bazel build //...", {
-      sessionId: "sess-xargs-build",
-      activeLeases: [],
-      coordinateBuilds: true,
-      cwd: rcCwdSub,
-    });
-    assert.equal(xargsBazelGuard.allowed, false);
-    assert.match(xargsBazelGuard.reason || "", /dynamically through xargs/);
-
-    const xargsParallelGuard = evaluateCommandGuard("xargs -n1 -P4 ./gradlew < tasks.txt", {
-      sessionId: "sess-xargs-par",
-      activeLeases: [],
-      coordinateBuilds: true,
-      cwd: dirB,
-    });
-    assert.equal(xargsParallelGuard.allowed, false);
-
-    const findMultiGuard = evaluateCommandGuard(
-      "find . -exec echo {} \\; -exec ./gradlew --stop \\;",
-      { sessionId: "sess-find-multi", activeLeases: [], coordinateBuilds: true, cwd: dirB },
-    );
-    assert.equal(findMultiGuard.allowed, false);
-    assert.match(findMultiGuard.reason || "", /gradle --stop/i);
-
-    const pipedStopXargsGuard = evaluateCommandGuard("printf '%s\\n' -- --stop | xargs ./gradlew", {
-      sessionId: "sess-xargs-stop",
-      activeLeases: [],
-      coordinateBuilds: true,
-      cwd: dirB,
-    });
-    assert.equal(pipedStopXargsGuard.allowed, false);
-    assert.match(pipedStopXargsGuard.reason || "", /gradle --stop/i);
-
-    const shPipedStopXargsGuard = evaluateCommandGuard(
-      "sh -c \"printf '%s\\\\n' --stop | xargs ./gradlew\"",
-      {
-        sessionId: "sess-sh-xargs-stop",
-        activeLeases: [],
-        coordinateBuilds: true,
-        cwd: dirB,
-      },
-    );
-    assert.equal(shPipedStopXargsGuard.allowed, false);
-    assert.match(shPipedStopXargsGuard.reason || "", /gradle --stop/i);
-
-    const findExecPrep = buildChildInvocation(
-      "find",
-      [".", "-maxdepth", "1", "-exec", "./gradlew", "assembleDebug", ";"],
-      null,
-      null,
-      process.env,
-      null,
-      { cwd: dirB },
-    );
-    assert.equal(findExecPrep.args[findExecPrep.args.length - 1], ";");
-    assert.match(findExecPrep.args[findExecPrep.args.length - 2], /^-Dorg\.gradle\.workers\.max=\d+$/);
-
-    const findMultiPrep = buildChildInvocation(
-      "find",
-      [
-        ".",
-        "-exec",
-        "./gradlew",
-        "assembleDebug",
-        ";",
-        "-exec",
-        "./gradlew",
-        "lintDebug",
-        "{}",
-        "+",
-      ],
-      null,
-      null,
-      process.env,
-      null,
-      { cwd: dirB },
-    );
-    const multiArgs = findMultiPrep.args.map(String);
-    const workersRe = /^-Dorg\.gradle\.workers\.max=\d+$/;
-    assert.match(multiArgs[4], workersRe);
-    assert.equal(multiArgs[5], ";");
-    assert.deepEqual(multiArgs.slice(-3, -1).map((a) => workersRe.test(a) || a), [true, "{}"]);
-    assert.equal(multiArgs[multiArgs.length - 1], "+");
-
-    const shFindPrep = buildChildInvocation(
-      "sh",
-      ["-c", "find . -exec echo {} \\; -exec ./gradlew assembleDebug {} +"],
-      null,
-      null,
-      process.env,
-      null,
-      { cwd: dirB },
-    );
-    assert.match(
-      String(shFindPrep.args[1]),
-      /-exec \.\/gradlew assembleDebug -Dorg\.gradle\.workers\.max=\d+ \{\} \+$/,
-    );
-    assert.match(String(shFindPrep.args[1]), /-exec echo \{\} \\; /);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
-    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Bazel version detection: .bazelversion / .bazeliskrc for Bazelisk launchers vs direct bazel binaries", () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-bazel-version-"));
+  try {
+    const noRc = ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc"];
+    const aliceEnv = { USER: "alice", HOME: "/Users/alice" };
+    const bvDir = path.join(wsDir, "bazel9-ws");
+    fs.mkdirSync(bvDir, { recursive: true });
+    fs.writeFileSync(path.join(bvDir, "MODULE.bazel"), 'module(name = "b9")\n');
+    fs.writeFileSync(path.join(bvDir, ".bazelversion"), "9.0.0\n");
+    const canonicalBvDir = realpath(bvDir);
+
+    const bvDarwinReqs = resolveBuildResources("bazelisk", [...noRc, "build", "//..."], bvDir, { platform: "darwin", env: aliceEnv });
+    assert.equal(bvDarwinReqs.bazelMajorVersion, 9);
+    assert.ok(bvDarwinReqs.defaultBazelOutputBases.some((p) => p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/")));
+    const bvDarwinWarmProbe = probeWarmBuildDaemons(bvDarwinReqs, {
+      platform: "darwin",
+      env: aliceEnv,
+      runner: () => ({
+        stdout: `9601 bazel(b9) -XX:+HeapDumpOnOutOfMemoryError --output_base=${bvDarwinReqs.defaultBazelOutputBases[0]} --workspace_directory=${canonicalBvDir}\n`,
+      }),
+    });
+    assert.equal(bvDarwinWarmProbe.warm, true);
+    assert.deepEqual(bvDarwinWarmProbe.daemonPids, [9601]);
+
+    // Workspace bazelw wrapper (what bazel ops prefer) is treated as a Bazelisk launcher
+    const bazelwReqs = resolveBuildResources(path.join(bvDir, "bazelw"), [...noRc, "build", "//..."], bvDir, { platform: "darwin", env: aliceEnv });
+    assert.equal(bazelwReqs.isBazelisk, true);
+    assert.equal(bazelwReqs.bazelMajorVersion, 9);
+
+    // Direct `/opt/bazel-8/bin/bazel` binary does not read .bazelversion and stays ambiguous on macOS
+    const directBazelDarwinReqs = resolveBuildResources("/opt/bazel-8/bin/bazel", [...noRc, "build", "//..."], bvDir, { platform: "darwin", env: aliceEnv });
+    assert.equal(directBazelDarwinReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(directBazelDarwinReqs.defaultBazelOutputBases, []);
+
+    if (posix) {
+      // Bare `bazel` resolved through PATH symlink to `bazelisk` reads .bazelversion, a standalone binary does not
+      const fakeBazeliskBinDir = path.join(wsDir, "fake-bazelisk-bin");
+      fs.mkdirSync(fakeBazeliskBinDir, { recursive: true });
+      const fakeBazeliskExe = path.join(fakeBazeliskBinDir, "bazelisk");
+      fs.writeFileSync(fakeBazeliskExe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      fs.symlinkSync(fakeBazeliskExe, path.join(fakeBazeliskBinDir, "bazel"));
+      const pathSymlinkBazelReqs = resolveBuildResources("bazel", [...noRc, "build", "//..."], bvDir, {
+        platform: "darwin",
+        env: { ...aliceEnv, PATH: fakeBazeliskBinDir },
+      });
+      assert.equal(pathSymlinkBazelReqs.isBazelisk, true);
+      assert.equal(pathSymlinkBazelReqs.bazelMajorVersion, 9);
+
+      const fakeStandaloneBazelBinDir = path.join(wsDir, "fake-standalone-bazel-bin");
+      fs.mkdirSync(fakeStandaloneBazelBinDir, { recursive: true });
+      fs.writeFileSync(path.join(fakeStandaloneBazelBinDir, "bazel"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const pathStandaloneBazelReqs = resolveBuildResources("bazel", [...noRc, "build", "//..."], bvDir, {
+        platform: "darwin",
+        env: { ...aliceEnv, PATH: fakeStandaloneBazelBinDir },
+      });
+      assert.equal(pathStandaloneBazelReqs.isBazelisk, false);
+      assert.equal(pathStandaloneBazelReqs.bazelMajorVersion, undefined);
+      assert.deepEqual(pathStandaloneBazelReqs.defaultBazelOutputBases, []);
+
+      // Non-executable PATH bazel->bazelisk entry is skipped
+      const nonExecBinDir = path.join(wsDir, "nonexec-bazelisk-bin");
+      fs.mkdirSync(nonExecBinDir, { recursive: true });
+      const nonExecBazelisk = path.join(nonExecBinDir, "bazelisk");
+      fs.writeFileSync(nonExecBazelisk, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+      fs.symlinkSync(nonExecBazelisk, path.join(nonExecBinDir, "bazel"));
+      const nonExecFallbackReqs = resolveBuildResources("bazel", [...noRc, "build", "//..."], bvDir, {
+        platform: "darwin",
+        env: { ...aliceEnv, PATH: `${nonExecBinDir}:${fakeStandaloneBazelBinDir}` },
+      });
+      assert.equal(nonExecFallbackReqs.isBazelisk, false);
+      assert.equal(nonExecFallbackReqs.bazelMajorVersion, undefined);
+      assert.deepEqual(nonExecFallbackReqs.defaultBazelOutputBases, []);
+    }
+
+    // .bazeliskrc USE_BAZEL_VERSION takes precedence over .bazelversion; non-numeric selectors do not fall back
+    const bazeliskRcWs = path.join(wsDir, "bazeliskrc-ws");
+    fs.mkdirSync(bazeliskRcWs, { recursive: true });
+    fs.writeFileSync(path.join(bazeliskRcWs, "MODULE.bazel"), 'module(name = "brc")\n');
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazelversion"), "8.2.1\n");
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazeliskrc"), "USE_BAZEL_VERSION=9.2.0\n");
+    const bazeliskRcReqs = resolveBuildResources("bazelisk", [...noRc, "build", "//..."], bazeliskRcWs, { platform: "darwin", env: aliceEnv });
+    assert.equal(bazeliskRcReqs.bazelMajorVersion, 9);
+    assert.ok(bazeliskRcReqs.defaultBazelOutputBases.some((p) => p.includes("/Users/alice/Library/Caches/bazel/_bazel_alice/")));
+
+    const lastGreenEnvReqs = resolveBuildResources("bazelisk", [...noRc, "build", "//..."], bvDir, {
+      platform: "darwin",
+      env: { ...aliceEnv, USE_BAZEL_VERSION: "last_green" },
+    });
+    assert.equal(lastGreenEnvReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(lastGreenEnvReqs.defaultBazelOutputBases, []);
+
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazelversion"), "9.0.0\n");
+    fs.writeFileSync(path.join(bazeliskRcWs, ".bazeliskrc"), "USE_BAZEL_VERSION=last_green\n");
+    const lastGreenRcReqs = resolveBuildResources("bazelisk", [...noRc, "build", "//..."], bazeliskRcWs, { platform: "darwin", env: aliceEnv });
+    assert.equal(lastGreenRcReqs.bazelMajorVersion, undefined);
+    assert.deepEqual(lastGreenRcReqs.defaultBazelOutputBases, []);
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test("vendored properties / bazelrc parsers survive seeded property-based fuzzing", () => {
+  let seed = 0x1337beef;
+  const nextRand = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 0x100000000;
+  };
+  const pick = (arr) => arr[Math.floor(nextRand() * arr.length)];
+  for (let i = 0; i < 200; i++) {
+    const k = `org.gradle.${pick(["jvmargs", "java.home", "daemon", "caching", "workers.max"])}`;
+    const v = pick(["-Xmx4g", "C:\\Java\\jdk-21", "/opt/jdk:21", "true", "false", "line1\\\n  line2"]);
+    const sep = pick(["=", ":", " = ", " : ", " "]);
+    const parsedProps = parseJavaProperties(`# comment\n${k}${sep}${v}\n`);
+    assert.equal(typeof parsedProps.get(k), "string");
+
+    const rcPhase = pick(["startup", "build", "test", "common", "build:ci"]);
+    const rcFlag = pick(["--output_base=/tmp/out", "--jobs=4", "--javabase=/jdk"]);
+    const rcLines = joinBackslashContinuations(`# bazelrc comment\n${rcPhase} \\\n  ${rcFlag}\n`).filter(
+      (l) => l.trim() && !l.trim().startsWith("#"),
+    );
+    assert.equal(rcLines.length, 1);
+    const rcWords = splitRcWords(rcLines[0]);
+    assert.equal(rcWords[0], rcPhase);
+    assert.equal(rcWords[1], rcFlag);
+  }
+  assert.deepEqual(splitRcWords("test --flag=iPhone\\ 16 'quoted arg' \"double q\""), ["test", "--flag=iPhone 16", "quoted arg", "double q"]);
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end runner: typed build ops through cmdExec / cmdBatch
+// ---------------------------------------------------------------------------
+
+test("exec gradle tasks coordinates pure builds via a build lease and writes structured JSONL audit logs", { skip: !posix }, async () => {
+  const s = setupProject({ gradlew: 'echo "ARGS:$*"; echo "OP:$ATC_BUILD_OP_ID"' });
+  try {
+    const execRes = await cmdExec(s.stateDir, ["gradle", "tasks", "assembleDebug", "--session", "sess-1", "--json"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory: hostInventory(),
+    });
+    assert.equal(execRes.exitCode, 0, execRes.error);
+    assert.match(execRes.stdout, /ARGS:assembleDebug -Dorg\.gradle\.workers\.max=\d+/);
+    assert.match(execRes.stdout, /OP:\S+/, "child receives its build op identity");
+
+    const afterState = readState(s.stateDir);
+    assert.deepEqual(afterState.buildLeases, {});
+    assert.deepEqual(afterState.buildQueue, []);
+
+    const events = readRecentAuditEvents(s.stateDir, { limit: 20 });
+    const eventNames = events.map((e) => e.event);
+    assert.ok(eventNames.includes("build_admit"), `Expected build_admit in ${JSON.stringify(eventNames)}`);
+    assert.ok(eventNames.includes("build_release"), `Expected build_release in ${JSON.stringify(eventNames)}`);
+    for (const ev of events) {
+      assert.equal(ev.schemaVersion, 1, "audit record must include schemaVersion: 1");
+      assert.equal(typeof ev.epochMs, "number", "audit record must include numeric epochMs");
+      assert.equal(ev.category, "build", "build_admit / build_release must have category 'build'");
+    }
+    const admitEv = events.find((e) => e.event === "build_admit");
+    const releaseEv = events.find((e) => e.event === "build_release");
+    assert.ok(admitEv?.buildId, "build_admit event must preserve top-level buildId");
+    assert.ok(admitEv?.opId, "build_admit event must preserve top-level opId");
+    assert.ok(Array.isArray(admitEv?.resourceKeys), "build_admit event must preserve top-level resourceKeys");
+    assert.ok(admitEv.resourceKeys.includes(`gradle:${canonicalizeBuildPath(s.proj)}`));
+    assert.equal(admitEv.sessionId, "sess-1");
+    assert.equal(releaseEv?.exitCode, 0, "build_release event must preserve top-level exitCode");
+
+    // A failing build still releases its build lease
+    script(path.join(s.proj, "gradlew"), "exit 3");
+    const failRes = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--session", "sess-1", "--json"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory: hostInventory(),
+    });
+    assert.equal(failRes.exitCode, 3);
+    assert.deepEqual(readState(s.stateDir).buildLeases, {});
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec --wait 0 admits immediately when the slot is free and exits 2 when the workspace or pool is busy", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    const run = (session, extra = []) =>
+      cmdExec(s.stateDir, ["gradle", "tasks", "assembleDebug", "--wait", "0", "--session", session, "--json", ...extra], {
+        env: s.env,
+        cwd: s.proj,
+        inventory: hostInventory(),
+      });
+
+    const freeRes = await run("sess-wait0-free");
+    assert.equal(freeRes.exitCode, 0, freeRes.error);
+
+    // Busy workspace key → --wait 0 fails immediately with exitCode 2
+    const resolvedWs = canonicalizeBuildPath(s.proj);
+    s.writeState((st) => {
+      st.config.maxConcurrentBuilds = 4;
+      st.buildLeases.build_busy = busyBuildLease("build_busy", [`gradle:${resolvedWs}`, `workspace:${resolvedWs}`], { workspaceRoot: resolvedWs });
+    });
+    const busyRes = await run("sess-wait0-busy");
+    assert.equal(busyRes.exitCode, 2);
+    assert.match(busyRes.error, /currently busy \(wait timeout reached\)/);
+    assert.equal(readState(s.stateDir).buildLeases.build_busy.state, "active", "holder untouched");
+
+    // A different workspace with a free pool is admitted
+    s.writeState((st) => {
+      st.buildLeases = { build_other: busyBuildLease("build_other", ["gradle:/other-workspace"]) };
+    });
+    const otherWsRes = await run("sess-wait0-other");
+    assert.equal(otherWsRes.exitCode, 0, otherWsRes.error);
+
+    // Full build pool (max concurrent builds reached, no burst) → busy even on a different workspace
+    s.writeState((st) => {
+      st.config.maxConcurrentBuilds = 1;
+      st.config.maxDeviceHolderBurstBuilds = 0;
+    });
+    const poolFullRes = await run("sess-wait0-pool");
+    assert.equal(poolFullRes.exitCode, 2);
+    assert.match(poolFullRes.error, /currently busy/);
+    assert.deepEqual(readState(s.stateDir).buildQueue, [], "timed-out waiters leave no queue tickets behind");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec serializes concurrent builds on the same workspace key", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    const log = path.join(s.root, "order.log");
+    script(path.join(s.proj, "gradlew"), `echo "start $1" >> ${log}; sleep 1; echo "end $1" >> ${log}`);
+    // Each waiter runs in its own process, as real agents do (the in-process queue wait is synchronous).
+    const cliUrl = new URL("../src/cli.mjs", import.meta.url).href;
+    const run = (task, session) =>
+      new Promise((resolve, reject) => {
+        const code = [
+          `const { cmdExec } = await import(${JSON.stringify(cliUrl)});`,
+          `const res = await cmdExec(${JSON.stringify(s.stateDir)}, ${JSON.stringify(["gradle", "tasks", task, "--session", session, "--wait", "60", "--json"])},`,
+          `  { env: process.env, cwd: ${JSON.stringify(s.proj)}, inventory: ${JSON.stringify(hostInventory())} });`,
+          `process.stdout.write(JSON.stringify({ exitCode: res.exitCode, error: res.error || null }));`,
+        ].join("\n");
+        const child = spawn(process.execPath, ["--input-type=module", "-e", code], { env: s.env, stdio: ["ignore", "pipe", "inherit"] });
+        let out = "";
+        child.stdout.on("data", (d) => (out += d));
+        child.on("error", reject);
+        child.on("close", () => {
+          try {
+            resolve(JSON.parse(out));
+          } catch (err) {
+            reject(new Error(`child output not JSON: ${out}`));
+          }
+        });
+      });
+    const [a, b] = await Promise.all([run("taskA", "sess-a"), run("taskB", "sess-b")]);
+    assert.equal(a.exitCode, 0, a.error);
+    assert.equal(b.exitCode, 0, b.error);
+    const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(lines.length, 4);
+    const first = lines[0].split(" ")[1];
+    const second = first === "taskA" ? "taskB" : "taskA";
+    assert.deepEqual(lines, [`start ${first}`, `end ${first}`, `start ${second}`, `end ${second}`], "builds on one workspace never overlap");
+    const st = readState(s.stateDir);
+    assert.deepEqual(st.buildLeases, {});
+    assert.deepEqual(st.buildQueue, []);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec fails fast with exit 5 on an unrecoverable host RAM shortfall even with a long --wait", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    s.writeState((st) => {
+      st.leases["serial:usb-phone-1"] = {
+        leaseId: "lease_phys_1",
+        deviceKey: "serial:usb-phone-1",
+        platform: "android",
+        kind: "physical",
+        serial: "usb-phone-1",
+        sessionId: "sess-other-phys",
+        state: "active",
+        claimedAtMs: Date.now(),
+        renewedAtMs: Date.now(),
+        expiresAtMs: Date.now() + 600_000,
+        firstSeenOfflineAtMs: null,
+      };
+    });
+    const lowRamRes = await cmdExec(s.stateDir, ["gradle", "tasks", "assembleDebug", "--wait", "600", "--session", "sess-low-ram", "--json"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory: hostInventory({ totalRamMb: 8192, availableRamMb: 1024 }),
+    });
+    assert.equal(lowRamRes.exitCode, 5, "Unrecoverable host RAM shortfall must fail fast with exitCode 5");
+    assert.match(lowRamRes.error, /Insufficient host RAM/);
+    assert.deepEqual(readState(s.stateDir).buildLeases, {});
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec --claim performs atomic device + build co-allocation and releases only the device it claimed", { skip: !posix }, async () => {
+  const s = setupProject({ gradlew: '[ "$ANDROID_SERIAL" = "emulator-5554" ] || exit 2; exit 0' });
+  try {
+    const inventory = hostInventory({}, [PIXEL_35]);
+    const res = await cmdExec(
+      s.stateDir,
+      ["gradle", "tasks", "connectedDebugAndroidTest", "--claim", "--type", "phone", "--api", "35", "--session", "sess-coalloc", "--json"],
+      { env: s.env, cwd: s.proj, inventory },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+
+    const afterState = readState(s.stateDir);
+    assert.deepEqual(afterState.leases, {}, "One-shot exec --claim must release the co-allocated device lease on exit");
+    assert.deepEqual(afterState.buildLeases, {});
+
+    const events = readRecentAuditEvents(s.stateDir, { limit: 20 }).map((e) => e.event);
+    assert.ok(events.includes("device_claim"), JSON.stringify(events));
+    assert.ok(events.includes("build_co_alloc_admit"), JSON.stringify(events));
+    assert.ok(events.includes("build_release"), JSON.stringify(events));
+    assert.ok(events.includes("device_free"), JSON.stringify(events));
+
+    // A pre-existing session lease is reused and NOT released by exec --claim
+    const preClaim = cmdClaim(s.stateDir, { type: "phone", api: "35", session: "sess-preexisting" }, { inventory, env: s.env });
+    assert.equal(preClaim.exitCode, 0, preClaim.error);
+    const preExec = await cmdExec(
+      s.stateDir,
+      ["gradle", "tasks", "connectedDebugAndroidTest", "--claim", "--session", "sess-preexisting", "--json"],
+      { env: s.env, cwd: s.proj, inventory },
+    );
+    assert.equal(preExec.exitCode, 0, preExec.error);
+    const afterPreState = readState(s.stateDir);
+    assert.equal(Object.keys(afterPreState.leases).length, 1, "Pre-existing session lease must remain active after exec --claim");
+    assert.deepEqual(afterPreState.buildLeases, {});
+
+    // Without --claim the held lease is used directly
+    const leasedExec = await cmdExec(s.stateDir, ["gradle", "tasks", "connectedCheck", "--session", "sess-preexisting", "--json"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory,
+    });
+    assert.equal(leasedExec.exitCode, 0, leasedExec.error);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec --claim does not claim or boot a device when the build pool is full", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    s.writeState((st) => {
+      st.config.maxConcurrentBuilds = 1;
+      st.config.maxDeviceHolderBurstBuilds = 0;
+      st.buildLeases.build_active = busyBuildLease("build_active", ["gradle:/other-workspace"], { sessionId: "sess-other-builder" });
+    });
+    const blockedRes = await cmdExec(
+      s.stateDir,
+      ["gradle", "tasks", "connectedDebugAndroidTest", "--claim", "--wait", "0", "--session", "sess-blocked-coalloc", "--json"],
+      { env: s.env, cwd: s.proj, inventory: hostInventory({}, [PIXEL_35]) },
+    );
+    assert.equal(blockedRes.exitCode, 2);
+    assert.match(blockedRes.error, /currently busy \(wait timeout reached\)/);
+    assert.deepEqual(readState(s.stateDir).leases, {}, "Device must not be claimed while build slot is unavailable");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("device-coupled builds and device ops require a matching-platform lease", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    const inventory = hostInventory({}, [PIXEL_35]);
+    const noLease = await cmdExec(s.stateDir, ["android", "install", "app.apk", "--session", "sess-no-lease", "--wait", "0"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory,
+      livenessCheck: () => true,
+    });
+    assert.equal(noLease.exitCode, 3, noLease.error);
+    assert.match(noLease.error, /holds no active android device lease/);
+
+    const noLeaseBuild = await cmdExec(s.stateDir, ["gradle", "tasks", "connectedCheck", "--session", "sess-no-lease", "--wait", "0"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory,
+      livenessCheck: () => true,
+    });
+    assert.equal(noLeaseBuild.exitCode, 3, noLeaseBuild.error);
+    assert.match(noLeaseBuild.error, /holds no active android device lease/);
+    assert.deepEqual(readState(s.stateDir).buildLeases, {}, "no build lease is left behind");
+
+    const claimRes = cmdClaim(s.stateDir, { session: "sess-android-only" }, { inventory, env: s.env, livenessCheck: () => true });
+    assert.equal(claimRes.exitCode, 0, claimRes.error);
+
+    if (process.platform === "darwin") {
+      fs.mkdirSync(path.join(s.proj, "App.xcodeproj"), { recursive: true });
+      const wrongPlatBuild = await cmdExec(s.stateDir, ["xcode", "test", "--scheme", "App", "--session", "sess-android-only", "--wait", "0"], {
+        env: s.env,
+        cwd: s.proj,
+        inventory,
+        livenessCheck: () => true,
+      });
+      assert.equal(wrongPlatBuild.exitCode, 3, wrongPlatBuild.error);
+      assert.match(wrongPlatBuild.error, /holds no active ios device lease/);
+    }
+
+    // Explicit platform selector that conflicts with the op's device platform is rejected
+    const conflicting = await cmdExec(s.stateDir, ["gradle", "tasks", "connectedCheck", "--ios", "--session", "sess-android-only"], {
+      env: s.env,
+      cwd: s.proj,
+      inventory,
+      livenessCheck: () => true,
+    });
+    assert.equal(conflicting.exitCode, 3);
+    assert.match(conflicting.error, /conflicts with explicit --ios selector/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec --claim releases the newly claimed device when pre-spawn validation fails", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    const physical = {
+      deviceKey: "serial:R5CX123",
+      serial: "R5CX123",
+      kind: "physical",
+      platform: "android",
+      online: true,
+      profile: { deviceType: "phone", apiLevel: "android-35" },
+    };
+    const res = await cmdExec(
+      s.stateDir,
+      ["android", "prop", "set", "debug.x", "--value", "1", "--claim", "--kind", "physical", "--session", "agent-claim-validation-fail", "--json"],
+      { env: s.env, cwd: s.proj, inventory: hostInventory({}, [physical]), livenessCheck: () => true },
+    );
+    assert.equal(res.exitCode, 3, res.error);
+    assert.equal(res.errorCode, "physical_not_allowed");
+    assert.equal(Object.keys(readState(s.stateDir).leases || {}).length, 0, "co-allocated lease must be released");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch runs typed build steps in dependency order and rejects invalid plans before anything runs", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    const orderLog = path.join(s.root, "dag-order.txt");
+    script(path.join(s.proj, "gradlew"), `echo "$1" >> ${orderLog}`);
+    const run = (plan, flags = {}) =>
+      cmdBatch(s.stateDir, { session: "sess-batch", json: true, ...flags }, { env: s.env, cwd: s.proj, plan, inventory: hostInventory() });
+
+    const cycleRes = await run({
+      version: 1,
+      steps: [
+        { id: "a", op: "gradle.tasks", tasks: ["a"], dependsOn: ["b"] },
+        { id: "b", op: "gradle.tasks", tasks: ["b"], dependsOn: ["a"] },
+      ],
+    });
+    assert.equal(cycleRes.exitCode, 7);
+    assert.ok(cycleRes.errors.length >= 1);
+    assert.match(cycleRes.error, /cycle/i);
+    assert.equal(fs.existsSync(orderLog), false);
+
+    // Pre-flight: a later invalid step (device tasks marked buildOnly, missing wrapper) rejects the whole plan
+    const emptyDir = path.join(s.root, "no-wrapper");
+    fs.mkdirSync(emptyDir);
+    const preflightFailRes = await run({
+      version: 1,
+      steps: [
+        { id: "step1", op: "gradle.tasks", tasks: ["compileLib"] },
+        { id: "step2", op: "gradle.tasks", tasks: ["connectedDebugAndroidTest"], buildOnly: true, dependsOn: ["step1"] },
+        { id: "step3", op: "gradle.tasks", tasks: ["lint"], cwd: emptyDir, dependsOn: ["step1"] },
+      ],
+    });
+    assert.equal(preflightFailRes.exitCode, 7);
+    assert.ok(preflightFailRes.errors.some((e) => e.code === "build_only_device"), JSON.stringify(preflightFailRes.errors));
+    assert.equal(fs.existsSync(orderLog), false, "step 1 must not run if a later step fails pre-flight");
+    const planErrRes = await run({
+      version: 1,
+      steps: [
+        { id: "step1", op: "gradle.tasks", tasks: ["compileLib"] },
+        { id: "step3", op: "gradle.tasks", tasks: ["lint"], workspace: emptyDir, dependsOn: ["step1"] },
+      ],
+    });
+    assert.equal(planErrRes.exitCode, 7);
+    assert.ok(planErrRes.errors.some((e) => e.code === "gradle_wrapper_not_found"), JSON.stringify(planErrRes.errors));
+    assert.equal(fs.existsSync(orderLog), false);
+
+    const dagRes = await run({
+      version: 1,
+      steps: [
+        { id: "test-ready", op: "gradle.tasks", tasks: ["testReady"], dependsOn: ["compile-lib", "compile-app"] },
+        { id: "compile-lib", op: "gradle.tasks", tasks: ["compileLib"], ramMb: 1024 },
+        { id: "compile-app", op: "gradle.tasks", tasks: ["compileApp"], dependsOn: ["compile-lib"] },
+      ],
+    });
+    assert.equal(dagRes.exitCode, 0, dagRes.error);
+    assert.deepEqual(dagRes.steps.map((x) => x.id), ["compile-lib", "compile-app", "test-ready"]);
+    assert.deepEqual(dagRes.steps.map((x) => x.status), ["ok", "ok", "ok"]);
+    assert.equal(fs.readFileSync(orderLog, "utf8"), "compileLib\ncompileApp\ntestReady\n");
+    const st = readState(s.stateDir);
+    assert.deepEqual(st.buildLeases, {}, "every step releases its build lease");
+    assert.deepEqual(st.buildQueue, []);
+  } finally {
+    s.cleanup();
   }
 });

@@ -356,13 +356,11 @@ export function resolveBuildResources(
     requiresDevice: false,
     requiresHeavySlot: true,
     requiresWorkspaceLock: true,
-    subcommand: directTool === "bazel" ? args[0] || null : null,
+    subcommand: directTool === "bazel" ? args.find((a) => !a.startsWith("-")) || null : null,
     tasks: directTool === "gradle" ? args.filter((a) => !a.startsWith("-")) : [],
   };
 
-  const strArgs = Array.isArray(args)
-    ? args.map((a) => String(a)).filter((a) => !XARGS_MARKERS.has(a))
-    : [];
+  const strArgs = args.map((a) => String(a));
 
   if (classified.tool === "gradle") {
     let projectDir = null;

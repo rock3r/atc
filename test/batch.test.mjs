@@ -74,7 +74,7 @@ test("batch: invalid plans are rejected in full before anything runs", { skip: !
     plan.steps[2].claim = { reuse: "nope" };
     plan.steps.push({ id: "x", op: "shell.run", command: "rm -rf /" });
     const res = await s.run(plan);
-    assert.equal(res.exitCode, 2);
+    assert.equal(res.exitCode, 7);
     assert.ok(res.errors.length >= 3);
     assert.deepEqual(s.calls(), []);
   } finally {
@@ -170,7 +170,7 @@ test("batch: unknown step fields such as phase or command are rejected", async (
   const s = setup();
   try {
     const res = await s.run({ version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["x"], phase: "pure-build", command: "./gradlew x" }] });
-    assert.equal(res.exitCode, 2);
+    assert.equal(res.exitCode, 7);
     assert.deepEqual(res.errors.map((e) => e.code).sort(), ["unknown_field", "unknown_field"]);
   } finally {
     s.cleanup();

@@ -383,6 +383,14 @@ export function parseOpArgv(tokens) {
   if (positionals.length > 0) {
     if (!op.positional) {
       errors.push(err("/", "unexpected_argument", `${opName} takes no positional arguments (got "${positionals[0]}").`));
+    } else if (Array.isArray(op.positional)) {
+      if (positionals.length > op.positional.length) {
+        errors.push(err("/", "unexpected_argument", `${opName} takes at most ${op.positional.length} positional arguments (${op.positional.join(", ")}).`));
+      } else {
+        positionals.forEach((v, i) => {
+          params[op.positional[i]] = parseScalar(op.params[op.positional[i]], v);
+        });
+      }
     } else {
       const spec = op.params[op.positional];
       if (/\[\]$/.test(spec.type)) {

@@ -75,7 +75,7 @@ test("exec: validation errors are collected and nothing runs", async () => {
     const marker = path.join(s.root, "ran");
     script(path.join(s.proj, "gradlew"), `touch ${marker}`);
     const res = await cmdExec(s.stateDir, ["gradle", "tasks", "a;b", "--bogus", "--cwd", "/x"], { env: s.env, cwd: s.proj });
-    assert.equal(res.exitCode, 2);
+    assert.equal(res.exitCode, 7);
     assert.equal(res.errors.length, 3);
     assert.ok(!fs.existsSync(marker));
   } finally {
@@ -88,7 +88,7 @@ test("exec: --claim on a pure build is rejected as claim_unused", async () => {
   try {
     script(path.join(s.proj, "gradlew"), "exit 0");
     const res = await cmdExec(s.stateDir, ["gradle", "tasks", "assembleDebug", "--claim"], { env: s.env, cwd: s.proj });
-    assert.equal(res.exitCode, 2);
+    assert.equal(res.exitCode, 7);
     assert.equal(res.errors[0].code, "claim_unused");
   } finally {
     s.cleanup();
@@ -100,10 +100,10 @@ test("exec: --force needs a reason, is recorded, and cannot unlock leading-dash 
   try {
     script(path.join(s.proj, "gradlew"), "exit 0");
     const noReason = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force"], { env: s.env, cwd: s.proj });
-    assert.equal(noReason.exitCode, 2);
+    assert.equal(noReason.exitCode, 7);
     assert.equal(noReason.errors[0].code, "force_reason_required");
     const dash = await cmdExec(s.stateDir, ["gradle", "tasks", "-x", "--force", "--reason", "please"], { env: s.env, cwd: s.proj });
-    assert.equal(dash.exitCode, 2);
+    assert.equal(dash.exitCode, 7);
     assert.equal(dash.errors[0].forceable, false);
     const ok = await cmdExec(s.stateDir, ["gradle", "tasks", "odd+name", "--force", "--reason", "vendor plugin task", "--json"], { env: s.env, cwd: s.proj });
     assert.equal(ok.exitCode, 0, ok.error);
@@ -260,4 +260,24 @@ test("execHelp lists every system and the feature request link", () => {
   for (const sys of ["gradle", "bazel", "xcode", "android", "ios", "snapshot"]) assert.match(h, new RegExp(`${sys}:`));
   assert.match(h, /atc exec android prop get <key>/);
   assert.match(h, /github\.com\/rock3r\/atc\/issues/);
+});
+
+test("exec: two in-process builds on one workspace serialize without blocking the event loop", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const log = path.join(s.root, "order.log");
+    script(path.join(s.proj, "gradlew"), `echo "start $1" >> ${log}; sleep 1; echo "end $1" >> ${log}`);
+    const [a, b] = await Promise.all([
+      cmdExec(s.stateDir, ["gradle", "tasks", "one", "--json"], { env: s.env, cwd: s.proj }),
+      cmdExec(s.stateDir, ["gradle", "tasks", "two", "--json"], { env: s.env, cwd: s.proj }),
+    ]);
+    assert.equal(a.exitCode, 0, a.error);
+    assert.equal(b.exitCode, 0, b.error);
+    const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(lines.length, 4);
+    assert.match(lines[0], /^start/);
+    assert.match(lines[1], /^end/, `builds overlapped: ${lines.join(" | ")}`);
+  } finally {
+    s.cleanup();
+  }
 });

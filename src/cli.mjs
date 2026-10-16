@@ -95,7 +95,7 @@ import {
   withStateTransaction,
 } from "./state.mjs";
 
-export const ATC_VERSION = "2.1.0";
+export const ATC_VERSION = "3.0.0";
 export { GUIDE_TOPICS, cmdGuide };
 
 function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {
@@ -6535,7 +6535,9 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
     // Queued in buildQueue: sleep with jitter and heartbeat both build ticket and pinned device lease
     const pollSleepCapMs = Math.max(100, Math.floor(((txRes.hbTimeoutSec || 10) * 1000) / 4));
     const sleepMs = Math.min(250 + Math.floor(Math.random() * 150), pollSleepCapMs);
-    sleepSync(sleepMs);
+    // Async sleep: in-process callers (MCP server, batch) must not block the event loop
+    // while another in-process op holds the slot.
+    await new Promise((r) => setTimeout(r, sleepMs));
   }
 
   const heartbeatIntervalMs = Math.min(60_000, Math.max(1000, Math.floor(check.ttlMs / 3)));
@@ -7375,7 +7377,7 @@ export function cmdGc(stateDir, options = {}) {
 export async function cmdBatch(stateDir, flags = {}, options = {}) {
   const unknownFlagErr = validateCommandFlags(flags, BATCH_ALLOWED_FLAGS, "batch");
   if (unknownFlagErr) {
-    return { exitCode: 2, error: unknownFlagErr };
+    return { exitCode: 1, error: unknownFlagErr };
   }
   const cwd = options.cwd || process.cwd();
   const env = options.env || process.env;
@@ -7389,7 +7391,7 @@ export async function cmdBatch(stateDir, flags = {}, options = {}) {
         readStdin: options.readStdin || readStdinSync,
       });
     } catch (err) {
-      return { exitCode: 2, error: err.message };
+      return { exitCode: 7, error: err.message };
     }
   }
   const identityFlags = {};
@@ -7740,7 +7742,7 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
         '[atc] "atc guard" was removed in ATC 3.0: ATC no longer inspects shell commands.\n' +
           '      Use typed operations instead: "atc exec --help", "atc batch", or the atc_* MCP tools.\n',
       );
-      return 2;
+      return 7;
     }
 
     case "hook": {

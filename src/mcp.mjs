@@ -1,5 +1,5 @@
 import readline from "node:readline";
-import { ATC_VERSION, cmdBatch, cmdClaim, cmdFree, cmdRenew, cmdSnapshot, cmdStatus, execDeps } from "./cli.mjs";
+import { cmdBatch, cmdClaim, cmdFree, cmdRenew, cmdSnapshot, cmdStatus, execDeps } from "./cli.mjs";
 import { execOp } from "./exec.mjs";
 import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
 import { listOps } from "./ops/catalog.mjs";
@@ -291,7 +291,7 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
         capabilities: { tools: {} },
         serverInfo: {
           name: "android-traffic-control",
-          version: ATC_VERSION,
+          version: "3.0.0",
         },
       },
     };

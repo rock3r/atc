@@ -419,6 +419,7 @@ export const OPS = Object.freeze({
     system: "android",
     kind: "device",
     platform: "android",
+    positional: ["key", "value"],
     params: {
       key: { type: "string", pattern: "propKey", required: true },
       value: { type: "string", pattern: "transportSafe", required: true },
