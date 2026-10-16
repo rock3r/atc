@@ -517,7 +517,7 @@ function computeQuotedMask(s) {
       }
       continue;
     }
-    if (ch === "<" && s[i + 1] === "<" && s[i + 2] !== "<") {
+    if (s[i - 1] !== "<" && ch === "<" && s[i + 1] === "<" && s[i + 2] !== "<") {
       let k = i + 2;
       const stripTabs = s[k] === "-";
       if (stripTabs) k++;
@@ -1513,12 +1513,33 @@ export function peelBuildWrapperTokens(cmd, args = [], options = {}) {
         if (base === "powershell" || base === "pwsh") return /^-(?:c|command)$/i.test(a);
         return a === "-c" || (/^-[A-Za-z]+$/.test(a) && a.includes("c"));
       });
-      if (cIdx !== -1 && cIdx + 1 < curArgs.length) {
+      let hereStrRaw = null;
+      if (
+        cIdx === -1 &&
+        inShell &&
+        (base === "sh" || base === "bash" || base === "zsh" || base === "dash" || base === "ksh")
+      ) {
+        for (let hi = 0; hi < curArgs.length; hi++) {
+          const cleanArg = stripLiteralSentinels(curArgs[hi]);
+          if (/^[0-9]*<<<$/.test(cleanArg) && hi + 1 < curArgs.length) {
+            hereStrRaw = String(curArgs[hi + 1] || "");
+            break;
+          }
+          if (/^[0-9]*<<<[\s\S]+$/.test(cleanArg)) {
+            const prefixLen = curArgs[hi].indexOf("<<<") + 3;
+            hereStrRaw = String(curArgs[hi].slice(prefixLen) || "");
+            break;
+          }
+        }
+      }
+      if ((cIdx !== -1 && cIdx + 1 < curArgs.length) || hereStrRaw !== null) {
         const rawScriptArg = stripLiteralSentinels(
-          (base === "cmd" || base === "powershell" || base === "pwsh") &&
-            curArgs.length > cIdx + 2
-            ? curArgs.slice(cIdx + 1).join(" ")
-            : String(curArgs[cIdx + 1] || ""),
+          hereStrRaw !== null
+            ? hereStrRaw
+            : (base === "cmd" || base === "powershell" || base === "pwsh") &&
+                curArgs.length > cIdx + 2
+              ? curArgs.slice(cIdx + 1).join(" ")
+              : String(curArgs[cIdx + 1] || ""),
         );
         const script = rawScriptArg.trim();
         const isAmpersandBackground = base !== "cmd";
@@ -3778,6 +3799,7 @@ export function resolveBuildResources(
     systemBazelrcPath = undefined,
     platform = undefined,
     bazelMajorVersion = undefined,
+    bazelVersion = undefined,
   } = {},
 ) {
   const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
@@ -3923,6 +3945,7 @@ export function resolveBuildResources(
         systemBazelrcPath,
         platform,
         bazelMajorVersion,
+        bazelVersion,
       });
     });
     const deny = clauseRes.find((r) => r.kind === "deny_lifecycle");
@@ -4310,7 +4333,9 @@ export function resolveBuildResources(
       }
       return path.resolve(resolveBaseDir, s);
     };
-    const applyStartupOptionTokens = (tokens, resolveBaseDir) => {
+    const ambiguousOutputBases = new Set();
+    const ambiguousOutputUserRoots = new Set();
+    const applyStartupOptionTokens = (tokens, resolveBaseDir, { ambiguous = false } = {}) => {
       const expandWs = (val) =>
         String(val || "").replace(/%workspace%/g, canonicalRoot);
       for (let i = 0; i < tokens.length; i++) {
@@ -4320,29 +4345,69 @@ export function resolveBuildResources(
           continue;
         }
         if (a === "--nobatch") {
-          batchMode = false;
+          if (ambiguous) {
+            hasCustomStartupOption = true;
+          } else {
+            batchMode = false;
+          }
           continue;
         }
         if (a === "--output_base" && i + 1 < tokens.length) {
-          outputBase = resolveBazelPath(resolveBaseDir, expandWs(tokens[++i]));
+          const nextOut = resolveBazelPath(resolveBaseDir, expandWs(tokens[++i]));
+          if (ambiguous) {
+            if (outputBase && outputBase !== nextOut) ambiguousOutputBases.add(outputBase);
+            ambiguousOutputBases.add(nextOut);
+            hasCustomStartupOption = true;
+          } else {
+            ambiguousOutputBases.clear();
+          }
+          outputBase = nextOut;
           continue;
         }
         if (a.startsWith("--output_base=")) {
-          outputBase = resolveBazelPath(
+          const nextOut = resolveBazelPath(
             resolveBaseDir,
             expandWs(a.slice("--output_base=".length)),
           );
+          if (ambiguous) {
+            if (outputBase && outputBase !== nextOut) ambiguousOutputBases.add(outputBase);
+            ambiguousOutputBases.add(nextOut);
+            hasCustomStartupOption = true;
+          } else {
+            ambiguousOutputBases.clear();
+          }
+          outputBase = nextOut;
           continue;
         }
         if (a === "--output_user_root" && i + 1 < tokens.length) {
-          outputUserRoot = resolveBazelPath(resolveBaseDir, expandWs(tokens[++i]));
+          const nextRoot = resolveBazelPath(resolveBaseDir, expandWs(tokens[++i]));
+          if (ambiguous) {
+            if (outputUserRoot && outputUserRoot !== nextRoot) {
+              ambiguousOutputUserRoots.add(outputUserRoot);
+            }
+            ambiguousOutputUserRoots.add(nextRoot);
+            hasCustomStartupOption = true;
+          } else {
+            ambiguousOutputUserRoots.clear();
+          }
+          outputUserRoot = nextRoot;
           continue;
         }
         if (a.startsWith("--output_user_root=")) {
-          outputUserRoot = resolveBazelPath(
+          const nextRoot = resolveBazelPath(
             resolveBaseDir,
             expandWs(a.slice("--output_user_root=".length)),
           );
+          if (ambiguous) {
+            if (outputUserRoot && outputUserRoot !== nextRoot) {
+              ambiguousOutputUserRoots.add(outputUserRoot);
+            }
+            ambiguousOutputUserRoots.add(nextRoot);
+            hasCustomStartupOption = true;
+          } else {
+            ambiguousOutputUserRoots.clear();
+          }
+          outputUserRoot = nextRoot;
           continue;
         }
         if (a === "--host_jvm_args" && i + 1 < tokens.length) {
@@ -4428,20 +4493,169 @@ export function resolveBuildResources(
       return -1;
     };
 
+    const parseBazelVersionRange = (rawVer) => {
+      if (rawVer === null || rawVer === undefined || rawVer === "") return null;
+      const s = String(rawVer).trim();
+      const m = s.match(/^v?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?(?:[-+][A-Za-z0-9_.-]+)?$/i);
+      if (!m) return null;
+      const maj = Number(m[1]);
+      if (!Number.isFinite(maj) || maj <= 0) return null;
+      const hasMin = m[2] !== undefined && m[2].toLowerCase() !== "x" && m[2] !== "*";
+      const min = hasMin ? Number(m[2]) : 0;
+      const hasPatch =
+        hasMin && m[3] !== undefined && m[3].toLowerCase() !== "x" && m[3] !== "*";
+      const patch = hasPatch ? Number(m[3]) : 0;
+      return {
+        major: maj,
+        min: [maj, hasMin ? min : 0, hasPatch ? patch : 0],
+        max: [
+          maj,
+          hasMin ? min : Number.MAX_SAFE_INTEGER,
+          hasPatch ? patch : Number.MAX_SAFE_INTEGER,
+        ],
+      };
+    };
+
+    const rawUseBazelVersion =
+      effectiveEnvVars.USE_BAZEL_VERSION === null || effectiveEnvVars.USE_BAZEL_VERSION === ""
+        ? null
+        : effectiveEnvVars.USE_BAZEL_VERSION || baseEnv.USE_BAZEL_VERSION || null;
+    const dotBazelversionRaw = (() => {
+      try {
+        const bvPath = path.join(canonicalRoot, ".bazelversion");
+        if (fs.existsSync(bvPath) && fs.statSync(bvPath).isFile()) {
+          const firstLine = fs
+            .readFileSync(bvPath, "utf8")
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .find((l) => Boolean(l) && !l.startsWith("#"));
+          return firstLine || null;
+        }
+      } catch {
+        // Ignore unreadable .bazelversion
+      }
+      return null;
+    })();
+    const bazelVersionRange =
+      parseBazelVersionRange(bazelVersion) ||
+      parseBazelVersionRange(bazelMajorVersion) ||
+      (rawUseBazelVersion && rawUseBazelVersion !== "__UNRESOLVED_DYNAMIC_ENV__"
+        ? parseBazelVersionRange(rawUseBazelVersion)
+        : null) ||
+      parseBazelVersionRange(dotBazelversionRaw);
+
     const rawBazelMajor =
       bazelMajorVersion !== null && bazelMajorVersion !== undefined && bazelMajorVersion !== ""
-        ? Number(bazelMajorVersion)
-        : null;
+        ? parseBazelVersionRange(bazelMajorVersion)?.major ?? Number(bazelMajorVersion)
+        : bazelVersion !== null && bazelVersion !== undefined && bazelVersion !== ""
+          ? parseBazelVersionRange(bazelVersion)?.major ?? null
+          : null;
     const effectiveBazelMajor =
       rawBazelMajor !== null && Number.isFinite(rawBazelMajor) && rawBazelMajor > 0
         ? rawBazelMajor
         : null;
 
+    const cmpSemverTuple = (a, b) => {
+      for (let i = 0; i < 3; i++) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+      }
+      return 0;
+    };
+
+    const evaluateBazelVersionCondition = (condStr, range) => {
+      const m = String(condStr || "")
+        .trim()
+        .match(/^(~|==|!=|<=|>=|<|>|=)(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+][A-Za-z0-9_.-]+)?$/);
+      if (!m || !range) return "ambiguous";
+      const op = m[1] === "=" ? "==" : m[1];
+      const cMaj = Number(m[2]);
+      const hasMin = m[3] !== undefined;
+      const cMin = hasMin ? Number(m[3]) : 0;
+      const hasPatch = m[4] !== undefined;
+      const cPatch = hasPatch ? Number(m[4]) : 0;
+      const target = [cMaj, cMin, cPatch];
+      const testSingle = (v) => {
+        if (op === "==") {
+          if (!hasMin) return v[0] === cMaj;
+          return cmpSemverTuple(v, target) === 0;
+        }
+        if (op === "!=") {
+          if (!hasMin) return v[0] !== cMaj;
+          return cmpSemverTuple(v, target) !== 0;
+        }
+        if (op === ">=") return cmpSemverTuple(v, target) >= 0;
+        if (op === "<=") return cmpSemverTuple(v, target) <= 0;
+        if (op === ">") return cmpSemverTuple(v, target) > 0;
+        if (op === "<") return cmpSemverTuple(v, target) < 0;
+        if (op === "~") {
+          if (cmpSemverTuple(v, target) < 0) return false;
+          return hasMin ? v[0] === cMaj && v[1] === cMin : v[0] === cMaj;
+        }
+        return false;
+      };
+      if (cmpSemverTuple(range.min, range.max) === 0) {
+        return testSingle(range.min) ? "true" : "false";
+      }
+      if (op === "!=") {
+        if (!hasMin) {
+          if (range.max[0] < cMaj || range.min[0] > cMaj) return "true";
+          if (range.min[0] === cMaj && range.max[0] === cMaj) return "false";
+          return "ambiguous";
+        }
+        if (
+          cmpSemverTuple(target, range.min) < 0 ||
+          cmpSemverTuple(target, range.max) > 0
+        ) {
+          return "true";
+        }
+        return "ambiguous";
+      }
+      const minSat = testSingle(range.min);
+      const maxSat = testSingle(range.max);
+      if (minSat && maxSat) return "true";
+      if (!minSat && !maxSat) {
+        const targetInsideRange =
+          cmpSemverTuple(target, range.min) >= 0 && cmpSemverTuple(target, range.max) <= 0;
+        if (!targetInsideRange) return "false";
+      }
+      return "ambiguous";
+    };
+
+    const effectiveHostPlatform = platform || process.platform;
+    const hostBazelOsName =
+      effectiveHostPlatform === "darwin"
+        ? "macos"
+        : effectiveHostPlatform === "win32"
+          ? "windows"
+          : effectiveHostPlatform === "linux"
+            ? "linux"
+            : effectiveHostPlatform === "freebsd"
+              ? "freebsd"
+              : effectiveHostPlatform === "openbsd"
+                ? "openbsd"
+                : null;
+    const BAZEL_KNOWN_STARTUP_OS_NAMES = new Set([
+      "linux",
+      "macos",
+      "windows",
+      "freebsd",
+      "openbsd",
+      "unknown",
+    ]);
+
     if (!ignoreAllRc) {
       const seenTopLevelRcs = new Set();
+      const rcUnqualifiedStartupGroups = [];
+      const rcOsStartupGroups = [];
       const parseBazelrcFile = (
         rcPath,
-        { required = false, depth = 0, activeStack = new Set() } = {},
+        {
+          required = false,
+          depth = 0,
+          activeStack = new Set(),
+          ambiguousCondition = false,
+        } = {},
       ) => {
         if (!rcPath || rcPath === "/dev/null" || rcPath.toUpperCase() === "NUL") return;
         if (depth > 8) {
@@ -4476,6 +4690,26 @@ export function resolveBuildResources(
         for (const rawLine of joinBackslashContinuations(content)) {
           const line = rawLine.trim();
           if (!line || line.startsWith("#")) continue;
+          const condImportMatch = line.match(/^try-import-if-bazel-version\s+(\S+)\s+(.+)$/);
+          if (condImportMatch) {
+            const condStr = condImportMatch[1];
+            const evalRes = evaluateBazelVersionCondition(condStr, bazelVersionRange);
+            if (evalRes === "false") {
+              continue;
+            }
+            const rawTarget = condImportMatch[2]
+              .trim()
+              .replace(/^['"]|['"]$/g, "")
+              .replace(/%workspace%/g, canonicalRoot);
+            const targetPath = path.resolve(rcDir, rawTarget);
+            parseBazelrcFile(targetPath, {
+              required: false,
+              depth: depth + 1,
+              activeStack: nextStack,
+              ambiguousCondition: ambiguousCondition || evalRes === "ambiguous",
+            });
+            continue;
+          }
           const importMatch = line.match(/^(import|try-import)\s+(.+)$/);
           if (importMatch) {
             const isRequiredImport = importMatch[1] === "import";
@@ -4488,16 +4722,30 @@ export function resolveBuildResources(
               required: isRequiredImport,
               depth: depth + 1,
               activeStack: nextStack,
+              ambiguousCondition,
             });
             continue;
           }
           const startupMatch = line.match(/^startup(?::([A-Za-z0-9_.-]+))?\s+(.+)$/);
           if (startupMatch) {
-            if (startupMatch[1]) {
-              hasCustomStartupOption = true;
+            const startupConfig = startupMatch[1] ? startupMatch[1].toLowerCase() : null;
+            if (startupConfig) {
+              if (hostBazelOsName && startupConfig === hostBazelOsName) {
+                rcOsStartupGroups.push({
+                  tokens: splitShellWords(startupMatch[2]),
+                  baseDir: canonicalRoot,
+                  ambiguous: ambiguousCondition,
+                });
+              } else if (!BAZEL_KNOWN_STARTUP_OS_NAMES.has(startupConfig)) {
+                hasCustomStartupOption = true;
+              }
+              continue;
             }
-            const tokens = splitShellWords(startupMatch[2]);
-            applyStartupOptionTokens(tokens, canonicalRoot);
+            rcUnqualifiedStartupGroups.push({
+              tokens: splitShellWords(startupMatch[2]),
+              baseDir: canonicalRoot,
+              ambiguous: ambiguousCondition,
+            });
             continue;
           }
           const cmdMatch = line.match(/^([A-Za-z0-9_.-]+)(?::([A-Za-z0-9_.-]+))?\s+(.+)$/);
@@ -4593,6 +4841,12 @@ export function resolveBuildResources(
           const expandedRc = String(rawExplicitRc).replace(/%workspace%/g, canonicalRoot);
           parseBazelrcFile(resolveBazelPath(baseCwd, expandedRc), { required: true });
         }
+      }
+      for (const grp of rcUnqualifiedStartupGroups) {
+        applyStartupOptionTokens(grp.tokens, grp.baseDir, { ambiguous: grp.ambiguous });
+      }
+      for (const grp of rcOsStartupGroups) {
+        applyStartupOptionTokens(grp.tokens, grp.baseDir, { ambiguous: grp.ambiguous });
       }
     }
 
@@ -4710,6 +4964,18 @@ export function resolveBuildResources(
     } else if (canonicalUserRoot) {
       const wsMd5 = crypto.createHash("md5").update(canonicalRoot).digest("hex");
       resourceKeys.push(`bazel:out:${path.join(canonicalUserRoot, wsMd5)}`);
+    }
+    for (const ambOut of ambiguousOutputBases) {
+      const key = `bazel:out:${canonicalizeBuildPath(ambOut, { platform })}`;
+      if (!resourceKeys.includes(key)) resourceKeys.push(key);
+    }
+    if (ambiguousOutputUserRoots.size > 0) {
+      const wsMd5 = crypto.createHash("md5").update(canonicalRoot).digest("hex");
+      for (const ambRoot of ambiguousOutputUserRoots) {
+        const canonAmbRoot = canonicalizeBuildPath(ambRoot, { platform });
+        const key = `bazel:out:${path.join(canonAmbRoot, wsMd5)}`;
+        if (!resourceKeys.includes(key)) resourceKeys.push(key);
+      }
     }
     const bazelEnvMeta = {
       baseCwd,

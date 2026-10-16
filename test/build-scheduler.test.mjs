@@ -3577,6 +3577,132 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
       false,
     );
     assert.equal(bazel9TopLevelDedupe.disablesDaemon, false);
+
+    // 13. Round 50: try-import-if-bazel-version, startup:<os> filtering & precedence, and here-string phase validation
+    const condImportRc = path.join(wsDir, "cond-import.rc");
+    const condDeviceRc = path.join(wsDir, "cond-device.rc");
+    const condOut87 = path.join(wsDir, "cond-out-87");
+    fs.writeFileSync(
+      condDeviceRc,
+      [
+        `startup --output_base=${condOut87}`,
+        `test --test_arg=--device=emulator-5554`,
+        `clean --expunge`,
+      ].join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      condImportRc,
+      `try-import-if-bazel-version >=8.7.0 ${condDeviceRc}\n`,
+    );
+
+    const condTrueTest = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "test", "//app:test"],
+      dirA,
+      { bazelVersion: "8.7.0" },
+    );
+    assert.equal(condTrueTest.kind, "device_coupled_build");
+    assert.equal(condTrueTest.requiresDevice, true);
+    assert.equal(condTrueTest.targetSerial, "emulator-5554");
+    assert.ok(condTrueTest.resourceKeys.some((k) => k.endsWith("cond-out-87")));
+    assert.equal(condTrueTest.disablesDaemon, false);
+
+    const condTrueClean = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "clean"],
+      dirA,
+      { bazelVersion: "8.7.0" },
+    );
+    assert.equal(condTrueClean.kind, "deny_lifecycle");
+
+    const condFalseTest = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "test", "//app:test"],
+      dirA,
+      { bazelVersion: "8.6.0" },
+    );
+    assert.equal(condFalseTest.kind, "pure_build");
+    assert.equal(condFalseTest.requiresDevice, false);
+    assert.equal(
+      condFalseTest.resourceKeys.some((k) => k.endsWith("cond-out-87")),
+      false,
+    );
+
+    const condAmbiguousTest = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${condImportRc}`, "test", "//app:test"],
+      dirA,
+    );
+    assert.equal(condAmbiguousTest.kind, "device_coupled_build");
+    assert.equal(condAmbiguousTest.requiresDevice, true);
+    assert.equal(condAmbiguousTest.targetSerial, "emulator-5554");
+    assert.ok(condAmbiguousTest.resourceKeys.some((k) => k.endsWith("cond-out-87")));
+    assert.equal(condAmbiguousTest.disablesDaemon, true);
+
+    const startupOsRc = path.join(wsDir, "startup-os.rc");
+    const macOut = path.join(wsDir, "out-mac");
+    const linuxOut = path.join(wsDir, "out-linux");
+    const defaultOut = path.join(wsDir, "out-default");
+    fs.writeFileSync(
+      startupOsRc,
+      [
+        `startup:macos --output_base=${macOut}`,
+        `startup:linux --output_base=${linuxOut}`,
+        `startup --output_base=${defaultOut}`,
+      ].join("\n") + "\n",
+    );
+    const macStartupRes = resolveBuildResources(
+      "bazel",
+      ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", `--bazelrc=${startupOsRc}`, "build", "//..."],
+      dirA,
+      { platform: "darwin" },
+    );
+    assert.ok(macStartupRes.resourceKeys.some((k) => k.endsWith("out-mac")));
+    assert.equal(
+      macStartupRes.resourceKeys.some((k) => k.endsWith("out-linux")),
+      false,
+    );
+    assert.equal(
+      macStartupRes.resourceKeys.some((k) => k.endsWith("out-default")),
+      false,
+    );
+    assert.equal(macStartupRes.disablesDaemon, false);
+
+    const hereStringBuildReqs = resolveBuildResources(
+      "bash",
+      ["-c", 'bash <<< "./gradlew build"'],
+      dirA,
+    );
+    assert.equal(hereStringBuildReqs.kind, "pure_build");
+    assert.equal(hereStringBuildReqs.requiresHeavySlot, true);
+    assert.equal(hereStringBuildReqs.requiresWorkspaceLock, true);
+
+    const readOnlyHereStringExec = await cmdExec(
+      stateDir,
+      ["bash", "-c", 'bash <<< "./gradlew build"'],
+      { session: "s-round50", phase: "read-only" },
+      { cwd: dirA },
+    );
+    assert.equal(readOnlyHereStringExec.exitCode, 3);
+    assert.match(readOnlyHereStringExec.error, /Phase conflict:.*violates --phase=read-only/);
+
+    const readOnlyHereStringBatch = await cmdBatch(
+      stateDir,
+      {
+        steps: [
+          {
+            id: "herestring-step",
+            phase: "read-only",
+            command: "bash",
+            args: ["-c", 'bash <<< "./gradlew build"'],
+          },
+        ],
+      },
+      { session: "s-round50" },
+      { cwd: dirA },
+    );
+    assert.equal(readOnlyHereStringBatch.exitCode, 3);
+    assert.match(readOnlyHereStringBatch.error, /Phase conflict:.*violates --phase=read-only/);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

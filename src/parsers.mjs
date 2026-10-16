@@ -869,7 +869,7 @@ export function parseScriptHeredocs(script, rawParts = null) {
       while (i + 1 < s.length && s[i + 1] !== "\n") i++;
       continue;
     }
-    if (ch === "<" && s[i + 1] === "<" && s[i + 2] !== "<") {
+    if (s[i - 1] !== "<" && ch === "<" && s[i + 1] === "<" && s[i + 2] !== "<") {
       const opStart =
         i > 0 && /[0-9]/.test(s[i - 1]) && (i === 1 || /[\s;&|()]/.test(s[i - 2])) ? i - 1 : i;
       let k = i + 2;
@@ -1169,6 +1169,12 @@ export function parseShellQuote(rawScript, { shellType = "posix" } = {}) {
     ) {
       tokens.push({ type: "op", op: `${s[i]}(` });
       i += 2;
+      continue;
+    }
+
+    if (s.slice(i, i + 3) === "<<<") {
+      tokens.push({ type: "op", op: "<<<" });
+      i += 3;
       continue;
     }
 

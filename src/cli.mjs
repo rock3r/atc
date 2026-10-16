@@ -5278,6 +5278,14 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   if (cmdDeviceClass.kind === "deny_lifecycle") {
     return { exitCode: 3, error: cmdDeviceClass.reason };
   }
+  if (cmdDeviceClass.buildClass === "reject_long_running") {
+    return {
+      exitCode: 3,
+      error:
+        cmdDeviceClass.rejectReason ||
+        "Continuous/watch build commands cannot be coordinated by atc exec because they hold build slots indefinitely.",
+    };
+  }
 
   if (explicitPhase) {
     if (
@@ -5294,11 +5302,18 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
         buildReqs.requiresHeavySlot ||
         buildReqs.requiresWorkspaceLock ||
         buildReqs.requiresDevice ||
-        cmdDeviceClass.kind === "device_action"
+        cmdDeviceClass.kind === "device_action" ||
+        (cmdDeviceClass.isBuildTool &&
+          cmdDeviceClass.buildClass &&
+          cmdDeviceClass.buildClass !== "read_only")
       ) {
+        const conflictKind =
+          buildReqs.kind && buildReqs.kind !== "not_build_tool"
+            ? buildReqs.kind
+            : cmdDeviceClass.buildClass || cmdDeviceClass.kind;
         return {
           exitCode: 3,
-          error: `Phase conflict: command requires build/workspace/device locks (${buildReqs.kind}), which violates --phase=read-only.`,
+          error: `Phase conflict: command requires build/workspace/device locks (${conflictKind}), which violates --phase=read-only.`,
         };
       }
       buildReqs.kind = "read_only";
@@ -5322,10 +5337,17 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       buildReqs.requiresHeavySlot = true;
       buildReqs.requiresDevice = true;
     } else if (explicitPhase === "device-test") {
-      if (buildReqs.requiresHeavySlot && !buildReqs.requiresDevice) {
+      if (
+        (buildReqs.requiresHeavySlot && !buildReqs.requiresDevice) ||
+        (cmdDeviceClass.isBuildTool && cmdDeviceClass.buildClass === "pure_build")
+      ) {
+        const conflictKind =
+          buildReqs.kind && buildReqs.kind !== "not_build_tool"
+            ? buildReqs.kind
+            : cmdDeviceClass.buildClass;
         return {
           exitCode: 3,
-          error: `Phase conflict: command is a pure compilation (${buildReqs.kind}) that does not target a device, which violates --phase=device-test. Use --phase=pure-build or --phase=device-build.`,
+          error: `Phase conflict: command is a pure compilation (${conflictKind}) that does not target a device, which violates --phase=device-test. Use --phase=pure-build or --phase=device-build.`,
         };
       }
       buildReqs.requiresDevice = true;
@@ -8021,6 +8043,12 @@ export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {})
         error: `Batch pre-flight failed on step "${id}": ${preflightDevClass.reason}`,
       };
     }
+    if (preflightDevClass.buildClass === "reject_long_running") {
+      return {
+        exitCode: 3,
+        error: `Batch pre-flight failed on step "${id}": ${preflightDevClass.rejectReason || "Continuous/watch build commands cannot be coordinated by atc batch because they hold build slots indefinitely."}`,
+      };
+    }
     if (stepPhase) {
       if (
         (stepPhase === "pure-build" || stepPhase === "read-only") &&
@@ -8036,11 +8064,18 @@ export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {})
           preflightBuildReqs.requiresHeavySlot ||
           preflightBuildReqs.requiresWorkspaceLock ||
           preflightBuildReqs.requiresDevice ||
-          preflightDevClass.kind === "device_action"
+          preflightDevClass.kind === "device_action" ||
+          (preflightDevClass.isBuildTool &&
+            preflightDevClass.buildClass &&
+            preflightDevClass.buildClass !== "read_only")
         ) {
+          const conflictKind =
+            preflightBuildReqs.kind && preflightBuildReqs.kind !== "not_build_tool"
+              ? preflightBuildReqs.kind
+              : preflightDevClass.buildClass || preflightDevClass.kind;
           return {
             exitCode: 3,
-            error: `Batch pre-flight failed on step "${id}": Phase conflict: command requires build/workspace/device locks (${preflightBuildReqs.kind}), which violates --phase=read-only.`,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command requires build/workspace/device locks (${conflictKind}), which violates --phase=read-only.`,
           };
         }
       } else if (stepPhase === "pure-build") {
@@ -8051,10 +8086,17 @@ export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {})
           };
         }
       } else if (stepPhase === "device-test") {
-        if (preflightBuildReqs.requiresHeavySlot && !preflightBuildReqs.requiresDevice) {
+        if (
+          (preflightBuildReqs.requiresHeavySlot && !preflightBuildReqs.requiresDevice) ||
+          (preflightDevClass.isBuildTool && preflightDevClass.buildClass === "pure_build")
+        ) {
+          const conflictKind =
+            preflightBuildReqs.kind && preflightBuildReqs.kind !== "not_build_tool"
+              ? preflightBuildReqs.kind
+              : preflightDevClass.buildClass;
           return {
             exitCode: 3,
-            error: `Batch pre-flight failed on step "${id}": Phase conflict: command is a pure compilation (${preflightBuildReqs.kind}) that does not target a device, which violates --phase=device-test.`,
+            error: `Batch pre-flight failed on step "${id}": Phase conflict: command is a pure compilation (${conflictKind}) that does not target a device, which violates --phase=device-test.`,
           };
         }
       }
