@@ -4607,10 +4607,24 @@ export function resolveBuildResources(
       const rawCmdLeaf = cleanedCmd.split(/[\\/]/).pop() || "";
       const baseCmd = rawCmdLeaf.toLowerCase().replace(/\.(exe|cmd|bat|com|sh)$/i, "");
       if (baseCmd === "bazelisk" || baseCmd === "bazelw") return true;
-      const checkCandidateIsBazelisk = (candidatePath) => {
+      const checkCandidateIsBazelisk = (candidatePath, { requireExecutable = false } = {}) => {
         try {
-          if (!fs.existsSync(candidatePath) || !fs.statSync(candidatePath).isFile()) {
+          if (!fs.existsSync(candidatePath)) {
             return null;
+          }
+          const st = fs.statSync(candidatePath);
+          if (!st.isFile()) {
+            return null;
+          }
+          if (requireExecutable && process.platform !== "win32") {
+            if ((st.mode & 0o111) === 0) {
+              return null;
+            }
+            try {
+              fs.accessSync(candidatePath, fs.constants.X_OK);
+            } catch {
+              return null;
+            }
           }
           const real = (fs.realpathSync.native || fs.realpathSync)(candidatePath);
           const realBase = (real.split(/[\\/]/).pop() || "")
@@ -4666,7 +4680,9 @@ export function resolveBuildResources(
             if (!cleanedDir) continue;
             const resolvedDir = path.resolve(baseCwd, cleanedDir);
             for (const exeName of exeCandidates) {
-              const res = checkCandidateIsBazelisk(path.join(resolvedDir, exeName));
+              const res = checkCandidateIsBazelisk(path.join(resolvedDir, exeName), {
+                requireExecutable: true,
+              });
               if (res !== null) {
                 return res;
               }

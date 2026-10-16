@@ -1698,6 +1698,22 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
   let baseVars = { ...inheritedVars };
   const envVars = {};
   let stripsAndroidSerial = Boolean(inheritedVars.__atc_stripped_android_serial);
+  let ignoreEnvironment = Boolean(inheritedVars.__atc_ignore_env);
+  let preservedEnvKeys = inheritedVars.__atc_preserved_env
+    ? new Set(String(inheritedVars.__atc_preserved_env).split(",").filter(Boolean))
+    : null;
+  const unsetEnvKeys = new Set();
+  const shellUnsetKeys = new Set();
+  for (const [k, v] of Object.entries(inheritedVars || {})) {
+    if (k.startsWith("__atc_unset_") && v === "1") {
+      const origKey = k.slice("__atc_unset_".length);
+      if (origKey) {
+        unsetEnvKeys.add(origKey);
+        delete baseVars[origKey];
+      }
+    }
+  }
+  let relCwd = inheritedVars.__atc_rel_cwd ? String(inheritedVars.__atc_rel_cwd) : null;
   let isPackageExec = false;
   let idx = 0;
 
@@ -1722,6 +1738,11 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           const k = arg.split("=")[0];
           delete baseVars[k];
           delete envVars[k];
+          if (k) {
+            unsetEnvKeys.add(k);
+            shellUnsetKeys.add(k);
+            envVars[`__atc_unset_${k}`] = "1";
+          }
           if (k === "ANDROID_SERIAL") {
             stripsAndroidSerial = true;
             envVars.__atc_stripped_android_serial = "1";
@@ -1756,6 +1777,11 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
         const k = tokens[idx++];
         delete baseVars[k];
         delete envVars[k];
+        if (k) {
+          unsetEnvKeys.add(k);
+          shellUnsetKeys.add(k);
+          envVars[`__atc_unset_${k}`] = "1";
+        }
         if (k === "ANDROID_SERIAL") {
           stripsAndroidSerial = true;
           envVars.__atc_stripped_android_serial = "1";
@@ -1771,6 +1797,13 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
         ? "__atc_cmd_sub__"
         : expandVariables(rawVal, { ...baseVars, ...envVars });
       envVars[k] = expandedVal;
+      unsetEnvKeys.delete(k);
+      shellUnsetKeys.delete(k);
+      delete baseVars[`__atc_unset_${k}`];
+      envVars[`__atc_unset_${k}`] = "";
+      if (preservedEnvKeys) {
+        preservedEnvKeys.add(k);
+      }
       if (k === "ANDROID_SERIAL") {
         if (expandedVal) {
           stripsAndroidSerial = false;
@@ -1802,21 +1835,30 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           if (flag === "-" || flag === "-i" || flag === "--ignore-environment") {
             baseVars = {};
             for (const k of Object.keys(envVars)) {
-              delete envVars[k];
+              if (!k.startsWith("__atc_rel_cwd")) {
+                delete envVars[k];
+              }
             }
+            ignoreEnvironment = true;
+            preservedEnvKeys = null;
+            unsetEnvKeys.clear();
             stripsAndroidSerial = true;
           } else if (flag === "-u" || flag === "--unset") {
             const unsetKey = tokens[idx] || "";
             if (idx < tokens.length) idx++;
             delete baseVars[unsetKey];
             delete envVars[unsetKey];
+            if (unsetKey) unsetEnvKeys.add(unsetKey);
             if (unsetKey === "ANDROID_SERIAL") {
               stripsAndroidSerial = true;
             }
           } else if (flag.startsWith("--unset=") || (flag.startsWith("-u") && flag.length > 2)) {
-            const unsetKey = flag.startsWith("--unset=") ? flag.slice("--unset=".length) : flag.slice(2);
+            const unsetKey = flag.startsWith("--unset=")
+              ? flag.slice("--unset=".length)
+              : flag.slice(2);
             delete baseVars[unsetKey];
             delete envVars[unsetKey];
+            if (unsetKey) unsetEnvKeys.add(unsetKey);
             if (unsetKey === "ANDROID_SERIAL") {
               stripsAndroidSerial = true;
             }
@@ -1826,10 +1868,22 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
               tokens.splice(idx, 1, ...tokenizeSegment(splitStr));
             }
           } else if (flag.startsWith("--split-string=") || (flag.startsWith("-S") && flag.length > 2)) {
-            const splitStr = flag.startsWith("--split-string=") ? flag.slice("--split-string=".length) : flag.slice(2);
+            const splitStr = flag.startsWith("--split-string=")
+              ? flag.slice("--split-string=".length)
+              : flag.slice(2);
             tokens.splice(idx, 0, ...tokenizeSegment(splitStr));
           } else if ((flag === "-C" || flag === "--chdir") && idx < tokens.length) {
-            idx++;
+            const nextDir = tokens[idx++];
+            if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
+              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+            }
+          } else if (flag.startsWith("--chdir=") || (flag.startsWith("-C") && flag.length > 2)) {
+            const nextDir = flag.startsWith("--chdir=")
+              ? flag.slice("--chdir=".length)
+              : flag.slice(2);
+            if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
+              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+            }
           }
         }
       } else if (base === "command") {
@@ -1851,7 +1905,8 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
           idx++;
         }
       } else if (base === "sudo") {
-        let sudoPreservesSerial = false;
+        let sudoPreservesAll = false;
+        const sudoPreservedList = [];
         while (idx < tokens.length && tokens[idx].startsWith("-")) {
           const flag = tokens[idx];
           idx++;
@@ -1861,34 +1916,65 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
             flag === "--preserve-env" ||
             (flag.startsWith("-") && !flag.startsWith("--") && flag.slice(1).includes("E"))
           ) {
-            sudoPreservesSerial = true;
-          } else if (
-            flag.startsWith("--preserve-env=") &&
-            flag
+            sudoPreservesAll = true;
+          } else if (flag.startsWith("--preserve-env=")) {
+            for (const k of flag
               .slice("--preserve-env=".length)
               .split(",")
               .map((s) => s.trim())
-              .includes("ANDROID_SERIAL")
-          ) {
-            sudoPreservesSerial = true;
+              .filter(Boolean)) {
+              sudoPreservedList.push(k);
+            }
+          } else if (flag.startsWith("--chdir=")) {
+            const nextDir = flag.slice("--chdir=".length);
+            if (nextDir && !nextDir.includes("__atc_cmd_sub__")) {
+              relCwd = relCwd ? path.join(relCwd, nextDir) : nextDir;
+            }
           }
           if (
             (flag === "-u" ||
               flag === "-g" ||
               flag === "-C" ||
               flag === "-D" ||
+              flag === "--chdir" ||
               flag === "-R" ||
               flag === "-T") &&
             idx < tokens.length
           ) {
-            idx++;
+            const val = tokens[idx++];
+            if ((flag === "-D" || flag === "--chdir") && val && !val.includes("__atc_cmd_sub__")) {
+              relCwd = relCwd ? path.join(relCwd, val) : val;
+            }
+          }
+        }
+        const sudoPreservesSerial =
+          sudoPreservesAll || sudoPreservedList.includes("ANDROID_SERIAL");
+        if (!sudoPreservesAll) {
+          if (sudoPreservedList.length > 0) {
+            const keep = new Set(sudoPreservedList);
+            for (const k of Object.keys(baseVars)) {
+              if (!keep.has(k)) delete baseVars[k];
+            }
+            for (const k of Object.keys(envVars)) {
+              if (!keep.has(k)) delete envVars[k];
+            }
+            ignoreEnvironment = true;
+            preservedEnvKeys = keep;
+          } else {
+            baseVars = {};
+            for (const k of Object.keys(envVars)) {
+              if (!k.startsWith("__atc_rel_cwd")) {
+                delete envVars[k];
+              }
+            }
+            ignoreEnvironment = true;
+            preservedEnvKeys = null;
+            unsetEnvKeys.clear();
           }
         }
         if (!sudoPreservesSerial) {
-          baseVars = {};
-          for (const k of Object.keys(envVars)) {
-            delete envVars[k];
-          }
+          delete baseVars.ANDROID_SERIAL;
+          delete envVars.ANDROID_SERIAL;
           stripsAndroidSerial = true;
         }
       } else if (base === "nice") {
@@ -2054,14 +2140,60 @@ export function parseSegment(segment, inheritedVars = {}, { allowHashComments = 
     extractExecutableBase(cmd, { allowPackageSpec: isPackageExec, allowWrapperAffix: true }) ||
     (cmd.split(/[\\/]/).pop() || cmd).toLowerCase();
   const args = remaining.slice(1);
+  if (baseCmd === "cd") {
+    let cdIdx = 0;
+    while (cdIdx < args.length && String(args[cdIdx]).startsWith("-")) {
+      const f = String(args[cdIdx]);
+      if (f === "-") break;
+      cdIdx++;
+      if (f === "--") break;
+    }
+    const cdTarget = args[cdIdx];
+    if (cdTarget && cdTarget !== "-" && !String(cdTarget).includes("__atc_cmd_sub__")) {
+      allVars.__atc_rel_cwd = relCwd ? path.join(relCwd, String(cdTarget)) : String(cdTarget);
+    }
+  }
   return {
     raw: expandVariables(segment, allVars),
     envVars: allVars,
+    unsetEnvKeys: Array.from(unsetEnvKeys),
+    shellUnsetKeys: Array.from(shellUnsetKeys),
+    ignoreEnvironment,
+    preservedEnvKeys: preservedEnvKeys ? Array.from(preservedEnvKeys) : null,
+    relCwd,
     stripsAndroidSerial,
     cmd,
     baseCmd,
     args,
   };
+}
+
+function propagateSegmentEnvMutations(targetVars, parsed) {
+  if (!parsed) return;
+  Object.assign(targetVars, parsed.envVars || {});
+  if (Array.isArray(parsed.shellUnsetKeys)) {
+    for (const uk of parsed.shellUnsetKeys) {
+      delete targetVars[uk];
+    }
+  }
+}
+
+function buildWrappedInheritedVars(parsed) {
+  const vars = { ...(parsed?.envVars || {}) };
+  if (parsed?.ignoreEnvironment) {
+    vars.__atc_ignore_env = "1";
+    if (Array.isArray(parsed.preservedEnvKeys) && parsed.preservedEnvKeys.length > 0) {
+      vars.__atc_preserved_env = parsed.preservedEnvKeys.join(",");
+    } else {
+      delete vars.__atc_preserved_env;
+    }
+  }
+  if (Array.isArray(parsed?.unsetEnvKeys)) {
+    for (const uk of parsed.unsetEnvKeys) {
+      vars[`__atc_unset_${uk}`] = "1";
+    }
+  }
+  return vars;
 }
 
 const UUID_RE = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
@@ -2273,9 +2405,11 @@ export function classifySegment(
   segment,
   inheritedVars = {},
   depth = 0,
-  { allowHashComments = true } = {},
+  { allowHashComments = true, cwd = process.cwd(), env = process.env } = {},
 ) {
   const parsed = parseSegment(segment, inheritedVars, { allowHashComments });
+  const baseCwd = cwd || process.cwd();
+  const effectiveCwd = parsed.relCwd ? path.resolve(baseCwd, parsed.relCwd) : baseCwd;
   if (depth > 8) {
     return {
       kind: "device_action",
@@ -2335,6 +2469,7 @@ export function classifySegment(
     if (subcommand === "exec") {
       const dashDashIdx = args.indexOf("--", subIdx + 1);
       let wrappedTokens = [];
+      let atcWorkspaceFlag = null;
       let i = subIdx + 1;
       const scanEnd = dashDashIdx !== -1 ? dashDashIdx : args.length;
       while (i < scanEnd) {
@@ -2377,10 +2512,15 @@ export function classifySegment(
         ) {
           if (a === "--udid") {
             atcSerialFlag = args[i + 1];
+          } else if (a === "--workspace") {
+            atcWorkspaceFlag = args[i + 1];
           }
           i += 2;
         } else if (a.startsWith("--udid=")) {
           atcSerialFlag = a.slice("--udid=".length);
+          i += 1;
+        } else if (a.startsWith("--workspace=")) {
+          atcWorkspaceFlag = a.slice("--workspace=".length);
           i += 1;
         } else if (a.startsWith("--")) {
           i += 1;
@@ -2397,7 +2537,7 @@ export function classifySegment(
         const wrappedSeg = wrappedTokens
           .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        const execInheritedVars = { ...parsed.envVars };
+        const execInheritedVars = buildWrappedInheritedVars(parsed);
         if (atcSerialFlag) {
           execInheritedVars.ANDROID_SERIAL = atcSerialFlag;
           execInheritedVars.SIMULATOR_UDID = atcSerialFlag;
@@ -2411,7 +2551,14 @@ export function classifySegment(
           execInheritedVars.SIMULATOR_UDID = "__ATC_EXEC_INJECTED_SERIAL__";
           execInheritedVars.ATC_DEVICE_SERIAL = "__ATC_EXEC_INJECTED_SERIAL__";
         }
-        const innerClass = classifySegment(wrappedSeg, execInheritedVars, depth + 1);
+        const execCwd = atcWorkspaceFlag
+          ? path.resolve(effectiveCwd, String(atcWorkspaceFlag))
+          : effectiveCwd;
+        const innerClass = classifySegment(wrappedSeg, execInheritedVars, depth + 1, {
+          allowHashComments,
+          cwd: execCwd,
+          env,
+        });
         if (innerClass.kind === "deny_lifecycle") {
           return innerClass;
         }
@@ -2808,11 +2955,35 @@ export function classifySegment(
       buildInfo.kind !== "deny_lifecycle" &&
       buildInfo.kind !== "read_only"
     ) {
+      const baseCallerEnv = env || process.env;
+      const envForBazel = {};
+      if (!parsed.ignoreEnvironment) {
+        for (const [k, v] of Object.entries(baseCallerEnv)) {
+          if (v !== undefined) envForBazel[k] = v;
+        }
+      } else if (Array.isArray(parsed.preservedEnvKeys)) {
+        for (const k of parsed.preservedEnvKeys) {
+          if (baseCallerEnv[k] !== undefined) envForBazel[k] = baseCallerEnv[k];
+        }
+      }
+      if (Array.isArray(parsed.unsetEnvKeys)) {
+        for (const k of parsed.unsetEnvKeys) {
+          delete envForBazel[k];
+        }
+      }
+      for (const [k, v] of Object.entries(parsed.envVars || {})) {
+        if (k.startsWith("__atc_")) continue;
+        if (v === "__atc_cmd_sub__" || (typeof v === "string" && v.includes("__atc_cmd_sub__"))) {
+          envForBazel[k] = "__UNRESOLVED_DYNAMIC_ENV__";
+        } else {
+          envForBazel[k] = v;
+        }
+      }
       const resolvedBazel = resolveBuildResources(
-        baseCmd,
+        parsed.cmd || baseCmd,
         args,
-        parsed.relCwd ? path.resolve(process.cwd(), parsed.relCwd) : process.cwd(),
-        { env: { ...process.env, ...(parsed.envVars || {}) } },
+        effectiveCwd,
+        { env: envForBazel },
       );
       if (resolvedBazel && resolvedBazel.kind && resolvedBazel.kind !== "not_build_tool") {
         buildInfo = resolvedBazel;
@@ -2886,7 +3057,7 @@ export function classifySegment(
         handledCWrapper = true;
         const rawScript = String(args[scriptIdx]);
         const posArgs = args.slice(scriptIdx + 1).map((a) => String(a));
-        const wrapperVars = { ...parsed.envVars };
+        const wrapperVars = buildWrappedInheritedVars(parsed);
         for (let i = 0; i < posArgs.length; i++) {
           wrapperVars[String(i)] = posArgs[i];
         }
@@ -2913,11 +3084,14 @@ export function classifySegment(
             allowHashComments: innerAllowHash,
           })
         ) {
-          innerEntries.push({ script: a, vars: { ...parsed.envVars } });
+          innerEntries.push({ script: a, vars: buildWrappedInheritedVars(parsed) });
         }
       }
       if (nonFlagArgs.length > 1) {
-        innerEntries.push({ script: nonFlagArgs.join(" "), vars: { ...parsed.envVars } });
+        innerEntries.push({
+          script: nonFlagArgs.join(" "),
+          vars: buildWrappedInheritedVars(parsed),
+        });
       }
     }
     if (innerEntries.length > 0) {
@@ -2930,8 +3104,10 @@ export function classifySegment(
           if (subSeg.trim() === effectiveSegment.trim()) continue;
           const subClass = classifySegment(subSeg, innerVars, depth + 1, {
             allowHashComments: innerAllowHash,
+            cwd: effectiveCwd,
+            env,
           });
-          Object.assign(innerVars, subClass.parsed?.envVars || {});
+          propagateSegmentEnvMutations(innerVars, subClass.parsed);
           if (subClass.parsed?.stripsAndroidSerial) {
             delete innerVars.ANDROID_SERIAL;
             innerVars.__atc_stripped_android_serial = "1";
@@ -3206,7 +3382,12 @@ export function classifySegment(
         const nestedSegment = cleanedArgs
           .map((a) => (/[\s"'\\]/.test(a) ? JSON.stringify(a) : a))
           .join(" ");
-        peeledClass = classifySegment(nestedSegment, parsed.envVars, depth + 1);
+        peeledClass = classifySegment(
+          nestedSegment,
+          buildWrappedInheritedVars(parsed),
+          depth + 1,
+          { allowHashComments, cwd: effectiveCwd, env },
+        );
         if (peeledClass.kind === "deny_lifecycle") {
           return peeledClass;
         }
@@ -3225,14 +3406,18 @@ export function classifySegment(
     if (embeddedCandidates.length > 0) {
       const embeddedSerials = new Set();
       let sawEmbeddedDeviceAction = false;
-      const baseEmbeddedVars = { ...parsed.envVars };
+      const baseEmbeddedVars = buildWrappedInheritedVars(parsed);
       delete baseEmbeddedVars.ANDROID_SERIAL;
       for (const candidate of embeddedCandidates) {
         const innerVars = { ...baseEmbeddedVars };
         for (const subSeg of splitShellSegments(candidate)) {
           if (subSeg.trim() === effectiveSegment.trim()) continue;
-          const subClass = classifySegment(subSeg, innerVars, depth + 1);
-          Object.assign(innerVars, subClass.parsed?.envVars || {});
+          const subClass = classifySegment(subSeg, innerVars, depth + 1, {
+            allowHashComments,
+            cwd: effectiveCwd,
+            env,
+          });
+          propagateSegmentEnvMutations(innerVars, subClass.parsed);
           if (subClass.kind === "deny_lifecycle") {
             return subClass;
           }
@@ -4893,6 +5078,8 @@ function rewriteCompoundCommand(
     execSerialByPlatform = null,
     coordinateBuilds = false,
     platform = "win32",
+    cwd = process.cwd(),
+    env = process.env,
     inheritedShellVars = null,
     inheritedLoopDepth = 0,
   },
@@ -4904,6 +5091,8 @@ function rewriteCompoundCommand(
     execSerialByPlatform,
     coordinateBuilds,
     platform,
+    cwd,
+    env,
   };
   const isWin = platform === "win32";
   const sessionFlag = sessionId
@@ -5250,8 +5439,8 @@ function rewriteCompoundCommand(
           classifyInput = `${stageForClassify} ${pipeUpstreamArgs.join(" ")}`;
         }
       }
-      const c = classifySegment(classifyInput, shellVars);
-      Object.assign(shellVars, c.parsed?.envVars || {});
+      const c = classifySegment(classifyInput, shellVars, 0, { cwd, env });
+      propagateSegmentEnvMutations(shellVars, c.parsed);
       for (const uv of maybeUnsetVars) {
         if (Object.prototype.hasOwnProperty.call(shellVars, uv)) {
           shellVars[uv] = "__atc_cmd_sub__";
@@ -6029,6 +6218,8 @@ export function evaluateCommandGuard(
     runningCountByPlatform = null,
     coordinateBuilds = false,
     platform = process.platform,
+    cwd = process.cwd(),
+    env = process.env,
   } = {},
 ) {
   if (!hasAndroidOrAtcTokens(command)) {
@@ -6058,8 +6249,8 @@ export function evaluateCommandGuard(
     for (const lv of extractStageLoopVariables(seg)) {
       shellVars[lv] = "__atc_cmd_sub__";
     }
-    const c = classifySegment(seg, shellVars);
-    Object.assign(shellVars, c.parsed?.envVars || {});
+    const c = classifySegment(seg, shellVars, 0, { cwd, env });
+    propagateSegmentEnvMutations(shellVars, c.parsed);
     for (const lv of extractStageLoopVariables(seg)) {
       shellVars[lv] = "__atc_cmd_sub__";
     }
@@ -6289,6 +6480,8 @@ export function evaluateCommandGuard(
         execSerialByPlatform,
         coordinateBuilds,
         platform: "win32",
+        cwd,
+        env,
       });
     } else {
       const envPrefix = sessionId
@@ -6306,6 +6499,8 @@ export function evaluateCommandGuard(
           execSerialByPlatform,
           coordinateBuilds,
           platform,
+          cwd,
+          env,
         });
       } else {
         const usesExtglob = stageUsesExtglob(command);
@@ -6337,6 +6532,8 @@ export function evaluateCommandGuard(
         execSerial: null,
         coordinateBuilds: true,
         platform: "win32",
+        cwd,
+        env,
       });
     } else {
       const envPrefix = sessionId
@@ -6353,6 +6550,8 @@ export function evaluateCommandGuard(
           execSerial: null,
           coordinateBuilds: true,
           platform,
+          cwd,
+          env,
         });
       } else {
         const usesExtglob = stageUsesExtglob(command);
@@ -6378,6 +6577,8 @@ export function evaluateCommandGuard(
         anchorPid,
         execSerial: null,
         platform: "win32",
+        cwd,
+        env,
       });
     } else if (segments.length > 1) {
       const exportVars = anchorPid

@@ -245,7 +245,7 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
 
   if (!inventory && options.runningCount === undefined) {
     const unscopedSegments = splitShellSegments(norm.command)
-      .map((seg) => classifySegment(seg))
+      .map((seg) => classifySegment(seg, {}, 0, { cwd, env: options.env || process.env }))
       .filter((c) => c.kind === "device_action" && !c.targetSerial);
     const runner = options.runner || runCommandSync;
     if (
@@ -357,6 +357,8 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
         runningCountByPlatform,
         coordinateBuilds,
         platform: options.platform,
+        cwd,
+        env: options.env || process.env,
       });
 
       if (

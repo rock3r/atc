@@ -5274,7 +5274,10 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
   const rawCmdStrForDeviceCheck = commandArgs
     .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
     .join(" ");
-  const cmdDeviceClass = classifySegment(rawCmdStrForDeviceCheck);
+  const cmdDeviceClass = classifySegment(rawCmdStrForDeviceCheck, {}, 0, {
+    cwd,
+    env: callerEnv,
+  });
   if (cmdDeviceClass.kind === "deny_lifecycle") {
     return { exitCode: 3, error: cmdDeviceClass.reason };
   }
@@ -5569,7 +5572,7 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
       const rawCmdStr = commandArgs
         .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
         .join(" ");
-      const cmdClass = classifySegment(rawCmdStr);
+      const cmdClass = classifySegment(rawCmdStr, {}, 0, { cwd, env: callerEnv });
       const preferredPlat = cmdClass.targetPlatform || buildReqs.targetPlatform;
       if (preferredPlat === "ios" || preferredPlat === "android") {
         const platformMatched = owned.filter(
@@ -5953,6 +5956,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                       ATC_PLATFORM: "android",
                     }
                 : {},
+              0,
+              { cwd, env: callerEnv },
             );
             if (wrappedClass.kind === "deny_lifecycle") {
               return {
@@ -6636,6 +6641,8 @@ export async function cmdExec(stateDir, commandArgs, flags = {}, options = {}) {
                 ATC_PLATFORM: "android",
               }
           : {},
+        0,
+        { cwd, env: callerEnv },
       );
       if (wrappedClass.kind === "deny_lifecycle") {
         postClaimValidationError = wrappedClass.reason;
@@ -7565,7 +7572,12 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
 
   if (!inventory && options.runningCount === undefined) {
     const unscopedSegments = splitShellSegments(commandStr)
-      .map((seg) => classifySegment(seg))
+      .map((seg) =>
+        classifySegment(seg, {}, 0, {
+          cwd: options.cwd || process.cwd(),
+          env: options.env || process.env,
+        }),
+      )
       .filter((c) => c.kind === "device_action" && !c.targetSerial);
     const runner = options.runner || runCommandSync;
     if (
@@ -7644,6 +7656,8 @@ export function cmdGuard(stateDir, commandStr, flags = {}, options = {}) {
       runningCount,
       runningCountByPlatform,
       platform: options.platform,
+      cwd: options.cwd || process.cwd(),
+      env: options.env || process.env,
       coordinateBuilds:
         options.coordinateBuilds !== undefined
           ? Boolean(options.coordinateBuilds)
@@ -8099,7 +8113,10 @@ export async function cmdBatch(stateDir, rawSpecInput, flags = {}, options = {})
     const rawStepCmdStr = [command, ...stepArgs]
       .map((a) => (/[\s"'\\]/.test(String(a)) ? JSON.stringify(String(a)) : String(a)))
       .join(" ");
-    const preflightDevClass = classifySegment(rawStepCmdStr);
+    const preflightDevClass = classifySegment(rawStepCmdStr, {}, 0, {
+      cwd: stepCwd,
+      env: stepEnv,
+    });
     if (preflightDevClass.kind === "deny_lifecycle") {
       return {
         exitCode: 3,

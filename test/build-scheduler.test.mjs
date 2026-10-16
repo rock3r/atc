@@ -3914,6 +3914,76 @@ test("Battle Plan v3.2: Round 35 defects, fail-closed shell-quote gate, explicit
     const cursorOut = JSON.parse(cursorBuildHookRes.stdout);
     assert.equal(cursorOut.permission, "deny");
     assert.match(cursorOut.agent_message, /atc exec --build -- \.\/gradlew build/);
+
+    // Round 54: non-executable PATH bazel->bazelisk entry is skipped, wrapper unsets (env -u BAZELRC) preserved in guard, and payload cwd threaded through hook Bazel rc evaluation
+    if (process.platform !== "win32") {
+      const nonExecBinDir = path.join(wsDir, "nonexec-bazelisk-bin");
+      fs.mkdirSync(nonExecBinDir, { recursive: true });
+      const nonExecBazelisk = path.join(nonExecBinDir, "bazelisk");
+      fs.writeFileSync(nonExecBazelisk, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+      fs.symlinkSync(nonExecBazelisk, path.join(nonExecBinDir, "bazel"));
+      const nonExecFallbackReqs = resolveBuildResources(
+        "bazel",
+        ["--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "build", "//..."],
+        bvDir,
+        {
+          platform: "darwin",
+          env: {
+            USER: "alice",
+            HOME: "/Users/alice",
+            PATH: `${nonExecBinDir}:${fakeStandaloneBazelBinDir}`,
+          },
+        },
+      );
+      assert.equal(nonExecFallbackReqs.isBazelisk, false);
+      assert.equal(nonExecFallbackReqs.bazelMajorVersion, undefined);
+      assert.deepEqual(nonExecFallbackReqs.defaultBazelOutputBases, []);
+    }
+
+    const guardRcWs = path.join(wsDir, "guard-rc-ws");
+    fs.mkdirSync(guardRcWs, { recursive: true });
+    fs.writeFileSync(path.join(guardRcWs, "MODULE.bazel"), 'module(name = "grc")\n');
+    fs.writeFileSync(path.join(guardRcWs, ".bazelrc"), "clean --expunge\n");
+    const safeRcPath = path.join(guardRcWs, "safe.rc");
+    fs.writeFileSync(safeRcPath, "clean --noexpunge\n");
+
+    const allowedWithSafeRc = evaluateCommandGuard("bazel --nosystem_rc --nohome_rc clean", {
+      cwd: guardRcWs,
+      env: { ...process.env, BAZELRC: safeRcPath },
+    });
+    assert.equal(allowedWithSafeRc.allowed, true);
+
+    const deniedWithEnvUnset = evaluateCommandGuard(
+      "env -u BAZELRC bazel --nosystem_rc --nohome_rc clean",
+      {
+        cwd: guardRcWs,
+        env: { ...process.env, BAZELRC: safeRcPath },
+      },
+    );
+    assert.equal(deniedWithEnvUnset.allowed, false);
+    assert.match(deniedWithEnvUnset.reason, /bazel clean --expunge/);
+
+    const deniedWithShellUnset = evaluateCommandGuard(
+      "unset BAZELRC && bazel --nosystem_rc --nohome_rc clean",
+      {
+        cwd: guardRcWs,
+        env: { ...process.env, BAZELRC: safeRcPath },
+      },
+    );
+    assert.equal(deniedWithShellUnset.allowed, false);
+    assert.match(deniedWithShellUnset.reason, /bazel clean --expunge/);
+
+    const hookPayloadCwdDeny = handlePreToolUseHook(
+      stateDir,
+      JSON.stringify({
+        session_id: "sess-hook-bazel-cwd",
+        cwd: guardRcWs,
+        tool_name: "Bash",
+        tool_input: { command: "bazel --nosystem_rc --nohome_rc clean" },
+      }),
+    );
+    assert.equal(hookPayloadCwdDeny.exitCode, 2);
+    assert.match(hookPayloadCwdDeny.stderr, /bazel clean --expunge/);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
