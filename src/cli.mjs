@@ -6679,7 +6679,19 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
       return { exitCode: err?.code === "physical_not_allowed" ? 3 : 1, error: err.message, errorCode: err?.code || null, steps };
     }
     let exitCode = 0;
+    // A step-level timeout (options.timeoutMs) is one deadline across all invocations of the op.
+    const stepDeadline = Number(options.timeoutMs) > 0 ? Date.now() + Number(options.timeoutMs) : null;
     for (const inv of invocations) {
+      let timeoutMs = inv.timeoutSec ? inv.timeoutSec * 1000 : undefined;
+      if (stepDeadline !== null) {
+        const remaining = stepDeadline - Date.now();
+        if (remaining <= 0) {
+          exitCode = 124;
+          steps.push({ cmd: inv.cmd, args: inv.args, cwd: inv.cwd || cwd, exitCode, timedOut: true, durationMs: 0, skipped: true });
+          break;
+        }
+        timeoutMs = timeoutMs ? Math.min(timeoutMs, remaining) : remaining;
+      }
       const prepared = prepareOpChildInvocation(inv, {
         lease: check.lease || null,
         sessionId: check.sessionId,
@@ -6701,7 +6713,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
         onChildSpawn,
         stdio: plan.stdio || options.stdio,
         onOutput: plan.onOutput || options.onOutput,
-        timeoutMs: inv.timeoutSec ? inv.timeoutSec * 1000 : options.timeoutMs,
+        timeoutMs,
         onChildExit: (info) => {
           childExitInfo = info;
         },

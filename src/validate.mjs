@@ -545,6 +545,9 @@ export function validateBatchPlan(plan, ctx = {}) {
         } else if (platform && claimPlatform(producer.claim) && claimPlatform(producer.claim) !== platform) {
           errors.push(err(`${p}/claim/reuse`, "platform_mismatch", `Step "${step.claim.reuse}" claims a ${claimPlatform(producer.claim)} device, but ${step.op} needs ${platform}.`));
         }
+        if (!needsDevice && paramsValid) {
+          errors.push(err(`${p}/claim`, "claim_unused", `${step.op} does not use a device here; remove the claim reuse so the device isn't held during this step.`));
+        }
       } else {
         errors.push(...validateClaimProfile(step.claim, `${p}/claim`));
         const cp = claimPlatform(step.claim);

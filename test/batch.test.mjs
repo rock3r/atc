@@ -216,3 +216,37 @@ test("batch: a claim is released once its last consumer is skipped", { skip: !po
     s.cleanup();
   }
 });
+
+test("batch: a step timeout is one deadline across a multi-invocation op", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), "sleep 2");
+    const started = Date.now();
+    const res = await s.run({
+      version: 1,
+      steps: [{ id: "s", op: "bazel.series", series: [{ command: "build", targets: ["//a"] }, { command: "build", targets: ["//b"] }], timeoutSec: 3 }],
+    });
+    assert.equal(res.exitCode, 124, JSON.stringify(res.steps));
+    assert.ok(Date.now() - started < 3900, "second invocation only got the remaining time");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: claim reuse on a device-free step is rejected", async () => {
+  const s = setup();
+  try {
+    const res = await s.run({
+      version: 1,
+      steps: [
+        { id: "install", op: "android.install", apk: "a.apk", claim: { platform: "android" } },
+        { id: "build", op: "gradle.tasks", tasks: ["assembleDebug"], dependsOn: ["install"], claim: { reuse: "install" } },
+      ],
+    });
+    assert.equal(res.exitCode, 7);
+    assert.equal(res.errors[0].code, "claim_unused");
+  } finally {
+    s.cleanup();
+  }
+});
