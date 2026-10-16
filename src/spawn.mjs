@@ -8,6 +8,7 @@ import {
   getKnownWindowsTreeDescendants,
   getPosixProcessStartToken,
   hasAliveProcessInGroup,
+  isAtcLockHeld,
   isProcessGroupAlive,
   killProcessGroupTree,
   seedPosixPgidStartTokens,
@@ -85,7 +86,12 @@ export function resolveExecutable(
   const normalizedCommand = hasPathSep ? command.replace(/\//g, path.sep) : command;
   const lower = normalizedCommand.toLowerCase();
   const isGradlew =
-    lower === "gradlew" || lower === "gradlew.bat" || lower === "gradlew.cmd";
+    lower === "gradlew" ||
+    lower === "gradlew.bat" ||
+    lower === "gradlew.cmd" ||
+    lower === "bazelw" ||
+    lower === "bazelw.bat" ||
+    lower === "bazelw.cmd";
   if (hasPathSep && (lower.endsWith(".cmd") || lower.endsWith(".bat"))) {
     return { executable: path.resolve(cwd, normalizedCommand), isBatch: true };
   }
@@ -251,7 +257,14 @@ export function buildSpawnConfig(command, args = [], options = {}) {
   };
 }
 
+export function assertOutsideAtcLock(what) {
+  if (isAtcLockHeld()) {
+    throw new Error(`Internal lock-boundary violation: ${what} attempted while holding atc.lock.`);
+  }
+}
+
 export function runCommandSync(command, args = [], options = {}) {
+  if (process.env.ATC_ASSERT_LOCK_BOUNDARY === "1") assertOutsideAtcLock(`runCommandSync(${command})`);
   if (options.detached) {
     let cfg;
     try {
@@ -359,427 +372,127 @@ export function runCommandSync(command, args = [], options = {}) {
   };
 }
 
-const ANDROID_VALUE_GLOBAL_FLAGS = new Set([
-  "--sdk",
-  "--device",
-  "-s",
-  "--format",
-  "--output",
-  "--log-level",
-  "--config",
-  "--project",
-  "-p",
-  "--duration",
-]);
-
-const REMOTE_LIFECYCLE_VERBS = new Set([
-  "remove",
-  "delete",
-  "disconnect",
-  "stop",
-  "release",
-  "create",
-  "reserve",
-  "connect",
-  "add",
-  "extend",
-]);
-
-function findAndroidSubcommand(args) {
-  let subIdx = 0;
-  while (subIdx < args.length) {
-    const a = String(args[subIdx]);
-    if (a === "--") {
-      subIdx += 1;
-      break;
-    }
-    if (ANDROID_VALUE_GLOBAL_FLAGS.has(a) && subIdx + 1 < args.length) {
-      subIdx += 2;
-    } else if (a.startsWith("-")) {
-      subIdx += 1;
-    } else {
-      break;
-    }
-  }
-  const sub = String(args[subIdx] || "");
-  let actIdx = subIdx + 1;
-  while (actIdx < args.length) {
-    const a = String(args[actIdx]);
-    if (ANDROID_VALUE_GLOBAL_FLAGS.has(a) && actIdx + 1 < args.length) {
-      actIdx += 2;
-    } else if (a.startsWith("-")) {
-      actIdx += 1;
-    } else {
-      break;
-    }
-  }
-  const action = String(args[actIdx] || args[subIdx + 1] || "");
-  return { subIdx, sub, actIdx, action };
-}
-
-export function buildChildInvocation(cmd, args, lease, sessionId, baseEnv = process.env) {
-  let effectiveCmd = cmd;
-  let effectiveArgs = [...args];
-  let useDefaultStandardPath = false;
-  while (
-    path.basename(effectiveCmd, path.extname(effectiveCmd)).toLowerCase() === "command"
-  ) {
-    let idx = 0;
-    let queryMode = false;
-    while (idx < effectiveArgs.length) {
-      const a = String(effectiveArgs[idx]);
-      if (a === "--") {
-        idx++;
-        break;
-      }
-      if (a === "-p") {
-        useDefaultStandardPath = true;
-        idx++;
-        continue;
-      }
-      if (a.startsWith("-") && /[vV]/.test(a)) {
-        queryMode = true;
-        break;
-      }
-      if (a.startsWith("-")) {
-        idx++;
-        continue;
-      }
-      break;
-    }
-    if (queryMode || idx >= effectiveArgs.length) {
-      break;
-    }
-    effectiveCmd = String(effectiveArgs[idx]);
-    effectiveArgs = effectiveArgs.slice(idx + 1);
-  }
-  cmd = effectiveCmd;
-  args = effectiveArgs;
-  const base = path.basename(cmd, path.extname(cmd)).toLowerCase();
-  const androidParsed = base === "android" ? findAndroidSubcommand(args) : null;
-  if (base === "emulator") {
-    if (!args.includes("-list-avds") && !args.includes("-version") && !args.includes("-help")) {
-      throw new Error(
-        'Direct emulator launch is disabled under ATC. Use "atc claim --type <type> --api <api>" instead.',
-      );
-    }
-  } else if (base === "android") {
-    if (androidParsed.sub === "emulator") {
-      const emuAction = androidParsed.action;
-      if (
-        ["start", "stop", "remove", "create"].includes(emuAction) &&
-        !(emuAction === "create" && args.includes("--list-profiles"))
-      ) {
-        throw new Error(
-          `Direct "android emulator ${emuAction}" is disabled under ATC. Use "atc claim" or "atc free --stop" instead.`,
-        );
-      }
-    } else if (androidParsed.sub === "device" && androidParsed.action === "remote") {
-      let remIdx = androidParsed.actIdx + 1;
-      while (remIdx < args.length) {
-        const a = String(args[remIdx]);
-        if (ANDROID_VALUE_GLOBAL_FLAGS.has(a) && remIdx + 1 < args.length) {
-          remIdx += 2;
-        } else if (a.startsWith("-")) {
-          remIdx += 1;
-        } else {
-          break;
-        }
-      }
-      const remoteAction = String(args[remIdx] || "");
-      const fallbackVerb = args
-        .slice(androidParsed.actIdx + 1)
-        .map(String)
-        .find((t) => REMOTE_LIFECYCLE_VERBS.has(t));
-      const deniedAction = REMOTE_LIFECYCLE_VERBS.has(remoteAction)
-        ? remoteAction
-        : fallbackVerb ||
-          (remoteAction && remoteAction !== "list" && remoteAction !== "status" ? remoteAction : "");
-      if (deniedAction && !args.includes("--help") && !args.includes("-h")) {
-        throw new Error(
-          `Direct "android device remote ${deniedAction}" is disabled under ATC because remote device lifecycle is not isolated per lease.`,
-        );
-      }
-    }
-  } else if (base === "adb") {
-    let subIdx = 0;
-    while (subIdx < args.length) {
-      const a = String(args[subIdx]);
-      if (a === "-d" || a === "-e" || a === "-t" || a.startsWith("-t")) {
-        throw new Error(
-          `Non-serial adb device selector "${a}" is not permitted under ATC; use -s "${lease.serial}" or omit selector flags to use ANDROID_SERIAL.`,
-        );
-      }
-      if (a === "--one-device" || a.startsWith("--one-device=")) {
-        throw new Error(
-          'Direct "adb --one-device" is disabled under ATC because it restricts the shared ADB server on the host.',
-        );
-      }
-      if (a.startsWith("-s") && a.length > 2) {
-        const inlineSerial = a.slice(2);
-        if (lease.serial && inlineSerial !== lease.serial) {
-          throw new Error(
-            `Conflicting device selector "${inlineSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-          );
-        }
-        subIdx += 1;
-        continue;
-      }
-      if (a === "-s" && subIdx + 1 < args.length) {
-        const explicitSerial = String(args[subIdx + 1]);
-        if (lease.serial && explicitSerial !== lease.serial) {
-          throw new Error(
-            `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-          );
-        }
-        subIdx += 2;
-        continue;
-      }
-      if (a === "-s" || a === "-H" || a === "-P" || a === "-L") {
-        subIdx += 2;
-      } else if (a.startsWith("-")) {
-        subIdx += 1;
-      } else if (a.startsWith("wait-for-") && subIdx + 1 < args.length) {
-        subIdx += 1;
-      } else {
-        break;
-      }
-    }
-    const adbSub = String(args[subIdx] || "");
-    const adbRest = args.slice(subIdx + 1).map(String);
-    if (adbSub === "kill-server") {
-      throw new Error(
-        'Direct "adb kill-server" is disabled under ATC because it disrupts all shared device sessions on the host.',
-      );
-    }
-    if (adbSub === "reconnect") {
-      const reconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
-      if (reconnectTargets.includes("offline")) {
-        throw new Error(
-          'Direct "adb reconnect offline" is disabled under ATC because it resets all offline/unauthorized devices on the host.',
-        );
-      }
-      if (reconnectTargets.length !== 1 || reconnectTargets[0] !== "device") {
-        throw new Error(
-          'Bare "adb reconnect" is disabled under ATC because it resets host-side ADB connections across the host; use "adb reconnect device" instead.',
-        );
-      }
-    }
-    if (adbSub === "emu" && adbRest[0] === "kill") {
-      throw new Error(
-        'Direct "adb emu kill" is disabled under ATC. Use "atc free --stop" instead.',
-      );
-    }
-    if (adbSub === "attach" || adbSub === "detach") {
-      const usbTargets = adbRest.filter((a) => !a.startsWith("-"));
-      if (usbTargets.length === 0) {
-        if (!lease.serial) {
-          throw new Error(
-            `Bare "adb ${adbSub}" is disabled under ATC when the lease has no bound serial; specify the leased target serial explicitly.`,
-          );
-        }
-      } else {
-        for (const target of usbTargets) {
-          if (lease.serial && target !== lease.serial) {
-            throw new Error(
-              `Conflicting device selector "${target}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-            );
-          }
-        }
-      }
-    }
-    if (adbSub === "disconnect") {
-      const disconnectTargets = adbRest.filter((a) => !a.startsWith("-"));
-      if (disconnectTargets.length === 0) {
-        throw new Error(
-          'Bare "adb disconnect" is disabled under ATC because it disconnects all TCP/IP devices on the host; specify the leased target serial explicitly.',
-        );
-      }
-      for (const target of disconnectTargets) {
-        if (lease.serial && target !== lease.serial) {
-          throw new Error(
-            `Conflicting device selector "${target}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-          );
-        }
-      }
-    }
-  }
-
-  if (base === "android") {
-    for (let i = 0; i < args.length; i++) {
-      const a = String(args[i]);
-      if (a === "--") break;
-      let explicitSerial = null;
-      if (a.startsWith("--device=")) {
-        explicitSerial = a.slice("--device=".length);
-      } else if (a === "--device" && i + 1 < args.length) {
-        explicitSerial = String(args[i + 1]);
-      } else if (a === "-s" && i + 1 < args.length) {
-        explicitSerial = String(args[i + 1]);
-      }
-      if (explicitSerial && lease.serial && explicitSerial !== lease.serial) {
-        throw new Error(
-          `Conflicting device selector "${explicitSerial}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-        );
-      }
-    }
-  }
-
-  let nextArgs = [...args];
-  if (
-    base === "simctl" ||
-    (base === "xcrun" && String(nextArgs[0] || "").toLowerCase() === "simctl")
-  ) {
-    const simctlOffset = base === "xcrun" ? 1 : 0;
-    let subIdx = simctlOffset;
-    while (subIdx < nextArgs.length && String(nextArgs[subIdx]).startsWith("-")) {
-      const flag = String(nextArgs[subIdx]);
-      if ((flag === "--set" || flag === "-s") && subIdx + 1 < nextArgs.length) {
-        subIdx += 2;
-      } else {
-        subIdx += 1;
-      }
-    }
-    const simSub = String(nextArgs[subIdx] || "").toLowerCase();
-    if (["boot", "shutdown", "erase", "create", "delete", "clone"].includes(simSub)) {
-      throw new Error(
-        `Direct "xcrun simctl ${simSub}" is disabled under ATC. Use "atc claim --ios" or "atc free --stop" instead.`,
-      );
-    }
-    const readOnlySimSubs = new Set(["list", "help", "diagnose", "getenv"]);
-    if (simSub && !readOnlySimSubs.has(simSub) && lease.serial) {
-      // Find first non-flag target argument after simSub
-      let targetIdx = subIdx + 1;
-      while (targetIdx < nextArgs.length && String(nextArgs[targetIdx]).startsWith("-")) {
-        targetIdx += 1;
-      }
-      if (targetIdx < nextArgs.length) {
-        const targetToken = String(nextArgs[targetIdx]);
-        if (targetToken.toLowerCase() === "booted") {
-          nextArgs[targetIdx] = lease.serial;
-        } else if (
-          /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(
-            targetToken,
-          ) &&
-          targetToken.toUpperCase() !== String(lease.serial).toUpperCase()
-        ) {
-          throw new Error(
-            `Conflicting device selector "${targetToken}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-          );
-        }
-      }
-    }
-  } else if (
-    base === "devicectl" ||
-    (base === "xcrun" && String(nextArgs[0] || "").toLowerCase() === "devicectl")
-  ) {
-    const devctlOffset = base === "xcrun" ? 1 : 0;
-    let subIdx = devctlOffset;
-    while (subIdx < nextArgs.length && String(nextArgs[subIdx]).startsWith("-")) {
-      subIdx += 1;
-    }
-    const devctlSub = String(nextArgs[subIdx] || "").toLowerCase();
-    let explicitDevice = null;
-    for (let i = devctlOffset; i < nextArgs.length; i++) {
-      const a = String(nextArgs[i]);
-      if (a.startsWith("--device=")) {
-        explicitDevice = a.slice("--device=".length);
-        break;
-      }
-      if ((a === "--device" || a === "-d") && i + 1 < nextArgs.length) {
-        explicitDevice = String(nextArgs[i + 1]);
-        break;
-      }
-    }
-    const allowedIds = new Set(
-      [lease.serial, lease.udid, lease.coreDeviceId, lease.profile?.coreDeviceId]
-        .filter(Boolean)
-        .map((s) => String(s).toUpperCase()),
-    );
-    if (
-      explicitDevice &&
-      allowedIds.size > 0 &&
-      !allowedIds.has(explicitDevice.toUpperCase())
-    ) {
-      throw new Error(
-        `Conflicting device selector "${explicitDevice}" in atc exec; lease ${lease.leaseId} is bound to "${lease.serial}".`,
-      );
-    }
-    const isHelp = nextArgs.includes("--help") || nextArgs.includes("-h");
-    if (
-      !explicitDevice &&
-      !isHelp &&
-      lease.serial &&
-      (devctlSub === "device" || devctlSub === "manage")
-    ) {
-      nextArgs = [...nextArgs, "--device", String(lease.serial)];
-    }
-  }
-
-  const leasePlatform = lease.platform || "android";
-  const env = {
-    ...baseEnv,
-    ...(useDefaultStandardPath && process.platform !== "win32"
-      ? { PATH: "/usr/bin:/bin" }
-      : {}),
-    ...(leasePlatform === "ios"
-      ? {
-          ...(lease.kind === "emulator" ? { SIMULATOR_UDID: lease.serial } : {}),
-        }
-      : {
-          ANDROID_SERIAL: lease.serial,
-        }),
-    ATC_PLATFORM: leasePlatform,
-    ATC_DEVICE_SERIAL: lease.serial,
-    ATC_LEASE_ID: lease.leaseId,
-    ATC_SESSION_ID: sessionId,
-  };
-  if (base === "android" && androidParsed) {
-    const hasDeviceFlag = nextArgs.some((a) => a === "--device" || a.startsWith("--device="));
-    const isHelp = nextArgs.includes("--help") || nextArgs.includes("-h");
-    if (!hasDeviceFlag && !isHelp && lease.serial) {
-      if (["run", "install", "layout"].includes(androidParsed.sub)) {
-        nextArgs = [
-          ...nextArgs.slice(0, androidParsed.subIdx + 1),
-          `--device=${lease.serial}`,
-          ...nextArgs.slice(androidParsed.subIdx + 1),
-        ];
-      } else if (androidParsed.sub === "screen" && androidParsed.action === "capture") {
-        nextArgs = [
-          ...nextArgs.slice(0, androidParsed.actIdx + 1),
-          `--device=${lease.serial}`,
-          ...nextArgs.slice(androidParsed.actIdx + 1),
-        ];
-      }
-    }
-  }
-  return { cmd, args: nextArgs, env };
-}
-
 function terminateChildTree(childPid, signal = "SIGTERM", options = {}) {
   killProcessGroupTree(childPid, signal, options);
 }
 
+const BAZEL_RESOURCE_SUBCOMMANDS = new Set(["build", "test", "run", "coverage"]);
+
+// Build the child process env and argv for a typed-op invocation (see docs/scope.md §6).
+// Invocations are already literal argv generated from validated params; the only additions
+// are lease/session env vars and per-build resource caps for heavy build tools.
+export function prepareOpChildInvocation(invocation, { lease = null, sessionId = null, baseEnv = process.env, buildLease = null, tool = null } = {}) {
+  const cmd = String(invocation.cmd);
+  let args = (invocation.args || []).map(String);
+  if (buildLease && tool) {
+    const hostCpus = Math.max(1, os.cpus()?.length || 4);
+    const maxConcurrent = Math.max(1, Number(buildLease.maxConcurrentBuilds || 2));
+    const jobsLimit = Math.max(2, Number(buildLease.jobsLimit || Math.floor(hostCpus / maxConcurrent)));
+    const ramLimitMb = Math.max(1024, Number(buildLease.reservedRamMb || 3072));
+    if (tool === "gradle") {
+      args = [...args, `-Dorg.gradle.workers.max=${jobsLimit}`];
+    } else if (tool === "bazel" && BAZEL_RESOURCE_SUBCOMMANDS.has(args[0])) {
+      const dashDash = args.indexOf("--");
+      const head = dashDash === -1 ? args : args.slice(0, dashDash);
+      const tail = dashDash === -1 ? [] : args.slice(dashDash);
+      args = [head[0], `--jobs=${jobsLimit}`, `--local_ram_resources=${ramLimitMb}`, ...head.slice(1), ...tail];
+    } else if (tool === "xcodebuild" && !args.includes("clean")) {
+      args = [...args, "-jobs", String(jobsLimit)];
+    }
+  }
+  const sanitizedBaseEnv = { ...baseEnv };
+  delete sanitizedBaseEnv.ATC_BUILD_OP_ID;
+  delete sanitizedBaseEnv.ATC_BUILD_OP_NONCE;
+  delete sanitizedBaseEnv.ATC_BUILD_ID;
+  const leasePlatform = lease ? lease.platform || "android" : null;
+  const env = {
+    ...sanitizedBaseEnv,
+    ...(invocation.env || {}),
+    ...(lease
+      ? {
+          ...(leasePlatform === "ios"
+            ? lease.kind === "emulator"
+              ? { SIMULATOR_UDID: lease.serial }
+              : {}
+            : { ANDROID_SERIAL: lease.serial }),
+          ATC_PLATFORM: leasePlatform,
+          ATC_DEVICE_SERIAL: lease.serial,
+          ATC_LEASE_ID: lease.leaseId,
+        }
+      : {}),
+    ...(buildLease && buildLease.opId && buildLease.opNonce
+      ? {
+          ATC_BUILD_OP_ID: buildLease.opId,
+          ATC_BUILD_OP_NONCE: buildLease.opNonce,
+          ATC_BUILD_ID: buildLease.buildId || buildLease.opId,
+        }
+      : {}),
+    ...(sessionId ? { ATC_SESSION_ID: sessionId } : {}),
+  };
+  return { cmd, args, env, cwd: invocation.cwd || null };
+}
+
 export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, options = {}) {
-  const invocation = buildChildInvocation(cmd, args, lease, sessionId, options.env);
+  assertOutsideAtcLock(`spawn(${cmd})`);
+  const invocation = options.prepared
+    ? options.prepared
+    : prepareOpChildInvocation(
+        { cmd, args, cwd: options.cwd },
+        { lease, sessionId, baseEnv: options.env || process.env, buildLease: options.buildLease || null, tool: options.tool || null },
+      );
   const detachChild = process.platform !== "win32";
   const spawnCfg = buildSpawnConfig(invocation.cmd, invocation.args, {
     stdio: options.stdio || "inherit",
     env: invocation.env,
+    cwd: invocation.cwd || options.cwd,
     detached: detachChild,
   });
 
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
+    const onOutput = typeof options.onOutput === "function" ? options.onOutput : null;
+    if (child.stdout) {
+      if (onOutput) {
+        child.stdout.on("data", (chunk) => onOutput(chunk, "stdout"));
+      } else if (options.redirectStdoutToStderr) {
+        child.stdout.pipe(process.stderr);
+      } else {
+        child.stdout.resume();
+      }
+    }
+    if (child.stderr) {
+      if (onOutput) {
+        child.stderr.on("data", (chunk) => onOutput(chunk, "stderr"));
+      } else if (options.redirectStdoutToStderr) {
+        child.stderr.pipe(process.stderr);
+      } else {
+        child.stderr.resume();
+      }
+    }
     const childPid = child.pid || null;
     const effectivePlatform = options.platform || process.platform;
     let childStartToken = null;
     let wrapperSignal = null;
+    let timedOut = false;
+    let timeoutTimer = null;
     let killEscalationTimer = null;
     let earlyWinDiscoveryTimer = null;
     const forwardedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
     const signalHandlers = new Map();
+
+    const escalateKill = () => {
+      if (!killEscalationTimer) {
+        killEscalationTimer = setTimeout(() => {
+          if (isProcessGroupAlive(childPid)) {
+            terminateChildTree(childPid, "SIGKILL");
+          }
+        }, 1500);
+        if (typeof killEscalationTimer.unref === "function") {
+          killEscalationTimer.unref();
+        }
+      }
+    };
 
     for (const sig of forwardedSignals) {
       const handler = () => {
@@ -788,20 +501,23 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
         }
         if (childPid) {
           terminateChildTree(childPid, sig);
-          if (!killEscalationTimer) {
-            killEscalationTimer = setTimeout(() => {
-              if (isProcessGroupAlive(childPid)) {
-                terminateChildTree(childPid, "SIGKILL");
-              }
-            }, 1500);
-            if (typeof killEscalationTimer.unref === "function") {
-              killEscalationTimer.unref();
-            }
-          }
+          escalateKill();
         }
       };
       signalHandlers.set(sig, handler);
       process.on(sig, handler);
+    }
+
+    if (childPid && Number(options.timeoutMs) > 0) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        if (!wrapperSignal) wrapperSignal = "SIGTERM";
+        terminateChildTree(childPid, "SIGTERM");
+        escalateKill();
+      }, Number(options.timeoutMs));
+      if (typeof timeoutTimer.unref === "function") {
+        timeoutTimer.unref();
+      }
     }
 
     if (childPid && effectivePlatform === "win32") {
@@ -845,17 +561,21 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
     }
 
     if (childPid && effectivePlatform === "win32") {
-      earlyWinDiscoveryTimer = setTimeout(() => {
-        earlyWinDiscoveryTimer = null;
-        try {
-          captureStartTokenWhileHandleOpen();
-          if (hasAliveProcessInGroup(childPid)) {
-            onHeartbeat();
+      earlyWinDiscoveryTimer = setTimeout(
+        () => {
+          earlyWinDiscoveryTimer = null;
+          if (child.exitCode !== null || child.signalCode !== null) return;
+          try {
+            captureStartTokenWhileHandleOpen();
+            if (hasAliveProcessInGroup(childPid)) {
+              onHeartbeat();
+            }
+          } catch {
+            // Best-effort early descendant discovery
           }
-        } catch {
-          // Best-effort early descendant discovery
-        }
-      }, 80);
+        },
+        options.buildMode && !lease ? 500 : 80,
+      );
       if (typeof earlyWinDiscoveryTimer.unref === "function") {
         earlyWinDiscoveryTimer.unref();
       }
@@ -875,6 +595,10 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
 
     const cleanupListenersAndTimers = () => {
       clearInterval(timer);
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
       if (earlyWinDiscoveryTimer) {
         clearTimeout(earlyWinDiscoveryTimer);
         earlyWinDiscoveryTimer = null;
@@ -891,6 +615,20 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
 
     child.on("error", (err) => {
       cleanupListenersAndTimers();
+      if (typeof options.onChildExit === "function") {
+        try {
+          options.onChildExit({
+            childPid,
+            exitedCleanly: false,
+            exitCode: 1,
+            code: 1,
+            signal: null,
+            aborted: true,
+          });
+        } catch {
+          // Best-effort exit callback
+        }
+      }
       reject(err);
     });
 
@@ -898,27 +636,55 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
       const effectiveSignal = signal || wrapperSignal;
       const finishClose = () => {
         cleanupListenersAndTimers();
-        try {
-          onHeartbeat();
-        } catch {
-          // Ignore final heartbeat error
-        }
-        if (wrapperSignal) {
+        let resolvedExitCode = 1;
+        if (timedOut) {
+          resolvedExitCode = 124;
+        } else if (wrapperSignal) {
           const sigNum = os.constants?.signals?.[wrapperSignal];
-          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
-          return;
-        }
-        if (typeof code === "number") {
-          resolve(code);
-          return;
-        }
-        if (effectiveSignal) {
+          resolvedExitCode = typeof sigNum === "number" ? 128 + sigNum : 1;
+        } else if (typeof code === "number") {
+          resolvedExitCode = code;
+        } else if (effectiveSignal) {
           const sigNum = os.constants?.signals?.[effectiveSignal];
-          resolve(typeof sigNum === "number" ? 128 + sigNum : 1);
-          return;
+          resolvedExitCode = typeof sigNum === "number" ? 128 + sigNum : 1;
         }
-        resolve(1);
+        if (typeof options.onChildExit === "function") {
+          try {
+            options.onChildExit({
+              childPid,
+              exitedCleanly: !effectiveSignal,
+              exitCode: resolvedExitCode,
+              code: resolvedExitCode,
+              signal: effectiveSignal || null,
+              timedOut,
+              aborted: Boolean(
+                effectiveSignal ||
+                  resolvedExitCode === 124 ||
+                  resolvedExitCode === 130 ||
+                  resolvedExitCode === 137 ||
+                  resolvedExitCode === 143,
+              ),
+            });
+          } catch {
+            // Best-effort exit callback
+          }
+        }
+        if (!options.buildMode || lease) {
+          try {
+            onHeartbeat();
+          } catch {
+            // Ignore final heartbeat error
+          }
+        }
+        resolve(resolvedExitCode);
       };
+
+      if (options.buildMode && !effectiveSignal) {
+        // Do not block or kill detached shared build daemons (GradleDaemon, kotlin-daemon, Bazel server)
+        // when the build client wrapper exits normally.
+        finishClose();
+        return;
+      }
 
       if (childPid && isProcessGroupAlive(childPid)) {
         if (effectiveSignal) {

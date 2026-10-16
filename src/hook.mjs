@@ -1,20 +1,17 @@
 import fs from "node:fs";
-import { parseAdbDevicesOutput } from "./android.mjs";
 import { cmdFree } from "./cli.mjs";
 import {
-  classifySegment,
-  evaluateCommandGuard,
-  hasAndroidOrAtcTokens,
-  splitShellSegments,
-} from "./guard.mjs";
-import { runCommandSync } from "./spawn.mjs";
-import {
   getAncestorPids,
+  readState,
   recordHookSession,
   resolveStableParentPid,
   validateSessionId,
   withStateTransaction,
 } from "./state.mjs";
+
+// v3: hooks never read, inspect or rewrite shell commands (see docs/scope.md §1). They only
+// record the host agent's session identity (so `atc` CLI calls and MCP tools resolve the same
+// session) and inject that session into ATC MCP tool calls.
 
 export function parseHookInput(rawStdin) {
   if (!rawStdin || !String(rawStdin).trim()) return null;
@@ -25,8 +22,21 @@ export function parseHookInput(rawStdin) {
   }
 }
 
-const ATC_MCP_TOOL_RE = /(?:^|[_:/.-])(atc_(?:claim|free|renew|snapshot|status|guide))$/i;
-const ATC_SESSION_MCP_TOOLS = new Set(["atc_claim", "atc_free", "atc_renew", "atc_snapshot"]);
+const ATC_MCP_TOOL_RE =
+  /(?:^|[_:/.-])(atc_(?:claim|free|renew|snapshot|status|guide|gradle|bazel|xcode|android|ios|batch))$/i;
+const ATC_SESSION_MCP_TOOLS = new Set([
+  "atc_claim",
+  "atc_free",
+  "atc_renew",
+  "atc_snapshot",
+  "atc_gradle",
+  "atc_bazel",
+  "atc_xcode",
+  "atc_android",
+  "atc_ios",
+  "atc_batch",
+]);
+const SHELL_SESSION_REFRESH_MS = 30_000;
 
 function matchAtcMcpTool(toolName) {
   if (typeof toolName !== "string" || !toolName) return null;
@@ -55,7 +65,6 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
         ? args.Arguments
         : {}
       : args;
-    const command = args.CommandLine ?? args.command ?? "";
     const rawSession = payload.conversationId || payload.session_id || `ppid-${ppid}`;
     const payloadCwd =
       typeof args.Cwd === "string" && args.Cwd.trim()
@@ -72,10 +81,9 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
       isShellTool: name === "run_command" || name === "bash" || name === "shell",
       isLazyMcpWrapper,
       mcpToolName,
-      command: typeof command === "string" ? command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
-      toolInput: mcpToolName ? mcpToolInput : args,
+      toolInput: mcpToolName ? mcpToolInput : {},
       cwd: payloadCwd,
     };
   }
@@ -95,7 +103,6 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
       hostFormat: "cursor",
       isShellTool: true,
       mcpToolName: null,
-      command: typeof payload.command === "string" ? payload.command : "",
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
     };
@@ -103,7 +110,8 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
 
   // GitHub Copilot CLI native format (camelCase `toolName` + `toolArgs`, object or JSON string)
   if (typeof payload.toolName === "string" && "toolArgs" in payload && !payload.tool_input) {
-    let toolArgs = payload.toolArgs;
+    const mcpToolName = matchAtcMcpTool(payload.toolName);
+    let toolArgs = mcpToolName ? payload.toolArgs : {};
     if (typeof toolArgs === "string") {
       try {
         toolArgs = JSON.parse(toolArgs);
@@ -116,8 +124,7 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
     return {
       hostFormat: "copilot",
       isShellTool: /^(bash|shell)$/i.test(payload.toolName),
-      mcpToolName: matchAtcMcpTool(payload.toolName),
-      command: typeof toolArgs.command === "string" ? toolArgs.command : "",
+      mcpToolName,
       sessionId: sanitizeSessionId(rawSession, ppid),
       anchorPid: ppid,
       toolInput: toolArgs,
@@ -126,9 +133,9 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
 
   // Claude Code / Codex format
   const toolName = String(payload.tool_name || payload.toolName || "");
-  const rawInput = payload.tool_input || payload.input || {};
+  const mcpToolName = matchAtcMcpTool(toolName);
+  const rawInput = mcpToolName ? payload.tool_input || payload.input || {} : {};
   const toolInput = rawInput && typeof rawInput === "object" ? rawInput : {};
-  const command = toolInput.command ?? toolInput.CommandLine ?? "";
   const rawSession =
     payload.session_id ||
     payload.sessionId ||
@@ -138,8 +145,7 @@ export function normalizeHookPayload(payload, ppid = process.ppid) {
   return {
     hostFormat: "standard",
     isShellTool: /^(bash|shell|run_command|terminal)$/i.test(toolName),
-    mcpToolName: matchAtcMcpTool(toolName),
-    command: typeof command === "string" ? command : "",
+    mcpToolName,
     sessionId: sanitizeSessionId(rawSession, ppid),
     anchorPid: ppid,
     toolInput,
@@ -154,11 +160,39 @@ function sanitizeSessionId(raw, ppid) {
   return validateSessionId(cleaned || `ppid-${ppid}`);
 }
 
+// Rebind leases created under a fallback identity (ppid-*/mcp-*) to the host's real session.
+function adoptFallbackLeases(state, anchorPid, sessionId, hookEntry) {
+  const singleSessionOnAnchor =
+    !Array.isArray(hookEntry?.seenSessions) || hookEntry.seenSessions.length <= 1;
+  const fallbackPpidSession = `ppid-${anchorPid}`;
+  const candidateFallbackSessions = new Set(
+    Object.values(state.leases)
+      .filter(
+        (l) =>
+          l.state === "active" &&
+          (l.sessionId === fallbackPpidSession ||
+            ((l.anchorPid === anchorPid || l.parentPid === anchorPid) &&
+              (String(l.sessionId).startsWith("ppid-") || String(l.sessionId).startsWith("mcp-")))),
+      )
+      .map((l) => l.sessionId),
+  );
+  if (candidateFallbackSessions.size === 1 && singleSessionOnAnchor) {
+    for (const l of Object.values(state.leases)) {
+      if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
+        if (String(l.sessionId).startsWith("mcp-")) {
+          l.mcpSessionId = l.mcpSessionId || l.sessionId;
+        }
+        l.sessionId = sessionId;
+      }
+    }
+  }
+}
+
 export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
   const payload = typeof rawStdin === "string" ? parseHookInput(rawStdin) : rawStdin;
   const rawPpid = options.ppid ?? process.ppid;
   const fastNorm = normalizeHookPayload(payload, rawPpid);
-  const cursorAllowOut =
+  const allowOut =
     fastNorm.hostFormat === "cursor"
       ? JSON.stringify({ permission: "allow" }) + "\n"
       : fastNorm.hostFormat === "antigravity"
@@ -218,241 +252,51 @@ export function handlePreToolUseHook(stateDir, rawStdin, options = {}) {
         stderr: "",
       };
     }
-    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
+    return { exitCode: 0, stdout: allowOut, stderr: "" };
   }
 
-  if (!fastNorm.isShellTool || !fastNorm.command) {
-    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
+  if (!fastNorm.isShellTool) {
+    return { exitCode: 0, stdout: allowOut, stderr: "" };
   }
 
-  // Fast Path (<2ms, Zero Lock)
-  if (!hasAndroidOrAtcTokens(fastNorm.command)) {
-    return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
+  // Shell tool call: always allowed and never inspected. Refresh the session record for this
+  // agent (so `atc` CLI invocations from its shell resolve the same session), at most every 30s.
+  const anchorPid = resolveStableParentPid(rawPpid, options.processChain);
+  const norm = normalizeHookPayload(payload, anchorPid);
+  const now = options.now ?? Date.now();
+  let fresh = false;
+  try {
+    const peek = readState(stateDir);
+    const entry = peek?.hookSessions?.[String(anchorPid)];
+    fresh = Boolean(entry && entry.sessionId === norm.sessionId && now - (entry.updatedAtMs || 0) < SHELL_SESSION_REFRESH_MS);
+  } catch {
+    fresh = false;
   }
-
-  getAncestorPids(rawPpid);
-  const norm = normalizeHookPayload(payload, resolveStableParentPid(rawPpid, options.processChain));
-
-  const cwd =
-    options.cwd ||
-    norm.cwd ||
-    (typeof payload?.cwd === "string" && payload.cwd.trim() ? payload.cwd : process.cwd());
-  const inventory = options.inventory || null;
-  let probedRunningCount = inventory ? (inventory.running || []).length : 0;
-  let probedAndroidRunning = 0;
-  let probedIosRunning = 0;
-  let hasPerPlatformProbe = false;
-
-  if (!inventory && options.runningCount === undefined) {
-    const unscopedSegments = splitShellSegments(norm.command)
-      .map((seg) => classifySegment(seg))
-      .filter((c) => c.kind === "device_action" && !c.targetSerial);
-    const runner = options.runner || runCommandSync;
-    if (
-      unscopedSegments.some((c) => (c.targetPlatform || c.platform || "android") === "android")
-    ) {
-      const adbRes = runner("adb", ["devices"], { timeoutMs: 3000 });
-      if (adbRes.status === 0 && adbRes.stdout !== undefined && adbRes.stdout !== null) {
-        probedAndroidRunning = parseAdbDevicesOutput(adbRes.stdout).length;
-      } else {
-        probedAndroidRunning = 2;
-      }
-      probedRunningCount = Math.max(probedRunningCount, probedAndroidRunning);
-      hasPerPlatformProbe = true;
-    }
-    if (unscopedSegments.some((c) => (c.targetPlatform || c.platform) === "ios")) {
-      const simRes = runner("xcrun", ["simctl", "list", "devices", "booted", "--json"], {
-        timeoutMs: 3000,
-      });
-      if (simRes.status === 0 && simRes.stdout !== undefined && simRes.stdout !== null) {
-        try {
-          const parsed = JSON.parse(simRes.stdout);
-          let count = 0;
-          for (const devs of Object.values(parsed?.devices || {})) {
-            if (Array.isArray(devs)) {
-              count += devs.filter((d) => d && d.state === "Booted").length;
-            }
-          }
-          probedIosRunning = count;
-        } catch {
-          probedIosRunning = 2;
-        }
-      } else {
-        probedIosRunning = 2;
-      }
-      probedRunningCount = Math.max(probedRunningCount, probedIosRunning);
-      hasPerPlatformProbe = true;
-    }
-  } else if (options.runningCount !== undefined) {
-    probedRunningCount = options.runningCount;
-  }
-
-  const evalResult = withStateTransaction(
-    stateDir,
-    (state, { now }) => {
-      const hookEntry = recordHookSession(state, {
-        anchorPid: norm.anchorPid,
-        sessionId: norm.sessionId,
-        cwd,
-        now,
-      });
-      const singleSessionOnAnchor =
-        !Array.isArray(hookEntry.seenSessions) || hookEntry.seenSessions.length <= 1;
-
-      const fallbackPpidSession = `ppid-${norm.anchorPid}`;
-      const candidateFallbackSessions = new Set(
-        Object.values(state.leases)
-          .filter(
-            (l) =>
-              l.state === "active" &&
-              (l.sessionId === fallbackPpidSession ||
-                ((l.anchorPid === norm.anchorPid || l.parentPid === norm.anchorPid) &&
-                  (String(l.sessionId).startsWith("ppid-") ||
-                    String(l.sessionId).startsWith("mcp-")))),
-          )
-          .map((l) => l.sessionId),
+  if (!fresh) {
+    const cwd =
+      options.cwd ||
+      norm.cwd ||
+      (typeof payload?.cwd === "string" && payload.cwd.trim() ? payload.cwd : process.cwd());
+    try {
+      withStateTransaction(
+        stateDir,
+        (state, { now: txNow }) => {
+          const hookEntry = recordHookSession(state, {
+            anchorPid: norm.anchorPid,
+            sessionId: norm.sessionId,
+            cwd,
+            now: txNow,
+          });
+          adoptFallbackLeases(state, norm.anchorPid, norm.sessionId, hookEntry);
+          return { mutated: true };
+        },
+        { ppid: norm.anchorPid },
       );
-      if (candidateFallbackSessions.size === 1 && singleSessionOnAnchor) {
-        for (const l of Object.values(state.leases)) {
-          if (l.state === "active" && candidateFallbackSessions.has(l.sessionId)) {
-            if (String(l.sessionId).startsWith("mcp-")) {
-              l.mcpSessionId = l.mcpSessionId || l.sessionId;
-            }
-            l.sessionId = norm.sessionId;
-          }
-        }
-      }
-
-      const allLeases = Object.values(state.leases);
-      const activeLeases = allLeases.filter(
-        (l) => l.state === "active" && l.sessionId === norm.sessionId,
-      );
-      const totalLeasedCount = allLeases.length;
-      const runningCount = Math.max(probedRunningCount, totalLeasedCount, activeLeases.length);
-      const runningCountByPlatform = hasPerPlatformProbe
-        ? {
-            android: Math.max(
-              probedAndroidRunning,
-              allLeases.filter((l) => (l.platform || "android") === "android").length,
-              activeLeases.filter((l) => (l.platform || "android") === "android").length,
-            ),
-            ios: Math.max(
-              probedIosRunning,
-              allLeases.filter((l) => l.platform === "ios").length,
-              activeLeases.filter((l) => l.platform === "ios").length,
-            ),
-          }
-        : options.runningCountByPlatform;
-
-      const guardRes = evaluateCommandGuard(norm.command, {
-        sessionId: norm.sessionId,
-        anchorPid: norm.anchorPid,
-        activeLeases,
-        runningCount,
-        runningCountByPlatform,
-        platform: options.platform,
-      });
-
-      if (guardRes.allowed && norm.hostFormat === "cursor" && guardRes.hasDirectDeviceAction) {
-        return {
-          mutated: true,
-          value: {
-            allowed: false,
-            reason:
-              `Blocked by ATC guardrail: Cursor hooks cannot rewrite commands to attach a lease heartbeat.\n` +
-              `  Run device commands via: atc exec -- ${norm.command}`,
-            rewrittenCommand: null,
-          },
-        };
-      }
-
-      if (guardRes.allowed && guardRes.renewLease) {
-        const ttlMs = (state.config?.defaultTtlSec ?? 600) * 1000;
-        const targeted =
-          Array.isArray(guardRes.targetSerials) && guardRes.targetSerials.length > 0
-            ? new Set(guardRes.targetSerials)
-            : guardRes.targetSerial
-              ? new Set([guardRes.targetSerial])
-              : null;
-        for (const lease of activeLeases) {
-          if (
-            !targeted ||
-            targeted.has(lease.serial) ||
-            (lease.udid && targeted.has(lease.udid)) ||
-            (lease.coreDeviceId && targeted.has(lease.coreDeviceId))
-          ) {
-            lease.loadedSnapshot = null;
-            lease.renewedAtMs = now;
-            lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
-          }
-        }
-      }
-
-      return { mutated: true, value: guardRes };
-    },
-    { ppid: norm.anchorPid },
-  );
-
-  if (!evalResult.allowed) {
-    const denyJson =
-      norm.hostFormat === "antigravity"
-        ? { decision: "deny", reason: evalResult.reason }
-        : norm.hostFormat === "cursor"
-          ? {
-              permission: "deny",
-              user_message: evalResult.reason,
-              agent_message: evalResult.reason,
-            }
-          : norm.hostFormat === "copilot"
-            ? { permissionDecision: "deny", permissionDecisionReason: evalResult.reason }
-            : {
-                decision: "block",
-                reason: evalResult.reason,
-                hookSpecificOutput: {
-                  hookEventName: "PreToolUse",
-                  permissionDecision: "deny",
-                  permissionDecisionReason: evalResult.reason,
-                },
-              };
-    return {
-      exitCode: norm.hostFormat === "antigravity" ? 0 : 2,
-      stdout: JSON.stringify(denyJson) + "\n",
-      stderr: evalResult.reason + "\n",
-    };
+    } catch {
+      // Best-effort session bookkeeping; never block the agent's tool call
+    }
   }
-
-  if (evalResult.rewrittenCommand && norm.hostFormat !== "cursor") {
-    const allowJson =
-      norm.hostFormat === "antigravity"
-        ? {
-            decision: "allow",
-            overwrite: {
-              CommandLine: evalResult.rewrittenCommand,
-            },
-          }
-        : norm.hostFormat === "copilot"
-          ? {
-              permissionDecision: "allow",
-              modifiedArgs: { ...norm.toolInput, command: evalResult.rewrittenCommand },
-            }
-          : {
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "allow",
-                updatedInput: {
-                  ...norm.toolInput,
-                  command: evalResult.rewrittenCommand,
-                },
-              },
-            };
-    return {
-      exitCode: 0,
-      stdout: JSON.stringify(allowJson) + "\n",
-      stderr: "",
-    };
-  }
-
-  return { exitCode: 0, stdout: cursorAllowOut, stderr: "" };
+  return { exitCode: 0, stdout: allowOut, stderr: "" };
 }
 
 export function handleStopHook(stateDir, rawStdin, options = {}) {

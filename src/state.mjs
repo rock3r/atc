@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hasValidPinnedDeviceLease } from "./build.mjs";
+import { flushAuditEvents } from "./logger.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   canSweepBreakClaimDir,
@@ -238,6 +240,17 @@ export function getAncestorPids(startPid = process.ppid) {
   return ancestors;
 }
 
+export function getAncestorProcessChain(startPid = process.ppid) {
+  const numericStart = Number(startPid);
+  if (!Number.isInteger(numericStart) || numericStart <= 0) {
+    return [];
+  }
+  if (!ancestorProcessCache.has(numericStart)) {
+    getAncestorPids(numericStart);
+  }
+  return ancestorProcessCache.get(numericStart) || [];
+}
+
 export const DEFAULT_CONFIG = Object.freeze({
   maxRunningEmulators: 2,
   maxRunningSimulators: 4,
@@ -257,6 +270,17 @@ export const DEFAULT_CONFIG = Object.freeze({
   autoStopIdleOnContention: true,
   allowPhysicalDevices: "explicit",
   allowedPhysicalSerials: [],
+  allowPhysicalPropSet: false,
+  maxConcurrentBuilds: "auto",
+  maxDeviceHolderBurstBuilds: 1,
+  buildRamEstimateMb: 3072,
+  buildRamReservationWindowSec: 30,
+  buildRamHysteresisMb: 256,
+  buildAbortCooldownSec: 5,
+  maxBuildDrainingSec: 30,
+  defaultBuildWaitSec: 600,
+  buildReorderWindowSec: 120,
+  auditLogging: true,
 });
 
 export function createDefaultState() {
@@ -266,7 +290,11 @@ export function createDefaultState() {
     leases: {},
     disconnectedPhysicalLeases: {},
     queue: [],
+    buildLeases: {},
+    buildQueue: [],
+    nextBuildQueueSeq: 1,
     hookSessions: {},
+    forcedRuns: [],
     lastOrphanSweepAtMs: 0,
   };
 }
@@ -321,6 +349,26 @@ function parseStateContent(raw) {
     typeof parsed.disconnectedPhysicalLeases !== "object"
   ) {
     parsed.disconnectedPhysicalLeases = {};
+  }
+  if (
+    !parsed.buildLeases ||
+    typeof parsed.buildLeases !== "object" ||
+    Array.isArray(parsed.buildLeases)
+  ) {
+    parsed.buildLeases = {};
+  }
+  if (!Array.isArray(parsed.buildQueue)) {
+    parsed.buildQueue = [];
+  }
+  if (!Array.isArray(parsed.forcedRuns)) {
+    parsed.forcedRuns = [];
+  }
+  if (
+    typeof parsed.nextBuildQueueSeq !== "number" ||
+    !Number.isFinite(parsed.nextBuildQueueSeq) ||
+    parsed.nextBuildQueueSeq < 1
+  ) {
+    parsed.nextBuildQueueSeq = 1;
   }
   return parsed;
 }
@@ -771,12 +819,23 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
   const pruned = {
     leases: [],
     queue: [],
+    buildLeases: [],
+    buildQueue: [],
     hookSessions: [],
     workersMutated: false,
   };
   const cfg = state.config || DEFAULT_CONFIG;
   const maxTtlMs = (cfg.maxTtlSec || 3600) * 1000;
   const hbTimeoutMs = (cfg.queueHeartbeatTimeoutSec || 10) * 1000;
+  const abortCooldownMs = (cfg.buildAbortCooldownSec ?? 5) * 1000;
+  const maxDrainingMs = (cfg.maxBuildDrainingSec ?? 30) * 1000;
+
+  if (!state.buildLeases || typeof state.buildLeases !== "object" || Array.isArray(state.buildLeases)) {
+    state.buildLeases = {};
+  }
+  if (!Array.isArray(state.buildQueue)) {
+    state.buildQueue = [];
+  }
 
   for (const [deviceKey, lease] of Object.entries(state.leases)) {
     if (!lease || typeof lease !== "object") {
@@ -868,6 +927,101 @@ export function runGarbageCollection(state, stateDir, now = Date.now(), liveness
         ticketId: ticket.ticketId,
         sessionId: ticket.sessionId,
         reason: expired ? "expired" : "dead_waiter",
+      });
+      return false;
+    }
+    return true;
+  });
+
+  for (const [buildId, bLease] of Object.entries(state.buildLeases)) {
+    if (!bLease || typeof bLease !== "object") {
+      delete state.buildLeases[buildId];
+      continue;
+    }
+    const beforeWorkerPids = JSON.stringify(bLease.workerPids || null);
+    const beforeWorkerPgids = JSON.stringify(bLease.workerPgids || null);
+    const beforeDescendants = JSON.stringify(bLease.workerDescendants || null);
+    const beforeStartTokens = JSON.stringify(bLease.workerPgidStartTokens || null);
+    const aliveWorkers = syncLeaseWorkers(bLease, livenessCheck);
+    if (
+      beforeWorkerPids !== JSON.stringify(bLease.workerPids || null) ||
+      beforeWorkerPgids !== JSON.stringify(bLease.workerPgids || null) ||
+      beforeDescendants !== JSON.stringify(bLease.workerDescendants || null) ||
+      beforeStartTokens !== JSON.stringify(bLease.workerPgidStartTokens || null)
+    ) {
+      pruned.workersMutated = true;
+    }
+    const groupAlive = aliveWorkers.length > 0;
+    const clientPidAlive = Boolean(bLease.workerPid && livenessCheck(bLease.workerPid));
+    const wrapperAlive = Boolean(bLease.execWrapperPid && livenessCheck(bLease.execWrapperPid));
+
+    if (bLease.state === "active") {
+      const lastRenewedMs =
+        typeof bLease.renewedAtMs === "number" ? bLease.renewedAtMs : bLease.createdAtMs;
+      const pastTtl =
+        (typeof bLease.expiresAtMs === "number" && now >= bLease.expiresAtMs) ||
+        (typeof lastRenewedMs === "number" && now > lastRenewedMs + maxTtlMs);
+      const prepHorizonMs =
+        ((cfg.bootTimeoutSec || 180) +
+          (cfg.stopTimeoutSec || 60) +
+          (cfg.defaultWaitSec || 300)) *
+        1000;
+      const activePrepReservation = Boolean(
+        bLease.preparingDevice &&
+          wrapperAlive &&
+          typeof bLease.createdAtMs === "number" &&
+          now - bLease.createdAtMs < Math.max(maxTtlMs, prepHorizonMs),
+      );
+      if (
+        (clientPidAlive || wrapperAlive) &&
+        (!pastTtl || activePrepReservation) &&
+        !bLease.abortedOrTimedOut
+      ) {
+        const defaultTtlMs = (cfg.defaultTtlSec || 600) * 1000;
+        bLease.renewedAtMs = Math.max(bLease.renewedAtMs || 0, now);
+        bLease.expiresAtMs = Math.max(
+          bLease.expiresAtMs || 0,
+          now + Math.min(defaultTtlMs, maxTtlMs),
+        );
+      } else {
+        bLease.state = "draining";
+        bLease.drainingStartedAtMs = now;
+        bLease.drainingCooldownUntilMs = now + abortCooldownMs;
+        bLease.drainingDeadlineMs = now + maxDrainingMs;
+        pruned.workersMutated = true;
+      }
+    } else if (bLease.state === "draining") {
+      const cooldownDone = now >= (bLease.drainingCooldownUntilMs || 0);
+      const pastMaxHorizon =
+        now >= (bLease.drainingDeadlineMs || (bLease.drainingStartedAtMs || now) + maxDrainingMs);
+      if ((!groupAlive && cooldownDone) || pastMaxHorizon) {
+        pruned.buildLeases.push({
+          buildId,
+          sessionId: bLease.sessionId,
+          reason: pastMaxHorizon && groupAlive ? "draining_horizon_exceeded" : "draining_complete",
+        });
+        delete state.buildLeases[buildId];
+      }
+    } else {
+      delete state.buildLeases[buildId];
+    }
+  }
+
+  state.buildQueue = state.buildQueue.filter((ticket) => {
+    if (!ticket || typeof ticket !== "object") return false;
+    const expired =
+      (typeof ticket.waitExpiresAtMs === "number" && now >= ticket.waitExpiresAtMs) ||
+      (typeof ticket.lastHeartbeatAtMs === "number" && now >= ticket.lastHeartbeatAtMs + hbTimeoutMs) ||
+      (typeof ticket.enqueuedAtMs === "number" && now < ticket.enqueuedAtMs);
+    const deadWaiter = !ticket.waiterPid || !livenessCheck(ticket.waiterPid);
+    const lostDevice =
+      Boolean(ticket.pinnedDeviceLeaseId || ticket.pinnedDeviceKey) &&
+      !hasValidPinnedDeviceLease(ticket, state.leases);
+    if (expired || deadWaiter || lostDevice) {
+      pruned.buildQueue.push({
+        ticketId: ticket.ticketId,
+        sessionId: ticket.sessionId,
+        reason: lostDevice ? "lost_device_lease" : expired ? "expired" : "dead_waiter",
       });
       return false;
     }
@@ -1570,7 +1724,11 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     const pgidStartTokens = {};
     if (preRaw) {
       const preParsed = JSON.parse(preRaw);
-      for (const lease of Object.values(preParsed?.leases || {})) {
+      const allPreLeases = [
+        ...Object.values(preParsed?.leases || {}),
+        ...Object.values(preParsed?.buildLeases || {}),
+      ];
+      for (const lease of allPreLeases) {
         if (!lease || typeof lease !== "object") continue;
         if (lease.workerDescendants && typeof lease.workerDescendants === "object") {
           for (const [k, v] of Object.entries(lease.workerDescendants)) {
@@ -1669,18 +1827,20 @@ export function withStateTransaction(stateDir, fn, options = {}) {
       clearKnownPosixPgidStartTokens(p);
     }
   }
-  return withLock(
+  const auditEvents = [];
+  let auditLoggingEnabled = true;
+  const txResult = withLock(
     stateDir,
     (lockHandle) =>
       withProcessGroupSnapshot(pgidSnapshot, () => {
         const now = options.now ?? Date.now();
         const state = readState(stateDir, { lockHandle });
-        if (
-          freshGenerationSet.size > 0 &&
-          state?.leases &&
-          typeof state.leases === "object"
-        ) {
-          for (const lease of Object.values(state.leases)) {
+        auditLoggingEnabled = state?.config?.auditLogging !== false;
+        if (freshGenerationSet.size > 0) {
+          for (const lease of [
+            ...Object.values(state?.leases || {}),
+            ...Object.values(state?.buildLeases || {}),
+          ]) {
             if (!lease || typeof lease !== "object") continue;
             for (const freshPid of freshGenerationSet) {
               reconcileLeaseWindowsGenerations(lease, freshPid, {
@@ -1690,10 +1850,44 @@ export function withStateTransaction(stateDir, fn, options = {}) {
           }
         }
         const pruned = runGarbageCollection(state, stateDir, now, options.livenessCheck);
-        const result = fn(state, { now, pruned, lockHandle });
+        for (const p of pruned.leases) {
+          auditEvents.push({
+            tsMs: now,
+            event: "device_gc_prune",
+            sessionId: null,
+            details: p,
+          });
+        }
+        for (const p of pruned.queue) {
+          auditEvents.push({
+            tsMs: now,
+            event: "device_queue_prune",
+            sessionId: p.sessionId || null,
+            details: p,
+          });
+        }
+        for (const p of pruned.buildLeases) {
+          auditEvents.push({
+            tsMs: now,
+            event: "build_gc_prune",
+            sessionId: p.sessionId || null,
+            details: p,
+          });
+        }
+        for (const p of pruned.buildQueue) {
+          auditEvents.push({
+            tsMs: now,
+            event: "build_queue_prune",
+            sessionId: p.sessionId || null,
+            details: p,
+          });
+        }
+        const result = fn(state, { now, pruned, lockHandle, auditEvents });
         const gcMutated =
           pruned.leases.length > 0 ||
           pruned.queue.length > 0 ||
+          pruned.buildLeases.length > 0 ||
+          pruned.buildQueue.length > 0 ||
           pruned.hookSessions.length > 0 ||
           Boolean(pruned.workersMutated);
         if ((result && result.mutated !== false) || gcMutated) {
@@ -1706,6 +1900,15 @@ export function withStateTransaction(stateDir, fn, options = {}) {
     undefined,
     options,
   );
+  if (auditEvents.length > 0) {
+    flushAuditEvents(auditEvents, {
+      stateDir,
+      env: options.env,
+      platform: options.platform,
+      enabled: auditLoggingEnabled,
+    });
+  }
+  return txResult;
 }
 
 export function normalizeDeviceType(type) {
@@ -1804,6 +2007,87 @@ export function matchesOsSpec(deviceOsVersion, osSpec) {
   return false;
 }
 
+const UUID_SELECTOR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function matchesSingleLeaseSelector(lease, sel) {
+  if (!lease || !sel) return false;
+  const trimmed = String(sel).trim();
+  if (!trimmed) return true;
+  if (trimmed.startsWith("ios_simulator_version=")) {
+    if ((lease.platform || "android") !== "ios") return false;
+    const verSpec = trimmed.slice("ios_simulator_version=".length).trim();
+    const leaseOs = lease.profile?.osVersion || lease.profile?.apiLevel || null;
+    if (!leaseOs) return false;
+    return matchesOsSpec(leaseOs, verSpec);
+  }
+  if (trimmed.startsWith("ios_simulator_device=") || (lease.platform || "android") === "ios") {
+    if ((lease.platform || "android") !== "ios") return false;
+    const rawDevSpec = trimmed.startsWith("ios_simulator_device=")
+      ? trimmed.slice("ios_simulator_device=".length).trim()
+      : trimmed;
+    const devSpec = rawDevSpec.toLowerCase();
+    if (!devSpec) return false;
+    const candidates = [
+      lease.serial,
+      lease.udid,
+      lease.coreDeviceId,
+      lease.profile?.coreDeviceId,
+      lease.profile?.deviceName,
+      lease.avd,
+      lease.profile?.deviceTypeId,
+      lease.profile?.deviceTypeIdentifier,
+    ]
+      .filter(Boolean)
+      .map((s) => String(s).trim().toLowerCase());
+    return candidates.includes(devSpec);
+  }
+  const exactIds = [
+    lease.serial,
+    lease.udid,
+    lease.coreDeviceId,
+    lease.profile?.coreDeviceId,
+  ].filter(Boolean);
+  for (const id of exactIds) {
+    if (String(id) === trimmed) return true;
+    if (UUID_SELECTOR_RE.test(trimmed) && UUID_SELECTOR_RE.test(String(id))) {
+      if (String(id).toLowerCase() === trimmed.toLowerCase()) return true;
+    }
+  }
+  return false;
+}
+
+export function findConflictingLeaseSelector(
+  lease,
+  targetSerial,
+  { allowRewritableBooted = false } = {},
+) {
+  if (!targetSerial || !lease) return null;
+  const parts = String(targetSerial)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const leasePlat = lease.platform || "android";
+  for (const part of parts) {
+    if (
+      allowRewritableBooted &&
+      leasePlat === "ios" &&
+      lease.kind === "emulator" &&
+      part.toLowerCase() === "booted"
+    ) {
+      continue;
+    }
+    if (!matchesSingleLeaseSelector(lease, part)) {
+      return part;
+    }
+  }
+  return null;
+}
+
+export function matchesLeaseTarget(lease, targetSerial, options = {}) {
+  if (!lease || !targetSerial) return false;
+  return findConflictingLeaseSelector(lease, targetSerial, options) === null;
+}
+
 export function matchesProfile(device, req = {}) {
   const devPlatform = device.platform || "android";
   if (req.platform && req.platform !== "any" && devPlatform !== req.platform) {
@@ -1827,9 +2111,19 @@ export function matchesProfile(device, req = {}) {
     if (devPlatform === "ios") {
       const wantAvd = String(req.avd).trim().toLowerCase();
       const devAvd = String(device.avd || "").trim().toLowerCase();
+      const devName = String(device.profile?.deviceName || "").trim().toLowerCase();
       const devUdid = String(device.udid || device.serial || "").trim().toLowerCase();
-      const devTypeId = String(device.profile?.deviceTypeIdentifier || "").trim().toLowerCase();
-      if (devAvd !== wantAvd && devUdid !== wantAvd && devTypeId !== wantAvd) {
+      const devTypeId = String(
+        device.profile?.deviceTypeId || device.profile?.deviceTypeIdentifier || "",
+      )
+        .trim()
+        .toLowerCase();
+      if (
+        devAvd !== wantAvd &&
+        devName !== wantAvd &&
+        devUdid !== wantAvd &&
+        devTypeId !== wantAvd
+      ) {
         return false;
       }
     } else if (device.avd !== req.avd) {

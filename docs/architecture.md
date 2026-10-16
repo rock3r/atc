@@ -1,95 +1,90 @@
 # atc architecture
 
-The `atc` CLI uses a shared state file to coordinate device discovery, leases, queued requests, and agent hooks.
+How the `atc` CLI, the typed-op catalog and validator, the lock-serialized state file, the 3-tier Android and iOS fleet discovery, the build scheduler, the warm-affinity queues, and the host hooks fit together.
 
-Status: `v2.1.0` · Updated `2026-10-12` · Node.js >= 20 on macOS, Linux, and Windows.
+Status: `v3.0.0` · Updated `2026-10-16` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 
-An agent claims an Android emulator (AVD), an iOS Simulator, or a physical USB/Wi-Fi device. It runs commands through `atc exec -- <cmd>` and releases the lease after use. `atc` coordinates access through a user-private `state.json` file protected by an atomic directory lock (`atc.lock`). It has no background daemon or npm dependencies.
+An agent claims exclusive access to an Android emulator (AVD), an iOS Simulator, or a physical USB/Wi-Fi device, asks `atc` for typed operations (`atc exec <system> <op>`, `atc batch`, or the `atc_*` MCP tools), and frees the lease when done. `atc` validates each request against a closed catalog, generates literal argv itself, admits it against build slots, workspace locks, host RAM and device leases, and runs it with a heartbeat. All coordination runs through a user-private `state.json` file guarded by an atomic directory lock (`atc.lock`) with no daemon and zero npm dependencies.
 
-`atc guide` supplies the CLI documentation. `atc guard` and `atc hook pre-tool-use` check lease ownership before agent commands run. `atc hook stop` handles turn-end cleanup; later commands reclaim leases whose agent process has died. The optional Model Context Protocol (MCP) server (`atc mcp`) exposes operations over stdio JSON-RPC 2.0.
+`atc` never receives, inspects, parses or runs shell commands. The CLI carries its own documentation (`atc guide`, `atc exec --help`), records host session identity (`atc hook pre-tool-use`), and frees leases when a turn ends (`atc hook stop`) or when an agent PID dies.
 
 | Invariant | Guarantee | Where enforced |
 |---|---|---|
-| Zero subprocesses under `atc.lock` | Fleet discovery runs before acquiring `atc.lock`; boot, wipe, snapshot, and stop run after releasing `atc.lock` under `"starting"` or `"stopping"` states. Lock hold time stays under `20 ms`. | `src/cli.mjs`, `src/lock.mjs` |
-| Physical claims require a request | Default claims set `--kind emulator`. Physical Android and iOS devices require `--serial`, `--udid`, or `--kind physical\|any` and use `0` virtual slots. | `src/cli.mjs`, `src/state.mjs` |
-| Queue protection starts after 120 seconds | Warm `Tier 0` matches can precede cold-boot tickets within `reorderWindowSec` (`120 s`). After that window, `atc` reserves competing resources for earlier tickets. Unrelated claims can proceed. | `src/state.mjs` (`canJumpAhead`) |
-| Virtual crash recovery vs. physical fail-fast | Crashed virtual devices hold a `45 s` reservation for in-place reboot (`expiresAtMs` preserved). Disconnected physical devices fail fast after `15 s` with a tombstone. | `src/state.mjs` (`reconcileOfflineLeases`), `src/cli.mjs` |
+| No shell | Requests are typed ops validated against allowlist patterns; invocations are literal argv spawned with `shell: false` (Windows `.bat` wrappers go through `cmd.exe /d /s /c` only with charset-checked args and paths). | `src/ops/*`, `src/validate.mjs`, `src/exec.mjs`, `src/spawn.mjs` |
+| Zero subprocesses under `atc.lock` | Discovery, wrapper resolution and warm-daemon probes run before acquiring `atc.lock`; boots, builds and device ops run after releasing it. `withLock` tracks the held depth and `spawnWithHeartbeat` refuses to spawn while `atc.lock` is held. | `src/cli.mjs`, `src/lock.mjs`, `src/spawn.mjs` |
+| No personal-phone hijack | Default claims set `--kind emulator`. Physical devices require `--serial`, `--udid`, or `--kind physical\|any`. Device ops only target the caller's own lease. | `src/cli.mjs`, `src/state.mjs` |
+| Builds don't trample each other | Builds on the same workspace key are serialized; heavy builds share a slot pool with RAM admission and a burst slot for device holders. | `src/build.mjs`, `src/cli.mjs` (`runOpInvocations`) |
+| Warm-affinity fairness ceiling | Warm `Tier 0` matches can jump ahead of cold-boot tickets within `reorderWindowSec` (`120 s`). | `src/state.mjs` (`canJumpAhead`) |
+| Virtual crash recovery vs. physical fail-fast | Crashed virtual devices hold a `45 s` reservation for in-place reboot. Disconnected physical devices fail fast after `15 s`. | `src/state.mjs` (`reconcileOfflineLeases`), `src/cli.mjs` |
+
+## A request flows parse → validate → plan → admit → run
+
+```mermaid
+flowchart LR
+    CLI["atc exec gradle tasks ...\n(argv tokens)"] --> Parse["parseOpArgv\nsrc/validate.mjs"]
+    MCP["atc_gradle {operation, params}"] --> Validate
+    Batch["atc batch plan.json"] --> BV["validateBatchPlan\n(structure, deps, cycles, claims)"] --> Validate
+    Parse --> Validate["validateOpParams\n(all errors at once)"]
+    Validate --> Plan["planOp src/exec.mjs\nwrapper/workspace resolution,\nhost OS, Windows contract,\nnotices, build requirements"]
+    Plan --> Admit["runOpInvocations src/cli.mjs\nbuild slot, workspace lock, RAM,\ndevice lease / co-claim\n(atc.lock < 20ms)"]
+    Admit --> Run["spawnWithHeartbeat src/spawn.mjs\nliteral argv + lease env,\nheartbeat, timeout"]
+```
+
+1. **Parse.** `parseOpArgv` maps `atc exec <system> <verb> …` to an op name and typed params. Raw commands (`-- <cmd>`), `--cwd` and `--env` are refused with the supported alternative.
+2. **Validate.** `validateOpParams` checks unknown fields, types, closed enums, ranges and value patterns (`src/ops/patterns.mjs`), collecting every problem as `{path, code, message, hint}`. `--force --reason` overrides only forceable build-value patterns, and never a leading `-`.
+3. **Plan.** `planOp` resolves the build executable (Gradle wrapper walking up from `workspace`/cwd; `./bazelw` → `bazelisk` → `bazel`; `xcodebuild`), checks the host OS and the Windows batch contract, collects efficiency notices, and derives build requirements (`src/ops/requirements.mjs`: workspace resource keys, Gradle heap/daemon properties, Bazel output base) by calling `resolveBuildResources` on the generated argv.
+4. **Admit.** `runOpInvocations` (the salvaged build/device admission engine) reserves a build slot and workspace lock, checks RAM, finds or co-allocates the device lease, and queues when busy, all in short `withStateTransaction` critical sections.
+5. **Run.** Invocations are generated against the admitted lease (`adb -s <serial>`, `xcrun simctl <verb> <udid>`, `-destination id=<udid>`), resource caps are appended (`-Dorg.gradle.workers.max`, `--jobs`/`--local_ram_resources`, `-jobs`), and each invocation is spawned in order with lease/session env vars, a heartbeat, optional `timeoutSec`, and stop-at-first-failure. Build leases enter a short `"draining"` cooldown when aborted.
+
+`atc batch` runs the same pipeline per step, sequentially in topological order, with per-step `cwd`/`env`, claims that are held for downstream `claim: {reuse}` consumers and renewed while held, and dependents skipped on failure.
+
+## Device-side transport
+
+Android ops that need a remote shell (`launch`, `clear-data`, `permission`, `prop`, `screenshot`) use fixed templates such as ``am start -n '<pkg>/<activity>'``. Every interpolated value matches a pattern that is a subset of `^[A-Za-z0-9_.:/@+=,-]+$` and is single-quoted, so the remote shell sees exactly one literal word. These checks cannot be forced.
 
 ## Every critical section under `atc.lock` finishes in under 20 ms
 
-`cmdClaim`, `cmdFree`, `cmdSnapshot`, and `cmdExec` split every operation into lock-free subprocess probes and `<20 ms` in-memory state transactions.
+`cmdClaim`, `cmdFree`, `cmdSnapshot`, and `runOpInvocations` split every operation into lock-free subprocess probes and `<20 ms` in-memory state transactions.
 
-```text
-~ cmdClaim(stateDir, flags, options)                  @ src/cli.mjs:1395
-  + resolveTargetPlatform(flags, cwd)                 @ src/ios.mjs:62
-  + discoverTargetFleet({ targetPlatform, ... })      @ src/cli.mjs:276
-    ~ discoverFleetAndHost(runner, avdHome, ...)      @ src/android.mjs:785
-    + discoverIosFleetAndHost(runner, cfg, ...)       @ src/ios.mjs:531
-  ~ withStateTransaction(stateDir, fn)                @ src/state.mjs:908
-    ~ runGarbageCollection(state, stateDir, now)      @ src/state.mjs:770
-    ~ reconcileOfflineLeases(state, inventory, ...)   @ src/state.mjs:1161
-    ~ matchesProfile(candidate, req)                  @ src/state.mjs:1423
-  + bootIosSimulator(udid, runner, timeoutMs)         @ src/ios.mjs:643
-  + loadIosSimulatorSnapshot(udid, name, runner)      @ src/ios.mjs:746
-```
-
-1. `resolveTargetPlatform()` (`src/ios.mjs:62`) selects `"android"` or `"ios"` from flags (`--ios`, `--android`, `--udid`, `--os`) or project markers (`.xcodeproj`, `.xcworkspace`, `Package.swift`).
-   `resolveSessionIdentity()` (`src/state.mjs:2079`) resolves `{ sessionId, anchorPid }` through six ordered sources.
-2. `discoverTargetFleet()` (`src/cli.mjs:276`) runs `android emulator list --long`, `adb devices -l`, `xcrun simctl list --json`, and `xcrun devicectl list devices --json-output` outside `atc.lock`.
-   It reads `.avd/config.ini`, snapshots, and host RAM and disk capacity.
-3. Under `atc.lock`, `runGarbageCollection()` removes expired leases and leases whose owner processes have died.
-   `reconcileOfflineLeases()` reserves offline virtual devices for recovery (`45 s`) and records physical disconnects in `disconnectedPhysicalLeases` (`15 s` grace).
-   `cmdClaim` checks Tier 0 for an existing session lease, recovery, or a running idle match.
-   It then checks Tier 1 for offline boot, Tier 2 for idle eviction, and Tier 3 for `--create-if-missing`.
-4. Outside the lock, `atc` boots devices, loads QEMU or APFS (`cp -cR`) snapshots, or clears app state.
-   `startWorkerHeartbeat()` extends `lease.deadlineMs` every 15 seconds during the operation.
-5. Under the lock, `cmdClaim` activates the `"starting"` lease with its `serial` / `udid` and `expiresAtMs`.
-   On failure, it deletes the starting record and releases the slot.
-
-## `atc exec` and `atc guard` route Android, iOS, and dual-lease KMP commands
-
-Kotlin Multiplatform (KMP) sessions can hold one Android lease and one iOS lease. `cmdExec` (`src/cli.mjs:4973`) and `evaluateCommandGuard` (`src/guard.mjs:1309`) select a platform lease for each command segment.
-
-| Command family | Target platform | Environment & argument injection in `buildChildInvocation` (`src/spawn.mjs:96`) |
-|---|---|---|
-| `adb ...` | `android` | Sets `ANDROID_SERIAL=<serial>`; injects `-s <serial>` after global `adb` flags when omitted. |
-| `android run\|install\|layout\|screen ...` | `android` | Sets `ANDROID_SERIAL=<serial>`; injects `--device=<serial>` when omitted. |
-| `./gradlew connected*` | `android` | Sets `ANDROID_SERIAL=<serial>`, `ATC_LEASE_ID`, `ATC_SESSION_ID`, `ATC_AVD`. |
-| `xcrun simctl ...` | `ios` | Sets `ATC_IOS_UDID=<udid>`, `SIMCTL_CHILD_ATC_LEASE_ID=<leaseId>`; rewrites `booted` to `<udid>`. |
-| `xcrun devicectl device\|manage ...` | `ios` | Sets `ATC_IOS_UDID=<udid>`; injects `--device <udid>` when omitted and validates `--device` against `serial` and `coreDeviceId`. |
-| `xcodebuild test ...` | `ios` | Sets `ATC_IOS_UDID=<udid>` and validates `-destination id=<udid>,name=<name>`. |
-| Generic (`sh -c ...`) in KMP session | `android` + `ios` | Exports both `ANDROID_SERIAL` and `ATC_IOS_UDID` into the child environment. |
-
-`evaluateCommandGuard()` checks commands for `adb`, `emulator`, `android`, `gradlew`, `simctl`, `devicectl`, and `xcodebuild`. Commands without these tools pass in under `2 ms` without a `state.json` read. The guard blocks direct lifecycle commands (`emulator -avd`, `adb emu kill`, `xcrun simctl boot|shutdown|erase|delete`) with exit code `2`. It rewrites compound commands (`adb ... && xcrun simctl ...`) segment by segment using `execSerialByPlatform`.
+1. **Resolve platform and session identity:** `resolveTargetPlatform()` picks `"android"` or `"ios"` from flags or project markers. `resolveSessionIdentity()` resolves `{ sessionId, anchorPid }` via the 6-step ladder.
+2. **Probe fleet outside `atc.lock`:** `discoverTargetFleet()` runs `android emulator list --long`, `adb devices -l`, `xcrun simctl list --json`, and `xcrun devicectl list devices --json-output`, then reads `.avd/config.ini`, snapshots, and host RAM/disk.
+3. **Select candidate under `atc.lock` (`<20 ms`):** GC prunes expired or dead-PID leases and evaluates `Tier 0` (idempotent re-claim, crash recovery, warm idle match), `Tier 1` (offline boot under slot/resource caps), `Tier 2` (idle eviction), and `Tier 3` (`--create-if-missing`).
+4. **Run slow transitions outside `atc.lock`:** a worker heartbeat extends the lease while `atc` boots, loads snapshots, clears app state, or runs builds and device ops.
+5. **Activate or roll back under `atc.lock`:** `"starting" -> "active"`, or the record is deleted on failure so the slot reopens immediately.
 
 ## Code map and on-disk state
 
 | Module | Path | Responsibility |
 |---|---|---|
-| CLI entrypoint | `bin/atc.mjs`, `src/cli.mjs` | Flag parsing and command handlers (`guide`, `claim`, `free`, `renew`, `snapshot`, `exec`, `status`, `config`, `gc`, `guard`, `hook`, `mcp`). |
-| Built-in guides | `src/guide.mjs`, `src/guides/*.md` | Markdown topics (`workflow`, `profiles`, `snapshots`, `multi-agent`, `traps`) served by `atc guide` and `atc_guide`. |
-| Atomic lock | `src/lock.mjs` | Directory mutex (`mkdir <stateDir>/atc.lock`), `owner.json` nonce check, stale-lock breaking, and atomic `state.json` write + `fsync` + `rename`. |
-| State & scheduler | `src/state.mjs` | Schema validation, corruption quarantine, dead-PID GC, 6-step session identity ladder, `watch`/`wear` profile matching, and warm-affinity queue selection. |
-| Android probes | `src/android.mjs` | Android 3-tier discovery, `.avd/config.ini` + dead-PID `.lock` cleanup, RAM/disk admission, and QEMU boot/stop/snapshot helpers. |
-| iOS probes | `src/ios.mjs` | iOS/watchOS/tvOS/visionOS discovery (`simctl` + `devicectl`), simulator boot/shutdown/erase/create, privacy/container app reset, and APFS `cp -cR` snapshots. |
-| Worker liveness | `src/heartbeat.mjs` | Cross-platform process-group tracking (`workerPgids`, POSIX start tokens, Windows CIM `CreationDate` trees) and orphan process-tree reaping. |
-| Spawner | `src/spawn.mjs` | Subprocess runner, Windows `.exe`/`.cmd` resolution, and Android/iOS target flag injection. |
-| Command guard | `src/guard.mjs` | Shell tokenizer, per-platform command classifier, and loop/compound command rewriter. |
-| Host hooks & MCP | `src/hook.mjs`, `src/mcp.mjs` | `PreToolUse` and `Stop` adapters for Claude Code, Codex, Cursor, Antigravity, and Gemini CLI, plus the stdio JSON-RPC 2.0 MCP server. |
+| CLI entrypoint | `bin/atc.mjs`, `src/cli.mjs` | Flag parsing and command handlers (`guide`, `claim`, `free`, `renew`, `snapshot`, `exec`, `batch`, `status`, `config`, `gc`, `hook`, `mcp`), and the internal runner `runOpInvocations`. |
+| Op catalog | `src/ops/catalog.mjs`, `src/ops/patterns.mjs` | Closed list of typed ops, their params, value patterns, invocation templates and notices. |
+| Validation | `src/validate.mjs` | CLI op parsing, param validation, batch plan validation (structure, deps, cycles, claims). |
+| Exec front-end | `src/exec.mjs` | `planOp`, `execOp`, Windows contract, `--brief` logs, forced-run attribution, `atc exec --help`. |
+| Batch executor | `src/batch.mjs` | Sequential DAG execution, claim reuse and release, `--validate` dry runs. |
+| Build requirements & scheduler | `src/ops/requirements.mjs`, `src/build.mjs` | Workspace keys, Gradle/Bazel/Xcode resource resolution on literal argv, build pool, queue selection, RAM admission, warm daemon probes, draining. |
+| Config parsers | `src/parsers.mjs` | `gradle.properties` and `.bazelrc` parsing. |
+| Built-in guides | `src/guide.mjs`, `src/guides/*.md` | Markdown topics served by `atc guide` and `atc_guide`. |
+| Atomic lock | `src/lock.mjs` | Directory mutex, `owner.json` nonce check, stale-lock breaking, atomic writes, lock-depth tracking. |
+| State & scheduler | `src/state.mjs` | Schema validation, corruption quarantine, dead-PID GC, session identity ladder, profile matching, warm-affinity queue, forced-run records. |
+| Android / iOS probes | `src/android.mjs`, `src/ios.mjs` | Discovery, boot/stop/snapshot helpers, RAM/disk admission. |
+| Worker liveness | `src/heartbeat.mjs` | Cross-platform process-group tracking and orphan reaping. |
+| Spawner | `src/spawn.mjs` | Executable resolution (incl. Windows), `prepareOpChildInvocation`, `spawnWithHeartbeat`. |
+| Host hooks & MCP | `src/hook.mjs`, `src/mcp.mjs` | Session recording and MCP session injection for Claude Code, Codex, Cursor, Copilot, Antigravity, and Gemini CLI; Stop-hook release; stdio JSON-RPC 2.0 MCP server. |
 
 | On-disk path | Written by | Contents |
 |---|---|---|
-| `<stateDir>/state.json` | `src/lock.mjs` | Active/transitional leases, wait queue tickets, `disconnectedPhysicalLeases` tombstones, config overrides, and hook PID breadcrumbs (`mode 0600`). |
-| `<stateDir>/atc.lock/owner.json` | `src/lock.mjs` | Lock holder `{ pid, createdAtMs, nonce }` checked before every atomic rename. |
-| `~/.android/avd/<Name>.avd/snapshots/<snap>/` | QEMU / `adb` | QEMU snapshots discovered by `src/android.mjs` and restored via `atc snapshot`. |
-| `~/.atc-snapshots/<udid>/<snap>/data/` | `src/ios.mjs` | APFS copy-on-write (`cp -cR`) clones of `~/Library/Developer/CoreSimulator/Devices/<udid>/data`. |
+| `<stateDir>/state.json` | `src/lock.mjs` | Leases, queue tickets, build leases and queue, tombstones, config overrides, hook session breadcrumbs, forced runs (`mode 0600`). |
+| `<stateDir>/atc.lock/owner.json` | `src/lock.mjs` | Lock holder `{ pid, createdAtMs, nonce }`. |
+| `<stateDir>/logs/<op>-<time>-<pid>.log` | `src/exec.mjs` | Full output of `--brief` build runs. |
+| `~/.android/avd/<Name>.avd/snapshots/<snap>/` | QEMU / `adb` | QEMU snapshots. |
+| `~/.atc-snapshots/<udid>/<snap>/data/` | `src/ios.mjs` | APFS copy-on-write clones of simulator data. |
 
 ## Verification commands
 
 | Command | Coverage |
 |---|---|
-| `npm test` (`node --test test/*.test.mjs`) | Tests cover lock serialization, corrupt-state handling, dead-PID GC, `45 s` virtual recovery, and `15 s` physical disconnect handling. They also cover scheduling, RAM/disk checks, guards, hooks, command targets, APFS snapshots, KMP leases, guides, and MCP. |
-| `npm run check` | Syntax check (`node --check`) across all `.mjs` files plus the full integration test suite. |
-| `npm run release:verify` | Version parity check across `package.json`, `plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/atc/SKILL.md`, and `skills/atc/skill-source.json`. |
+| `npm test` | Lock serialization, state GC, crash recovery, queueing, RAM/disk admission, build scheduling, the op catalog and validator, exec/batch/MCP flows with fake tools, Windows and transport contracts, the lock-boundary assertion, hooks, iOS, guides and packaging. |
+| `npm run check` | Syntax check (`node --check`) across all `.mjs` files plus the full test suite. |
+| `npm run release:verify` | Version parity across `package.json`, `plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `skills/atc/SKILL.md`, and `skills/atc/skill-source.json`. |

@@ -827,15 +827,18 @@ export function isProcessGroupAlive(
       return activePgidLivenessSnapshot.get(pgidKey);
     }
     if (allowSubprocess) {
-      return Boolean(
-        queryWindowsProcessGroups([pgidKey], spawnSyncFn, {
-          knownDescendants: effectiveKnown,
-          pgidStartTokens:
-            options.pgidStartTokens || lease?.workerPgidStartTokens || null,
-          expectedStartToken: options.expectedStartToken || null,
-          lease,
-        }).get(pgidKey),
-      );
+      const qRes = queryWindowsProcessGroups([pgidKey], spawnSyncFn, {
+        triState: Boolean(options.triState),
+        knownDescendants: effectiveKnown,
+        pgidStartTokens:
+          options.pgidStartTokens || lease?.workerPgidStartTokens || null,
+        expectedStartToken: options.expectedStartToken || null,
+        lease,
+      });
+      const qVal = qRes.get(pgidKey);
+      if (qVal !== null && qVal !== undefined) {
+        return Boolean(qVal);
+      }
     }
     const knownMap = winKnownTreeDescendants.get(pgidKey);
     const rootMeta = knownMap?.get(pgid);
@@ -2316,6 +2319,13 @@ export function releaseLock(lockHandle) {
   sweepStaleLockClaims(stateDir, lockName);
 }
 
+// Process-wide depth of held atc.lock sections (see AGENTS.md: never spawn subprocesses while
+// holding atc.lock). spawn.mjs consults this to fail loudly on lock-boundary violations.
+let atcLockDepth = 0;
+export function isAtcLockHeld() {
+  return atcLockDepth > 0;
+}
+
 export function withLock(
   stateDir,
   fn,
@@ -2325,9 +2335,12 @@ export function withLock(
   options = {},
 ) {
   const handle = acquireLock(stateDir, timeoutMs, lockName, staleLockMs, options);
+  const isAtcLock = lockName === "atc.lock";
+  if (isAtcLock) atcLockDepth++;
   try {
     return fn(handle);
   } finally {
+    if (isAtcLock) atcLockDepth--;
     releaseLock(handle);
   }
 }

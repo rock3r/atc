@@ -1,5 +1,8 @@
 # Android Traffic Control (ATC) design
 
+> [!IMPORTANT]
+> **ATC 3.0 supersedes the command-execution parts of this historical spec.** ATC no longer receives, inspects, rewrites or runs shell commands: `atc exec -- <cmd>`, `atc guard`, and PreToolUse command classification (§6.1 `exec` row, §7.1, §9.4, §9.5.3) are removed. Agents request allowlisted typed operations (`atc exec <system> <op>`, `atc batch`, `atc_*` MCP tools) and hooks only record session identity. See [`docs/scope.md`](docs/scope.md) for the 3.0 contract and [`docs/architecture.md`](docs/architecture.md) for the current design. Lease, queue, lock, snapshot and recovery sections below still describe current behavior.
+
 - **Status:** 1.0 Design Specification (v1.0.0)
 - **Target Platforms:** macOS, Linux (Windows supported via `adb` and SDK `emulator` fallback; `android emulator` subcommands are macOS/Linux only per official Android CLI support)
 - **Runtime Stack:** Node.js (>= 20 LTS, zero external runtime dependencies, ESM `.mjs`)
@@ -560,7 +563,7 @@ Usage: `atc exec [--serial <serial>] [--session <id>] -- <command> [args...]`
 | `atc free [target] [options]` | Release lease(s) (`leaseId` > `serial` > `avd`); optional `--snapshot-save`, `--snapshot-load`, `--stop`, `--force` | `0` ok, `2` transition in progress, `3` not owner, `5` disk full on snapshot save, `1` error |
 | `atc renew [target] [--ttl <sec>]` | Extend lease expiration time on an online active lease (clamped to `maxTtlSec`) | `0` ok, `3` not owner, `1` error/offline |
 | `atc snapshot <list\|save\|load\|delete> [name]` | Inspect or save/load/delete QEMU snapshots on leased emulator | `0` ok, `3` not owner, `5` disk full, `1` error |
-| `atc exec -- <cmd> [args...]` | Run command with `ANDROID_SERIAL` & periodic lease heartbeat | Child exit code, or `3` no lease |
+| `atc exec <system> <op> [params]` | Run an allowlisted typed operation (3.0; replaces `atc exec -- <cmd>`) under the lease/build slot with a periodic heartbeat | Child exit code, `3` no lease, `7` rejected request |
 | `atc status [--type ...] [--api ...] [--json]` | Show 3-tier fleet (`running`, `offline` spin-up candidates, `creatable` profiles), host RAM/disk capacity, active leases, and affinity wait queue | `0` ok |
 | `atc config <get\|set> [key] [val]` | View or configure `maxRunningEmulators`, `maxRunningSimulators`, `reorderWindowSec`, `minFreeRamMb`, `minFreeDiskMb`, `offlineGraceMs`, `physicalOfflineGraceMs` | `0` ok, `1` invalid value |
 | `atc gc` | Run garbage collection immediately and print pruned entries | `0` ok |
@@ -622,6 +625,8 @@ atc/
 ```
 
 ### 7.1 Universal Command Guard (`atc guard` & `atc hook pre-tool-use`)
+> **Removed in 3.0.** This section is kept for history only. ATC 3.0 hooks never read shell commands; see `docs/scope.md` §7.
+
 > The guard checks shell command strings for missing leases and missing `--device` / `ANDROID_SERIAL` targets. Agents can bypass these checks through deliberate command obfuscation. The guard provides no OS security boundary.
 
 1. **Host input handling without shell interpolation:**
@@ -744,6 +749,8 @@ Android emulators and iOS Simulators share `state.queue` and the host RAM and di
      3. Under `atc.lock`, verifies `leaseId` and transitions the lease back to `state: "active"` with `expiresAtMs = now + ttlMs` (or on failure/timeout, attempts best-effort reboot to restore online state before exiting `1`).
 
 ### 9.4 iOS `atc exec` & `atc guard` (Fast-Path, Explicit Target Validation & `"booted"` Protection)
+> **Removed in 3.0.** iOS ops are typed (`ios.*`, `xcode.*`) and always target the leased UDID explicitly; there is no `booted` rewriting or command guard.
+
 Apple's `simctl`, `devicectl`, and `xcodebuild` require explicit UDID arguments. Android tools can use `ANDROID_SERIAL`. When several simulators run, `xcrun simctl ... booted` can select an arbitrary simulator:
 1. **`atc exec` Environment & Injection:**
    - Sets `ATC_DEVICE_SERIAL=<lease.serial>`, `ATC_PLATFORM=ios`, and `SIMULATOR_UDID=<lease.serial>`.

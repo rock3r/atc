@@ -65,7 +65,7 @@ VS Code hooks are experimental and in Preview. VS Code can load Claude-format pl
 
 ### Antigravity
 
-Copy or symlink the package or repository root into `~/.gemini/config/plugins/atc`. Another option is to register its `plugin.json` path in `~/.gemini/plugins.json`. Antigravity loads `plugin.json`, `skills/atc/SKILL.md`, the `PreToolUse` / `Stop` hooks in `hooks.json`, and the `atc mcp` server in `mcp_config.json`:
+Copy or symlink the package or repository root into `~/.gemini/config/plugins/atc`. Another option is to register its `plugin.json` path in `~/.gemini/plugins.json`. Antigravity loads `plugin.json`, `skills/atc/SKILL.md`, the `PreToolUse` / `Stop` session hooks in `hooks.json`, and the `atc mcp` server in `mcp_config.json`:
 
 ```bash
 mkdir -p ~/.gemini/config/plugins

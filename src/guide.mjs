@@ -33,10 +33,20 @@ const GUIDE_ALIASES = Object.freeze({
   guard: "multi-agent",
   mcp: "multi-agent",
   concurrency: "multi-agent",
+  build: "multi-agent",
+  builds: "multi-agent",
+  batch: "multi-agent",
+  plan: "multi-agent",
+  phase: "multi-agent",
+  coscheduling: "multi-agent",
+  gradle: "multi-agent",
+  bazel: "multi-agent",
   trap: "traps",
   troubleshooting: "traps",
   errors: "traps",
   "exit-codes": "traps",
+  audit: "traps",
+  logs: "traps",
 });
 
 export function resolveGuideTopic(rawTopic) {

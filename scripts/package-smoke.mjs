@@ -156,8 +156,17 @@ try {
     );
   }
   const guidePayload = JSON.parse(guideJsonRun.stdout);
-  if (guidePayload.topic !== "traps" || !guidePayload.text?.includes("ANDROID_SERIAL")) {
+  if (guidePayload.topic !== "traps" || !guidePayload.text?.includes("EINVALID_OP")) {
     throw new Error(`unexpected packaged guide JSON payload: ${guideJsonRun.stdout}`);
+  }
+
+  const execHelpRun = run(process.execPath, [primaryCli, "exec", "--help"]);
+  if (
+    execHelpRun.status !== 0 ||
+    !execHelpRun.stdout.includes("atc exec gradle tasks") ||
+    !execHelpRun.stdout.includes("https://github.com/rock3r/atc/issues")
+  ) {
+    throw new Error(`packaged atc exec --help failed: ${execHelpRun.stderr || execHelpRun.stdout}`);
   }
 
   if (process.platform === "win32") {

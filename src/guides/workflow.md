@@ -1,16 +1,18 @@
 # atc workflow guide
 
-Run `atc guide <topic>` to read `workflow`, `profiles`, `snapshots`, `multi-agent`, or `traps`.
+Guides: `workflow` (this page) · `profiles` · `snapshots` · `multi-agent` · `traps` (`atc guide <topic>`).
+
+`atc` coordinates devices and builds. You never hand it a shell command: you ask for a **typed operation** (`atc exec <system> <op>`, `atc batch`, or the `atc_*` MCP tools) and `atc` builds and runs the exact command itself. Run `atc exec --help` for the full catalog.
 
 ## 1. Check fleet capacity before claiming a device
 
-Run `atc status` to check available RAM, free disk, and used slots (`emu slots` and `sim slots`). It also lists running devices, offline Android Virtual Devices (AVDs) and Simulators, and active leases.
+Run `atc status` to inspect available RAM, free disk, used Android emulator slots (`emu slots`), used iOS Simulator slots (`sim slots`), used build slots (`build slots`), running devices, offline AVDs/Simulators, active leases, and active builds.
 
-Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`, `xcrun simctl boot`, `xcrun simctl shutdown`, or `xcrun simctl erase`. `atc` owns the virtual device lifecycle.
+Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`, `xcrun simctl boot`, `xcrun simctl shutdown`, `xcrun simctl erase`, `./gradlew --stop`, or `bazel shutdown`. `atc` owns the virtual device lifecycle and the shared build daemons, and will not do these on request.
 
-## 2. Claim, run under `atc exec`, snapshot, and free
+## 2. Claim, run typed operations, snapshot, and free
 
-1. Claim a device with the platform and profile the task requires:
+1. **Claim a device** matching the platform and profile your task needs (skip this for pure builds):
    ```bash
    # Android emulator (default outside iOS-only directories)
    atc claim --type phone --api ">=35" --play --wait 300
@@ -19,49 +21,69 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
    atc claim --ios --type phone --os ">=18.0" --wait 300
    ```
    If your agent host does not export a session ID, pass `--session <id>` or set `ATC_SESSION_ID=<id>`.
-2. Run every device command through `atc exec`:
+2. **Run builds and device work as typed operations**:
    ```bash
-   # Android commands
-   atc exec -- adb shell getprop ro.product.model
-   atc exec -- android layout --pretty
-   atc exec -- ./gradlew connectedDebugAndroidTest
+   # Pure builds: build slot + per-workspace lock, no device held
+   atc exec gradle tasks :app:assembleDebug :app:assembleDebugAndroidTest --brief
+   atc exec bazel build //app:main --config ci
+   atc exec xcode build-for-testing --scheme App --project App.xcodeproj
 
-   # iOS Simulator / physical iOS commands (macOS)
-   atc exec -- xcrun simctl launch booted com.example.app
-   atc exec -- xcrun devicectl device info details
+   # Device-coupled builds use your lease (or claim one for the run with --claim)
+   atc exec gradle tasks :app:connectedDebugAndroidTest
+   atc exec gradle tasks :app:connectedDebugAndroidTest --claim --type phone --api ">=35"
+   atc exec xcode test-without-building --scheme App --project App.xcodeproj
+
+   # Android device ops
+   atc exec android install app/build/outputs/apk/debug/app-debug.apk --replace
+   atc exec android launch --package com.example.app --activity .MainActivity
+   atc exec android permission --package com.example.app --permission android.permission.CAMERA --action grant
+   atc exec android prop get ro.product.model
+   atc exec android logcat --lines 200 --filter "MyTag:D" --filter "*:S"
+   atc exec android screenshot out/home.png
+
+   # iOS Simulator ops (macOS)
+   atc exec ios install build/App.app
+   atc exec ios launch com.example.App
+   atc exec ios privacy --bundle-id com.example.App --service photos --action grant
    ```
-   On Android, `atc exec` sets `ANDROID_SERIAL` and adds `--device`. On iOS, it sets `ATC_IOS_UDID`, replaces `simctl`'s `booted` target with `<udid>`, and adds `devicectl`'s `--device`. It tracks the worker process group and renews the lease every 15 seconds.
-
-3. Use dual leases for Kotlin Multiplatform (KMP) tasks.
-   One session can hold one Android lease and one iOS lease. `atc exec` selects Android for `adb`/`android`/`gradlew` and iOS for `xcrun simctl`/`devicectl`/`xcodebuild`. Select a platform with `--android` or `--ios` in `atc renew`, `atc snapshot`, or `atc free`.
-4. Reset state with snapshots when a test changes device storage:
+   `atc` validates every value first and lists **all** problems at once (exit `7`, nothing ran). It injects the leased serial/UDID, shapes worker/RAM flags (`-Dorg.gradle.workers.max`, `--jobs`, `-jobs`), serializes builds on the same workspace, tracks the worker process group, and renews your lease while the op runs. Add `--json` for structured results and `--brief` on builds for a condensed summary with the full log on disk.
+3. **Use `atc batch` for anything with ceremony** (several steps, `cwd`, `env`, claims, timeouts). Validate first:
+   ```bash
+   atc batch --file plan.json --validate
+   atc batch --file plan.json
+   ```
+   Put compilation in its own step with no claim, and claim the device only for the steps that need it (`"claim": {"platform": "android", ...}`, then `"claim": {"reuse": "<stepId>"}` downstream).
+4. **Use dual leases for Kotlin Multiplatform (KMP) tasks**: one session can hold **1 Android lease + 1 iOS lease** at once. Each op uses the lease of its platform. Pass `--android` or `--ios` to target one leg in `atc renew`, `atc snapshot`, or `atc free`.
+5. **Reset state with snapshots** when a test mutates device storage:
    ```bash
    atc snapshot save clean_login
    # run destructive test steps...
    atc snapshot load clean_login
    ```
-5. Renew during long interactive pauses when no `atc exec` worker is running:
+6. **Renew during long interactive pauses** when nothing is running through `atc`:
    ```bash
    atc renew --ttl 600
    ```
-6. Free the lease when the task finishes:
+7. **Free the lease when your task finishes**:
    ```bash
    atc free
    ```
-   A running idle device lets the next queued agent claim it in under 20 ms (`Tier 0`). Use `atc free --stop` only for specialized devices, such as `xr` or `watch`, that other tasks will not reuse.
+   Leaving the virtual device warm lets the next queued agent claim it in under 20 ms (`Tier 0`). Pass `atc free --stop` only when shutting down a specialized device (such as `xr` or `watch`) that other tasks will not reuse.
 
 ## 3. Rules that keep concurrent agents safe
 
 | Rule | Why it matters | Command pattern |
 |---|---|---|
-| Scope every device command with `atc exec --` | Raw `adb`, `./gradlew connected*`, `simctl ... booted`, or `xcodebuild test` collides once a second device boots. | `atc exec -- adb install app.apk` |
+| Request device and build work through `atc` | Raw `adb`, `./gradlew`, `simctl` or `xcodebuild` are not coordinated: they collide once a second device boots or another agent builds the same repo. | `atc exec android install app.apk` |
+| Split compile and device phases | Holding a device while compiling starves other agents. `atc` prints a notice when a request mixes them. | Batch: assemble step (no claim) → device step (`claim`) |
 | Opt in to physical phones explicitly | Default claims set `--kind emulator` so charging USB phones are never touched. | `atc claim --serial <id>` or `atc claim --ios --udid <id>` |
-| Keep shell loops inside one `atc exec` subshell | Subshells inside `atc exec` need loop variables evaluated in the same shell (or rewritten by `atc hook pre-tool-use`). | `atc exec -- sh -c 'for apk in *.apk; do adb install -r "$apk"; done'` |
-| Respect exit code `5` (`ERESOURCE_EXCEEDED`) | Starting an emulator or saving a snapshot below the RAM/disk reserve risks host OOM or disk exhaustion. | Run `atc free --stop` on idle devices before asking to pass `--force`. |
+| Treat `--force` as taking responsibility | It only overrides build-value patterns, needs `--reason`, and is recorded; later failures point back to it. | `atc exec gradle tasks odd+task --force --reason "vendor plugin task"` |
+| Respect exit code `5` (`ERESOURCE_EXCEEDED`) | Starting an emulator or saving a snapshot below the RAM/disk reserve risks host OOM or disk exhaustion; builds below the RAM floor wait or fail. | Run `atc free --stop` on idle devices. Only device boots/snapshot saves can be forced (with user approval); builds cannot. |
+| Ask for missing operations | Unsupported operations are refused with the closest alternative. | Request it at https://github.com/rock3r/atc/issues |
 
 ## 4. Done checklist
 
-- [ ] Every test or UI check ran under `atc exec --`.
-- [ ] The agent cleared temporary app state or restored a snapshot.
+- [ ] Every build, test, and device interaction ran as an `atc` operation.
+- [ ] Temporary app state was cleaned up or restored from a snapshot.
 - [ ] `atc free` released all held leases.
-- [ ] `atc status` shows zero active leases or queue tickets for your session.
+- [ ] `atc status` shows zero active leases, builds, or queue tickets for your session.

@@ -2,7 +2,7 @@
   "atc": {
     "PreToolUse": [
       {
-        "matcher": "Bash|run_command|shell|call_mcp_tool|.*atc_(claim|free|renew|snapshot|status|guide)",
+        "matcher": "Bash|run_command|shell|call_mcp_tool|.*atc_(claim|free|renew|snapshot|status|guide|gradle|bazel|xcode|android|ios|batch)",
         "hooks": [
           {
             "type": "command",

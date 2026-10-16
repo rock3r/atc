@@ -1,7 +1,51 @@
 import readline from "node:readline";
-import { cmdClaim, cmdFree, cmdRenew, cmdSnapshot, cmdStatus } from "./cli.mjs";
+import { cmdBatch, cmdClaim, cmdFree, cmdRenew, cmdSnapshot, cmdStatus, execDeps } from "./cli.mjs";
+import { execOp } from "./exec.mjs";
 import { GUIDE_TOPICS, cmdGuide } from "./guide.mjs";
+import { listOps } from "./ops/catalog.mjs";
+import { FEATURE_REQUEST_URL } from "./ops/patterns.mjs";
 import { consumePendingMcpHookSession } from "./state.mjs";
+
+const OP_FAMILIES = ["gradle", "bazel", "xcode", "android", "ios"];
+
+function describeParams(op) {
+  return Object.entries(op.params)
+    .map(([k, s]) => {
+      let t = s.type;
+      if (s.type === "enum" || s.type === "enum[]") t = `${s.type === "enum[]" ? "array of " : ""}${s.values.join("|")}`;
+      if (s.type === "objectList") t = `array of {${Object.keys(s.item).join(", ")}}`;
+      if (s.type === "map") t = "object of string values";
+      return `${k}${s.required ? "" : "?"}: ${t}`;
+    })
+    .join("; ");
+}
+
+function opFamilyTool(system) {
+  const ops = listOps(system);
+  const verbs = ops.map((o) => o.name.slice(system.length + 1));
+  return {
+    name: `atc_${system}`,
+    description:
+      `Run an allowlisted ${system} operation through ATC (never a shell command). ` +
+      `Operations: ${ops.map((o) => `${o.name.slice(system.length + 1)} {${describeParams(o)}}`).join(" | ")}. ` +
+      `Invalid params are rejected with all problems listed. Missing something? ${FEATURE_REQUEST_URL}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        operation: { type: "string", enum: verbs, description: `One of: ${verbs.join(", ")}` },
+        params: { type: "object", description: "Operation parameters (see tool description)." },
+        claim: { type: "boolean", description: "Claim a device for the duration of a device-coupled build" },
+        serial: { type: "string", description: "Use this leased Android serial" },
+        udid: { type: "string", description: "Use this leased iOS simulator UDID" },
+        waitSec: { type: "number", description: "Max seconds to wait for a build slot/device" },
+        force: { type: "boolean", description: "Override forceable validation; requires reason. Never unlocks shell, unknown ops or extra args." },
+        reason: { type: "string", description: "Why you take responsibility for a forced run" },
+        session: { type: "string", description: "Optional explicit session ID override" },
+      },
+      required: ["operation"],
+    },
+  };
+}
 
 export const MCP_TOOLS = [
   {
@@ -125,7 +169,53 @@ export const MCP_TOOLS = [
       },
     },
   },
+  ...OP_FAMILIES.map(opFamilyTool),
+  {
+    name: "atc_batch",
+    description:
+      "Run a JSON plan (DAG) of typed ATC operations: {version: 1, steps: [{id, op, ...params, dependsOn?, cwd?, env?, claim?, timeoutSec?, continueOnError?, force?}]}. " +
+      'Use claim: {platform, ...profile} to claim a device for a step and claim: {reuse: "<stepId>"} to reuse it downstream. ' +
+      "The whole plan is validated before anything runs. Set validate: true for a dry run that returns exact invocations.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        plan: { type: "object", description: "The batch plan" },
+        validate: { type: "boolean", description: "Validate and show invocations without running" },
+        session: { type: "string", description: "Optional explicit session ID override" },
+      },
+      required: ["plan"],
+    },
+  },
 ];
+
+const EXEC_TOOL_NAMES = new Set([...OP_FAMILIES.map((s) => `atc_${s}`), "atc_batch"]);
+
+async function handleExecTool(stateDir, id, toolName, args, callOptions) {
+  let res;
+  const opts = { ...callOptions, json: true, stdio: undefined };
+  if (toolName === "atc_batch") {
+    res = await cmdBatch(stateDir, { session: callOptions.sessionId, json: true, validate: Boolean(args.validate) }, { ...opts, plan: args.plan });
+  } else {
+    const system = toolName.slice("atc_".length);
+    const flags = { json: true, session: args.session || callOptions.sessionId };
+    for (const k of ["claim", "serial", "udid", "force", "reason"]) if (args[k] !== undefined) flags[k] = args[k];
+    if (args.waitSec !== undefined) flags.wait = String(args.waitSec);
+    res = await execOp(
+      stateDir,
+      { op: `${system}.${args.operation}`, params: args.params && typeof args.params === "object" ? args.params : {}, flags },
+      execDeps(stateDir, { ...opts, flags: { session: flags.session } }),
+      opts,
+    );
+  }
+  return {
+    jsonrpc: "2.0",
+    id,
+    result: {
+      isError: res.exitCode !== 0,
+      content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+    },
+  };
+}
 
 function resolveMcpCallOptions(sessionOptions = {}, toolArgs = {}) {
   const hostAgentPid = sessionOptions.ppid ?? process.ppid;
@@ -201,7 +291,7 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
         capabilities: { tools: {} },
         serverInfo: {
           name: "android-traffic-control",
-          version: "2.1.0",
+          version: "3.0.0",
         },
       },
     };
@@ -227,7 +317,8 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
       toolName === "atc_renew" ||
       toolName === "atc_snapshot" ||
       toolName === "atc_status" ||
-      toolName === "atc_guide"
+      toolName === "atc_guide" ||
+      EXEC_TOOL_NAMES.has(toolName)
     ) {
       const pendingHook = consumePendingMcpHookSession(stateDir, {
         ...callOptions,
@@ -243,7 +334,8 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
         (toolName === "atc_claim" ||
           toolName === "atc_free" ||
           toolName === "atc_renew" ||
-          toolName === "atc_snapshot")
+          toolName === "atc_snapshot" ||
+          EXEC_TOOL_NAMES.has(toolName))
       ) {
         const errRes = {
           exitCode: 1,
@@ -266,6 +358,10 @@ export function handleMcpRequest(stateDir, msg, sessionOptions = {}) {
     }
 
     let res;
+    if (EXEC_TOOL_NAMES.has(toolName)) {
+      // Async: returns a Promise resolved by startMcpServer.
+      return handleExecTool(stateDir, id, toolName, args, callOptions);
+    }
     if (toolName === "atc_claim") {
       res = cmdClaim(
         stateDir,
@@ -333,7 +429,7 @@ export function startMcpServer(stateDir, sessionOptions = {}) {
       input: process.stdin,
       terminal: false,
     });
-    rl.on("line", (line) => {
+    rl.on("line", async (line) => {
       if (!line.trim()) return;
       let msg;
       try {
@@ -343,7 +439,7 @@ export function startMcpServer(stateDir, sessionOptions = {}) {
         return;
       }
       try {
-        const reply = handleMcpRequest(stateDir, msg, sessionOptions);
+        const reply = await handleMcpRequest(stateDir, msg, sessionOptions);
         if (reply) {
           process.stdout.write(JSON.stringify(reply) + "\n");
         }
