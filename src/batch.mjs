@@ -262,13 +262,14 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
           if (owner) {
             owner.lastIdx = Math.max(owner.lastIdx, lastIdx);
             if (!owner.timer && owner.lastIdx > i && deps.cmdRenew) {
+              const ownerTtlMs = Math.max(15_000, Number(res.lease.expiresAtMs || owner.lease.expiresAtMs || 0) - Date.now());
               owner.timer = setInterval(() => {
                 try {
                   deps.cmdRenew(stateDir, owner.lease.leaseId, { session: sessionId }, { env, cwd });
                 } catch {
                   // best-effort heartbeat
                 }
-              }, 60_000);
+              }, Math.max(5_000, Math.floor(ownerTtlMs / 3)));
               if (typeof owner.timer.unref === "function") owner.timer.unref();
             }
             heldClaims.set(id, { lease: res.lease, created: false, timer: null, lastIdx, aliasOf: true });

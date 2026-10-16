@@ -565,3 +565,16 @@ test("ios ops refuse physical leases (simctl is simulator-only)", () => {
     (e) => e.code === "simulator_only",
   );
 });
+
+test("xcode test actions refuse a physical iOS lease unless targeting macOS", () => {
+  const physical = { cwd: "/", lease: { serial: "00008120-000464CE2E44C01E", kind: "physical" } };
+  for (const [op, params] of [
+    ["xcode.test", { scheme: "App" }],
+    ["xcode.testWithoutBuilding", { scheme: "App", testDestination: "simulator" }],
+    ["xcode.actions", { scheme: "App", actions: ["build", "test"] }],
+  ]) {
+    assert.throws(() => OPS[op].invocations(params, physical), (e) => e.code === "simulator_only", op);
+  }
+  assert.deepEqual(OPS["xcode.test"].invocations({ scheme: "App", testDestination: "macos" }, physical)[0].args.slice(-2), ["-destination", "platform=macOS"]);
+  assert.equal(OPS["xcode.build"].invocations({ scheme: "App" }, physical).length, 1, "pure builds don't touch the lease");
+});

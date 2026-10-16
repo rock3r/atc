@@ -138,6 +138,13 @@ const XCODE_DEVICE_ACTIONS = new Set(["test", "test-without-building"]);
 function xcodeDestinationArgs(params, ctx, actions) {
   if (!actions.some((a) => XCODE_DEVICE_ACTIONS.has(a))) return [];
   if (params.testDestination === "macos") return ["-destination", "platform=macOS"];
+  if (ctx.lease?.kind === "physical") {
+    throw new OpError(
+      "simulator_only",
+      "Xcode test actions target a simulator (testDestination: simulator); this session's iOS lease is a physical device.",
+      'Claim a simulator, or use testDestination: "macos" for macOS tests. Physical-device test runs are not in the catalog yet; request them at https://github.com/rock3r/atc/issues.',
+    );
+  }
   return ctx.lease?.serial ? ["-destination", `id=${ctx.lease.serial}`] : [];
 }
 
