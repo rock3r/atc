@@ -103,16 +103,20 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
     let placeholder = null;
     if (p.errors.length === 0 && p.op.kind !== "snapshot" && (p.op.kind !== "build" || p.buildReqs.requiresDevice)) {
       const claim = step.claim?.reuse !== undefined ? stepById.get(step.claim.reuse)?.claim : step.claim;
+      const opPlatform = p.op.platform || p.op.devicePlatform;
+      // No claim: the step uses the session's existing lease, so model that lease's kind.
+      const sessionLease = !claim && deps.sessionLease ? deps.sessionLease(opPlatform) : null;
+      const kind = claim ? (claim.kind === "physical" ? "physical" : "emulator") : sessionLease?.kind === "physical" ? "physical" : "emulator";
       placeholder = {
         serial: "<leased-device>",
         leaseId: "<lease>",
-        kind: claim?.kind === "physical" ? "physical" : "emulator",
-        platform: p.op.platform || p.op.devicePlatform,
+        kind,
+        platform: opPlatform,
       };
       try {
         p.makeInvocations(placeholder);
       } catch (err) {
-        if (err?.code === "physical_not_allowed") {
+        if (err?.code === "physical_not_allowed" || err?.code === "simulator_only") {
           planErrors.push({ path: `/steps/${idx}/claim`, code: err.code, message: err.message, ...(err.hint ? { hint: err.hint } : {}) });
         }
       }

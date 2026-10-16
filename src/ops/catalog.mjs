@@ -171,6 +171,13 @@ function simctl(ctx, verb, ...args) {
   if (!ctx.lease?.serial) {
     throw new OpError("claim_required", "This operation needs an active iOS simulator lease.", "Run `atc claim --ios` first.");
   }
+  if (ctx.lease.kind === "physical") {
+    throw new OpError(
+      "simulator_only",
+      "iOS device operations run through simctl and only support simulators; this session's iOS lease is a physical device.",
+      "Claim a simulator (atc claim --ios --kind emulator). Physical iOS device ops are not in the catalog yet; request them at https://github.com/rock3r/atc/issues.",
+    );
+  }
   return { cmd: "xcrun", args: ["simctl", verb, ctx.lease.serial, ...args] };
 }
 

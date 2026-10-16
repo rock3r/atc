@@ -6676,7 +6676,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
     try {
       invocations = plan.makeInvocations(check.lease || null);
     } catch (err) {
-      return { exitCode: err?.code === "physical_not_allowed" ? 3 : 1, error: err.message, errorCode: err?.code || null, steps };
+      return { exitCode: err?.code === "physical_not_allowed" || err?.code === "simulator_only" ? 3 : 1, error: err.message, errorCode: err?.code || null, steps };
     }
     let exitCode = 0;
     // A step-level timeout (options.timeoutMs) is one deadline across all invocations of the op.
@@ -7454,6 +7454,18 @@ export async function cmdBatch(stateDir, flags = {}, options = {}) {
         );
       } catch {
         return false;
+      }
+    },
+    sessionLease: (platform) => {
+      try {
+        const state = readState(stateDir);
+        return (
+          Object.values(state.leases || {}).find(
+            (l) => l && l.state === "active" && l.sessionId === sessionId && (!platform || (l.platform || "android") === platform),
+          ) || null
+        );
+      } catch {
+        return null;
       }
     },
   };

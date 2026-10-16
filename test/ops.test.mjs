@@ -558,3 +558,10 @@ test("validateBatchPlan: claim version selectors accept the atc claim grammar", 
   const bad = validateBatchPlan({ version: 1, steps: [{ id: "i", op: "android.install", apk: "a.apk", claim: { platform: "android", api: ">=35;rm" } }] });
   assert.equal(bad.errors[0].code, "pattern_mismatch");
 });
+
+test("ios ops refuse physical leases (simctl is simulator-only)", () => {
+  assert.throws(
+    () => OPS["ios.launch"].invocations({ bundleId: "com.ex.App" }, { cwd: "/", lease: { serial: "00008120-000464CE2E44C01E", kind: "physical" } }),
+    (e) => e.code === "simulator_only",
+  );
+});

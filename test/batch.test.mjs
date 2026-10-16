@@ -313,3 +313,30 @@ test("batch: a step's env is used for its claim too", async () => {
     s.cleanup();
   }
 });
+
+test("batch: planning models an existing physical session lease when the step has no claim", async () => {
+  const s = setup();
+  try {
+    const { runBatch } = await import("../src/batch.mjs");
+    const { execDeps } = await import("../src/cli.mjs");
+    const physical = { serial: "R5CX", kind: "physical", platform: "android", state: "active" };
+    const deps = {
+      ...execDeps(s.stateDir, {}),
+      cmdClaim: () => ({ exitCode: 1 }),
+      cmdFree: () => ({ exitCode: 0 }),
+      sessionHasLease: () => true,
+      sessionLease: () => physical,
+      resolveSessionId: () => "s",
+    };
+    const res = await runBatch(
+      s.stateDir,
+      { version: 1, steps: [{ id: "p", op: "android.prop.set", key: "debug.x", value: "1" }] },
+      deps,
+      { env: s.env, cwd: s.proj, json: true, validateOnly: true },
+    );
+    assert.equal(res.exitCode, 7, JSON.stringify(res));
+    assert.equal(res.errors[0].code, "physical_not_allowed");
+  } finally {
+    s.cleanup();
+  }
+});
