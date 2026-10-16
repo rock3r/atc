@@ -528,3 +528,7 @@ test("validateBatchPlan: wrong param types are reported, never thrown", () => {
   assert.ok(codes.includes("/steps/1/actions:type"), codes.join(", "));
   assert.ok(!codes.some((c) => c.includes("claim_unused")), "no spurious claim errors on invalid params");
 });
+
+test("bazel.clean accepts the shared build params", () => {
+  assert.deepEqual(validateOpParams("bazel.clean", { expunge: true, ramMb: 4096, buildOnly: true, brief: true, workspace: "." }).errors, []);
+});

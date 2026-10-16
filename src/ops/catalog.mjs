@@ -295,7 +295,7 @@ export const OPS = Object.freeze({
     name: "bazel.clean",
     system: "bazel",
     kind: "build",
-    params: { expunge: { type: "boolean" }, workspace: BUILD_COMMON.workspace, brief: BUILD_COMMON.brief },
+    params: { expunge: { type: "boolean" }, ...BUILD_COMMON },
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
       return [{ cmd, args: ["clean", ...(params.expunge ? ["--expunge"] : [])], cwd: wsRoot }];

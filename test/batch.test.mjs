@@ -177,3 +177,42 @@ test("batch: unknown step fields such as phase or command are rejected", async (
     s.cleanup();
   }
 });
+
+test("batch: bazel.run keeps its required timeoutSec", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), "exit 0");
+    const res = await s.run({ version: 1, steps: [{ id: "gen", op: "bazel.run", target: "//tools:gen", timeoutSec: 30 }] }, { validate: true });
+    assert.equal(res.exitCode, 0, res.error);
+    assert.equal(res.steps[0].invocations[0].timeoutSec, 30);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("batch: a claim is released once its last consumer is skipped", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const leaseCountDuringStep = path.join(s.root, "leases.txt");
+    const stateFile = path.join(s.stateDir, "state.json");
+    script(
+      path.join(s.proj, "gradlew"),
+      `[ "$1" = "fail" ] && exit 5; if grep -q '"avd:Pixel_8_API_35"' ${stateFile}; then echo held > ${leaseCountDuringStep}; else echo free > ${leaseCountDuringStep}; fi; exit 0`,
+    );
+    const res = await s.run({
+      version: 1,
+      steps: [
+        { id: "install", op: "android.install", apk: "a.apk", claim: { platform: "android" } },
+        { id: "flaky", op: "gradle.tasks", tasks: ["fail"], continueOnError: true },
+        { id: "launch", op: "android.launch", package: "com.ex.app", activity: ".Main", dependsOn: ["install", "flaky"], claim: { reuse: "install" } },
+        { id: "later", op: "gradle.tasks", tasks: ["lint"], dependsOn: ["launch"], continueOnError: true },
+        { id: "unrelated", op: "gradle.tasks", tasks: ["check"] },
+      ],
+    });
+    assert.deepEqual(res.steps.map((x) => x.status), ["ok", "failed", "skipped", "skipped", "ok"]);
+    assert.equal(fs.readFileSync(leaseCountDuringStep, "utf8").trim(), "free", "claim released before the unrelated step");
+  } finally {
+    s.cleanup();
+  }
+});

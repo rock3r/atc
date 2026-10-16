@@ -481,7 +481,8 @@ export function validateBatchPlan(plan, ctx = {}) {
     }
     const opParams = {};
     for (const [k, v] of Object.entries(step)) {
-      if (!STEP_COMMON_FIELDS.has(k)) opParams[k] = v;
+      // timeoutSec is both a step field and a bazel.run param: pass it through where declared.
+      if (!STEP_COMMON_FIELDS.has(k) || (k === "timeoutSec" && op.params.timeoutSec)) opParams[k] = v;
     }
     const res = validateOpParams(step.op, opParams, { force: forceOn, basePath: p });
     errors.push(...res.errors);

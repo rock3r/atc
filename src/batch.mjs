@@ -3,13 +3,18 @@
 import fs from "node:fs";
 import path from "node:path";
 import { EXIT_INVALID, execOp, planOp, renderNotice } from "./exec.mjs";
+import { OPS } from "./ops/catalog.mjs";
 import { formatErrors, validateBatchPlan } from "./validate.mjs";
 
 const STEP_COMMON_FIELDS = new Set(["id", "op", "dependsOn", "cwd", "env", "claim", "timeoutSec", "continueOnError", "force"]);
 
 function stepParams(step) {
+  const declared = OPS[step.op]?.params || {};
   const out = {};
-  for (const [k, v] of Object.entries(step)) if (!STEP_COMMON_FIELDS.has(k)) out[k] = v;
+  for (const [k, v] of Object.entries(step)) {
+    // timeoutSec is both a step field and a bazel.run param: pass it through where declared.
+    if (!STEP_COMMON_FIELDS.has(k) || (k === "timeoutSec" && declared.timeoutSec)) out[k] = v;
+  }
   return out;
 }
 
@@ -174,6 +179,12 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
 
   let batchExit = 0;
   let stopped = false;
+  // Release claims whose last consumer has run or been skipped (or whose producer failed).
+  const sweepClaims = (i, id, status) => {
+    for (const [pid, h] of [...heldClaims]) {
+      if (h.lastIdx <= i || (pid === id && status !== "ok")) releaseClaim(pid);
+    }
+  };
   try {
     for (let i = 0; i < order.length; i++) {
       const id = order[i];
@@ -184,10 +195,12 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
       const failedDep = deps_.find((d) => results.get(d)?.status !== "ok");
       if (failedDep) {
         results.set(id, { id, op: step.op, status: "skipped", reason: "dependency_failed", dependency: failedDep });
+        sweepClaims(i, id, "skipped");
         continue;
       }
       if (stopped) {
         results.set(id, { id, op: step.op, status: "skipped", reason: "batch_stopped" });
+        sweepClaims(i, id, "skipped");
         continue;
       }
       const flags = { session: sessionId, ...(json ? { json: true } : {}) };
@@ -248,10 +261,7 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
         };
       }
       results.set(id, r);
-      // Release claims whose last consumer has run (or whose producer failed).
-      for (const [pid, h] of [...heldClaims]) {
-        if (h.lastIdx <= i || (pid === id && r.status !== "ok")) releaseClaim(pid);
-      }
+      sweepClaims(i, id, r.status);
       if (r.status !== "ok") {
         if (!step.continueOnError) {
           if (batchExit === 0) batchExit = r.exitCode || 1;
