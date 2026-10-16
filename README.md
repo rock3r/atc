@@ -134,7 +134,7 @@ flowchart LR
     style S3 fill:#fff4e5,stroke:#e08a00
 ```
 
-If a step fails, the steps that depend on it are skipped, the batch stops, and any claim it made is released. Nothing in the plan runs at all if the plan is invalid.
+If a step fails, the steps that depend on it are skipped and any claim it made is released. The batch stops there unless that step set `continueOnError: true`, in which case independent steps keep running. Nothing in the plan runs at all if the plan is invalid.
 
 ## Commands
 
