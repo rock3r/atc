@@ -107,6 +107,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | Prop key / value | `^[A-Za-z0-9_.-]{1,128}$` / transport-safe charset, ≤ 256 chars |
 | Snapshot name / step id | `^[A-Za-z0-9_.-]{1,64}$` |
 | Env var name / value (batch) | `^[A-Za-z_][A-Za-z0-9_]{0,127}$` / transport-safe charset |
+| Claim `api` / `os` (batch) | same grammar as `atc claim`: `^(>=\|<=\|>\|<\|=)?[A-Za-z0-9._-]+(\.\.[A-Za-z0-9._-]+)?$` (e.g. `36`, `>=35`, `34..36`, `18.2`) |
 | Paths (`apk`, `app`, `cwd`, `workspace`, `output`, `derivedDataPath`, `workspaceFile`, `project`) | no NUL/newline, no leading `-`. **Syntax is checked at validation time; existence is checked at execution time** (inputs may be produced by ancestor steps). A batch step's `cwd` must exist at validation; a build's wrapper/workspace marker must be found before anything runs. |
 
 **Windows execution contract:**

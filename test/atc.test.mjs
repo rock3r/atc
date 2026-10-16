@@ -82,6 +82,15 @@ import {
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
 
+// Keep the suite hermetic: an agent host (e.g. the atc pre-tool hook rewriting the command to
+// `export ATC_SESSION_ID=… ATC_ANCHOR_PID=…; npm run check`) can leak ATC_* identity/coordination
+// variables into this process. cmdClaim/cmdFree/etc. read process.env by default, so a leaked
+// ATC_ANCHOR_PID would be stamped on every lease as anchorPid and then GC'd as dead_anchor by tests
+// that pass a restrictive livenessCheck.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("ATC_")) delete process.env[key];
+}
+
 function makeTempStateDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "atc-test-"));
 }

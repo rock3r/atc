@@ -90,6 +90,12 @@ export const PATTERNS = Object.freeze({
     label: "a transport-safe value ([A-Za-z0-9_.:/@+=,-], max 256 chars)",
     forceable: false,
   },
+  // Claim version selectors, same grammar as `atc claim --api/--os`: 36, >=35, 34..36, 18.2, android-35.
+  versionSpec: {
+    re: /^(>=|<=|>|<|=)?[A-Za-z0-9._-]{1,32}(\.\.[A-Za-z0-9._-]{1,32})?$/,
+    label: "a version spec (e.g. 36, >=35, 34..36, 18.2)",
+    forceable: false,
+  },
   // Arguments forwarded to the program being run (after `--` for bazel run, after the bundle id
   // for simctl launch). They cannot reach the tool's own option parser, so a leading "-" is fine.
   passthroughArg: {

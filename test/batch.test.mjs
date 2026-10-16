@@ -250,3 +250,18 @@ test("batch: claim reuse on a device-free step is rejected", async () => {
     s.cleanup();
   }
 });
+
+test("cli: `atc batch -` and `--file -` read the plan from stdin", async () => {
+  const { parseCliArgs } = await import("../src/cli.mjs");
+  assert.deepEqual(parseCliArgs(["batch", "-"]).positionals, ["-"]);
+  assert.equal(parseCliArgs(["batch", "--file", "-"]).flags.file, "-");
+  const s = setup();
+  try {
+    const plan = JSON.stringify({ version: 1, steps: [{ id: "a", op: "gradle.tasks", tasks: ["lint"] }] });
+    fs.writeFileSync(path.join(s.proj, "gradlew"), "#!/bin/sh\nexit 0\n");
+    const res = await cmdBatch(s.stateDir, { session: "stdin", json: true, validate: true, file: "-" }, { env: s.env, cwd: s.proj, readStdin: () => plan });
+    assert.equal(res.exitCode, 0, res.error);
+  } finally {
+    s.cleanup();
+  }
+});

@@ -532,3 +532,14 @@ test("validateBatchPlan: wrong param types are reported, never thrown", () => {
 test("bazel.clean accepts the shared build params", () => {
   assert.deepEqual(validateOpParams("bazel.clean", { expunge: true, ramMb: 4096, buildOnly: true, brief: true, workspace: "." }).errors, []);
 });
+
+test("validateBatchPlan: claim version selectors accept the atc claim grammar", () => {
+  for (const api of ["36", ">=35", "34..36", "android-35"]) {
+    const r = validateBatchPlan({ version: 1, steps: [{ id: "i", op: "android.install", apk: "a.apk", claim: { platform: "android", api } }] });
+    assert.deepEqual(r.errors, [], api);
+  }
+  const ios = validateBatchPlan({ version: 1, steps: [{ id: "i", op: "ios.install", app: "A.app", claim: { platform: "ios", os: ">=18.0" } }] });
+  assert.deepEqual(ios.errors, []);
+  const bad = validateBatchPlan({ version: 1, steps: [{ id: "i", op: "android.install", apk: "a.apk", claim: { platform: "android", api: ">=35;rm" } }] });
+  assert.equal(bad.errors[0].code, "pattern_mismatch");
+});

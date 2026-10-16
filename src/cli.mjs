@@ -383,7 +383,7 @@ export function parseCliArgs(argv) {
 
   for (let i = 0; i < mainArgs.length; i++) {
     const tok = mainArgs[i];
-    if (!tok.startsWith("-")) {
+    if (!tok.startsWith("-") || tok === "-") {
       positionals.push(tok);
       continue;
     }
@@ -456,7 +456,7 @@ export function parseCliArgs(argv) {
     const key = tok
       .replace(/^-+/, "")
       .replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-    if (i + 1 < mainArgs.length && !mainArgs[i + 1].startsWith("-")) {
+    if (i + 1 < mainArgs.length && (!mainArgs[i + 1].startsWith("-") || mainArgs[i + 1] === "-")) {
       flags[key] = mainArgs[++i];
     } else {
       flags[key] = true;
