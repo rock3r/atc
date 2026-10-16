@@ -188,6 +188,7 @@ const BOOLEAN_FLAG_KEYS = new Set([
   "claim",
   "validate",
   "dryRun",
+  "forced",
 ]);
 
 const COMMON_ALLOWED_FLAGS = new Set([
@@ -303,6 +304,7 @@ const STATUS_ALLOWED_FLAGS = new Set([
   "services",
   "play",
   "abi",
+  "forced",
 ]);
 
 const GUARD_ALLOWED_FLAGS = new Set([...COMMON_ALLOWED_FLAGS, "format"]);
@@ -435,6 +437,7 @@ export function parseCliArgs(argv) {
         "--json",
         "--validate",
         "--dry-run",
+        "--forced",
         "--help",
         "-h",
       ].includes(tok)
@@ -6896,6 +6899,13 @@ export function execDeps(stateDir, options = {}) {
       }
     },
     recordForcedRun: (entry) => recordForcedRun(stateDir, entry, options),
+    recentForcedRuns: () => {
+      try {
+        return readState(stateDir).forcedRuns || [];
+      } catch {
+        return [];
+      }
+    },
   };
 }
 
@@ -7035,6 +7045,7 @@ export function cmdStatus(stateDir, flags = {}, options = {}) {
           queue: state.queue,
           buildLeases: state.buildLeases,
           buildQueue: state.buildQueue,
+          forcedRuns: state.forcedRuns || [],
           logPath: resolveAuditLogPath(stateDir, options.env || process.env),
           config: state.config,
         },
@@ -7817,6 +7828,23 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
       if (res.exitCode !== 0) {
         process.stderr.write(`[atc] ${res.error}\n`);
         return res.exitCode;
+      }
+      if (parsed.flags.forced) {
+        const runs = res.forcedRuns || [];
+        if (parsed.flags.json) {
+          process.stdout.write(JSON.stringify({ forcedRuns: runs }, null, 2) + "\n");
+        } else if (runs.length === 0) {
+          process.stdout.write("No forced runs recorded.\n");
+        } else {
+          for (const r of runs) {
+            process.stdout.write(
+              `${new Date(r.atMs).toISOString()}  ${r.runId}  ${r.op}  session=${r.sessionId || "?"}  cwd=${r.cwd}\n` +
+                `    reason: ${r.reason}\n` +
+                `    overridden: ${(r.overridden || []).map((o) => `${o.path}=${JSON.stringify(o.value)}`).join(", ") || "none"}\n`,
+            );
+          }
+        }
+        return 0;
       }
       if (parsed.flags.json) {
         process.stdout.write(JSON.stringify(res, null, 2) + "\n");

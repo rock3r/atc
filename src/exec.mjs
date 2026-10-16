@@ -316,6 +316,22 @@ export async function execOp(stateDir, request, deps, options = {}) {
   if (brief) {
     out.summary = summarizeBriefOutput(briefLines, res.exitCode);
   }
+  if (res.exitCode !== 0 && deps.recentForcedRuns) {
+    const since = Date.now() - 24 * 3600 * 1000;
+    const related = deps
+      .recentForcedRuns()
+      .filter((r) => r && r.atMs >= since && r.runId !== forcedRunId && (r.cwd === cwd || String(cwd).startsWith(`${r.cwd}${path.sep}`) || String(r.cwd).startsWith(`${cwd}${path.sep}`)));
+    if (related.length > 0) {
+      out.attribution = related.map((r) => ({ runId: r.runId, op: r.op, reason: r.reason, sessionId: r.sessionId, atMs: r.atMs }));
+      if (!json) {
+        for (const r of related) {
+          process.stderr.write(
+            `[atc] note: forced run ${r.runId} (${r.op}, session ${r.sessionId || "?"}, "${r.reason}") touched this workspace ${Math.round((Date.now() - r.atMs) / 60000)} min ago and may be related.\n`,
+          );
+        }
+      }
+    }
+  }
   return out;
 }
 
