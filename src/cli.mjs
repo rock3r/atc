@@ -5211,7 +5211,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
 
   const requiredDevicePlatform =
     (buildReqs.requiresDevice && buildReqs.targetPlatform) ||
-    (cmdDeviceClass.kind === "device_action" && cmdDeviceClass.targetPlatform) ||
+    ((cmdDeviceClass.kind === "device_action" || cmdDeviceClass.kind === "read_only_device") && cmdDeviceClass.targetPlatform) ||
     null;
   if (requiredDevicePlatform === "ios" || requiredDevicePlatform === "android") {
     if (platFilter && platFilter !== requiredDevicePlatform) {
@@ -5253,7 +5253,9 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
         k !== "workspace" &&
         k !== "phase" &&
         k !== "ramMb" &&
-        k !== "ram-mb",
+        k !== "ram-mb" &&
+        k !== "force" &&
+        k !== "reason",
     ),
   );
   if (!claimFlags.platform && !claimFlags.ios && !claimFlags.android && requiredDevicePlatform) {
@@ -5389,7 +5391,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
       coldBoot: parseBoolFlag(claimFlags.cold),
       resetApp: claimFlags.resetApp || null,
       headless: parseBoolFlag(claimFlags.headless),
-      force: parseBoolFlag(claimFlags.force),
+      force: false,
       reason: claimFlags.reason || null,
     };
   }
@@ -6111,7 +6113,8 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
           const estimateMb = effectiveWarmDaemon
             ? Math.max(0, explicitRamMb || 0)
             : partialWarmColdMb;
-          if (canAdmit && buildReqs.requiresHeavySlot && !parseBoolFlag(flags.force)) {
+          // Validation --force never bypasses RAM admission (docs/scope.md §5).
+          if (canAdmit && buildReqs.requiresHeavySlot) {
             ramCheck = checkUnifiedRamAdmission(state, host, estimateMb, now, {
               hysteresisMb: wasAlreadyQueued ? 0 : undefined,
             });

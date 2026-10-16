@@ -497,3 +497,20 @@ test("documented CLI translations (docs/migration-3.0.md, guides) parse and vali
     assert.deepEqual(validateOpParams(r.opName, r.params).errors, [], argv.join(" "));
   }
 });
+
+// ---------------------------------------------------------------- review fixes
+
+test("parseOpArgv: --no-<flag> negates exec-level boolean selectors", () => {
+  const r = parseOpArgv(["gradle", "tasks", "connectedCheck", "--claim", "--no-play"]);
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.execFlags, { claim: true, play: false });
+});
+
+test("xcode ops run from and resolve paths against the workspace param", () => {
+  const ctx = { cwd: "/repo", lease: null };
+  const [inv] = OPS["xcode.build"].invocations({ scheme: "App", workspace: "ios", project: "App.xcodeproj", derivedDataPath: "dd" }, ctx);
+  assert.equal(inv.cwd, "/repo/ios");
+  assert.deepEqual(inv.args, ["-project", "/repo/ios/App.xcodeproj", "-scheme", "App", "-derivedDataPath", "/repo/ios/dd", "build"]);
+  const [plain] = OPS["xcode.actions"].invocations({ scheme: "App", actions: ["clean", "build"] }, ctx);
+  assert.equal(plain.cwd, "/repo");
+});

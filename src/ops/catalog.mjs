@@ -108,15 +108,16 @@ function bazelCommonArgs(params) {
 }
 
 function xcodeBaseArgs(params, ctx) {
+  const base = buildBaseDir(params, ctx);
   const args = [];
-  if (params.workspaceFile) args.push("-workspace", path.resolve(ctx.cwd, params.workspaceFile));
-  if (params.project) args.push("-project", path.resolve(ctx.cwd, params.project));
+  if (params.workspaceFile) args.push("-workspace", path.resolve(base, params.workspaceFile));
+  if (params.project) args.push("-project", path.resolve(base, params.project));
   args.push("-scheme", params.scheme);
   if (params.configuration) args.push("-configuration", params.configuration);
   if (params.testPlan) args.push("-testPlan", params.testPlan);
   for (const t of params.onlyTesting || []) args.push(`-only-testing:${t}`);
   for (const t of params.skipTesting || []) args.push(`-skip-testing:${t}`);
-  if (params.derivedDataPath) args.push("-derivedDataPath", path.resolve(ctx.cwd, params.derivedDataPath));
+  if (params.derivedDataPath) args.push("-derivedDataPath", path.resolve(base, params.derivedDataPath));
   return args;
 }
 
@@ -138,7 +139,7 @@ function xcodeOp(name, actions) {
     devicePlatform: "ios",
     deviceCoupled: (p) => p.testDestination !== "macos" && actions.some((a) => XCODE_DEVICE_ACTIONS.has(a)),
     invocations(params, ctx) {
-      return [{ cmd: "xcodebuild", args: [...xcodeBaseArgs(params, ctx), ...actions, ...xcodeDestinationArgs(params, ctx, actions)] }];
+      return [{ cmd: "xcodebuild", args: [...xcodeBaseArgs(params, ctx), ...actions, ...xcodeDestinationArgs(params, ctx, actions)], cwd: buildBaseDir(params, ctx) }];
     },
   };
 }
@@ -315,7 +316,7 @@ export const OPS = Object.freeze({
     },
     deviceCoupled: (p) => p.testDestination !== "macos" && (p.actions || []).some((a) => XCODE_DEVICE_ACTIONS.has(a)),
     invocations(params, ctx) {
-      return [{ cmd: "xcodebuild", args: [...xcodeBaseArgs(params, ctx), ...params.actions, ...xcodeDestinationArgs(params, ctx, params.actions)] }];
+      return [{ cmd: "xcodebuild", args: [...xcodeBaseArgs(params, ctx), ...params.actions, ...xcodeDestinationArgs(params, ctx, params.actions)], cwd: buildBaseDir(params, ctx) }];
     },
   },
 

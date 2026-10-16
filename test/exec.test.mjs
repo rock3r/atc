@@ -281,3 +281,39 @@ test("exec: two in-process builds on one workspace serialize without blocking th
     s.cleanup();
   }
 });
+
+test("planOp: read-only device ops carry their platform for lease selection", () => {
+  const A = ["andr", "oid"].join("");
+  const p = planOp(`${A}.logcat`, { lines: 10 }, { cwd: "/" });
+  assert.deepEqual(p.deviceClass, { kind: "read_only_device", targetPlatform: A });
+});
+
+test("exec: read-only op never runs against an opposite-platform lease", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const log = path.join(s.root, "adb.log");
+    script(path.join(s.bin, "adb"), `echo "$*" >> ${log}`);
+    const iosInventory = {
+      ...mockInventory,
+      running: [
+        {
+          deviceKey: "sim:AAAA",
+          platform: "ios",
+          avd: "iPhone 16",
+          serial: "11111111-2222-3333-4444-555555555555",
+          udid: "11111111-2222-3333-4444-555555555555",
+          kind: "emulator",
+          online: true,
+          profile: { deviceType: "phone", osVersion: "18.2", runtime: "iOS 18.2" },
+        },
+      ],
+    };
+    const claim = cmdClaim(s.stateDir, { session: "sess-x", ios: true }, { inventory: iosInventory, env: s.env, platform: "darwin" });
+    assert.equal(claim.exitCode, 0, claim.error);
+    const res = await cmdExec(s.stateDir, ["android", "logcat", "--session", "sess-x", "--wait", "0", "--json"], { env: s.env, cwd: s.proj, inventory: iosInventory });
+    assert.notEqual(res.exitCode, 0);
+    assert.ok(!fs.existsSync(log), "adb must not be invoked with an iOS UDID");
+  } finally {
+    s.cleanup();
+  }
+});

@@ -318,9 +318,12 @@ export function parseOpArgv(tokens) {
     let name = camelCase(rawName);
     let inlineVal = eq === -1 ? undefined : tok.slice(eq + 1);
     let negated = false;
-    if (name.startsWith("no") && /^no[A-Z]/.test(name) && (op.params[name[2].toLowerCase() + name.slice(3)]?.type === "boolean")) {
-      negated = true;
-      name = name[2].toLowerCase() + name.slice(3);
+    if (name.startsWith("no") && /^no[A-Z]/.test(name)) {
+      const positive = name[2].toLowerCase() + name.slice(3);
+      if (op.params[positive]?.type === "boolean" || (!op.params[positive] && EXEC_LEVEL_FLAGS[positive] === "boolean")) {
+        negated = true;
+        name = positive;
+      }
     }
     if (name === "ramMb" && !op.params.ramMb) {
       errors.push(err(`/${name}`, "unknown_flag", `--ram-mb does not apply to ${opName}.`));
@@ -357,7 +360,7 @@ export function parseOpArgv(tokens) {
     }
     const execType = EXEC_LEVEL_FLAGS[name];
     if (execType) {
-      if (execType === "boolean") execFlags[name] = inlineVal === undefined ? true : !/^(false|0|no|off)$/i.test(inlineVal);
+      if (execType === "boolean") execFlags[name] = negated ? false : inlineVal === undefined ? true : !/^(false|0|no|off)$/i.test(inlineVal);
       else {
         const v = takeValue();
         if (v !== null) execFlags[name] = v;
