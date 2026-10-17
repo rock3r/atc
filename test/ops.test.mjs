@@ -586,3 +586,51 @@ test("validateBatchPlan: several session leases on the platform require an expli
   assert.deepEqual(validateBatchPlan(plan, { sessionLeaseCount: () => 1 }).errors, []);
   assert.equal(validateBatchPlan(plan, { sessionLeaseCount: () => 0 }).errors[0].code, "claim_required");
 });
+
+test("executable: gradle and bazel ops accept custom executable and record custom_executable override", () => {
+  const root = tmpDir();
+  touch(path.join(root, "MODULE.bazel"), 0o644);
+  touch(path.join(root, "settings.gradle.kts"), 0o644);
+  const bazelCmd = touch(path.join(root, "bazel.cmd"));
+  const customGradle = touch(path.join(root, "tools", "my-gradlew"));
+  const sub = path.join(root, "platform", "jewel");
+  fs.mkdirSync(sub, { recursive: true });
+
+  // From a subdirectory, ./bazel.cmd and bazel.cmd resolve against the Bazel workspace root
+  for (const execVal of ["./bazel.cmd", "bazel.cmd"]) {
+    const [inv] = OPS["bazel.build"].invocations({ targets: ["//platform/jewel/..."], executable: execVal }, { cwd: sub, platform: "darwin" });
+    assert.equal(inv.cmd, bazelCmd);
+    assert.equal(inv.cwd, root);
+  }
+
+  // External / nested custom Gradle executable still runs in the Gradle project root
+  const [gInv] = OPS["gradle.tasks"].invocations({ tasks: ["assemble"], executable: "../tools/my-gradlew" }, { cwd: path.join(root, "platform"), platform: "darwin" });
+  assert.equal(gInv.cmd, customGradle);
+  assert.equal(gInv.cwd, root);
+
+  // Validation records custom_executable in overridden without needing force: true
+  for (const [opName, params] of [
+    ["gradle.tasks", { tasks: ["assemble"], executable: "./gradlew-custom" }],
+    ["bazel.build", { targets: ["//..."], executable: "./bazel.cmd" }],
+    ["bazel.test", { targets: ["//..."], executable: "bazel.cmd" }],
+    ["bazel.coverage", { targets: ["//..."], executable: "bazel.cmd" }],
+    ["bazel.run", { target: "//a:b", timeoutSec: 30, executable: "bazel.cmd" }],
+    ["bazel.series", { series: [{ command: "build", targets: ["//..."] }], executable: "bazel.cmd" }],
+    ["bazel.clean", { expunge: true, executable: "bazel.cmd" }],
+  ]) {
+    const v = validateOpParams(opName, params);
+    assert.deepEqual(v.errors, [], opName);
+    assert.deepEqual(v.overridden, [{ path: "/executable", check: "custom_executable", value: params.executable }], opName);
+  }
+
+  // Missing custom executable fails clearly
+  assert.throws(
+    () => OPS["gradle.tasks"].invocations({ tasks: ["build"], executable: "./no-such-gradlew" }, { cwd: root, platform: "darwin" }),
+    (e) => e instanceof OpError && e.code === "executable_not_found",
+  );
+  assert.throws(
+    () => OPS["bazel.build"].invocations({ targets: ["//..."], executable: "./no-such-bazel" }, { cwd: root, platform: "darwin" }),
+    (e) => e instanceof OpError && e.code === "executable_not_found",
+  );
+});
+

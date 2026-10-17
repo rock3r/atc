@@ -29,16 +29,16 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 
 | Op | Params / flags |
 |---|---|
-| `gradle.tasks` | `tasks[]` (any task name/path), run as **one** wrapper invocation · `offline`, `info`, `stacktrace`, `rerunTasks`, `continueAfterFailure`, `properties{}` (`-P`) |
-| `bazel.build` / `bazel.test` / `bazel.coverage` | `targets[]` · `configs[]`, `testFilter` (test/coverage), `keepGoing` |
-| `bazel.run` | `target`, `runArgs[]` (after `--`) · `timeoutSec` **required** |
-| `bazel.series` | ordered `series: [{command, targets[], configs[]?, expunge?}]` with `command ∈ {build, test, coverage, clean}` (closed enum; `run` is not allowed in a series). Run exactly as given: one invocation per entry, in order, stopping at the first failure. Batch/MCP only. |
-| `bazel.clean` | `expunge` (bool) |
+| `gradle.tasks` | `tasks[]` (any task name/path), run as **one** wrapper invocation · `offline`, `info`, `stacktrace`, `rerunTasks`, `continueAfterFailure`, `properties{}` (`-P`), `executable` |
+| `bazel.build` / `bazel.test` / `bazel.coverage` | `targets[]` · `configs[]`, `testFilter` (test/coverage), `keepGoing`, `executable` |
+| `bazel.run` | `target`, `runArgs[]` (after `--`) · `timeoutSec` **required**, `executable` |
+| `bazel.series` | ordered `series: [{command, targets[], configs[]?, expunge?}]` with `command ∈ {build, test, coverage, clean}` (closed enum; `run` is not allowed in a series) · `executable`. Run exactly as given: one invocation per entry, in order, stopping at the first failure. Batch/MCP only. |
+| `bazel.clean` | `expunge` (bool), `executable` |
 | `xcode.build` / `xcode.test` / `xcode.buildForTesting` / `xcode.testWithoutBuilding` / `xcode.archive` / `xcode.clean` | `scheme`, `workspaceFile` or `project` · `configuration`, `testPlan`, `onlyTesting[]`, `skipTesting[]`, `derivedDataPath`, `testDestination ∈ {simulator, macos}` |
 | `xcode.actions` | the same params + ordered `actions[]` with each action `∈ {build, test, build-for-testing, test-without-building, archive, clean}`, as one `xcodebuild` call |
 
 **ATC derives:**
-- the executable: the project's Gradle wrapper (`gradlew` / `gradlew.bat`, found by walking up from `workspace`/cwd; a system-wide `gradle` is not supported), Bazel as `./bazelw` at the workspace root, else `bazelisk`, else `bazel`; `xcodebuild`;
+- the executable: by default, the project's Gradle wrapper (`gradlew` / `gradlew.bat`, found by walking up from `workspace`/cwd) and Bazel as `./bazelw` at the workspace root, else `bazelisk`, else `bazel`; `xcodebuild`. Gradle and Bazel ops also accept an explicit `executable` (e.g. `./bazel.cmd` in `intellij-community` or a custom Gradle wrapper), which acts as a force-like override in and by itself (echoed in `overridden`, logged to `state.forcedRuns`, and attributed on later workspace failures);
 - device vs pure build (Gradle device task names such as `connected*`, `install*`, `uninstall*`; Xcode `test`/`test-without-building` unless `testDestination: "macos"`);
 - worker/job/RAM limits (`-Dorg.gradle.workers.max`, `--jobs` + `--local_ram_resources`, `-jobs`), the workspace resource key, the Bazel output base, and the device destination/serial from the claim.
 
@@ -155,11 +155,13 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 - **Output:** every error as `{path, code, message, hint}`; exit `7`, and nothing runs.
 - **`--validate`:** prints the order, the exact argv per step (the leased device serial is shown as a placeholder), notices and overridden checks, and runs nothing.
 
-## 5. `--force`: the agent takes responsibility
-**Overrides only:** value-**pattern** rejections for build-host values (Gradle tasks and properties keys, Bazel targets and configs, Xcode names and test identifiers).
+## 5. `--force` and `executable`: the agent takes responsibility
+**`--force` overrides only:** value-**pattern** rejections for build-host values (Gradle tasks and properties keys, Bazel targets and configs, Xcode names and test identifiers).
+
+**`executable` (Gradle and Bazel ops):** specifying a custom wrapper/executable (`--executable <path>` / `"executable": "<path>"`, such as `./bazel.cmd`) is a force-like override in and by itself. It does not require `--force`, and carries the same "you take responsibility" notice, audit entry, and failure attribution.
 
 **Never overrides:**
-- shell, arbitrary executables, unknown ops or params;
+- shell, unknown ops or params;
 - extra arguments (**there is no `extraArgs`**), or any value starting with `-`;
 - the device-side transport charset and the Windows batch-transport charset;
 - device selectors or claims, locks, slots, and RAM admission;

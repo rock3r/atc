@@ -217,6 +217,45 @@ export function validateBatchArgs(args, strictInternal = false) {
   }
 }
 
+function needsPosixShInterpreter(executablePath, cwd = process.cwd()) {
+  const candidate = executablePath.includes("/") ? path.resolve(cwd, executablePath) : null;
+  if (!candidate) return null;
+  let fd;
+  try {
+    const st = fs.statSync(candidate);
+    if (!st.isFile() || st.size < 2) return null;
+    fs.accessSync(candidate, fs.constants.X_OK);
+    fd = fs.openSync(candidate, "r");
+    const buf = Buffer.alloc(4);
+    const bytesRead = fs.readSync(fd, buf, 0, 4, 0);
+    if (bytesRead < 2) return null;
+    if (buf[0] === 0x23 && buf[1] === 0x21) return null; // "#!"
+    if (buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) return null; // ELF
+    const magicBE = bytesRead === 4 ? buf.readUInt32BE(0) : 0;
+    if (
+      magicBE === 0xfeedface ||
+      magicBE === 0xcefaedfe ||
+      magicBE === 0xfeedfacf ||
+      magicBE === 0xcffaedfe ||
+      magicBE === 0xcafebabe ||
+      magicBE === 0xbebafeca
+    ) {
+      return null; // Mach-O / Universal binary
+    }
+    return candidate;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
 export function buildSpawnConfig(command, args = [], options = {}) {
   const env = options.env || process.env;
   const cwd = options.cwd || process.cwd();
@@ -244,6 +283,21 @@ export function buildSpawnConfig(command, args = [], options = {}) {
         windowsVerbatimArguments: true,
       },
     };
+  }
+
+  if (platform !== "win32") {
+    const shScript = needsPosixShInterpreter(resolved.executable, cwd);
+    if (shScript) {
+      return {
+        command: "/bin/sh",
+        args: [shScript, ...args.map(String)],
+        options: {
+          ...options,
+          env: effectiveEnv,
+          shell: false,
+        },
+      };
+    }
   }
 
   return {

@@ -192,6 +192,17 @@ export function validateOpParams(opName, params, { force = false, basePath = "" 
   }
   const ctx = { force, overridden };
   const errors = validateObject(op.params, params || {}, basePath, ctx);
+  if (
+    params?.executable !== undefined &&
+    params?.executable !== null &&
+    !errors.some((e) => e.path === `${basePath}/executable`)
+  ) {
+    overridden.push({
+      path: `${basePath}/executable`,
+      check: "custom_executable",
+      value: String(params.executable),
+    });
+  }
   if (errors.length === 0 && typeof op.check === "function") {
     errors.push(...op.check(params).map((e) => ({ ...e, path: `${basePath}${e.path}` })));
   }

@@ -16,13 +16,21 @@ const BRIEF_TAIL_LINES = 40;
 const BRIEF_MAX_LINES = 80;
 const BRIEF_SIGNAL_RE = /(error|failed|failure|what went wrong|exception|\bfatal\b|✗|cannot|could not|unresolved)/i;
 
-// Pure-Node PATH lookup (no subprocess).
-export function whichSync(name, env = process.env, platform = process.platform) {
+// Pure-Node PATH lookup (no subprocess). Always resolves against cwd and returns an absolute path.
+export function whichSync(name, env = process.env, platform = process.platform, cwd = process.cwd()) {
   const dirs = String(env.PATH || env.Path || "").split(platform === "win32" ? ";" : ":").filter(Boolean);
-  const exts = platform === "win32" ? String(env.PATHEXT || ".EXE;.CMD;.BAT").split(";").filter(Boolean) : [""];
+  const rawExts = platform === "win32" ? String(env.PATHEXT || ".EXE;.CMD;.BAT").split(";").filter(Boolean) : [""];
+  const exts = platform === "win32" && /\.(?:exe|cmd|bat|com)$/i.test(name) ? ["", ...rawExts] : rawExts;
   for (const d of dirs) {
+    const resolvedDir =
+      platform === "win32" && (/^[A-Za-z]:[\\/]/.test(d) || d.startsWith("\\\\"))
+        ? path.win32.resolve(d)
+        : path.resolve(cwd, d);
     for (const ext of exts) {
-      const candidate = path.join(d, name + ext.toLowerCase());
+      const candidate =
+        platform === "win32" && (/^[A-Za-z]:[\\/]/.test(resolvedDir) || resolvedDir.startsWith("\\\\"))
+          ? path.win32.join(resolvedDir, name + ext.toLowerCase())
+          : path.join(resolvedDir, name + ext.toLowerCase());
       try {
         if (fs.statSync(candidate).isFile()) {
           if (platform !== "win32") fs.accessSync(candidate, fs.constants.X_OK);
@@ -142,7 +150,7 @@ export function planOp(opName, params, { force = false, reason = null, cwd = pro
       overridden,
     };
   }
-  const ctxBase = { cwd, platform, which: (n) => whichSync(n, env, platform) };
+  const ctxBase = { cwd, platform, which: (n) => whichSync(n, env, platform, cwd) };
   let probe = [];
   if (op.kind === "build") {
     try {
@@ -221,17 +229,22 @@ export async function execOp(stateDir, request, deps, options = {}) {
 
   if (!json) for (const n of plan.notices) process.stderr.write(renderNotice(n));
 
+  const effectiveWorkspaceDir = plan.buildReqs?.workspaceRoot || plan.probe?.[0]?.cwd || cwd;
   let forcedRunId = null;
-  if (force) {
+  if (force || plan.overridden.length > 0) {
+    const effectiveReason =
+      flags.reason && String(flags.reason).trim()
+        ? String(flags.reason).trim()
+        : `custom executable (${params.executable})`;
     forcedRunId = deps.recordForcedRun
       ? deps.recordForcedRun(
-          { op: opName, reason: String(flags.reason).trim(), overridden: plan.overridden, cwd },
+          { op: opName, reason: effectiveReason, overridden: plan.overridden, cwd: effectiveWorkspaceDir },
           { session: flags.session, anchorPid: flags.anchorPid },
         )
       : null;
     if (!json) {
       process.stderr.write(
-        `[atc] forced run${forcedRunId ? ` ${forcedRunId}` : ""}: you take responsibility (${String(flags.reason).trim()}). Overridden: ${
+        `[atc] forced run${forcedRunId ? ` ${forcedRunId}` : ""}: you take responsibility (${effectiveReason}). Overridden: ${
           plan.overridden.map((o) => `${o.path}=${JSON.stringify(o.value)}`).join(", ") || "none"
         }\n`,
       );
@@ -323,7 +336,15 @@ export async function execOp(stateDir, request, deps, options = {}) {
     const since = Date.now() - 24 * 3600 * 1000;
     const related = deps
       .recentForcedRuns()
-      .filter((r) => r && r.atMs >= since && r.runId !== forcedRunId && (r.cwd === cwd || String(cwd).startsWith(`${r.cwd}${path.sep}`) || String(r.cwd).startsWith(`${cwd}${path.sep}`)));
+      .filter(
+        (r) =>
+          r &&
+          r.atMs >= since &&
+          r.runId !== forcedRunId &&
+          (r.cwd === effectiveWorkspaceDir ||
+            String(effectiveWorkspaceDir).startsWith(`${r.cwd}${path.sep}`) ||
+            String(r.cwd).startsWith(`${effectiveWorkspaceDir}${path.sep}`)),
+      );
     if (related.length > 0) {
       out.attribution = related.map((r) => ({ runId: r.runId, op: r.op, reason: r.reason, sessionId: r.sessionId, atMs: r.atMs }));
       if (!json) {
