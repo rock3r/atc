@@ -400,3 +400,37 @@ test("batch: two producers that receive the same idempotent lease share ownershi
     s.cleanup();
   }
 });
+
+test("batch: custom executable on gradle/bazel steps validates and records forcedRunId without step.force", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    const customGradle = path.join(s.proj, "gradlew-custom");
+    script(customGradle, `echo "custom-gradle $*" >> ${s.log}`);
+    const plan = {
+      version: 1,
+      steps: [{ id: "b", op: "gradle.tasks", tasks: ["assembleDebug"], executable: "./gradlew-custom" }],
+    };
+    const dry = await s.run(plan, { validate: true });
+    assert.equal(dry.exitCode, 0, JSON.stringify(dry));
+    assert.equal(dry.steps[0].invocations[0].cmd, customGradle);
+    assert.deepEqual(dry.steps[0].overridden, [{ path: "/executable", check: "custom_executable", value: "./gradlew-custom" }]);
+
+    const ran = await s.run(plan);
+    assert.equal(ran.exitCode, 0, JSON.stringify(ran));
+    assert.ok(ran.steps[0].forcedRunId);
+    assert.deepEqual(ran.steps[0].overridden, [{ path: "/executable", check: "custom_executable", value: "./gradlew-custom" }]);
+    assert.ok(s.calls().some((l) => l.startsWith("custom-gradle assembleDebug")));
+
+    // A later failing batch step in the same workspace surfaces attribution in the step result
+    script(path.join(s.proj, "gradlew"), "exit 2");
+    const failed = await s.run({
+      version: 1,
+      steps: [{ id: "later", op: "gradle.tasks", tasks: ["test"] }],
+    });
+    assert.equal(failed.exitCode, 2);
+    assert.equal(failed.steps[0].attribution?.[0]?.runId, ran.steps[0].forcedRunId);
+  } finally {
+    s.cleanup();
+  }
+});
+

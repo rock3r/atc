@@ -20,6 +20,14 @@ const BUILD_COMMON = {
   ramMb: { type: "integer", min: 1, max: 1048576, description: "Minimum RAM to reserve (MB)" },
 };
 
+const EXECUTABLE_PARAM = {
+  executable: {
+    type: "path",
+    role: "input",
+    description: "Custom wrapper or executable to run (you take responsibility, same as --force)",
+  },
+};
+
 const XCODE_COMMON = {
   scheme: { type: "string", pattern: "xcodeName", required: true },
   workspaceFile: { type: "path", role: "input", description: "Path to .xcworkspace" },
@@ -74,22 +82,106 @@ function buildBaseDir(params, ctx) {
   return dir;
 }
 
-function resolveGradleWrapper(params, ctx) {
+function resolveCustomExecutable(rawExec, { baseDir, rootDir = null, ctx, system }) {
+  const isWin = (ctx.platform || process.platform) === "win32";
+  const raw = String(rawExec);
+  const hasSep = raw.includes("/") || raw.includes("\\") || (isWin && /^[A-Za-z]:/.test(raw));
+  const winExts = isWin && !/\.(?:exe|cmd|bat|com)$/i.test(raw) ? ["", ".bat", ".cmd", ".exe"] : [""];
+  const checkFile = (p) => {
+    for (const ext of winExts) {
+      const candidate = p + ext;
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          if (!isWin && process.platform !== "win32") {
+            fs.accessSync(candidate, fs.constants.X_OK);
+          }
+          return candidate;
+        }
+      } catch (err) {
+        if (err && (err.code === "EACCES" || err.code === "EPERM")) {
+          throw new OpError(
+            "executable_not_executable",
+            `Custom ${system} executable ${candidate} is not executable.`,
+            `Run chmod +x ${candidate} or pass an executable binary/wrapper.`,
+          );
+        }
+      }
+    }
+    return null;
+  };
+
+  if (hasSep) {
+    const searchBases = [
+      baseDir,
+      ...(rootDir && rootDir !== baseDir ? [rootDir] : []),
+      ...(ctx.cwd && ctx.cwd !== baseDir && ctx.cwd !== rootDir ? [ctx.cwd] : []),
+    ];
+    for (const b of searchBases) {
+      const found = checkFile(path.resolve(b, raw));
+      if (found) return found;
+    }
+    throw new OpError(
+      "executable_not_found",
+      `Custom ${system} executable "${raw}" was not found (resolved against ${baseDir}).`,
+      "Pass an existing executable path, or omit executable to use the default.",
+    );
+  }
+
+  const localNames = winExts.map((ext) => raw + ext);
+  const inRoot = rootDir ? findUp(rootDir, localNames) : null;
+  if (inRoot && path.dirname(inRoot) === rootDir) {
+    const checked = checkFile(inRoot);
+    if (checked) return checked;
+  }
+  const walked = findUp(baseDir, localNames);
+  if (walked) {
+    const checked = checkFile(walked);
+    if (checked) return checked;
+  }
+  const which = ctx.which || (() => null);
+  const fromPath = which(raw);
+  if (fromPath) return fromPath;
+  throw new OpError(
+    "executable_not_found",
+    `Custom ${system} executable "${raw}" was not found in ${baseDir} or on PATH.`,
+    "Pass an existing wrapper path or executable on PATH, or omit executable to use the default.",
+  );
+}
+
+function resolveGradleExecutable(params, ctx) {
+  const baseDir = buildBaseDir(params, ctx);
   const isWin = (ctx.platform || process.platform) === "win32";
   const names = isWin ? ["gradlew.bat", "gradlew.cmd"] : ["gradlew"];
-  const wrapper = findUp(buildBaseDir(params, ctx), names);
+  const projectMarker =
+    findUp(baseDir, ["settings.gradle.kts", "settings.gradle", ...names]) ||
+    findUp(baseDir, ["build.gradle.kts", "build.gradle"]);
+  const projectRoot = projectMarker ? path.dirname(projectMarker) : null;
+  if (params.executable) {
+    const cmd = resolveCustomExecutable(params.executable, {
+      baseDir,
+      rootDir: projectRoot,
+      ctx,
+      system: "Gradle",
+    });
+    const execDir = path.dirname(cmd);
+    const execIsAncestor = baseDir === execDir || baseDir.startsWith(`${execDir}${path.sep}`);
+    const cwd = projectRoot || (execIsAncestor ? execDir : baseDir);
+    return { cmd, cwd };
+  }
+  const wrapper = findUp(baseDir, names);
   if (!wrapper) {
     throw new OpError(
       "gradle_wrapper_not_found",
-      `No Gradle wrapper (${names.join(" / ")}) found in ${buildBaseDir(params, ctx)} or its parents.`,
-      "gradle.tasks runs the project's Gradle wrapper. Run from inside the project, or pass workspace. A system-wide `gradle` is not supported; request it if you need it.",
+      `No Gradle wrapper (${names.join(" / ")}) found in ${baseDir} or its parents.`,
+      "gradle.tasks runs the project's Gradle wrapper by default. Run from inside the project, pass workspace, or pass executable.",
     );
   }
-  return wrapper;
+  return { cmd: wrapper, cwd: path.dirname(wrapper) };
 }
 
 function resolveBazelExecutable(params, ctx) {
-  const wsMarker = findUp(buildBaseDir(params, ctx), [
+  const baseDir = buildBaseDir(params, ctx);
+  const wsMarker = findUp(baseDir, [
     "MODULE.bazel",
     "REPO.bazel",
     "WORKSPACE.bazel",
@@ -98,11 +190,20 @@ function resolveBazelExecutable(params, ctx) {
   if (!wsMarker) {
     throw new OpError(
       "bazel_workspace_not_found",
-      `No Bazel workspace (MODULE.bazel / WORKSPACE) found in ${buildBaseDir(params, ctx)} or its parents.`,
+      `No Bazel workspace (MODULE.bazel / WORKSPACE) found in ${baseDir} or its parents.`,
       "Run from inside the Bazel workspace, or pass workspace.",
     );
   }
   const wsRoot = path.dirname(wsMarker);
+  if (params.executable) {
+    const cmd = resolveCustomExecutable(params.executable, {
+      baseDir,
+      rootDir: wsRoot,
+      ctx,
+      system: "Bazel",
+    });
+    return { cmd, wsRoot };
+  }
   const isWin = (ctx.platform || process.platform) === "win32";
   const local = findUp(wsRoot, isWin ? ["bazelw.bat", "bazelw.cmd"] : ["bazelw"]);
   if (local && path.dirname(local) === wsRoot) return { cmd: local, wsRoot };
@@ -202,12 +303,13 @@ export const OPS = Object.freeze({
       rerunTasks: { type: "boolean" },
       continueAfterFailure: { type: "boolean" },
       properties: { type: "map", keyPattern: "gradlePropertyKey", valuePattern: "transportSafe" },
+      ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     devicePlatform: "android",
     deviceCoupled: (p) => Array.isArray(p.tasks) && p.tasks.some((t) => isGradleDeviceTaskName(String(t).split(":").pop())),
     invocations(params, ctx) {
-      const wrapper = resolveGradleWrapper(params, ctx);
+      const { cmd, cwd } = resolveGradleExecutable(params, ctx);
       const args = [...params.tasks];
       if (params.offline) args.push("--offline");
       if (params.info) args.push("--info");
@@ -215,7 +317,7 @@ export const OPS = Object.freeze({
       if (params.rerunTasks) args.push("--rerun-tasks");
       if (params.continueAfterFailure) args.push("--continue");
       for (const [k, v] of Object.entries(params.properties || {})) args.push(`-P${k}=${v}`);
-      return [{ cmd: wrapper, args, cwd: path.dirname(wrapper) }];
+      return [{ cmd, args, cwd }];
     },
     notices(params) {
       const tasks = params.tasks || [];
@@ -246,6 +348,7 @@ export const OPS = Object.freeze({
       runArgs: { type: "string[]", pattern: "passthroughArg", maxItems: 64 },
       configs: { type: "string[]", pattern: "bazelConfig" },
       timeoutSec: { type: "integer", min: 1, max: 86400, required: true },
+      ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     invocations(params, ctx) {
@@ -272,6 +375,7 @@ export const OPS = Object.freeze({
           expunge: { type: "boolean" },
         },
       },
+      ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     invocations(params, ctx) {
@@ -321,7 +425,7 @@ export const OPS = Object.freeze({
     name: "bazel.clean",
     system: "bazel",
     kind: "build",
-    params: { expunge: { type: "boolean" }, ...BUILD_COMMON },
+    params: { expunge: { type: "boolean" }, ...EXECUTABLE_PARAM, ...BUILD_COMMON },
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
       return [{ cmd, args: ["clean", ...(params.expunge ? ["--expunge"] : [])], cwd: wsRoot }];
@@ -539,6 +643,7 @@ function bazelSimple(command) {
       configs: { type: "string[]", pattern: "bazelConfig" },
       ...(command === "test" || command === "coverage" ? { testFilter: { type: "string", pattern: "transportSafe" } } : {}),
       keepGoing: { type: "boolean" },
+      ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     invocations(params, ctx) {

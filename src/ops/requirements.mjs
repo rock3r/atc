@@ -36,9 +36,10 @@ export function resolveOpBuildRequirements(op, params, invocations, { env = proc
     };
   }
   const deviceCoupled = Boolean(op.deviceCoupled && op.deviceCoupled(params));
+  const tool = op.system === "xcode" ? "xcodebuild" : op.system;
   let merged = null;
   for (const inv of invocations) {
-    const r = resolve(inv.cmd, classifiableArgs(op, inv), inv.cwd || process.cwd(), { env, forceBuild: true, workspace: inv.cwd || null });
+    const r = resolve(inv.cmd, classifiableArgs(op, inv), inv.cwd || process.cwd(), { env, forceBuild: true, workspace: inv.cwd || null, tool });
     if (!r || r.kind === "not_build_tool") continue;
     if (!merged) {
       merged = { ...r, resourceKeys: [...(r.resourceKeys || [])] };

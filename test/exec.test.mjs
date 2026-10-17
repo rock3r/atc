@@ -347,3 +347,97 @@ test("exec: forced runs are attributed to the explicit --session", { skip: !posi
     s.cleanup();
   }
 });
+
+test("exec: custom --executable runs polyglot bazel.cmd without shebang and records forcedRun accountability", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    // Polyglot .cmd script like intellij-community/bazel.cmd (no #! shebang on line 1)
+    const bazelCmd = path.join(s.proj, "bazel.cmd");
+    fs.writeFileSync(
+      bazelCmd,
+      ':<<"::CMDLITERAL"\n@ECHO OFF\nGOTO :CMDSCRIPT\n::CMDLITERAL\necho "POLYGLOT_BAZEL:$*"\nexit 0\n',
+    );
+    fs.chmodSync(bazelCmd, 0o755);
+    const sub = path.join(s.proj, "platform", "jewel");
+    fs.mkdirSync(sub, { recursive: true });
+
+    const res = await cmdExec(
+      s.stateDir,
+      ["bazel", "build", "//platform/jewel/...", "--executable", "./bazel.cmd", "--session", "agent-ij", "--json"],
+      { env: s.env, cwd: sub, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    assert.match(res.stdout, /POLYGLOT_BAZEL:build --jobs=\d+ --local_ram_resources=\d+ \/\/platform\/jewel\/\.\.\./);
+    assert.ok(res.forcedRunId, "custom executable records a forcedRunId in and by itself");
+    assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: "./bazel.cmd" }]);
+    const st = readState(s.stateDir);
+    assert.equal(st.forcedRuns.length, 1);
+    assert.equal(st.forcedRuns[0].runId, res.forcedRunId);
+    assert.equal(st.forcedRuns[0].sessionId, "agent-ij");
+    assert.match(st.forcedRuns[0].reason, /custom executable/);
+
+    // Subsequent failure in the same workspace attributes the custom-executable run
+    script(path.join(s.proj, "bazelw"), "exit 2");
+    const later = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--session", "agent-other", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    assert.equal(later.exitCode, 2);
+    assert.equal(later.attribution?.[0]?.runId, res.forcedRunId);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec: custom gradle --executable runs in project root and records responsibility", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "settings.gradle.kts"), "");
+    const custom = script(path.join(s.bin, "custom-gradle"), 'echo "CWD:$(pwd) ARGS:$*"');
+    const res = await cmdExec(
+      s.stateDir,
+      ["gradle", "tasks", ":app:test", "--executable", custom, "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    assert.match(res.stdout, new RegExp(`CWD:${fs.realpathSync(s.proj).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ARGS::app:test -Dorg\\.gradle\\.workers\\.max=`));
+    assert.ok(res.forcedRunId);
+    assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: custom }]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("planOp: external gradle executable from another checkout still reads target workspace gradle.properties", { skip: !posix }, () => {
+  const s = setup();
+  try {
+    const otherCheckout = path.join(s.root, "other-checkout");
+    fs.mkdirSync(otherCheckout, { recursive: true });
+    fs.writeFileSync(path.join(otherCheckout, "settings.gradle.kts"), "");
+    fs.writeFileSync(path.join(otherCheckout, "gradle.properties"), "org.gradle.jvmargs=-Xmx512m\n");
+    const externalWrapper = script(path.join(otherCheckout, "gradlew"), "exit 0");
+
+    fs.writeFileSync(path.join(s.proj, "settings.gradle.kts"), "");
+    fs.writeFileSync(path.join(s.proj, "gradle.properties"), "org.gradle.jvmargs=-Xmx6144m\n");
+    const sub = path.join(s.proj, "sub");
+    fs.mkdirSync(sub, { recursive: true });
+    const toolInSub = script(path.join(sub, "tools", "my-gradle"), "exit 0");
+
+    const plan = planOp("gradle.tasks", { tasks: ["assemble"], executable: externalWrapper }, { cwd: s.proj, env: s.env });
+    assert.deepEqual(plan.errors, []);
+    assert.equal(plan.buildReqs.requestedHeapMb, 6144, "reads target workspace gradle.properties, not external wrapper checkout");
+    assert.equal(plan.buildReqs.workspaceRoot, fs.realpathSync(s.proj));
+
+    // Relative PATH entry resolves against planOp's cwd and returns an absolute path
+    const relPathPlan = planOp(
+      "gradle.tasks",
+      { tasks: ["assemble"], executable: "my-gradle" },
+      { cwd: sub, env: { ...s.env, PATH: "tools:/usr/bin:/bin" } },
+    );
+    assert.deepEqual(relPathPlan.errors, []);
+    assert.equal(relPathPlan.probe[0].cmd, toolInSub);
+    assert.equal(relPathPlan.probe[0].cwd, s.proj);
+  } finally {
+    s.cleanup();
+  }
+});
+
+

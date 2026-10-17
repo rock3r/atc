@@ -240,6 +240,7 @@ export function resolveBuildResources(
     bazelMajorVersion = undefined,
     bazelVersion = undefined,
     isBazelisk = undefined,
+    tool = undefined,
   } = {},
 ) {
   const baseEnv = { ...(env || process.env), ...(inheritedEnvVars || {}) };
@@ -336,7 +337,7 @@ export function resolveBuildResources(
   const args = Array.isArray(rawArgs) ? rawArgs.map(String) : [];
   const effectiveEnvVars = { ...(inheritedEnvVars || {}) };
   const baseCwd = outerCwd;
-  const directTool = normalizeBuildToolName(cmd);
+  const directTool = tool || normalizeBuildToolName(cmd);
   if (!directTool) {
     return {
       kind: "not_build_tool",
@@ -376,12 +377,25 @@ export function resolveBuildResources(
       }
     }
 
-    let searchStart = projectDir;
+    let searchStart = projectDir || (workspace ? path.resolve(outerCwd, String(workspace)) : null);
     if (!searchStart && cmd && (cmd.includes("/") || cmd.includes("\\"))) {
       const resolvedCmd = path.resolve(baseCwd, cmd);
       try {
         if (fs.existsSync(resolvedCmd) && fs.statSync(resolvedCmd).isFile()) {
-          searchStart = path.dirname(resolvedCmd);
+          const cmdDir = path.dirname(resolvedCmd);
+          const cmdHasMarker = Boolean(
+            findNearestMarkerAncestor(cmdDir, [
+              "settings.gradle.kts",
+              "settings.gradle",
+              "gradlew",
+              "gradlew.bat",
+              "build.gradle.kts",
+              "build.gradle",
+            ]),
+          );
+          if (cmdHasMarker || baseCwd === cmdDir || baseCwd.startsWith(`${cmdDir}${path.sep}`)) {
+            searchStart = cmdDir;
+          }
         }
       } catch {
         // Fallback to baseCwd
