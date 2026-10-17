@@ -35,7 +35,7 @@ function runHeartbeatTick() {
       },
       {
         ancestorPids: [],
-        lockTimeoutMs: Math.min(1000, intervalMs),
+        lockTimeoutMs: Math.max(1500, intervalMs),
         shouldAbort,
       },
     );
