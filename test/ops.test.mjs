@@ -500,6 +500,21 @@ test("documented CLI translations (docs/migration-3.0.md, guides) parse and vali
 
 // ---------------------------------------------------------------- review fixes
 
+test("parseOpArgv: separated leading-dash passthrough values are consumed for runArgs and launchArgs", () => {
+  const b = parseOpArgv(["bazel", "run", "//tools:gen", "--run-arg", "--verbose", "--run-arg", "-n=1", "--timeout-sec", "30"]);
+  assert.deepEqual(b.errors, []);
+  assert.equal(b.opName, "bazel.run");
+  assert.deepEqual(b.params, { target: "//tools:gen", runArgs: ["--verbose", "-n=1"], timeoutSec: 30 });
+  assert.deepEqual(validateOpParams(b.opName, b.params).errors, []);
+
+  const i = parseOpArgv(["ios", "launch", "com.example.App", "--launch-arg", "--uitesting", "--launch-arg=-AppleLanguages"]);
+  assert.deepEqual(i.errors, []);
+  assert.equal(i.opName, "ios.launch");
+  assert.deepEqual(i.params, { bundleId: "com.example.App", launchArgs: ["--uitesting", "-AppleLanguages"] });
+  assert.deepEqual(validateOpParams(i.opName, i.params).errors, []);
+});
+
+
 test("parseOpArgv: --no-<flag> negates exec-level boolean selectors", () => {
   const r = parseOpArgv(["gradle", "tasks", "connectedCheck", "--claim", "--no-play"]);
   assert.deepEqual(r.errors, []);

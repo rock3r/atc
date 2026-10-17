@@ -1919,7 +1919,6 @@ function publishOwnerFileExclusive(targetPath, content, nonce, canPublish = null
   const fd = fs.openSync(tmpPath, "wx", 0o600);
   try {
     fs.writeFileSync(fd, content, "utf8");
-    fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
   }
@@ -2225,51 +2224,10 @@ export function releaseLock(lockHandle) {
   if (!lockHandle || !lockHandle.ownerPath || !lockHandle.lockDir || !lockHandle.nonce) {
     return;
   }
-  const info = inspectOwnerFile(lockHandle.ownerPath, Date.now(), STALE_LOCK_MS, false);
-  if (!info.valid || info.nonce !== lockHandle.nonce) {
-    return;
-  }
-  const token = getValidOwnerToken(lockHandle.lockDir, info);
-  if (!token) {
-    return;
-  }
   const stateDir = path.dirname(lockHandle.lockDir);
   const lockName = path.basename(lockHandle.lockDir);
 
-  tryWithBreakClaim(stateDir, lockName, token, ({ claimDir, myClaimNonce, canProceed }) => {
-    const verifyInfo = inspectOwnerFile(lockHandle.ownerPath, Date.now(), STALE_LOCK_MS, false);
-    if (
-      !verifyInfo.valid ||
-      verifyInfo.nonce !== lockHandle.nonce ||
-      getValidOwnerToken(lockHandle.lockDir, verifyInfo) !== token ||
-      !canProceed()
-    ) {
-      return false;
-    }
-
-    const movedLockDir = path.join(claimDir, `moved.${myClaimNonce}`);
-    let renamedLockDir = false;
-    try {
-      fs.renameSync(lockHandle.lockDir, movedLockDir);
-      renamedLockDir = true;
-    } catch {
-      // Fallback to in-place unlink + rmdir
-    }
-
-    if (renamedLockDir) {
-      try {
-        fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
-      } catch {
-        // Ignore
-      }
-      try {
-        fs.rmSync(movedLockDir, { recursive: true, force: true });
-      } catch {
-        // Swept later by orphan sweep
-      }
-      return true;
-    }
-
+  const unlinkAndRemoveInPlace = () => {
     let unlinkedOwner = false;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -2309,13 +2267,74 @@ export function releaseLock(lockHandle) {
         break;
       }
     }
-    try {
-      fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
-    } catch {
-      // Ignore
-    }
     return true;
-  }, { removeClaimOnComplete: true });
+  };
+
+  const releaseDeadlineMs = Date.now() + MISSING_OWNER_STALE_MS + 1000;
+  while (Date.now() < releaseDeadlineMs) {
+    const info = inspectOwnerFile(lockHandle.ownerPath, Date.now(), STALE_LOCK_MS, false);
+    if (!info.valid || info.nonce !== lockHandle.nonce) {
+      break;
+    }
+    const token = getValidOwnerToken(lockHandle.lockDir, info);
+    if (!token) {
+      break;
+    }
+    const released = tryWithBreakClaim(
+      stateDir,
+      lockName,
+      token,
+      ({ claimDir, myClaimNonce, canProceed }) => {
+        const verifyInfo = inspectOwnerFile(lockHandle.ownerPath, Date.now(), STALE_LOCK_MS, false);
+        if (
+          !verifyInfo.valid ||
+          verifyInfo.nonce !== lockHandle.nonce ||
+          getValidOwnerToken(lockHandle.lockDir, verifyInfo) !== token ||
+          !canProceed()
+        ) {
+          return false;
+        }
+
+        const movedLockDir = path.join(claimDir, `moved.${myClaimNonce}`);
+        let renamedLockDir = false;
+        try {
+          fs.renameSync(lockHandle.lockDir, movedLockDir);
+          renamedLockDir = true;
+        } catch {
+          // Fallback to in-place unlink + rmdir
+        }
+
+        if (renamedLockDir) {
+          try {
+            fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+          } catch {
+            // Ignore
+          }
+          try {
+            fs.rmSync(movedLockDir, { recursive: true, force: true });
+          } catch {
+            // Swept later by orphan sweep
+          }
+          return true;
+        }
+
+        if (!unlinkAndRemoveInPlace()) {
+          return false;
+        }
+        try {
+          fs.writeFileSync(path.join(claimDir, "done"), "1", "utf8");
+        } catch {
+          // Ignore
+        }
+        return true;
+      },
+      { removeClaimOnComplete: true },
+    );
+    if (released || !verifyLockOwnership(lockHandle)) {
+      break;
+    }
+    sleepSync(25);
+  }
   sweepStaleLockClaims(stateDir, lockName);
 }
 

@@ -650,7 +650,7 @@ function startWorkerDeadlineHeartbeat(stateDir, deviceKey, leaseId, timeoutMs) {
   if (typeof worker.unref === "function") {
     worker.unref();
   }
-  Atomics.wait(stopFlag, 2, 0, 2000);
+  Atomics.wait(stopFlag, 2, 0, 5000);
   return {
     stop() {
       Atomics.store(stopFlag, 0, 1);

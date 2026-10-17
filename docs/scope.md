@@ -134,6 +134,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 }
 ```
 - Common step fields: `id`, `op`, `dependsOn`, `cwd`, `env` (literal string values), `claim` (a profile object `{platform, kind?, type?, api?, os?, play?, abi?, services?, snapshotLoad?, ttlSec?}` or `{ "reuse": "<stepId>" }`), `timeoutSec`, `continueOnError`, `force: { reason }`. Every other field is an op param.
+- **Step timeout vs. queue wait:** `timeoutSec` bounds step **execution**, and its clock starts after build/device admission (exiting `124` if exceeded, across all invocations of a multi-invocation op). Time spent queued waiting for a build slot or workspace lock is bounded separately by `--wait` / `defaultBuildWaitSec` (exiting `2` or `4`).
 - **Executor (v1):** **sequential**, in a deterministic topological order. There is no parallel step execution in v1.
 - **Failure:** a failed step skips its dependents (`dependency_failed`) and stops the batch, unless the step has `continueOnError: true`, in which case independent steps keep running and the failure does not fail the batch.
 
@@ -204,7 +205,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | `5` | Host RAM/disk below the safety reserve. |
 | `6` | Physical device claim rejected by policy. |
 | `7` | Request rejected by validation (unsupported op/param/value); nothing ran. |
-| `124` | An op's `timeoutSec` elapsed and ATC stopped it. |
+| `124` | An op's `timeoutSec` elapsed during execution (after admission) and ATC stopped it. |
 
 ## 9. Design decisions
 1. Cross-agent destructive actions stay hard-denied even with `--force`. Agents can still run them outside ATC in an emergency, but ATC owns these shared resources and won't do it on request.

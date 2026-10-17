@@ -341,9 +341,10 @@ export function parseOpArgv(tokens) {
       continue;
     }
     const pKey = paramKeyFor(name);
+    const allowLeadingDash = Boolean(pKey && op.params[pKey]?.pattern && PATTERNS[op.params[pKey].pattern]?.allowLeadingDash);
     const takeValue = () => {
       if (inlineVal !== undefined) return inlineVal;
-      if (i + 1 < rest.length && !rest[i + 1].startsWith("--")) return rest[++i];
+      if (i + 1 < rest.length && (allowLeadingDash || !rest[i + 1].startsWith("--"))) return rest[++i];
       errors.push(err(`/${name}`, "missing_value", `--${rawName} requires a value.`));
       return null;
     };
