@@ -401,6 +401,34 @@ test("exec: custom gradle --executable runs in project root and records responsi
     assert.match(res.stdout, new RegExp(`CWD:${fs.realpathSync(s.proj).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ARGS::app:test -Dorg\\.gradle\\.workers\\.max=`));
     assert.ok(res.forcedRunId);
     assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: custom }]);
+
+    // Running from a parent directory with --workspace scopes forcedRuns to that workspace, not siblings
+    const sib = path.join(s.root, "sibling");
+    fs.mkdirSync(sib, { recursive: true });
+    script(path.join(sib, "gradlew"), "exit 2");
+    script(path.join(s.proj, "gradlew"), "exit 2");
+    const stateDir2 = path.join(s.root, "state2");
+    fs.mkdirSync(stateDir2, { recursive: true });
+    const scoped = await cmdExec(
+      stateDir2,
+      ["gradle", "tasks", ":app:test", "--workspace", "proj", "--executable", custom, "--json"],
+      { env: { ...s.env, ATC_STATE_DIR: stateDir2 }, cwd: s.root, host: HOST },
+    );
+    assert.equal(scoped.exitCode, 0, scoped.error);
+    const sibFail = await cmdExec(
+      stateDir2,
+      ["gradle", "tasks", "test", "--json"],
+      { env: { ...s.env, ATC_STATE_DIR: stateDir2 }, cwd: sib, host: HOST },
+    );
+    assert.equal(sibFail.exitCode, 2);
+    assert.equal(sibFail.attribution, undefined, "sibling workspace is not attributed");
+    const projFail = await cmdExec(
+      stateDir2,
+      ["gradle", "tasks", "test", "--json"],
+      { env: { ...s.env, ATC_STATE_DIR: stateDir2 }, cwd: s.proj, host: HOST },
+    );
+    assert.equal(projFail.exitCode, 2);
+    assert.equal(projFail.attribution?.[0]?.runId, scoped.forcedRunId, "target workspace is attributed");
   } finally {
     s.cleanup();
   }

@@ -229,6 +229,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
 
   if (!json) for (const n of plan.notices) process.stderr.write(renderNotice(n));
 
+  const effectiveWorkspaceDir = plan.buildReqs?.workspaceRoot || plan.probe?.[0]?.cwd || cwd;
   let forcedRunId = null;
   if (force || plan.overridden.length > 0) {
     const effectiveReason =
@@ -237,7 +238,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
         : `custom executable (${params.executable})`;
     forcedRunId = deps.recordForcedRun
       ? deps.recordForcedRun(
-          { op: opName, reason: effectiveReason, overridden: plan.overridden, cwd },
+          { op: opName, reason: effectiveReason, overridden: plan.overridden, cwd: effectiveWorkspaceDir },
           { session: flags.session, anchorPid: flags.anchorPid },
         )
       : null;
@@ -335,7 +336,15 @@ export async function execOp(stateDir, request, deps, options = {}) {
     const since = Date.now() - 24 * 3600 * 1000;
     const related = deps
       .recentForcedRuns()
-      .filter((r) => r && r.atMs >= since && r.runId !== forcedRunId && (r.cwd === cwd || String(cwd).startsWith(`${r.cwd}${path.sep}`) || String(r.cwd).startsWith(`${cwd}${path.sep}`)));
+      .filter(
+        (r) =>
+          r &&
+          r.atMs >= since &&
+          r.runId !== forcedRunId &&
+          (r.cwd === effectiveWorkspaceDir ||
+            String(effectiveWorkspaceDir).startsWith(`${r.cwd}${path.sep}`) ||
+            String(r.cwd).startsWith(`${effectiveWorkspaceDir}${path.sep}`)),
+      );
     if (related.length > 0) {
       out.attribution = related.map((r) => ({ runId: r.runId, op: r.op, reason: r.reason, sessionId: r.sessionId, atMs: r.atMs }));
       if (!json) {
