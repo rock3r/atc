@@ -32,6 +32,12 @@ export const PATTERNS = Object.freeze({
     label: "a single Bazel query expression ([A-Za-z0-9_.:/@+=,|()'[\\]*?^ -], max 4096 chars; no shell metacharacters)",
     forceable: false,
   },
+  // KEY=VALUE for --repo_env. No shell expansion characters.
+  bazelRepoEnv: {
+    re: /^[A-Za-z_][A-Za-z0-9_]{0,127}=[A-Za-z0-9_.:/@+=,-]{0,512}$/,
+    label: "a Bazel --repo_env KEY=VALUE ([A-Za-z0-9_.:/@+=,-], no shell metacharacters)",
+    forceable: false,
+  },
   xcodeName: {
     re: /^[A-Za-z0-9_.-]+( [A-Za-z0-9_.-]+)*$/,
     label: "an Xcode scheme/configuration/test plan name ([A-Za-z0-9_.-], single spaces)",

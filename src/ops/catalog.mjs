@@ -50,6 +50,16 @@ const BAZEL_SERIES_COMMANDS = ["build", "test", "coverage", "clean"];
 const BAZEL_QUERY_OUTPUTS = ["label", "label_kind", "xml", "proto", "streamed_jsonproto", "graph", "minrank", "maxrank", "location", "package", "build"];
 const BAZEL_CQUERY_OUTPUTS = ["label", "starlark", "proto", "jsonproto", "textproto", "files", "graph"];
 export const BAZEL_QUERY_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+const BAZEL_ISOLATION_PARAMS = {
+  ignoreAllRcFiles: { type: "boolean", description: "Pass --ignore_all_rc_files before the verb so imported .bazelrc files are not loaded" },
+  outputUserRoot: { type: "path", role: "dir", description: "Private --output_user_root (startup option, absolute path)" },
+  outputBase: { type: "path", role: "dir", description: "Private --output_base (startup option, absolute path)" },
+  repositoryCache: { type: "path", role: "dir", description: "Private --repository_cache (command option, absolute path)" },
+  diskCache: { type: "path", role: "dir", description: "Private --disk_cache (command option, absolute path)" },
+  lockfileMode: { type: "enum", values: ["error", "off", "update", "refresh"], description: "Pass --lockfile_mode after the verb" },
+  noWorkspaceSymlinks: { type: "boolean", description: "Pass --symlink_prefix=/ after the verb so Bazel does not write convenience symlinks into the workspace" },
+  repoEnv: { type: "string[]", pattern: "bazelRepoEnv", maxItems: 32, description: "Repeatable --repo_env=KEY=VALUE after the verb" },
+};
 
 function findUp(startDir, fileNames) {
   let cur = path.resolve(startDir);
@@ -649,20 +659,88 @@ function bazelQueryOp(command, outputValues) {
       outputFile: { type: "path", role: "output", required: true },
       maxOutputBytes: { type: "integer", min: 1, max: BAZEL_QUERY_MAX_OUTPUT_BYTES },
       keepGoing: { type: "boolean" },
+      ...BAZEL_ISOLATION_PARAMS,
       ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
-      const args = [command, `--output=${params.output}`];
+      const startup = bazelIsolationStartup(params, ctx, wsRoot);
+      const commandArgs = bazelIsolationCommand(params, ctx, wsRoot);
+      const args = [...startup, command, `--output=${params.output}`, ...commandArgs];
       if (params.keepGoing) args.push("--keep_going");
       args.push(params.query);
       return [{ cmd, args, cwd: wsRoot }];
     },
     check(params) {
-      return checkBazelQueryOutputFile(params);
+      return [...checkBazelQueryOutputFile(params), ...checkBazelIsolationPaths(params)];
     },
   };
+}
+
+function bazelIsolationStartup(params, ctx, wsRoot) {
+  const args = [];
+  if (params.ignoreAllRcFiles) args.push("--ignore_all_rc_files");
+  if (params.outputUserRoot) args.push(`--output_user_root=${resolvePrivateBazelPath(params.outputUserRoot, ctx, "outputUserRoot", wsRoot)}`);
+  if (params.outputBase) args.push(`--output_base=${resolvePrivateBazelPath(params.outputBase, ctx, "outputBase", wsRoot)}`);
+  return args;
+}
+
+function bazelIsolationCommand(params, ctx, wsRoot) {
+  const args = [];
+  if (params.repositoryCache) args.push(`--repository_cache=${resolvePrivateBazelPath(params.repositoryCache, ctx, "repositoryCache", wsRoot)}`);
+  if (params.diskCache) args.push(`--disk_cache=${resolvePrivateBazelPath(params.diskCache, ctx, "diskCache", wsRoot)}`);
+  if (params.lockfileMode) args.push(`--lockfile_mode=${params.lockfileMode}`);
+  if (params.noWorkspaceSymlinks) args.push("--symlink_prefix=/");
+  for (const entry of params.repoEnv || []) args.push(`--repo_env=${entry}`);
+  return args;
+}
+
+function checkBazelIsolationPaths(params) {
+  const errs = [];
+  for (const field of ["outputUserRoot", "outputBase", "repositoryCache", "diskCache"]) {
+    const raw = params[field];
+    if (raw === undefined || raw === null) continue;
+    if (!path.isAbsolute(String(raw))) {
+      errs.push({
+        path: `/${field}`,
+        code: "unsafe_output",
+        message: `${field} must be an absolute path.`,
+        hint: "Pass a private absolute directory outside the Bazel workspace and outside shared IDE caches.",
+      });
+    }
+  }
+  return errs;
+}
+
+function resolvePrivateBazelPath(raw, ctx, field, wsRoot = null) {
+  const value = String(raw);
+  if (!path.isAbsolute(value)) {
+    throw new OpError("unsafe_output", `${field} must be an absolute path.`, "Pass a private absolute directory outside the Bazel workspace and outside shared IDE caches.");
+  }
+  const resolved = path.resolve(value);
+  const forbidden = privatePathForbidden(resolved, ctx, wsRoot);
+  if (forbidden) {
+    throw new OpError("unsafe_output", `${field} ${forbidden}.`, "Use a private scratch directory that is not the workspace and not a shared JetBrains/Bazel cache.");
+  }
+  return resolved;
+}
+
+function privatePathForbidden(resolved, ctx, wsRoot) {
+  const home = ctx.env?.HOME || process.env.HOME || "";
+  const shared = [];
+  if (home) {
+    shared.push(path.join(home, "Library", "Caches", "JetBrains"));
+    shared.push(path.join(home, "Library", "Caches", "bazel"));
+  }
+  if (wsRoot) shared.push(path.resolve(wsRoot));
+  for (const root of shared) {
+    if (!root) continue;
+    const abs = path.resolve(root);
+    if (resolved === abs || resolved.startsWith(abs + path.sep)) return `resolves inside ${abs}`;
+  }
+  if (/[/\\]\.bazelrc$/i.test(resolved)) return "names a .bazelrc file";
+  return null;
 }
 
 function checkBazelQueryOutputFile(params) {

@@ -215,6 +215,72 @@ test("bazel.query and bazel.cquery: literal argv, allowlisted output, no flag es
   assert.ok(missing.errors.some((e) => e.path === "/outputFile" && e.code === "required"));
 });
 
+test("bazel.query isolation: startup flags before the verb, private paths, no shell", () => {
+  const root = tmpDir();
+  touch(path.join(root, "MODULE.bazel"), 0o644);
+  const scratch = tmpDir();
+  const home = tmpDir();
+  const ctx = { cwd: root, which: () => null, env: { HOME: home } };
+  const expr = "kind('rule', deps(//:main))";
+  const [inv] = OPS["bazel.query"].invocations({
+    query: expr,
+    output: "xml",
+    outputFile: "out/rules.xml",
+    ignoreAllRcFiles: true,
+    outputUserRoot: path.join(scratch, "user"),
+    outputBase: path.join(scratch, "base"),
+    repositoryCache: path.join(scratch, "repo"),
+    diskCache: path.join(scratch, "disk"),
+    lockfileMode: "error",
+    noWorkspaceSymlinks: true,
+    repoEnv: ["HTTP_PROXY="],
+  }, ctx);
+  assert.deepEqual(inv.args.slice(0, 4), [
+    "--ignore_all_rc_files",
+    `--output_user_root=${path.join(scratch, "user")}`,
+    `--output_base=${path.join(scratch, "base")}`,
+    "query",
+  ]);
+  assert.ok(inv.args.indexOf("query") < inv.args.indexOf("--lockfile_mode=error"));
+  assert.ok(inv.args.includes("--symlink_prefix=/"));
+  assert.ok(inv.args.includes("--repo_env=HTTP_PROXY="));
+  assert.equal(inv.args.at(-1), expr);
+  assert.equal(inv.cwd, root);
+
+  assert.throws(
+    () => OPS["bazel.query"].invocations({
+      query: expr,
+      output: "xml",
+      outputFile: "out/x",
+      diskCache: path.join(home, "Library", "Caches", "JetBrains", "shared"),
+    }, ctx),
+    (e) => e.code === "unsafe_output",
+  );
+  assert.throws(
+    () => OPS["bazel.cquery"].invocations({
+      query: "deps(//:main)",
+      output: "label",
+      outputFile: "out/x",
+      outputBase: path.join(root, "inside"),
+    }, ctx),
+    (e) => e.code === "unsafe_output",
+  );
+  const relative = validateOpParams("bazel.query", {
+    query: expr,
+    output: "xml",
+    outputFile: "out/x",
+    outputUserRoot: "scratch/user",
+  });
+  assert.ok(relative.errors.some((e) => e.path === "/outputUserRoot" && e.code === "unsafe_output"));
+  const shellEnv = validateOpParams("bazel.query", {
+    query: expr,
+    output: "xml",
+    outputFile: "out/x",
+    repoEnv: ["PATH=$(id)"],
+  });
+  assert.ok(shellEnv.errors.some((e) => e.code === "pattern_mismatch" && e.forceable === false));
+});
+
 test("bazel.run: timeout required and run args after --", () => {
   const root = tmpDir();
   touch(path.join(root, "MODULE.bazel"), 0o644);

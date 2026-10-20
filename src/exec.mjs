@@ -340,7 +340,7 @@ export function planOp(opName, params, { force = false, reason = null, cwd = pro
       overridden,
     };
   }
-  const ctxBase = { cwd, platform, which: (n) => whichSync(n, env, platform, cwd) };
+  const ctxBase = { cwd, platform, env, which: (n) => whichSync(n, env, platform, cwd) };
   let probe = [];
   if (op.kind === "build") {
     try {
