@@ -178,6 +178,37 @@ test("batch: unknown step fields such as phase or command are rejected", async (
   }
 });
 
+test("batch: bazel.query is a coordinated step and returns the artifact", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), 'printf "source file //:Main.kt\\n"');
+    const res = await s.run({
+      version: 1,
+      steps: [{
+        id: "sources",
+        op: "bazel.query",
+        query: "kind('source file|generated file', deps(//:main))",
+        output: "label_kind",
+        outputFile: "out/main-sources.txt",
+      }],
+    });
+    assert.equal(res.exitCode, 0, res.error);
+    assert.equal(res.steps[0].status, "ok");
+    assert.match(res.steps[0].steps[0].args[0], /^query$/);
+    assert.equal(res.steps[0].steps[0].args.at(-1), "kind('source file|generated file', deps(//:main))");
+    assert.equal(fs.readFileSync(res.steps[0].artifact.path, "utf8"), "source file //:Main.kt\n");
+    const rejected = await s.run({
+      version: 1,
+      steps: [{ id: "bad", op: "bazel.cquery", query: "deps(//:main) && //:other", output: "proto", outputFile: "/tmp/x" }],
+    });
+    assert.equal(rejected.exitCode, 7);
+    assert.ok(rejected.errors.some((e) => e.code === "pattern_mismatch" || e.code === "enum" || e.code === "unsafe_output"));
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("batch: bazel.run keeps its required timeoutSec", { skip: !posix }, async () => {
   const s = setup();
   try {

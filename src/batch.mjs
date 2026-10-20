@@ -317,6 +317,8 @@ export async function runBatch(stateDir, plan, deps, options = {}) {
           ...(res.overridden?.length ? { overridden: res.overridden } : {}),
           ...(res.attribution?.length ? { attribution: res.attribution } : {}),
           ...(json && res.stdout !== undefined ? { stdout: res.stdout, stderr: res.stderr } : {}),
+          ...(res.artifact ? { artifact: res.artifact } : {}),
+          ...(res.stderr !== undefined && res.artifact ? { stderr: res.stderr } : {}),
           ...(res.snapshots ? { snapshots: res.snapshots } : {}),
         };
       }

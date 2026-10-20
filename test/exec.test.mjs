@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cmdClaim, cmdExec } from "../src/cli.mjs";
-import { checkWindowsContract, execHelp, planOp, summarizeBriefOutput } from "../src/exec.mjs";
+import crypto from "node:crypto";
+import { checkWindowsContract, createQueryCapture, execHelp, planOp, summarizeBriefOutput } from "../src/exec.mjs";
 import { readState } from "../src/state.mjs";
 const HOST = { totalRamMb: 65536, availableRamMb: 32768, freeDiskMb: 100000, cpuCores: 8 };
 
@@ -196,6 +197,116 @@ test("exec: bazel.run honours timeoutSec (exit 124)", { skip: !posix }, async ()
   } finally {
     s.cleanup();
   }
+});
+
+test("exec: bazel.query writes a hashed artifact and refuses unsafe output before launch", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), 'printf "%s\\n" "$*"; printf "source file //:Main.kt\\n"; printf "warn\\n" >&2');
+    const expr = "kind('source file|generated file', deps(//:main))";
+    const res = await cmdExec(
+      s.stateDir,
+      ["bazel", "query", expr, "--output", "label_kind", "--output-file", "out/main-sources.txt", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    assert.deepEqual(res.steps[0].args.slice(0, 3), ["query", "--output=label_kind", expr]);
+    assert.ok(!res.steps[0].args.includes("--output_file"), "Bazel does not receive an output-file flag");
+    const body = fs.readFileSync(res.artifact.path, "utf8");
+    assert.match(body, /^query --output=label_kind /);
+    assert.match(body, /source file \/\/:Main.kt/);
+    assert.equal(res.artifact.bytes, Buffer.byteLength(body));
+    assert.equal(res.artifact.sha256, crypto.createHash("sha256").update(body).digest("hex"));
+    assert.match(res.stderr, /warn/);
+    assert.equal(res.stdout, undefined, "the artifact is the result, not an unbounded stdout");
+
+    const marker = path.join(s.root, "ran");
+    script(path.join(s.proj, "bazelw"), `touch ${marker}`);
+    const refused = await cmdExec(
+      s.stateDir,
+      ["bazel", "query", "deps(//:main)", "--output", "yaml", "--output-file", "out/nope.txt"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(refused.exitCode, 7);
+    assert.ok(refused.errors.some((e) => e.code === "enum"));
+    assert.ok(!fs.existsSync(marker));
+    const escaped = await cmdExec(
+      s.stateDir,
+      ["bazel", "cquery", "deps(//:main)", "--output", "label", "--output-file", "../outside.txt"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(escaped.exitCode, 7);
+    assert.equal(escaped.errors[0].code, "unsafe_output");
+    assert.ok(!fs.existsSync(marker));
+    assert.ok(!fs.existsSync(path.join(s.root, "outside.txt")));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec: query limit, nonzero exit, and cancellation leave no artifact", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), 'printf "0123456789abcdef";');
+    const limited = await cmdExec(
+      s.stateDir,
+      ["bazel", "query", "deps(//:main)", "--output", "xml", "--output-file", "out/rules.xml", "--max-output-bytes", "8", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(limited.exitCode, 1);
+    assert.equal(limited.errorCode, "output_limit");
+    assert.equal(limited.artifact, undefined);
+    assert.ok(!fs.existsSync(path.join(s.proj, "out", "rules.xml")));
+    assert.equal(fs.readdirSync(path.join(s.proj, "out")).filter((n) => n.includes("rules")).length, 0);
+
+    script(path.join(s.proj, "bazelw"), 'printf "partial-rules"; exit 2');
+    const failed = await cmdExec(
+      s.stateDir,
+      ["bazel", "cquery", "deps(//:main)", "--output", "label", "--output-file", "out/configured.txt", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(failed.exitCode, 2);
+    assert.equal(failed.errorCode, "query_failed");
+    assert.ok(!fs.existsSync(path.join(s.proj, "out", "configured.txt")));
+
+    script(path.join(s.proj, "bazelw"), "sleep 30");
+    const started = Date.now();
+    const timedOut = await cmdExec(
+      s.stateDir,
+      ["bazel", "query", "deps(//:main)", "--output", "label_kind", "--output-file", "out/slow.txt", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST, timeoutMs: 400 },
+    );
+    assert.equal(timedOut.exitCode, 124, timedOut.error);
+    assert.ok(Date.now() - started < 10000);
+    assert.equal(timedOut.artifact, undefined);
+    assert.ok(!fs.existsSync(path.join(s.proj, "out", "slow.txt")));
+    assert.equal(fs.readdirSync(path.join(s.proj, "out")).some((n) => n.startsWith("slow.txt")), false);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("query capture: a failed publish does not leave a truncated destination", () => {
+  const root = tmp();
+  const dest = path.join(root, "nested", "rules.xml");
+  const cap = createQueryCapture(dest, 32);
+  cap.onChunk(Buffer.from("<query>"));
+  cap.onChunk(Buffer.from("rules"));
+  const ok = cap.finish(0);
+  assert.equal(ok.ok, true);
+  assert.equal(fs.readFileSync(dest, "utf8"), "<query>rules");
+  assert.equal(ok.artifact.bytes, 12);
+
+  const over = createQueryCapture(path.join(root, "over.xml"), 4);
+  over.onChunk(Buffer.from("abcdef"));
+  const denied = over.finish(0);
+  assert.equal(denied.ok, false);
+  assert.equal(denied.exceeded, true);
+  assert.equal(denied.artifact, null);
+  assert.ok(!fs.existsSync(path.join(root, "over.xml")));
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test("exec: bazel.clean --expunge is allowed and serialized like a build", { skip: !posix }, async () => {

@@ -171,6 +171,44 @@ test("bazel.series: one invocation per entry, clean with expunge", () => {
   );
 });
 
+test("bazel.query and bazel.cquery: literal argv, allowlisted output, no flag escape", () => {
+  const root = tmpDir();
+  touch(path.join(root, "MODULE.bazel"), 0o644);
+  const ctx = { cwd: root, which: () => null };
+  const expr = "kind('source file|generated file', deps(//:main))";
+  const [q] = OPS["bazel.query"].invocations(
+    { query: expr, output: "label_kind", outputFile: "out/main-sources.txt", keepGoing: true },
+    ctx,
+  );
+  assert.deepEqual(q.args, ["query", "--output=label_kind", "--keep_going", expr]);
+  assert.equal(q.args.filter((a) => a === expr).length, 1, "expression is one argv element");
+  assert.equal(q.cwd, root);
+  const [c] = OPS["bazel.cquery"].invocations(
+    { query: "deps(//:main)", output: "label", outputFile: "out/configured.txt" },
+    ctx,
+  );
+  assert.deepEqual(c.args, ["cquery", "--output=label", "deps(//:main)"]);
+
+  const badFormat = validateOpParams("bazel.query", { query: "deps(//:main)", output: "json", outputFile: "out/x" });
+  assert.ok(badFormat.errors.some((e) => e.path === "/output" && e.code === "enum"));
+  const cqueryXml = validateOpParams("bazel.cquery", { query: "deps(//:main)", output: "xml", outputFile: "out/x" });
+  assert.deepEqual(cqueryXml.errors, []);
+  const queryXml = validateOpParams("bazel.query", { query: "kind('rule', deps(//:main))", output: "xml", outputFile: "out/rules.xml" });
+  assert.deepEqual(queryXml.errors, []);
+  const unknown = validateOpParams("bazel.query", { query: "deps(//:main)", output: "label", outputFile: "out/x", extraArgs: ["--output_base=/tmp"] });
+  assert.ok(unknown.errors.some((e) => e.code === "unknown_field"));
+  const shellish = validateOpParams("bazel.query", { query: "deps(//:main); rm -rf /", output: "label", outputFile: "out/x" });
+  assert.ok(shellish.errors.some((e) => e.code === "pattern_mismatch" && e.forceable === false));
+  const forced = validateOpParams("bazel.query", { query: "deps(//:main); touch /tmp/pwned", output: "label", outputFile: "out/x" }, { force: true });
+  assert.ok(forced.errors.some((e) => e.path === "/query"));
+  const abs = validateOpParams("bazel.query", { query: "deps(//:main)", output: "label", outputFile: "/tmp/out.txt" });
+  assert.equal(abs.errors[0].code, "unsafe_output");
+  const climb = validateOpParams("bazel.cquery", { query: "deps(//:main)", output: "label", outputFile: "out/../../etc/passwd" });
+  assert.equal(climb.errors[0].code, "unsafe_output");
+  const missing = validateOpParams("bazel.query", { query: "deps(//:main)", output: "label_kind" });
+  assert.ok(missing.errors.some((e) => e.path === "/outputFile" && e.code === "required"));
+});
+
 test("bazel.run: timeout required and run args after --", () => {
   const root = tmpDir();
   touch(path.join(root, "MODULE.bazel"), 0o644);
@@ -469,6 +507,8 @@ test("documented CLI translations (docs/migration-3.0.md, guides) parse and vali
     [["bazel", "test", "//app:tests", "--config", "ci", "--keep-going"], "bazel.test"],
     [["bazel", "clean", "--expunge"], "bazel.clean"],
     [["bazel", "run", "//tools:gen", "--run-arg=--out=x", "--timeout-sec", "300"], "bazel.run"],
+    [["bazel", "query", "kind('source file', deps(//:main))", "--output", "label_kind", "--output-file", "out/main-sources.txt"], "bazel.query"],
+    [["bazel", "cquery", "deps(//:main)", "--output", "label", "--output-file", "out/configured.txt"], "bazel.cquery"],
     [["xcode", "test", "--scheme", "App"], "xcode.test"],
     [["xcode", "build-for-testing", "--scheme", "App", "--project", "App.xcodeproj"], "xcode.buildForTesting"],
     [["xcode", "test", "--scheme", "App", "--project", "App.xcodeproj", "--only-testing", "AppTests/LoginTests"], "xcode.test"],

@@ -1910,6 +1910,58 @@ test("exec --wait 0 admits immediately when the slot is free and exits 2 when th
   }
 });
 
+test("bazel.query waits for a heavy build slot instead of bypassing admission", { skip: !posix }, async () => {
+  const s = setupProject();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    const log = path.join(s.root, "order.log");
+    script(path.join(s.proj, "bazelw"), `echo "start $1" >> ${log}; sleep 1; echo "end $1" >> ${log}; echo "source file //:Main.kt"`);
+    s.writeState((st) => {
+      st.config.maxConcurrentBuilds = 1;
+      st.config.maxDeviceHolderBurstBuilds = 0;
+    });
+    const cliUrl = new URL("../src/cli.mjs", import.meta.url).href;
+    const run = (argv, session) =>
+      new Promise((resolve, reject) => {
+        const code = [
+          `const { cmdExec } = await import(${JSON.stringify(cliUrl)});`,
+          `const res = await cmdExec(${JSON.stringify(s.stateDir)}, ${JSON.stringify([...argv, "--session", session, "--wait", "60", "--json"])},`,
+          `  { env: process.env, cwd: ${JSON.stringify(s.proj)}, inventory: ${JSON.stringify(hostInventory())} });`,
+          `process.stdout.write(JSON.stringify({ exitCode: res.exitCode, error: res.error || null, artifact: res.artifact || null }));`,
+        ].join("\n");
+        const child = spawn(process.execPath, ["--input-type=module", "-e", code], { env: s.env, stdio: ["ignore", "pipe", "inherit"] });
+        let out = "";
+        child.stdout.on("data", (d) => (out += d));
+        child.on("error", reject);
+        child.on("close", () => {
+          try {
+            resolve(JSON.parse(out));
+          } catch {
+            reject(new Error(`child output not JSON: ${out}`));
+          }
+        });
+      });
+    const [build, query] = await Promise.all([
+      run(["bazel", "build", "//:main"], "sess-build"),
+      run(["bazel", "query", "deps(//:main)", "--output", "label", "--output-file", "out/main.txt"], "sess-query"),
+    ]);
+    assert.equal(build.exitCode, 0, build.error);
+    assert.equal(query.exitCode, 0, query.error);
+    assert.equal(query.artifact.bytes > 0, true);
+    assert.match(query.artifact.sha256, /^[a-f0-9]{64}$/);
+    const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(lines.length, 4);
+    const first = lines[0].split(" ")[1];
+    const second = first === "build" ? "query" : "build";
+    assert.deepEqual(lines, [`start ${first}`, `end ${first}`, `start ${second}`, `end ${second}`]);
+    const st = readState(s.stateDir);
+    assert.deepEqual(st.buildLeases, {});
+    assert.deepEqual(st.buildQueue, []);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("exec serializes concurrent builds on the same workspace key", { skip: !posix }, async () => {
   const s = setupProject();
   try {

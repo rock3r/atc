@@ -63,7 +63,7 @@ Install the optional agent plugin so your coding agent loads the `atc` skill, th
 | System | Operations |
 |---|---|
 | `gradle` | `tasks` (any task names/paths, one wrapper invocation; clean is just `tasks clean`) |
-| `bazel` | `build`, `test`, `coverage`, `run` (needs `--timeout-sec` / `timeoutSec`), `series` (batch/MCP), `clean` (`--expunge`) |
+| `bazel` | `build`, `test`, `coverage`, `run` (needs `--timeout-sec` / `timeoutSec`), `query`, `cquery`, `series` (batch/MCP), `clean` (`--expunge`) |
 | `xcode` | `build`, `test`, `build-for-testing`, `test-without-building`, `archive`, `clean`, `actions` |
 | `android` | `install`, `uninstall`, `launch`, `clear-data`, `permission`, `logcat` (dump), `screenshot`, `prop get`, `prop set` |
 | `ios` | `install`, `uninstall`, `launch`, `terminate`, `open-url`, `screenshot`, `privacy` (simulators only) |
@@ -72,6 +72,7 @@ Install the optional agent plugin so your coding agent loads the `atc` skill, th
 ```bash
 atc exec gradle tasks :app:assembleDebug --offline --brief
 atc exec bazel test //app:tests --config ci --keep-going
+atc exec bazel query "kind('source file|generated file', deps(//:main))" --output label_kind --output-file out/main-sources.txt --max-output-bytes 67108864
 atc exec xcode test --scheme App --project App.xcodeproj --only-testing AppTests/LoginTests
 atc exec android permission --package com.example.app --permission android.permission.CAMERA --action grant
 atc exec android prop set debug.layout true
@@ -113,6 +114,20 @@ flowchart TD
     F -->|"no"| RJ["Rejected, exit 7<br/>hint: --force --reason"]
     F -->|"yes"| REC["Runs as requested<br/>recorded in atc status --forced<br/>blamed if a later run in this workspace fails"]
 ```
+
+## Compare a sparse `//:main` closure without treating a build as equivalence
+
+A successful `bazel.build //:main` does not prove that source membership or rule attributes match another tree. Capture fresh query output from each tree through ATC, then compare the artifact hashes. Reusing an old label list or a stored digest does not certify a newly materialized sparse stage.
+
+```bash
+# From each tree (the original pin, then the sparse stage). outputFile is relative to cwd.
+atc exec bazel query "kind('source file|generated file', deps(//:main))" --output label_kind --output-file out/main-sources.txt
+atc exec bazel query "kind('rule', deps(//:main))" --output xml --output-file out/main-rules.xml
+# Only when the comparison is configured targets, not the unconfigured graph:
+atc exec bazel cquery "deps(//:main)" --output label --output-file out/main-configured.txt
+```
+
+The same steps work in a batch plan (`op: "bazel.query"`, `query`, `output`, `outputFile`). Each op takes the workspace lock and a build slot, the same admission as `bazel.build`. ATC writes the file only if Bazel exits 0 and the capture stays within `maxOutputBytes` (default 64 MiB). The JSON result's `artifact` field is `{path, bytes, sha256, maxBytes}`. If the limit is exceeded, Bazel fails, or the write is interrupted, the op fails and no partial file is left behind. Two trees are equivalent for this check only when both captures succeed and their `sha256` values match. Do not pass extra Bazel flags; the catalog has no flag escape hatch.
 
 ## One agent claims by profile and runs with a heartbeat
 

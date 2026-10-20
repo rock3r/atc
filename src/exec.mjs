@@ -1,9 +1,10 @@
 // `atc exec` front-end for typed operations (see docs/scope.md §2–§4).
 // Parse → validate (all errors at once) → build literal invocations → dispatch by kind.
 // ATC never receives, inspects or runs shell commands.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { OPS, OpError, SYSTEMS, listOps } from "./ops/catalog.mjs";
+import { BAZEL_QUERY_MAX_OUTPUT_BYTES, OPS, OpError, SYSTEMS, listOps } from "./ops/catalog.mjs";
 import { FEATURE_REQUEST_URL, WINDOWS_BATCH_ARG_RE, WINDOWS_BATCH_PATH_FORBIDDEN_RE } from "./ops/patterns.mjs";
 import { resolveOpBuildRequirements } from "./ops/requirements.mjs";
 import { formatErrors, parseOpArgv, validateOpParams } from "./validate.mjs";
@@ -103,6 +104,112 @@ function boundedAppend(buf, chunk) {
   if (buf.length >= MAX_CAPTURE_BYTES) return buf;
   const s = chunk.toString("utf8");
   return buf + s.slice(0, MAX_CAPTURE_BYTES - buf.length);
+}
+
+const BAZEL_GRAPH_OPS = new Set(["bazel.query", "bazel.cquery"]);
+
+export function resolveQueryOutputFile(cwd, outputFile) {
+  const raw = String(outputFile ?? "");
+  if (!raw || path.isAbsolute(raw) || raw.split(/[/\\]/).includes("..")) {
+    throw new OpError(
+      "unsafe_output",
+      "outputFile must be a relative path inside the working directory.",
+      "Pass a relative path such as out/main-rules.xml.",
+    );
+  }
+  const resolved = path.resolve(cwd, raw);
+  const root = path.resolve(cwd);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new OpError("unsafe_output", `outputFile resolves outside ${root}.`, "Pass a relative path that stays inside the working directory.");
+  }
+  return resolved;
+}
+
+// Stream a query/cquery result to a file with a hard byte cap. A limit breach, a
+// failed write, or a non-zero Bazel exit removes the file: a truncated artifact is
+// never a valid manifest.
+export function createQueryCapture(filePath, maxBytes) {
+  const limit = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : BAZEL_QUERY_MAX_OUTPUT_BYTES;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  // Write beside the destination and publish only after a complete, in-limit, zero-exit capture.
+  const partialPath = `${filePath}.atc-partial-${process.pid}`;
+  const fd = fs.openSync(partialPath, "w");
+  const hash = crypto.createHash("sha256");
+  let bytes = 0;
+  let exceeded = false;
+  let writeError = null;
+  let closed = false;
+  const drop = () => {
+    if (!closed) {
+      closed = true;
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+    try {
+      fs.rmSync(partialPath, { force: true });
+    } catch {
+      // best-effort: the result is still a failure and the destination is untouched
+    }
+  };
+  return {
+    filePath,
+    maxBytes: limit,
+    onChunk(chunk) {
+      if (exceeded || writeError || closed) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (bytes + buf.length > limit) {
+        exceeded = true;
+        drop();
+        return;
+      }
+      try {
+        fs.writeSync(fd, buf);
+        hash.update(buf);
+        bytes += buf.length;
+      } catch (err) {
+        writeError = err;
+        drop();
+      }
+    },
+    finish(exitCode) {
+      const failed = exceeded || writeError || exitCode !== 0;
+      if (failed) {
+        drop();
+        return {
+          ok: false,
+          exceeded,
+          writeError: writeError ? writeError.message : null,
+          artifact: null,
+        };
+      }
+      try {
+        if (!closed) {
+          fs.closeSync(fd);
+          closed = true;
+        }
+        fs.rmSync(filePath, { force: true });
+        fs.renameSync(partialPath, filePath);
+      } catch (err) {
+        writeError = err;
+        drop();
+        try {
+          fs.rmSync(filePath, { force: true });
+        } catch {
+          // destination may already be gone; do not report it
+        }
+        return { ok: false, exceeded: false, writeError: err.message, artifact: null };
+      }
+      return {
+        ok: true,
+        exceeded: false,
+        writeError: null,
+        artifact: { path: filePath, bytes, sha256: hash.digest("hex"), maxBytes: limit },
+      };
+    },
+  };
 }
 
 function briefLogPath(stateDir, opName) {
@@ -265,6 +372,19 @@ export async function execOp(stateDir, request, deps, options = {}) {
   if (params.ramMb) runnerFlags.ramMb = params.ramMb;
 
   const brief = Boolean(params.brief) && op.kind === "build";
+  const graphCapture = BAZEL_GRAPH_OPS.has(opName);
+  let queryCapture = null;
+  if (graphCapture) {
+    try {
+      queryCapture = createQueryCapture(
+        resolveQueryOutputFile(cwd, params.outputFile),
+        params.maxOutputBytes,
+      );
+    } catch (err) {
+      if (err instanceof OpError) return invalid([{ path: "/outputFile", code: err.code, message: err.message, hint: err.hint }], { op: opName });
+      throw err;
+    }
+  }
   let stdout = "";
   let stderr = "";
   let logPath = null;
@@ -273,7 +393,13 @@ export async function execOp(stateDir, request, deps, options = {}) {
   const briefLines = [];
   let onOutput = null;
   let stdio = undefined;
-  if (brief) {
+  if (graphCapture) {
+    stdio = ["ignore", "pipe", "pipe"];
+    onOutput = (chunk, stream) => {
+      if (stream === "stdout") queryCapture.onChunk(chunk);
+      else stderr = boundedAppend(stderr, chunk);
+    };
+  } else if (brief) {
     logPath = briefLogPath(stateDir, opName);
     logFd = fs.openSync(logPath, "a");
     stdio = ["ignore", "pipe", "pipe"];
@@ -301,6 +427,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
 
   const startedAt = Date.now();
   let res;
+  let captured = null;
   try {
     res = await deps.runOpInvocations(
       stateDir,
@@ -317,16 +444,37 @@ export async function execOp(stateDir, request, deps, options = {}) {
         // ignore
       }
     }
+    if (queryCapture) captured = queryCapture.finish(res?.exitCode ?? 1);
+  }
+  let artifact = null;
+  let artifactError = null;
+  let artifactCode = null;
+  if (captured && !captured.ok) {
+    if (captured.exceeded) {
+      artifactError = `Query output exceeded ${queryCapture.maxBytes} bytes. No artifact was kept.`;
+      artifactCode = "output_limit";
+    } else if (captured.writeError) {
+      artifactError = `Query output could not be written: ${captured.writeError}. No artifact was kept.`;
+      artifactCode = "output_write_failed";
+    } else {
+      artifactError = "Query failed or was interrupted. No artifact was kept.";
+      artifactCode = "query_failed";
+    }
+  } else if (captured) {
+    artifact = captured.artifact;
   }
   const out = {
     ...base,
-    ok: res.exitCode === 0,
-    exitCode: res.exitCode,
+    ok: Boolean(res) && res.exitCode === 0 && !artifactError,
+    exitCode: !res ? 1 : artifactError && res.exitCode === 0 ? 1 : res.exitCode,
     durationMs: Date.now() - startedAt,
-    steps: res.steps || [],
-    ...(res.error ? { error: res.error } : {}),
-    ...(res.errorCode ? { errorCode: res.errorCode } : {}),
-    ...(json && !brief ? { stdout, stderr } : {}),
+    steps: res?.steps || [],
+    ...(res?.error ? { error: res.error } : {}),
+    ...(artifactError ? { error: res?.error || artifactError, errorCode: res?.errorCode || artifactCode } : {}),
+    ...(res?.errorCode && !artifactError ? { errorCode: res.errorCode } : {}),
+    ...(artifact ? { artifact } : {}),
+    ...(json && !brief && !graphCapture ? { stdout, stderr } : {}),
+    ...(json && graphCapture ? { stderr } : {}),
     ...(logPath ? { logPath } : {}),
   };
   if (brief) {
@@ -366,6 +514,9 @@ export function renderExecResult(res, { json = false, write = (s) => process.std
     return;
   }
   if (res.error) writeErr(`[atc] ${res.error}\n`);
+  if (res.artifact) {
+    writeErr(`[atc] artifact: ${res.artifact.path} (${res.artifact.bytes} bytes, sha256 ${res.artifact.sha256})\n`);
+  }
   if (res.logPath) {
     if (res.exitCode === 0) {
       writeErr(`[atc] ✓ ${res.op} succeeded in ${Math.round((res.durationMs || 0) / 100) / 10}s (full log: ${res.logPath})\n`);

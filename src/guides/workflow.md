@@ -26,6 +26,9 @@ Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb ki
    # Pure builds: build slot + per-workspace lock, no device held
    atc exec gradle tasks :app:assembleDebug :app:assembleDebugAndroidTest --brief
    atc exec bazel build //app:main --config ci
+   # Graph inspection is coordinated too. Compare artifact sha256 values; a green build is not closure equivalence.
+   atc exec bazel query "kind('source file|generated file', deps(//:main))" --output label_kind --output-file out/main-sources.txt
+   atc exec bazel query "kind('rule', deps(//:main))" --output xml --output-file out/main-rules.xml
    atc exec xcode build-for-testing --scheme App --project App.xcodeproj
 
    # Device-coupled builds use your lease (or claim one for the run with --claim)
