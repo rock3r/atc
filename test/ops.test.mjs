@@ -277,16 +277,24 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
   assert.equal(inv.args.at(-1), expr);
   assert.equal(inv.cwd, root);
 
-  const hostHome = os.homedir();
-  assert.throws(
-    () => OPS["bazel.query"].invocations({
-      query: expr,
-      output: "xml",
-      outputFile: "out/x",
-      diskCache: path.join(hostHome, "Library", "Caches", "JetBrains", "shared"),
-    }, { ...ctx, env: { HOME: path.join(scratch, "home") } }),
-    (e) => e.code === "unsafe_output" && /JetBrains/.test(e.message),
-  );
+  const hostHome = os.userInfo().homedir;
+  const savedHome = process.env.HOME;
+  process.env.HOME = path.join(scratch, "home");
+  try {
+    assert.notEqual(os.homedir(), hostHome);
+    assert.throws(
+      () => OPS["bazel.query"].invocations({
+        query: expr,
+        output: "xml",
+        outputFile: "out/x",
+        diskCache: path.join(hostHome, "Library", "Caches", "JetBrains", "shared"),
+      }, { ...ctx, env: { HOME: path.join(scratch, "home") } }),
+      (e) => e.code === "unsafe_output" && /JetBrains/.test(e.message),
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  }
   const alias = path.join(scratch, "alias");
   fs.symlinkSync(path.join(hostHome, "Library", "Caches", "JetBrains"), alias);
   assert.throws(
@@ -544,7 +552,7 @@ test("validateBatchPlan: step fields", () => {
           op: "gradle.tasks",
           tasks: ["x"],
           cwd: "missing-dir",
-          env: { "BAD-KEY": "v", OK: "a b" },
+          env: { "BAD-KEY": "v", OK: "a b", SHELL: "a$(id)" },
           timeoutSec: 0,
           continueOnError: "yes",
           phase: "whatever",
@@ -558,7 +566,7 @@ test("validateBatchPlan: step fields", () => {
   for (const c of [
     "/steps/0/cwd:not_found",
     "/steps/0/env/BAD-KEY:pattern_mismatch",
-    "/steps/0/env/OK:pattern_mismatch",
+    "/steps/0/env/SHELL:pattern_mismatch",
     "/steps/0/timeoutSec:range",
     "/steps/0/continueOnError:type",
     "/steps/0/phase:unknown_field",
@@ -566,6 +574,7 @@ test("validateBatchPlan: step fields", () => {
   ]) {
     assert.ok(codes.includes(c), `${c} in ${codes.join(", ")}`);
   }
+  assert.ok(!codes.some((c) => c.startsWith("/steps/0/env/OK:")), codes.join(", "));
 });
 
 test("validateBatchPlan: step force overrides forceable patterns and is recorded", () => {

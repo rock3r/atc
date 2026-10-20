@@ -832,8 +832,21 @@ function canonicalPrivatePath(raw, field) {
   return missing ? path.resolve(real, missing) : real;
 }
 
+function hostAccountHome() {
+  // os.homedir() follows process.env.HOME. A preflight that starts ATC with
+  // HOME=<private scratch> would then miss the real ~/Library/Caches/JetBrains.
+  // userInfo().homedir is the OS account home (getpwuid on POSIX).
+  try {
+    const home = os.userInfo().homedir;
+    if (home) return home;
+  } catch {
+    // userInfo can throw when the uid has no passwd entry.
+  }
+  return null;
+}
+
 function privatePathForbidden(resolved, wsRoot) {
-  const home = os.homedir();
+  const home = hostAccountHome();
   const shared = [];
   if (home) {
     shared.push(path.join(home, "Library", "Caches", "JetBrains"));
