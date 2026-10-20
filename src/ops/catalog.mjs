@@ -1,6 +1,7 @@
 // Closed catalog of typed ATC operations (see docs/scope.md §2).
 // ATC never runs shell: each op turns validated, typed params into literal invocations.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isGradleDeviceTaskName } from "../build.mjs";
 import { quoteRemote } from "./patterns.mjs";
@@ -67,6 +68,8 @@ const BAZEL_ISOLATION_PARAMS = {
   noWorkspaceSymlinks: { type: "boolean", description: "cquery only: command --symlink_prefix=/. Rejected on query; Bazel 9 BuildRequestOptions does not accept it there, and the JetBrains fork is untested." },
   repoEnv: { type: "string[]", pattern: "bazelRepoEnv", maxItems: 32, description: "Repeatable command --repo_env=KEY=VALUE" },
   remoteCache: { type: "string", description: "Command --remote_cache. Empty string clears it. Non-empty values must be transport-safe." },
+  remoteExecutor: { type: "string", description: "Command --remote_executor. Empty string clears it. A cleared remote_cache is not enough: Bazel can use remote_executor as the cache endpoint." },
+  besBackend: { type: "string", description: "Command --bes_backend. Empty string clears it." },
   remoteUploadLocalResults: { type: "boolean", description: "Command --remote_upload_local_results" },
   color: { type: "enum", values: ["yes", "no", "auto"] },
   curses: { type: "enum", values: ["yes", "no", "auto"] },
@@ -718,6 +721,8 @@ function bazelIsolationCommand(params, ctx, wsRoot, command) {
   }
   for (const entry of params.repoEnv || []) args.push(`--repo_env=${entry}`);
   if (params.remoteCache !== undefined) args.push(`--remote_cache=${params.remoteCache}`);
+  if (params.remoteExecutor !== undefined) args.push(`--remote_executor=${params.remoteExecutor}`);
+  if (params.besBackend !== undefined) args.push(`--bes_backend=${params.besBackend}`);
   if (params.remoteUploadLocalResults === false) args.push("--noremote_upload_local_results");
   if (params.remoteUploadLocalResults === true) args.push("--remote_upload_local_results");
   if (params.color) args.push(`--color=${params.color}`);
@@ -746,8 +751,11 @@ function checkBazelIsolationPaths(params, command) {
       hint: "Do not send --symlink_prefix to query.",
     });
   }
-  if (params.remoteCache !== undefined && params.remoteCache !== "" && !/^[A-Za-z0-9_.:/@+=,-]{1,256}$/.test(params.remoteCache)) {
-    errs.push({ path: "/remoteCache", code: "pattern_mismatch", message: "remoteCache must be empty or a transport-safe value." });
+  for (const field of ["remoteCache", "remoteExecutor", "besBackend"]) {
+    const value = params[field];
+    if (value !== undefined && value !== "" && !/^[A-Za-z0-9_.:/@+=,-]{1,256}$/.test(value)) {
+      errs.push({ path: `/${field}`, code: "pattern_mismatch", message: `${field} must be empty or a transport-safe value.` });
+    }
   }
   for (const field of ["outputUserRoot", "outputBase", "repositoryCache", "diskCache"]) {
     const raw = params[field];
@@ -764,7 +772,7 @@ function checkBazelIsolationPaths(params, command) {
   return errs;
 }
 
-function resolvePrivateBazelPath(raw, ctx, field, wsRoot = null, outputUserRoot = null) {
+function resolvePrivateBazelPath(raw, _ctx, field, wsRoot = null, outputUserRoot = null) {
   const value = String(raw);
   if (!path.isAbsolute(value)) {
     throw new OpError("unsafe_output", `${field} must be an absolute path.`, "Pass a private absolute directory outside the Bazel workspace and outside shared IDE caches.");
@@ -772,22 +780,60 @@ function resolvePrivateBazelPath(raw, ctx, field, wsRoot = null, outputUserRoot 
   if (value.split(/[/\\]/).includes("..")) {
     throw new OpError("unsafe_output", `${field} must not contain '..'.`, "Pass a resolved absolute private directory.");
   }
-  const resolved = path.resolve(value);
-  const forbidden = privatePathForbidden(resolved, ctx, wsRoot);
+  const canonical = canonicalPrivatePath(value, field);
+  const forbidden = privatePathForbidden(canonical, wsRoot);
   if (forbidden) {
     throw new OpError("unsafe_output", `${field} ${forbidden}.`, "Use a private scratch directory that is not the workspace and not a shared JetBrains/Bazel cache.");
   }
   if (field === "outputBase" && outputUserRoot) {
-    const root = path.resolve(String(outputUserRoot));
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    const root = canonicalPrivatePath(String(outputUserRoot), "outputUserRoot");
+    if (canonical !== root && !canonical.startsWith(root + path.sep)) {
       throw new OpError("unsafe_output", "outputBase must be inside outputUserRoot.", "The proven layout is output_base under the private output_user_root.");
     }
   }
-  return resolved;
+  return canonical;
 }
 
-function privatePathForbidden(resolved, ctx, wsRoot) {
-  const home = ctx.env?.HOME || process.env.HOME || "";
+// Resolve the existing ancestor for real, reject any symlink component, then append
+// the not-yet-created suffix. A lexical prefix check would follow alias -> JetBrains.
+function canonicalPrivatePath(raw, field) {
+  const abs = path.resolve(raw);
+  const root = path.parse(abs).root;
+  const parts = abs.slice(root.length).split(path.sep).filter(Boolean);
+  let cur = root;
+  let missing = null;
+  for (const part of parts) {
+    if (missing) {
+      missing = path.join(missing, part);
+      continue;
+    }
+    const next = path.join(cur, part);
+    let st;
+    try {
+      st = fs.lstatSync(next);
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        missing = part;
+        continue;
+      }
+      throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
+    }
+    if (st.isSymbolicLink()) {
+      throw new OpError("unsafe_output", `${field} contains a symlink component.`, "Pass a path whose existing parents are real directories, not aliases into a shared cache or the workspace.");
+    }
+    cur = next;
+  }
+  let real = cur;
+  try {
+    real = fs.realpathSync(cur);
+  } catch (err) {
+    throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
+  }
+  return missing ? path.resolve(real, missing) : real;
+}
+
+function privatePathForbidden(resolved, wsRoot) {
+  const home = os.homedir();
   const shared = [];
   if (home) {
     shared.push(path.join(home, "Library", "Caches", "JetBrains"));
@@ -796,11 +842,19 @@ function privatePathForbidden(resolved, ctx, wsRoot) {
   if (wsRoot) shared.push(path.resolve(wsRoot));
   for (const root of shared) {
     if (!root) continue;
-    const abs = path.resolve(root);
+    const abs = canonicalExistingOrLexical(root);
     if (resolved === abs || resolved.startsWith(abs + path.sep)) return `resolves inside ${abs}`;
   }
   if (/[/\\]\.bazelrc$/i.test(resolved)) return "names a .bazelrc file";
   return null;
+}
+
+function canonicalExistingOrLexical(root) {
+  try {
+    return canonicalPrivatePath(root, "forbidden");
+  } catch {
+    return path.resolve(root);
+  }
 }
 
 function checkBazelQueryOutputFile(params) {

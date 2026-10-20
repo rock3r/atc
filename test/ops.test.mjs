@@ -238,6 +238,8 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
     lockfileMode: "error",
     repoEnv: ["HTTP_PROXY="],
     remoteCache: "",
+    remoteExecutor: "",
+    besBackend: "",
     remoteUploadLocalResults: false,
     showProgress: false,
   }, ctx);
@@ -255,6 +257,9 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
   assert.ok(inv.args.indexOf("query") < inv.args.indexOf("--lockfile_mode=error"));
   assert.ok(!inv.args.includes("--symlink_prefix=/"));
   assert.ok(inv.args.includes("--remote_cache="));
+  assert.ok(inv.args.includes("--remote_executor="));
+  assert.ok(inv.args.includes("--bes_backend="));
+  assert.ok(inv.args.indexOf("query") < inv.args.indexOf("--remote_executor="));
   assert.ok(inv.args.includes("--noremote_upload_local_results"));
   const querySymlinks = validateOpParams("bazel.query", { query: expr, output: "xml", outputFile: "out/x", noWorkspaceSymlinks: true });
   assert.ok(querySymlinks.errors.some((e) => e.path === "/noWorkspaceSymlinks"));
@@ -272,12 +277,24 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
   assert.equal(inv.args.at(-1), expr);
   assert.equal(inv.cwd, root);
 
+  const hostHome = os.homedir();
   assert.throws(
     () => OPS["bazel.query"].invocations({
       query: expr,
       output: "xml",
       outputFile: "out/x",
-      diskCache: path.join(home, "Library", "Caches", "JetBrains", "shared"),
+      diskCache: path.join(hostHome, "Library", "Caches", "JetBrains", "shared"),
+    }, { ...ctx, env: { HOME: path.join(scratch, "home") } }),
+    (e) => e.code === "unsafe_output" && /JetBrains/.test(e.message),
+  );
+  const alias = path.join(scratch, "alias");
+  fs.symlinkSync(path.join(hostHome, "Library", "Caches", "JetBrains"), alias);
+  assert.throws(
+    () => OPS["bazel.query"].invocations({
+      query: expr,
+      output: "xml",
+      outputFile: "out/x",
+      outputUserRoot: path.join(alias, "output"),
     }, ctx),
     (e) => e.code === "unsafe_output",
   );
