@@ -67,9 +67,9 @@ const BAZEL_ISOLATION_PARAMS = {
   lockfileMode: { type: "enum", values: ["error", "off", "update", "refresh"], description: "Command --lockfile_mode. error is the protected-tree mode; prove it on a disposable tree before the protected original." },
   noWorkspaceSymlinks: { type: "boolean", description: "cquery only: command --symlink_prefix=/. Rejected on query; Bazel 9 BuildRequestOptions does not accept it there, and the JetBrains fork is untested." },
   repoEnv: { type: "string[]", pattern: "bazelRepoEnv", maxItems: 32, description: "Repeatable command --repo_env=KEY=VALUE" },
-  remoteCache: { type: "string", description: "Command --remote_cache. Empty string clears it. Non-empty values must be transport-safe." },
-  remoteExecutor: { type: "string", description: "Command --remote_executor. Empty string clears it. A cleared remote_cache is not enough: Bazel can use remote_executor as the cache endpoint." },
-  besBackend: { type: "string", description: "Command --bes_backend. Empty string clears it." },
+  remoteCache: { type: "string", allowEmpty: true, description: "Command --remote_cache. Empty string clears it. Non-empty values must be transport-safe." },
+  remoteExecutor: { type: "string", allowEmpty: true, description: "Command --remote_executor. Empty string clears it. A cleared remote_cache is not enough: Bazel can use remote_executor as the cache endpoint." },
+  besBackend: { type: "string", allowEmpty: true, description: "Command --bes_backend. Empty string clears it." },
   remoteUploadLocalResults: { type: "boolean", description: "Command --remote_upload_local_results" },
   color: { type: "enum", values: ["yes", "no", "auto"] },
   curses: { type: "enum", values: ["yes", "no", "auto"] },
@@ -785,7 +785,10 @@ function resolvePrivateBazelPath(raw, _ctx, field, wsRoot = null, outputUserRoot
   if (forbidden) {
     throw new OpError("unsafe_output", `${field} ${forbidden}.`, "Use a private scratch directory that is not the workspace and not a shared JetBrains/Bazel cache.");
   }
-  if (field === "outputBase" && outputUserRoot) {
+  if (field === "outputBase") {
+    if (!outputUserRoot) {
+      throw new OpError("unsafe_output", "outputBase requires outputUserRoot.", "The proven layout is output_base under the private output_user_root.");
+    }
     const root = canonicalPrivatePath(String(outputUserRoot), "outputUserRoot");
     if (canonical !== root && !canonical.startsWith(root + path.sep)) {
       throw new OpError("unsafe_output", "outputBase must be inside outputUserRoot.", "The proven layout is output_base under the private output_user_root.");

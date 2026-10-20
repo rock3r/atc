@@ -69,9 +69,9 @@ function validateField(spec, value, p, ctx) {
   const push = (e) => e && errors.push(e);
   switch (spec.type) {
     case "string":
-      if (typeof value !== "string" || value.length === 0) {
-        push(err(p, "type", "Expected a non-empty string."));
-      } else if (spec.pattern) {
+      if (typeof value !== "string" || (value.length === 0 && !spec.allowEmpty)) {
+        push(err(p, "type", spec.allowEmpty ? "Expected a string." : "Expected a non-empty string."));
+      } else if (spec.pattern && value.length > 0) {
         push(patternError(p, spec.pattern, value, ctx));
       }
       break;

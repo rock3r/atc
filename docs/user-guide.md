@@ -135,13 +135,13 @@ A protected tree whose `.bazelrc` imports a shared IDE cache needs the typed iso
 atc exec bazel query "kind('rule', deps(//:main))" \
   --workspace /protected/original \
   --output xml --output-file out/original-rules.xml \
-  --ignore-all-rc-files \
+  --no-system-rc --no-home-rc --bazelrc /dev/null \
   --output-user-root /private/scratch/bazel-user \
-  --output-base /private/scratch/bazel-output \
+  --output-base /private/scratch/bazel-user/main \
   --repository-cache /private/scratch/repository-cache \
   --disk-cache /private/scratch/disk-cache \
+  --remote-cache '' --remote-executor '' --bes-backend '' \
   --lockfile-mode error \
-  --no-workspace-symlinks \
   --executable /opt/pinned/bazel
 ```
 

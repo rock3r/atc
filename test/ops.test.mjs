@@ -316,6 +316,36 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
     }, ctx),
     (e) => e.code === "unsafe_output",
   );
+  const cleared = validateOpParams("bazel.query", {
+    query: expr,
+    output: "xml",
+    outputFile: "out/x",
+    remoteCache: "",
+    remoteExecutor: "",
+    besBackend: "",
+  });
+  assert.deepEqual(cleared.errors, []);
+  const parsed = parseOpArgv([
+    "bazel", "query", expr,
+    "--output", "xml",
+    "--output-file", "out/x",
+    "--remote-cache", "",
+    "--remote-executor=",
+    "--bes-backend", "",
+  ]);
+  assert.deepEqual(parsed.errors, []);
+  assert.equal(parsed.params.remoteCache, "");
+  assert.equal(parsed.params.remoteExecutor, "");
+  assert.equal(parsed.params.besBackend, "");
+  assert.throws(
+    () => OPS["bazel.query"].invocations({
+      query: expr,
+      output: "xml",
+      outputFile: "out/x",
+      outputBase: path.join(scratch, "orphan-base"),
+    }, ctx),
+    (e) => e.code === "unsafe_output" && /outputUserRoot/.test(e.message),
+  );
   const relative = validateOpParams("bazel.query", {
     query: expr,
     output: "xml",
