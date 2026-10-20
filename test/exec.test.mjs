@@ -317,7 +317,7 @@ test("query capture: concurrent captures and symlink escapes do not share or lea
     assert.equal(fs.readdirSync(outside).length, 0);
     fs.rmSync(outside, { recursive: true, force: true });
 
-    if (process.platform !== "win32") {
+    if (process.platform !== "win32" && typeof process.getuid === "function" && process.getuid() !== 0) {
       const ro = path.join(root, "ro");
       fs.mkdirSync(ro);
       fs.chmodSync(ro, 0o555);

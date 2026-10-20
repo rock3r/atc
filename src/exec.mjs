@@ -421,15 +421,13 @@ export async function execOp(stateDir, request, deps, options = {}) {
   const brief = Boolean(params.brief) && op.kind === "build";
   const graphCapture = BAZEL_GRAPH_OPS.has(opName);
   let queryCapture = null;
+  let outputPath = null;
   if (graphCapture) {
     try {
-      queryCapture = createQueryCapture(
-        resolveQueryOutputFile(cwd, params.outputFile),
-        params.maxOutputBytes,
-      );
+      outputPath = resolveQueryOutputFile(cwd, params.outputFile);
     } catch (err) {
-      const code = err instanceof OpError ? err.code : "output_write_failed";
-      const message = err instanceof OpError ? err.message : `Query output could not be opened: ${err.message}`;
+      const code = err instanceof OpError ? err.code : "unsafe_output";
+      const message = err instanceof OpError ? err.message : `outputFile could not be resolved: ${err.message}`;
       return invalid([{ path: "/outputFile", code, message, hint: err instanceof OpError ? err.hint : null }], { op: opName });
     }
   }
@@ -441,10 +439,16 @@ export async function execOp(stateDir, request, deps, options = {}) {
   const briefLines = [];
   let onOutput = null;
   let stdio = undefined;
+  const prepareCapture = graphCapture
+    ? () => {
+        queryCapture = createQueryCapture(outputPath, params.maxOutputBytes);
+        return queryCapture;
+      }
+    : null;
   if (graphCapture) {
     stdio = ["ignore", "pipe", "pipe"];
     onOutput = (chunk, stream) => {
-      if (stream === "stdout") queryCapture.onChunk(chunk);
+      if (stream === "stdout") queryCapture?.onChunk(chunk);
       else stderr = boundedAppend(stderr, chunk);
     };
   } else if (brief) {
@@ -479,7 +483,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
   try {
     res = await deps.runOpInvocations(
       stateDir,
-      { ...plan, stdio, onOutput },
+      { ...plan, stdio, onOutput, prepareCapture },
       runnerFlags,
       { ...options, env, cwd, platform: options.platform },
     );

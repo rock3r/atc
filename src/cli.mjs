@@ -6671,7 +6671,18 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
   };
 
   const steps = [];
+  let openedCapture = null;
   try {
+    if (typeof plan.prepareCapture === "function") {
+      try {
+        openedCapture = plan.prepareCapture();
+      } catch (err) {
+        const wrapped = new Error(err.message);
+        wrapped.code = err.code || "output_write_failed";
+        wrapped.exitCode = 7;
+        throw wrapped;
+      }
+    }
     let invocations;
     try {
       invocations = plan.makeInvocations(check.lease || null);
@@ -6879,7 +6890,10 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
           );
         }
       }
-    } catch {
+    } catch (err) {
+      if (err?.exitCode === 7) {
+        return { exitCode: 7, error: err.message, errorCode: err.code || "output_write_failed", steps };
+      }
       // Best-effort workerPid cleanup
     }
   }

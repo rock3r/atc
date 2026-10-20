@@ -194,7 +194,9 @@ test("bazel.query and bazel.cquery: literal argv, allowlisted output, no flag es
   const transitions = validateOpParams("bazel.cquery", { query: "deps(//:main)", output: "transitions", outputFile: "out/x" });
   assert.ok(transitions.errors.some((e) => e.path === "/output" && e.code === "enum"), "transitions needs a companion flag ATC will not emit");
   const cqueryXml = validateOpParams("bazel.cquery", { query: "deps(//:main)", output: "xml", outputFile: "out/x" });
-  assert.deepEqual(cqueryXml.errors, []);
+  assert.ok(cqueryXml.errors.some((e) => e.code === "enum"), "cquery does not implement xml");
+  const cqueryLabel = validateOpParams("bazel.cquery", { query: "deps(//:main)", output: "label", outputFile: "out/x" });
+  assert.deepEqual(cqueryLabel.errors, []);
   const queryXml = validateOpParams("bazel.query", { query: "kind('rule', deps(//:main))", output: "xml", outputFile: "out/rules.xml" });
   assert.deepEqual(queryXml.errors, []);
   const unknown = validateOpParams("bazel.query", { query: "deps(//:main)", output: "label", outputFile: "out/x", extraArgs: ["--output_base=/tmp"] });
