@@ -190,9 +190,11 @@ export function createQueryCapture(filePath, maxBytes, { workspaceRoot = null } 
   let fd;
   let partialPath;
   try {
-    if (workspaceRoot) assertNoSymlinkBetween(fs.realpathSync(workspaceRoot), path.resolve(filePath));
+    // Compare against the lexical workspace root. realpath(cwd) on macOS follows
+    // /var -> /private/var and would reject every path inside the workspace.
+    if (workspaceRoot) assertNoSymlinkBetween(path.resolve(workspaceRoot), path.resolve(filePath));
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    if (workspaceRoot) assertNoSymlinkBetween(fs.realpathSync(workspaceRoot), path.resolve(filePath));
+    if (workspaceRoot) assertNoSymlinkBetween(path.resolve(workspaceRoot), path.resolve(filePath));
     // Exclusive random name: concurrent captures in one process must not share a partial file.
     partialPath = path.join(
       path.dirname(filePath),
