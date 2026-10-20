@@ -2,7 +2,7 @@
 
 Coordinate builds and exclusive Android and iOS device leases across concurrent coding agents without a daemon.
 
-Status: `v3.1.0` · Updated `2026-10-17` · Node.js >= 20 on macOS, Linux, and Windows.
+Status: `v3.2.0` · Updated `2026-10-20` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 

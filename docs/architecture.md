@@ -2,7 +2,7 @@
 
 How the `atc` CLI, the typed-op catalog and validator, the lock-serialized state file, the 3-tier Android and iOS fleet discovery, the build scheduler, the warm-affinity queues, and the host hooks fit together.
 
-Status: `v3.1.0` · Updated `2026-10-17` · Node.js >= 20 on macOS, Linux, and Windows.
+Status: `v3.2.0` · Updated `2026-10-20` · Node.js >= 20 on macOS, Linux, and Windows.
 
 ## Executive summary
 
