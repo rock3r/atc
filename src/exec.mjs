@@ -1,9 +1,10 @@
 // `atc exec` front-end for typed operations (see docs/scope.md §2–§4).
 // Parse → validate (all errors at once) → build literal invocations → dispatch by kind.
 // ATC never receives, inspects or runs shell commands.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { OPS, OpError, SYSTEMS, listOps } from "./ops/catalog.mjs";
+import { BAZEL_QUERY_MAX_OUTPUT_BYTES, OPS, OpError, SYSTEMS, listOps } from "./ops/catalog.mjs";
 import { FEATURE_REQUEST_URL, WINDOWS_BATCH_ARG_RE, WINDOWS_BATCH_PATH_FORBIDDEN_RE } from "./ops/patterns.mjs";
 import { resolveOpBuildRequirements } from "./ops/requirements.mjs";
 import { formatErrors, parseOpArgv, validateOpParams } from "./validate.mjs";
@@ -103,6 +104,195 @@ function boundedAppend(buf, chunk) {
   if (buf.length >= MAX_CAPTURE_BYTES) return buf;
   const s = chunk.toString("utf8");
   return buf + s.slice(0, MAX_CAPTURE_BYTES - buf.length);
+}
+
+const BAZEL_GRAPH_OPS = new Set(["bazel.query", "bazel.cquery"]);
+
+function assertNoSymlinkBetween(rootReal, filePath) {
+  const rel = path.relative(rootReal, filePath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new OpError("unsafe_output", "outputFile resolves outside the working directory.", "Pass a relative path inside the working directory.");
+  }
+  let cur = rootReal;
+  for (const part of rel.split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st;
+    try {
+      st = fs.lstatSync(cur);
+    } catch (err) {
+      if (err?.code === "ENOENT") return;
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new OpError(
+        "unsafe_output",
+        "outputFile follows a symlink outside the working directory.",
+        "Pass a relative path whose parents are real directories inside the working directory.",
+      );
+    }
+  }
+}
+
+function realExistingAncestor(start) {
+  let cur = path.resolve(start);
+  for (let i = 0; i < 64; i++) {
+    try {
+      return { real: fs.realpathSync(cur), missing: path.relative(cur, start) };
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+      const parent = path.dirname(cur);
+      if (!parent || parent === cur) throw err;
+      cur = parent;
+    }
+  }
+  throw new OpError("unsafe_output", "outputFile could not be resolved.", "Pass a relative path inside the working directory.");
+}
+
+export function resolveQueryOutputFile(cwd, outputFile) {
+  const raw = String(outputFile ?? "");
+  if (!raw || path.isAbsolute(raw) || raw.split(/[/\\]/).includes("..")) {
+    throw new OpError(
+      "unsafe_output",
+      "outputFile must be a relative path inside the working directory.",
+      "Pass a relative path such as out/main-rules.xml.",
+    );
+  }
+  const lexical = path.resolve(cwd, raw);
+  const root = path.resolve(cwd);
+  if (lexical !== root && !lexical.startsWith(root + path.sep)) {
+    throw new OpError("unsafe_output", `outputFile resolves outside ${root}.`, "Pass a relative path that stays inside the working directory.");
+  }
+  let rootReal;
+  let dest;
+  try {
+    rootReal = fs.realpathSync(root);
+    dest = realExistingAncestor(lexical);
+  } catch (err) {
+    if (err instanceof OpError) throw err;
+    throw new OpError("output_write_failed", `outputFile could not be resolved: ${err.message}`, "Check that the working directory is readable.");
+  }
+  const realDest = dest.missing ? path.resolve(dest.real, dest.missing) : dest.real;
+  if (realDest !== rootReal && !realDest.startsWith(rootReal + path.sep)) {
+    throw new OpError(
+      "unsafe_output",
+      "outputFile follows a symlink outside the working directory.",
+      "Pass a relative path whose existing parents stay inside the working directory.",
+    );
+  }
+  return lexical;
+}
+
+// Stream a query/cquery result to a file with a hard byte cap. A limit breach, a
+// failed write, or a non-zero Bazel exit removes the file: a truncated artifact is
+// never a valid manifest.
+export function createQueryCapture(filePath, maxBytes, { workspaceRoot = null } = {}) {
+  const limit = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : BAZEL_QUERY_MAX_OUTPUT_BYTES;
+  let fd;
+  let partialPath;
+  try {
+    // Compare against the lexical workspace root. realpath(cwd) on macOS follows
+    // /var -> /private/var and would reject every path inside the workspace.
+    if (workspaceRoot) assertNoSymlinkBetween(path.resolve(workspaceRoot), path.resolve(filePath));
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    if (workspaceRoot) assertNoSymlinkBetween(path.resolve(workspaceRoot), path.resolve(filePath));
+    // Exclusive random name: concurrent captures in one process must not share a partial file.
+    partialPath = path.join(
+      path.dirname(filePath),
+      `.${path.basename(filePath)}.atc-partial-${crypto.randomBytes(8).toString("hex")}`,
+    );
+    fd = fs.openSync(partialPath, "wx");
+  } catch (err) {
+    throw new OpError("output_write_failed", `Query output could not be opened: ${err.message}`, "Check that outputFile's directory is writable.");
+  }
+  const hash = crypto.createHash("sha256");
+  let bytes = 0;
+  let exceeded = false;
+  let writeError = null;
+  let closed = false;
+  const drop = () => {
+    if (!closed) {
+      closed = true;
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+    try {
+      fs.rmSync(partialPath, { force: true });
+    } catch {
+      // best-effort
+    }
+    // A failed rerun must not leave a previous successful artifact at this path.
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // best-effort: the result is still a failure
+    }
+  };
+  return {
+    filePath,
+    maxBytes: limit,
+    onChunk(chunk) {
+      if (exceeded || writeError || closed) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (bytes + buf.length > limit) {
+        exceeded = true;
+        drop();
+        return;
+      }
+      try {
+        let offset = 0;
+        while (offset < buf.length) {
+          const wrote = fs.writeSync(fd, buf, offset, buf.length - offset);
+          if (!Number.isInteger(wrote) || wrote <= 0) {
+            throw new Error("short write produced no bytes");
+          }
+          hash.update(buf.subarray(offset, offset + wrote));
+          bytes += wrote;
+          offset += wrote;
+        }
+      } catch (err) {
+        writeError = err;
+        drop();
+      }
+    },
+    finish(exitCode) {
+      const failed = exceeded || writeError || exitCode !== 0;
+      if (failed) {
+        drop();
+        return {
+          ok: false,
+          exceeded,
+          writeError: writeError ? writeError.message : null,
+          artifact: null,
+        };
+      }
+      try {
+        if (!closed) {
+          fs.closeSync(fd);
+          closed = true;
+        }
+        fs.rmSync(filePath, { force: true });
+        fs.renameSync(partialPath, filePath);
+      } catch (err) {
+        writeError = err;
+        drop();
+        try {
+          fs.rmSync(filePath, { force: true });
+        } catch {
+          // destination may already be gone; do not report it
+        }
+        return { ok: false, exceeded: false, writeError: err.message, artifact: null };
+      }
+      return {
+        ok: true,
+        exceeded: false,
+        writeError: null,
+        artifact: { path: filePath, bytes, sha256: hash.digest("hex"), maxBytes: limit },
+      };
+    },
+  };
 }
 
 function briefLogPath(stateDir, opName) {
@@ -265,6 +455,18 @@ export async function execOp(stateDir, request, deps, options = {}) {
   if (params.ramMb) runnerFlags.ramMb = params.ramMb;
 
   const brief = Boolean(params.brief) && op.kind === "build";
+  const graphCapture = BAZEL_GRAPH_OPS.has(opName);
+  let queryCapture = null;
+  let outputPath = null;
+  if (graphCapture) {
+    try {
+      outputPath = resolveQueryOutputFile(cwd, params.outputFile);
+    } catch (err) {
+      const code = err instanceof OpError ? err.code : "unsafe_output";
+      const message = err instanceof OpError ? err.message : `outputFile could not be resolved: ${err.message}`;
+      return invalid([{ path: "/outputFile", code, message, hint: err instanceof OpError ? err.hint : null }], { op: opName });
+    }
+  }
   let stdout = "";
   let stderr = "";
   let logPath = null;
@@ -273,7 +475,19 @@ export async function execOp(stateDir, request, deps, options = {}) {
   const briefLines = [];
   let onOutput = null;
   let stdio = undefined;
-  if (brief) {
+  const prepareCapture = graphCapture
+    ? () => {
+        queryCapture = createQueryCapture(outputPath, params.maxOutputBytes, { workspaceRoot: cwd });
+        return queryCapture;
+      }
+    : null;
+  if (graphCapture) {
+    stdio = ["ignore", "pipe", "pipe"];
+    onOutput = (chunk, stream) => {
+      if (stream === "stdout") queryCapture?.onChunk(chunk);
+      else stderr = boundedAppend(stderr, chunk);
+    };
+  } else if (brief) {
     logPath = briefLogPath(stateDir, opName);
     logFd = fs.openSync(logPath, "a");
     stdio = ["ignore", "pipe", "pipe"];
@@ -301,10 +515,11 @@ export async function execOp(stateDir, request, deps, options = {}) {
 
   const startedAt = Date.now();
   let res;
+  let captured = null;
   try {
     res = await deps.runOpInvocations(
       stateDir,
-      { ...plan, stdio, onOutput },
+      { ...plan, stdio, onOutput, prepareCapture },
       runnerFlags,
       { ...options, env, cwd, platform: options.platform },
     );
@@ -317,16 +532,37 @@ export async function execOp(stateDir, request, deps, options = {}) {
         // ignore
       }
     }
+    if (queryCapture) captured = queryCapture.finish(res?.exitCode ?? 1);
+  }
+  let artifact = null;
+  let artifactError = null;
+  let artifactCode = null;
+  if (captured && !captured.ok) {
+    if (captured.exceeded) {
+      artifactError = `Query output exceeded ${queryCapture.maxBytes} bytes. No artifact was kept.`;
+      artifactCode = "output_limit";
+    } else if (captured.writeError) {
+      artifactError = `Query output could not be written: ${captured.writeError}. No artifact was kept.`;
+      artifactCode = "output_write_failed";
+    } else {
+      artifactError = "Query failed or was interrupted. No artifact was kept.";
+      artifactCode = "query_failed";
+    }
+  } else if (captured) {
+    artifact = captured.artifact;
   }
   const out = {
     ...base,
-    ok: res.exitCode === 0,
-    exitCode: res.exitCode,
+    ok: Boolean(res) && res.exitCode === 0 && !artifactError,
+    exitCode: !res ? 1 : artifactError && res.exitCode === 0 ? 1 : res.exitCode,
     durationMs: Date.now() - startedAt,
-    steps: res.steps || [],
-    ...(res.error ? { error: res.error } : {}),
-    ...(res.errorCode ? { errorCode: res.errorCode } : {}),
-    ...(json && !brief ? { stdout, stderr } : {}),
+    steps: res?.steps || [],
+    ...(res?.error ? { error: res.error } : {}),
+    ...(artifactError ? { error: res?.error || artifactError, errorCode: res?.errorCode || artifactCode } : {}),
+    ...(res?.errorCode && !artifactError ? { errorCode: res.errorCode } : {}),
+    ...(artifact ? { artifact } : {}),
+    ...(json && !brief && !graphCapture ? { stdout, stderr } : {}),
+    ...(graphCapture && stderr ? { stderr } : {}),
     ...(logPath ? { logPath } : {}),
   };
   if (brief) {
@@ -365,7 +601,11 @@ export function renderExecResult(res, { json = false, write = (s) => process.std
     write(JSON.stringify(payload, null, 2) + "\n");
     return;
   }
+  if (res.exitCode !== 0 && res.stderr) writeErr(res.stderr.endsWith("\n") ? res.stderr : `${res.stderr}\n`);
   if (res.error) writeErr(`[atc] ${res.error}\n`);
+  if (res.artifact) {
+    writeErr(`[atc] artifact: ${res.artifact.path} (${res.artifact.bytes} bytes, sha256 ${res.artifact.sha256})\n`);
+  }
   if (res.logPath) {
     if (res.exitCode === 0) {
       writeErr(`[atc] ✓ ${res.op} succeeded in ${Math.round((res.durationMs || 0) / 100) / 10}s (full log: ${res.logPath})\n`);

@@ -34,6 +34,8 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | `bazel.run` | `target`, `runArgs[]` (after `--`) · `timeoutSec` **required**, `executable` |
 | `bazel.series` | ordered `series: [{command, targets[], configs[]?, expunge?}]` with `command ∈ {build, test, coverage, clean}` (closed enum; `run` is not allowed in a series) · `executable`. Run exactly as given: one invocation per entry, in order, stopping at the first failure. Batch/MCP only. |
 | `bazel.clean` | `expunge` (bool), `executable` |
+| `bazel.query` | one literal `query` expression · `output ∈ {label, label_kind, xml, proto, streamed_jsonproto, graph, minrank, maxrank, location, package, build}` · required relative `outputFile` · optional `maxOutputBytes` (1…64 MiB, default 64 MiB), `keepGoing`, `executable` |
+| `bazel.cquery` | one literal `query` expression · `output ∈ {label, starlark, proto, jsonproto, textproto, files, graph}` · required relative `outputFile` · optional `maxOutputBytes`, `keepGoing`, `executable`. Formats Bazel does not implement for cquery (`label_kind`, `xml`, `streamed_jsonproto`) and `transitions` (it needs a companion `--transitions` mode) are rejected. |
 | `xcode.build` / `xcode.test` / `xcode.buildForTesting` / `xcode.testWithoutBuilding` / `xcode.archive` / `xcode.clean` | `scheme`, `workspaceFile` or `project` · `configuration`, `testPlan`, `onlyTesting[]`, `skipTesting[]`, `derivedDataPath`, `testDestination ∈ {simulator, macos}` |
 | `xcode.actions` | the same params + ordered `actions[]` with each action `∈ {build, test, build-for-testing, test-without-building, archive, clean}`, as one `xcodebuild` call |
 
@@ -42,7 +44,9 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 - device vs pure build (Gradle device task names such as `connected*`, `install*`, `uninstall*`; Xcode `test`/`test-without-building` unless `testDestination: "macos"`);
 - worker/job/RAM limits (`-Dorg.gradle.workers.max`, `--jobs` + `--local_ram_resources`, `-jobs`), the workspace resource key, the Bazel output base, and the device destination/serial from the claim.
 
-**Serialization:** builds on the same workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, `xcode:dd:<derivedData>`) are serialized, and heavy builds share the host build-slot pool. A clean therefore never races another build in the same workspace. Multi-invocation ops (`bazel.series`) hold their slot and locks for the whole run.
+**Serialization:** builds on the same workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, `xcode:dd:<derivedData>`) are serialized, and heavy builds share the host build-slot pool. A clean therefore never races another build in the same workspace. Multi-invocation ops (`bazel.series`) hold their slot and locks for the whole run. `bazel.query` and `bazel.cquery` use that same workspace lock and heavy slot; they do not bypass admission.
+
+**Graph inspection artifacts.** `query` and `cquery` write stdout to `outputFile` (resolved against the working directory; absolute paths and `..` are rejected before Bazel starts). ATC streams the write, stops at `maxOutputBytes`, and publishes the file only after Bazel exits 0 inside the limit. The result is `{path, bytes, sha256, maxBytes}`. An exceeded limit, a failed or cancelled query, or an interrupted write deletes the partial file and fails the op. A truncated file is never reported as a valid manifest. Compare two trees by hashing those artifacts; a successful `bazel.build` or a previously stored digest does not certify the closure.
 
 **Not supported, hard-denied even with `--force`:** stopping Gradle daemons, stopping the Bazel server, Gradle continuous mode. Daemons and servers are shared across sessions, and ATC owns them. None of these are expressible in the catalog.
 
@@ -96,6 +100,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | Gradle task / path | `^:?[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)*$` |
 | Gradle property (`-P`) key / value | `^[A-Za-z0-9_.-]{1,128}$` / transport-safe charset |
 | Bazel target | `^(@[A-Za-z0-9_.~+-]*)?//[A-Za-z0-9_./+-]*(:[A-Za-z0-9_./+=,@~-]+)?$` (incl. `//...`, `:all`) |
+| Bazel query expression | one argv element, `^[A-Za-z0-9_.:/@+=,|()'[\]*?^ -]{1,4096}$`. Not forceable. No `$`, quotes, backticks, `;`, `&`, `\\`, or newlines. |
 | Bazel config / test filter | `^[A-Za-z0-9_.-]+$` / transport-safe charset |
 | `bazel.run` `runArgs[]`, `ios.launch` `launchArgs[]` | transport-safe charset (leading `-` allowed) |
 | Xcode scheme / configuration / test plan | `^[A-Za-z0-9_.-]+( [A-Za-z0-9_.-]+)*$` |

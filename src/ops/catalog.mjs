@@ -47,6 +47,9 @@ const XCODE_COMMON = {
 
 const XCODE_ACTIONS = ["build", "test", "build-for-testing", "test-without-building", "archive", "clean"];
 const BAZEL_SERIES_COMMANDS = ["build", "test", "coverage", "clean"];
+const BAZEL_QUERY_OUTPUTS = ["label", "label_kind", "xml", "proto", "streamed_jsonproto", "graph", "minrank", "maxrank", "location", "package", "build"];
+const BAZEL_CQUERY_OUTPUTS = ["label", "starlark", "proto", "jsonproto", "textproto", "files", "graph"];
+export const BAZEL_QUERY_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 function findUp(startDir, fileNames) {
   let cur = path.resolve(startDir);
@@ -431,6 +434,8 @@ export const OPS = Object.freeze({
       return [{ cmd, args: ["clean", ...(params.expunge ? ["--expunge"] : [])], cwd: wsRoot }];
     },
   },
+  "bazel.query": bazelQueryOp("query", BAZEL_QUERY_OUTPUTS),
+  "bazel.cquery": bazelQueryOp("cquery", BAZEL_CQUERY_OUTPUTS),
 
   "xcode.build": xcodeOp("xcode.build", ["build"]),
   "xcode.test": xcodeOp("xcode.test", ["test"]),
@@ -631,6 +636,56 @@ export const OPS = Object.freeze({
   "snapshot.load": snapshotOp("snapshot.load", "load", true),
   "snapshot.delete": snapshotOp("snapshot.delete", "delete", true),
 });
+
+function bazelQueryOp(command, outputValues) {
+  return {
+    name: `bazel.${command}`,
+    system: "bazel",
+    kind: "build",
+    positional: "query",
+    params: {
+      query: { type: "string", pattern: "bazelQueryExpr", required: true },
+      output: { type: "enum", values: outputValues, required: true },
+      outputFile: { type: "path", role: "output", required: true },
+      maxOutputBytes: { type: "integer", min: 1, max: BAZEL_QUERY_MAX_OUTPUT_BYTES },
+      keepGoing: { type: "boolean" },
+      ...EXECUTABLE_PARAM,
+      ...BUILD_COMMON,
+    },
+    invocations(params, ctx) {
+      const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
+      const args = [command, `--output=${params.output}`];
+      if (params.keepGoing) args.push("--keep_going");
+      args.push(params.query);
+      return [{ cmd, args, cwd: wsRoot }];
+    },
+    check(params) {
+      return checkBazelQueryOutputFile(params);
+    },
+  };
+}
+
+function checkBazelQueryOutputFile(params) {
+  if (params.outputFile === undefined || params.outputFile === null) return [];
+  const raw = String(params.outputFile);
+  if (path.isAbsolute(raw)) {
+    return [{
+      path: "/outputFile",
+      code: "unsafe_output",
+      message: "outputFile must be a relative path inside the working directory.",
+      hint: "Pass a relative path such as out/main-rules.xml. ATC resolves it against cwd and refuses paths that escape it.",
+    }];
+  }
+  if (raw.split(/[/\\]/).includes("..")) {
+    return [{
+      path: "/outputFile",
+      code: "unsafe_output",
+      message: "outputFile must not contain '..'.",
+      hint: "Pass a relative path that stays inside the working directory.",
+    }];
+  }
+  return [];
+}
 
 function bazelSimple(command) {
   return {
