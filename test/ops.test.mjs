@@ -281,7 +281,8 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
   const savedHome = process.env.HOME;
   process.env.HOME = path.join(scratch, "home");
   try {
-    assert.notEqual(os.homedir(), hostHome);
+    if (process.platform !== "win32") assert.notEqual(os.homedir(), hostHome);
+    else assert.equal(os.homedir(), hostHome);
     assert.throws(
       () => OPS["bazel.query"].invocations({
         query: expr,

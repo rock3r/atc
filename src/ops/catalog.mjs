@@ -819,7 +819,18 @@ function canonicalPrivatePath(raw, field) {
       throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
     }
     if (st.isSymbolicLink()) {
-      throw new OpError("unsafe_output", `${field} contains a symlink component.`, "Pass a path whose existing parents are real directories, not aliases into a shared cache or the workspace.");
+      // macOS /var -> /private/var is a filesystem-root alias, not a caller-chosen
+      // escape. Rejecting it would refuse every /var/folders scratch path.
+      // A symlink below that root, including alias -> JetBrains, still fails.
+      if (cur !== root) {
+        throw new OpError("unsafe_output", `${field} contains a symlink component.`, "Pass a path whose existing parents are real directories, not aliases into a shared cache or the workspace.");
+      }
+      try {
+        cur = fs.realpathSync(next);
+      } catch (err) {
+        throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
+      }
+      continue;
     }
     cur = next;
   }
@@ -833,25 +844,29 @@ function canonicalPrivatePath(raw, field) {
 }
 
 function hostAccountHome() {
-  // os.homedir() follows process.env.HOME. A preflight that starts ATC with
-  // HOME=<private scratch> would then miss the real ~/Library/Caches/JetBrains.
-  // userInfo().homedir is the OS account home (getpwuid on POSIX).
+  // os.homedir() follows process.env.HOME on POSIX. A preflight that starts ATC
+  // with HOME=<private scratch> would then miss the real ~/Library/Caches/JetBrains.
+  // userInfo().homedir is the OS account home (getpwuid on POSIX). On Windows
+  // neither follows HOME, which is the correct account home there.
   try {
     const home = os.userInfo().homedir;
     if (home) return home;
   } catch {
-    // userInfo can throw when the uid has no passwd entry.
+    // userInfo throws when the uid has no passwd entry.
   }
-  return null;
+  throw new OpError(
+    "unsafe_output",
+    "The OS account home could not be resolved.",
+    "Isolated Bazel paths cannot be checked against shared caches without the account home. Do not start ATC from an account with no home directory.",
+  );
 }
 
 function privatePathForbidden(resolved, wsRoot) {
   const home = hostAccountHome();
-  const shared = [];
-  if (home) {
-    shared.push(path.join(home, "Library", "Caches", "JetBrains"));
-    shared.push(path.join(home, "Library", "Caches", "bazel"));
-  }
+  const shared = [
+    path.join(home, "Library", "Caches", "JetBrains"),
+    path.join(home, "Library", "Caches", "bazel"),
+  ];
   if (wsRoot) shared.push(path.resolve(wsRoot));
   for (const root of shared) {
     if (!root) continue;
