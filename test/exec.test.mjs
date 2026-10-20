@@ -309,6 +309,16 @@ test("query capture: concurrent captures and symlink escapes do not share or lea
     assert.equal(fs.readdirSync(path.join(root, "out")).filter((n) => n.includes("partial")).length, 0);
 
     const outside = tmp("atc-query-outside-");
+    fs.mkdirSync(path.join(root, "linked"));
+    const resolved = resolveQueryOutputFile(root, "linked/result.xml");
+    fs.rmSync(path.join(root, "linked"), { recursive: true });
+    fs.symlinkSync(outside, path.join(root, "linked"));
+    assert.throws(
+      () => createQueryCapture(resolved, 32, { workspaceRoot: root }),
+      (e) => e.code === "output_write_failed" && /symlink/.test(e.message),
+    );
+    assert.equal(fs.readdirSync(outside).length, 0);
+    fs.unlinkSync(path.join(root, "linked"));
     fs.symlinkSync(outside, path.join(root, "linked"));
     assert.throws(
       () => createQueryCapture(resolveQueryOutputFile(root, "linked/result.xml"), 32),

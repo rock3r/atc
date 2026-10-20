@@ -108,6 +108,31 @@ function boundedAppend(buf, chunk) {
 
 const BAZEL_GRAPH_OPS = new Set(["bazel.query", "bazel.cquery"]);
 
+function assertNoSymlinkBetween(rootReal, filePath) {
+  const rel = path.relative(rootReal, filePath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new OpError("unsafe_output", "outputFile resolves outside the working directory.", "Pass a relative path inside the working directory.");
+  }
+  let cur = rootReal;
+  for (const part of rel.split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st;
+    try {
+      st = fs.lstatSync(cur);
+    } catch (err) {
+      if (err?.code === "ENOENT") return;
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new OpError(
+        "unsafe_output",
+        "outputFile follows a symlink outside the working directory.",
+        "Pass a relative path whose parents are real directories inside the working directory.",
+      );
+    }
+  }
+}
+
 function realExistingAncestor(start) {
   let cur = path.resolve(start);
   for (let i = 0; i < 64; i++) {
@@ -160,12 +185,14 @@ export function resolveQueryOutputFile(cwd, outputFile) {
 // Stream a query/cquery result to a file with a hard byte cap. A limit breach, a
 // failed write, or a non-zero Bazel exit removes the file: a truncated artifact is
 // never a valid manifest.
-export function createQueryCapture(filePath, maxBytes) {
+export function createQueryCapture(filePath, maxBytes, { workspaceRoot = null } = {}) {
   const limit = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : BAZEL_QUERY_MAX_OUTPUT_BYTES;
   let fd;
   let partialPath;
   try {
+    if (workspaceRoot) assertNoSymlinkBetween(fs.realpathSync(workspaceRoot), path.resolve(filePath));
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    if (workspaceRoot) assertNoSymlinkBetween(fs.realpathSync(workspaceRoot), path.resolve(filePath));
     // Exclusive random name: concurrent captures in one process must not share a partial file.
     partialPath = path.join(
       path.dirname(filePath),
@@ -213,9 +240,16 @@ export function createQueryCapture(filePath, maxBytes) {
         return;
       }
       try {
-        fs.writeSync(fd, buf);
-        hash.update(buf);
-        bytes += buf.length;
+        let offset = 0;
+        while (offset < buf.length) {
+          const wrote = fs.writeSync(fd, buf, offset, buf.length - offset);
+          if (!Number.isInteger(wrote) || wrote <= 0) {
+            throw new Error("short write produced no bytes");
+          }
+          hash.update(buf.subarray(offset, offset + wrote));
+          bytes += wrote;
+          offset += wrote;
+        }
       } catch (err) {
         writeError = err;
         drop();
@@ -441,7 +475,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
   let stdio = undefined;
   const prepareCapture = graphCapture
     ? () => {
-        queryCapture = createQueryCapture(outputPath, params.maxOutputBytes);
+        queryCapture = createQueryCapture(outputPath, params.maxOutputBytes, { workspaceRoot: cwd });
         return queryCapture;
       }
     : null;
