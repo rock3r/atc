@@ -226,23 +226,48 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
     query: expr,
     output: "xml",
     outputFile: "out/rules.xml",
-    ignoreAllRcFiles: true,
+    noSystemRc: true,
+    noHomeRc: true,
+    bazelrc: "/dev/null",
     outputUserRoot: path.join(scratch, "user"),
-    outputBase: path.join(scratch, "base"),
+    outputBase: path.join(scratch, "user", "main"),
+    serverJavabase: path.join(scratch, "jdk"),
+    hostJvmArgs: ["-Xmx6g", "-Djava.io.tmpdir=/private/tmp"],
     repositoryCache: path.join(scratch, "repo"),
     diskCache: path.join(scratch, "disk"),
     lockfileMode: "error",
-    noWorkspaceSymlinks: true,
     repoEnv: ["HTTP_PROXY="],
+    remoteCache: "",
+    remoteUploadLocalResults: false,
+    showProgress: false,
   }, ctx);
-  assert.deepEqual(inv.args.slice(0, 4), [
-    "--ignore_all_rc_files",
+  const verb = inv.args.indexOf("query");
+  assert.deepEqual(inv.args.slice(0, verb), [
+    "--nosystem_rc",
+    "--nohome_rc",
+    "--bazelrc=/dev/null",
     `--output_user_root=${path.join(scratch, "user")}`,
-    `--output_base=${path.join(scratch, "base")}`,
-    "query",
+    `--output_base=${path.join(scratch, "user", "main")}`,
+    `--server_javabase=${path.join(scratch, "jdk")}`,
+    "--host_jvm_args=-Xmx6g",
+    "--host_jvm_args=-Djava.io.tmpdir=/private/tmp",
   ]);
   assert.ok(inv.args.indexOf("query") < inv.args.indexOf("--lockfile_mode=error"));
-  assert.ok(inv.args.includes("--symlink_prefix=/"));
+  assert.ok(!inv.args.includes("--symlink_prefix=/"));
+  assert.ok(inv.args.includes("--remote_cache="));
+  assert.ok(inv.args.includes("--noremote_upload_local_results"));
+  const querySymlinks = validateOpParams("bazel.query", { query: expr, output: "xml", outputFile: "out/x", noWorkspaceSymlinks: true });
+  assert.ok(querySymlinks.errors.some((e) => e.path === "/noWorkspaceSymlinks"));
+  const [cquery] = OPS["bazel.cquery"].invocations({
+    query: "deps(//:main)",
+    output: "label",
+    outputFile: "out/configured.txt",
+    noWorkspaceSymlinks: true,
+    experimentalScaleTimeouts: 4,
+    distdir: path.join(scratch, "distdir"),
+  }, ctx);
+  assert.ok(cquery.args.indexOf("cquery") < cquery.args.indexOf("--symlink_prefix=/"));
+  assert.ok(cquery.args.includes("--experimental_scale_timeouts=4"));
   assert.ok(inv.args.includes("--repo_env=HTTP_PROXY="));
   assert.equal(inv.args.at(-1), expr);
   assert.equal(inv.cwd, root);

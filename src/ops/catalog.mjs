@@ -51,14 +51,27 @@ const BAZEL_QUERY_OUTPUTS = ["label", "label_kind", "xml", "proto", "streamed_js
 const BAZEL_CQUERY_OUTPUTS = ["label", "starlark", "proto", "jsonproto", "textproto", "files", "graph"];
 export const BAZEL_QUERY_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const BAZEL_ISOLATION_PARAMS = {
-  ignoreAllRcFiles: { type: "boolean", description: "Pass --ignore_all_rc_files before the verb so imported .bazelrc files are not loaded" },
-  outputUserRoot: { type: "path", role: "dir", description: "Private --output_user_root (startup option, absolute path)" },
-  outputBase: { type: "path", role: "dir", description: "Private --output_base (startup option, absolute path)" },
-  repositoryCache: { type: "path", role: "dir", description: "Private --repository_cache (command option, absolute path)" },
-  diskCache: { type: "path", role: "dir", description: "Private --disk_cache (command option, absolute path)" },
-  lockfileMode: { type: "enum", values: ["error", "off", "update", "refresh"], description: "Pass --lockfile_mode after the verb" },
-  noWorkspaceSymlinks: { type: "boolean", description: "Pass --symlink_prefix=/ after the verb so Bazel does not write convenience symlinks into the workspace" },
-  repoEnv: { type: "string[]", pattern: "bazelRepoEnv", maxItems: 32, description: "Repeatable --repo_env=KEY=VALUE after the verb" },
+  // Proven no-rc triple. ignoreAllRcFiles is accepted but was not verified on the JetBrains fork.
+  noSystemRc: { type: "boolean", description: "Startup --nosystem_rc" },
+  noHomeRc: { type: "boolean", description: "Startup --nohome_rc" },
+  bazelrc: { type: "path", role: "input", description: "Startup --bazelrc. Use /dev/null to load no rc file." },
+  ignoreAllRcFiles: { type: "boolean", description: "Startup --ignore_all_rc_files. Not a substitute for the proven nosystem_rc/nohome_rc/--bazelrc=/dev/null triple until validated on the pinned Bazel." },
+  outputUserRoot: { type: "path", role: "dir", description: "Private startup --output_user_root (absolute)" },
+  outputBase: { type: "path", role: "dir", description: "Private startup --output_base (absolute, inside outputUserRoot)" },
+  serverJavabase: { type: "path", role: "dir", description: "Startup --server_javabase (absolute JDK home)" },
+  hostJvmArgs: { type: "string[]", pattern: "passthroughArg", maxItems: 16, description: "Repeatable startup --host_jvm_args" },
+  repositoryCache: { type: "path", role: "dir", description: "Private command --repository_cache (absolute)" },
+  diskCache: { type: "path", role: "dir", description: "Private command --disk_cache (absolute)" },
+  distdir: { type: "path", role: "dir", description: "Command --distdir (absolute). Required by the historical configured cquery." },
+  lockfileMode: { type: "enum", values: ["error", "off", "update", "refresh"], description: "Command --lockfile_mode. error is the protected-tree mode; prove it on a disposable tree before the protected original." },
+  noWorkspaceSymlinks: { type: "boolean", description: "cquery only: command --symlink_prefix=/. Rejected on query; Bazel 9 BuildRequestOptions does not accept it there, and the JetBrains fork is untested." },
+  repoEnv: { type: "string[]", pattern: "bazelRepoEnv", maxItems: 32, description: "Repeatable command --repo_env=KEY=VALUE" },
+  remoteCache: { type: "string", description: "Command --remote_cache. Empty string clears it. Non-empty values must be transport-safe." },
+  remoteUploadLocalResults: { type: "boolean", description: "Command --remote_upload_local_results" },
+  color: { type: "enum", values: ["yes", "no", "auto"] },
+  curses: { type: "enum", values: ["yes", "no", "auto"] },
+  showProgress: { type: "boolean" },
+  experimentalScaleTimeouts: { type: "integer", min: 1, max: 100, description: "Command --experimental_scale_timeouts. Historical cquery used 4." },
 };
 
 function findUp(startDir, fileNames) {
@@ -666,38 +679,76 @@ function bazelQueryOp(command, outputValues) {
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
       const startup = bazelIsolationStartup(params, ctx, wsRoot);
-      const commandArgs = bazelIsolationCommand(params, ctx, wsRoot);
+      const commandArgs = bazelIsolationCommand(params, ctx, wsRoot, command);
       const args = [...startup, command, `--output=${params.output}`, ...commandArgs];
       if (params.keepGoing) args.push("--keep_going");
       args.push(params.query);
       return [{ cmd, args, cwd: wsRoot }];
     },
     check(params) {
-      return [...checkBazelQueryOutputFile(params), ...checkBazelIsolationPaths(params)];
+      return [...checkBazelQueryOutputFile(params), ...checkBazelIsolationPaths(params, command)];
     },
   };
 }
 
 function bazelIsolationStartup(params, ctx, wsRoot) {
   const args = [];
+  if (params.noSystemRc) args.push("--nosystem_rc");
+  if (params.noHomeRc) args.push("--nohome_rc");
+  if (params.bazelrc !== undefined) args.push(`--bazelrc=${resolveBazelrcPath(params.bazelrc)}`);
   if (params.ignoreAllRcFiles) args.push("--ignore_all_rc_files");
   if (params.outputUserRoot) args.push(`--output_user_root=${resolvePrivateBazelPath(params.outputUserRoot, ctx, "outputUserRoot", wsRoot)}`);
-  if (params.outputBase) args.push(`--output_base=${resolvePrivateBazelPath(params.outputBase, ctx, "outputBase", wsRoot)}`);
+  if (params.outputBase) args.push(`--output_base=${resolvePrivateBazelPath(params.outputBase, ctx, "outputBase", wsRoot, params.outputUserRoot)}`);
+  if (params.serverJavabase) args.push(`--server_javabase=${resolvePrivateBazelPath(params.serverJavabase, ctx, "serverJavabase")}`);
+  for (const jvmArg of params.hostJvmArgs || []) args.push(`--host_jvm_args=${jvmArg}`);
   return args;
 }
 
-function bazelIsolationCommand(params, ctx, wsRoot) {
+function bazelIsolationCommand(params, ctx, wsRoot, command) {
   const args = [];
   if (params.repositoryCache) args.push(`--repository_cache=${resolvePrivateBazelPath(params.repositoryCache, ctx, "repositoryCache", wsRoot)}`);
   if (params.diskCache) args.push(`--disk_cache=${resolvePrivateBazelPath(params.diskCache, ctx, "diskCache", wsRoot)}`);
+  if (params.distdir) args.push(`--distdir=${resolvePrivateBazelPath(params.distdir, ctx, "distdir", wsRoot)}`);
   if (params.lockfileMode) args.push(`--lockfile_mode=${params.lockfileMode}`);
-  if (params.noWorkspaceSymlinks) args.push("--symlink_prefix=/");
+  if (params.noWorkspaceSymlinks) {
+    if (command !== "cquery") {
+      throw new OpError("unsafe_output", "noWorkspaceSymlinks is only valid on bazel.cquery.", "Do not send --symlink_prefix to query. Validate query symlink behavior on a disposable tree first.");
+    }
+    args.push("--symlink_prefix=/");
+  }
   for (const entry of params.repoEnv || []) args.push(`--repo_env=${entry}`);
+  if (params.remoteCache !== undefined) args.push(`--remote_cache=${params.remoteCache}`);
+  if (params.remoteUploadLocalResults === false) args.push("--noremote_upload_local_results");
+  if (params.remoteUploadLocalResults === true) args.push("--remote_upload_local_results");
+  if (params.color) args.push(`--color=${params.color}`);
+  if (params.curses) args.push(`--curses=${params.curses}`);
+  if (params.showProgress === false) args.push("--noshow_progress");
+  if (params.showProgress === true) args.push("--show_progress");
+  if (params.experimentalScaleTimeouts) args.push(`--experimental_scale_timeouts=${params.experimentalScaleTimeouts}`);
   return args;
 }
 
-function checkBazelIsolationPaths(params) {
+function resolveBazelrcPath(raw) {
+  const value = String(raw);
+  if (value !== "/dev/null" && !path.isAbsolute(value)) {
+    throw new OpError("unsafe_output", "bazelrc must be /dev/null or an absolute path.", "The proven no-rc setting is --bazelrc=/dev/null.");
+  }
+  return value;
+}
+
+function checkBazelIsolationPaths(params, command) {
   const errs = [];
+  if (params.noWorkspaceSymlinks && command !== "cquery") {
+    errs.push({
+      path: "/noWorkspaceSymlinks",
+      code: "not_allowed",
+      message: "noWorkspaceSymlinks is only valid on bazel.cquery.",
+      hint: "Do not send --symlink_prefix to query.",
+    });
+  }
+  if (params.remoteCache !== undefined && params.remoteCache !== "" && !/^[A-Za-z0-9_.:/@+=,-]{1,256}$/.test(params.remoteCache)) {
+    errs.push({ path: "/remoteCache", code: "pattern_mismatch", message: "remoteCache must be empty or a transport-safe value." });
+  }
   for (const field of ["outputUserRoot", "outputBase", "repositoryCache", "diskCache"]) {
     const raw = params[field];
     if (raw === undefined || raw === null) continue;
@@ -713,15 +764,24 @@ function checkBazelIsolationPaths(params) {
   return errs;
 }
 
-function resolvePrivateBazelPath(raw, ctx, field, wsRoot = null) {
+function resolvePrivateBazelPath(raw, ctx, field, wsRoot = null, outputUserRoot = null) {
   const value = String(raw);
   if (!path.isAbsolute(value)) {
     throw new OpError("unsafe_output", `${field} must be an absolute path.`, "Pass a private absolute directory outside the Bazel workspace and outside shared IDE caches.");
+  }
+  if (value.split(/[/\\]/).includes("..")) {
+    throw new OpError("unsafe_output", `${field} must not contain '..'.`, "Pass a resolved absolute private directory.");
   }
   const resolved = path.resolve(value);
   const forbidden = privatePathForbidden(resolved, ctx, wsRoot);
   if (forbidden) {
     throw new OpError("unsafe_output", `${field} ${forbidden}.`, "Use a private scratch directory that is not the workspace and not a shared JetBrains/Bazel cache.");
+  }
+  if (field === "outputBase" && outputUserRoot) {
+    const root = path.resolve(String(outputUserRoot));
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new OpError("unsafe_output", "outputBase must be inside outputUserRoot.", "The proven layout is output_base under the private output_user_root.");
+    }
   }
   return resolved;
 }
