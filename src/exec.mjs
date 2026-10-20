@@ -192,7 +192,13 @@ export function createQueryCapture(filePath, maxBytes) {
     try {
       fs.rmSync(partialPath, { force: true });
     } catch {
-      // best-effort: the result is still a failure and the destination is untouched
+      // best-effort
+    }
+    // A failed rerun must not leave a previous successful artifact at this path.
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // best-effort: the result is still a failure
     }
   };
   return {
@@ -516,7 +522,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
     ...(res?.errorCode && !artifactError ? { errorCode: res.errorCode } : {}),
     ...(artifact ? { artifact } : {}),
     ...(json && !brief && !graphCapture ? { stdout, stderr } : {}),
-    ...(json && graphCapture ? { stderr } : {}),
+    ...(graphCapture && stderr ? { stderr } : {}),
     ...(logPath ? { logPath } : {}),
   };
   if (brief) {
@@ -555,6 +561,7 @@ export function renderExecResult(res, { json = false, write = (s) => process.std
     write(JSON.stringify(payload, null, 2) + "\n");
     return;
   }
+  if (res.exitCode !== 0 && res.stderr) writeErr(res.stderr.endsWith("\n") ? res.stderr : `${res.stderr}\n`);
   if (res.error) writeErr(`[atc] ${res.error}\n`);
   if (res.artifact) {
     writeErr(`[atc] artifact: ${res.artifact.path} (${res.artifact.bytes} bytes, sha256 ${res.artifact.sha256})\n`);

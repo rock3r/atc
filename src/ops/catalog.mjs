@@ -48,7 +48,7 @@ const XCODE_COMMON = {
 const XCODE_ACTIONS = ["build", "test", "build-for-testing", "test-without-building", "archive", "clean"];
 const BAZEL_SERIES_COMMANDS = ["build", "test", "coverage", "clean"];
 const BAZEL_QUERY_OUTPUTS = ["label", "label_kind", "xml", "proto", "streamed_jsonproto", "graph", "minrank", "maxrank", "location", "package", "build"];
-const BAZEL_CQUERY_OUTPUTS = ["label", "label_kind", "transitions", "starlark", "jsonproto", "streamed_jsonproto", "textproto", "xml", "graph", "files"];
+const BAZEL_CQUERY_OUTPUTS = ["label", "label_kind", "starlark", "jsonproto", "streamed_jsonproto", "textproto", "xml", "graph", "files"];
 export const BAZEL_QUERY_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 function findUp(startDir, fileNames) {

@@ -261,7 +261,8 @@ test("exec: query limit, nonzero exit, and cancellation leave no artifact", { sk
     assert.ok(!fs.existsSync(path.join(s.proj, "out", "rules.xml")));
     assert.equal(fs.readdirSync(path.join(s.proj, "out")).filter((n) => n.includes("rules")).length, 0);
 
-    script(path.join(s.proj, "bazelw"), 'printf "partial-rules"; exit 2');
+    fs.writeFileSync(path.join(s.proj, "out", "configured.txt"), "stale previous capture\n");
+    script(path.join(s.proj, "bazelw"), 'printf "partial-rules"; echo "ERROR: cycle in graph" >&2; exit 2');
     const failed = await cmdExec(
       s.stateDir,
       ["bazel", "cquery", "deps(//:main)", "--output", "label", "--output-file", "out/configured.txt", "--json"],
@@ -269,7 +270,8 @@ test("exec: query limit, nonzero exit, and cancellation leave no artifact", { sk
     );
     assert.equal(failed.exitCode, 2);
     assert.equal(failed.errorCode, "query_failed");
-    assert.ok(!fs.existsSync(path.join(s.proj, "out", "configured.txt")));
+    assert.match(failed.stderr, /cycle in graph/);
+    assert.ok(!fs.existsSync(path.join(s.proj, "out", "configured.txt")), "a failed rerun removes the previous artifact");
 
     script(path.join(s.proj, "bazelw"), "sleep 30");
     const started = Date.now();
