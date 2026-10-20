@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { OPS, OpError, listOps, resolveOpName } from "../src/ops/catalog.mjs";
+import { OPS, OpError, _canonicalPrivatePathForTest, listOps, resolveOpName } from "../src/ops/catalog.mjs";
 import {
   PATTERNS,
   WINDOWS_BATCH_ARG_RE,
@@ -248,9 +248,9 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
     "--nosystem_rc",
     "--nohome_rc",
     "--bazelrc=/dev/null",
-    `--output_user_root=${path.join(scratch, "user")}`,
-    `--output_base=${path.join(scratch, "user", "main")}`,
-    `--server_javabase=${path.join(scratch, "jdk")}`,
+    `--output_user_root=${path.join(fs.realpathSync(scratch), "user")}`,
+    `--output_base=${path.join(fs.realpathSync(scratch), "user", "main")}`,
+    `--server_javabase=${path.join(fs.realpathSync(scratch), "jdk")}`,
     "--host_jvm_args=-Xmx6g",
     "--host_jvm_args=-Djava.io.tmpdir=/private/tmp",
   ]);
@@ -330,6 +330,51 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
     repoEnv: ["PATH=$(id)"],
   });
   assert.ok(shellEnv.errors.some((e) => e.code === "pattern_mismatch" && e.forceable === false));
+});
+
+test("private Bazel path: only macOS /var -> /private/var is a root symlink exception", () => {
+  const root = process.platform === "win32" ? "C:\\" : "/";
+  const entries = new Map([
+    ["/", { dir: true }],
+    ["/alias", { link: "/private/scratch" }],
+    ["/private", { dir: true }],
+    ["/private/scratch", { dir: true }],
+    ["/var", { link: "/private/var" }],
+    ["/private/var", { dir: true }],
+    ["/private/var/folders", { dir: true }],
+  ]);
+  const fsImpl = {
+    lstatSync(p) {
+      const hit = entries.get(p);
+      if (!hit) {
+        const err = new Error("missing");
+        err.code = "ENOENT";
+        throw err;
+      }
+      return { isSymbolicLink: () => Boolean(hit.link) };
+    },
+    realpathSync(p) {
+      const hit = entries.get(p);
+      if (hit?.link) return hit.link;
+      if (hit) return p;
+      throw new Error(`unmapped ${p}`);
+    },
+  };
+  const saved = process.platform;
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    assert.throws(
+      () => _canonicalPrivatePathForTest("/alias/output", "outputUserRoot", fsImpl),
+      (e) => e.code === "unsafe_output" && /symlink/.test(e.message),
+    );
+    assert.equal(
+      _canonicalPrivatePathForTest("/var/folders/scratch", "outputUserRoot", fsImpl),
+      "/private/var/folders/scratch",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", { value: saved });
+  }
+  assert.ok(root);
 });
 
 test("bazel.run: timeout required and run args after --", () => {

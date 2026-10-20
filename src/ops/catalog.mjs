@@ -796,7 +796,17 @@ function resolvePrivateBazelPath(raw, _ctx, field, wsRoot = null, outputUserRoot
 
 // Resolve the existing ancestor for real, reject any symlink component, then append
 // the not-yet-created suffix. A lexical prefix check would follow alias -> JetBrains.
-function canonicalPrivatePath(raw, field) {
+function isDarwinVarAlias(parent, next, st, fsImpl) {
+  if (!st.isSymbolicLink() || process.platform !== "darwin") return false;
+  if (parent !== path.parse(next).root || path.basename(next) !== "var") return false;
+  try {
+    return fsImpl.realpathSync(next) === "/private/var";
+  } catch {
+    return false;
+  }
+}
+
+function canonicalPrivatePath(raw, field, fsImpl = fs) {
   const abs = path.resolve(raw);
   const root = path.parse(abs).root;
   const parts = abs.slice(root.length).split(path.sep).filter(Boolean);
@@ -810,7 +820,7 @@ function canonicalPrivatePath(raw, field) {
     const next = path.join(cur, part);
     let st;
     try {
-      st = fs.lstatSync(next);
+      st = fsImpl.lstatSync(next);
     } catch (err) {
       if (err?.code === "ENOENT") {
         missing = part;
@@ -819,24 +829,19 @@ function canonicalPrivatePath(raw, field) {
       throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
     }
     if (st.isSymbolicLink()) {
-      // macOS /var -> /private/var is a filesystem-root alias, not a caller-chosen
-      // escape. Rejecting it would refuse every /var/folders scratch path.
-      // A symlink below that root, including alias -> JetBrains, still fails.
-      if (cur !== root) {
+      // Only macOS /var -> /private/var. A caller-created /alias is still rejected.
+      // A symlink below the root, including alias -> JetBrains, still fails.
+      if (!isDarwinVarAlias(cur, next, st, fsImpl)) {
         throw new OpError("unsafe_output", `${field} contains a symlink component.`, "Pass a path whose existing parents are real directories, not aliases into a shared cache or the workspace.");
       }
-      try {
-        cur = fs.realpathSync(next);
-      } catch (err) {
-        throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
-      }
+      cur = "/private/var";
       continue;
     }
     cur = next;
   }
   let real = cur;
   try {
-    real = fs.realpathSync(cur);
+    real = fsImpl.realpathSync(cur);
   } catch (err) {
     throw new OpError("unsafe_output", `${field} could not be resolved: ${err.message}`, "Check that the private path is readable.");
   }
@@ -955,6 +960,8 @@ function snapshotOp(name, action, needsName) {
 }
 
 export const SYSTEMS = Object.freeze(["gradle", "bazel", "xcode", "android", "ios", "snapshot"]);
+
+export const _canonicalPrivatePathForTest = canonicalPrivatePath;
 
 export function listOps(system = null) {
   return Object.values(OPS).filter((o) => !system || o.system === system);
