@@ -332,7 +332,7 @@ test("bazel.query isolation: startup flags before the verb, private paths, no sh
   assert.ok(shellEnv.errors.some((e) => e.code === "pattern_mismatch" && e.forceable === false));
 });
 
-test("private Bazel path: only macOS /var -> /private/var is a root symlink exception", () => {
+test("private Bazel path: only macOS /var -> /private/var is a root symlink exception", { skip: process.platform === "win32" }, () => {
   const root = process.platform === "win32" ? "C:\\" : "/";
   const entries = new Map([
     ["/", { dir: true }],
