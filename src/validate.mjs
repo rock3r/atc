@@ -69,9 +69,9 @@ function validateField(spec, value, p, ctx) {
   const push = (e) => e && errors.push(e);
   switch (spec.type) {
     case "string":
-      if (typeof value !== "string" || value.length === 0) {
-        push(err(p, "type", "Expected a non-empty string."));
-      } else if (spec.pattern) {
+      if (typeof value !== "string" || (value.length === 0 && !spec.allowEmpty)) {
+        push(err(p, "type", spec.allowEmpty ? "Expected a string." : "Expected a non-empty string."));
+      } else if (spec.pattern && value.length > 0) {
         push(patternError(p, spec.pattern, value, ctx));
       }
       break;
@@ -524,8 +524,8 @@ export function validateBatchPlan(plan, ctx = {}) {
       } else {
         for (const [k, v] of Object.entries(step.env)) {
           if (!PATTERNS.envKey.re.test(k)) errors.push(err(`${p}/env/${k}`, "pattern_mismatch", `"${k}" is not ${PATTERNS.envKey.label}.`));
-          if (typeof v !== "string" || !PATTERNS.transportSafe.re.test(v)) {
-            errors.push(err(`${p}/env/${k}`, "pattern_mismatch", `Env values must be ${PATTERNS.transportSafe.label}.`));
+          if (typeof v !== "string" || !PATTERNS.batchEnvValue.re.test(v)) {
+            errors.push(err(`${p}/env/${k}`, "pattern_mismatch", `Env values must be ${PATTERNS.batchEnvValue.label}.`));
           }
         }
       }

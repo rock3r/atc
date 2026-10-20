@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { OPS, OpError, listOps, resolveOpName } from "../src/ops/catalog.mjs";
+import { OPS, OpError, _canonicalPrivatePathForTest, listOps, resolveOpName } from "../src/ops/catalog.mjs";
 import {
   PATTERNS,
   WINDOWS_BATCH_ARG_RE,
@@ -213,6 +213,198 @@ test("bazel.query and bazel.cquery: literal argv, allowlisted output, no flag es
   assert.equal(climb.errors[0].code, "unsafe_output");
   const missing = validateOpParams("bazel.query", { query: "deps(//:main)", output: "label_kind" });
   assert.ok(missing.errors.some((e) => e.path === "/outputFile" && e.code === "required"));
+});
+
+test("bazel.query isolation: startup flags before the verb, private paths, no shell", () => {
+  const root = tmpDir();
+  touch(path.join(root, "MODULE.bazel"), 0o644);
+  const scratch = tmpDir();
+  const home = tmpDir();
+  const ctx = { cwd: root, which: () => null, env: { HOME: home } };
+  const expr = "kind('rule', deps(//:main))";
+  const [inv] = OPS["bazel.query"].invocations({
+    query: expr,
+    output: "xml",
+    outputFile: "out/rules.xml",
+    noSystemRc: true,
+    noHomeRc: true,
+    bazelrc: "/dev/null",
+    outputUserRoot: path.join(scratch, "user"),
+    outputBase: path.join(scratch, "user", "main"),
+    serverJavabase: path.join(scratch, "jdk"),
+    hostJvmArgs: ["-Xmx6g", "-Djava.io.tmpdir=/private/tmp"],
+    repositoryCache: path.join(scratch, "repo"),
+    diskCache: path.join(scratch, "disk"),
+    lockfileMode: "error",
+    repoEnv: ["HTTP_PROXY="],
+    remoteCache: "",
+    remoteExecutor: "",
+    besBackend: "",
+    remoteUploadLocalResults: false,
+    showProgress: false,
+  }, ctx);
+  const verb = inv.args.indexOf("query");
+  assert.deepEqual(inv.args.slice(0, verb), [
+    "--nosystem_rc",
+    "--nohome_rc",
+    "--bazelrc=/dev/null",
+    `--output_user_root=${path.join(fs.realpathSync(scratch), "user")}`,
+    `--output_base=${path.join(fs.realpathSync(scratch), "user", "main")}`,
+    `--server_javabase=${path.join(fs.realpathSync(scratch), "jdk")}`,
+    "--host_jvm_args=-Xmx6g",
+    "--host_jvm_args=-Djava.io.tmpdir=/private/tmp",
+  ]);
+  assert.ok(inv.args.indexOf("query") < inv.args.indexOf("--lockfile_mode=error"));
+  assert.ok(!inv.args.includes("--symlink_prefix=/"));
+  assert.ok(inv.args.includes("--remote_cache="));
+  assert.ok(inv.args.includes("--remote_executor="));
+  assert.ok(inv.args.includes("--bes_backend="));
+  assert.ok(inv.args.indexOf("query") < inv.args.indexOf("--remote_executor="));
+  assert.ok(inv.args.includes("--noremote_upload_local_results"));
+  const querySymlinks = validateOpParams("bazel.query", { query: expr, output: "xml", outputFile: "out/x", noWorkspaceSymlinks: true });
+  assert.ok(querySymlinks.errors.some((e) => e.path === "/noWorkspaceSymlinks"));
+  const [cquery] = OPS["bazel.cquery"].invocations({
+    query: "deps(//:main)",
+    output: "label",
+    outputFile: "out/configured.txt",
+    noWorkspaceSymlinks: true,
+    experimentalScaleTimeouts: 4,
+    distdir: path.join(scratch, "distdir"),
+  }, ctx);
+  assert.ok(cquery.args.indexOf("cquery") < cquery.args.indexOf("--symlink_prefix=/"));
+  assert.ok(cquery.args.includes("--experimental_scale_timeouts=4"));
+  assert.ok(inv.args.includes("--repo_env=HTTP_PROXY="));
+  assert.equal(inv.args.at(-1), expr);
+  assert.equal(inv.cwd, root);
+
+  const hostHome = os.userInfo().homedir;
+  const savedHome = process.env.HOME;
+  process.env.HOME = path.join(scratch, "home");
+  try {
+    if (process.platform !== "win32") assert.notEqual(os.homedir(), hostHome);
+    else assert.equal(os.homedir(), hostHome);
+    assert.throws(
+      () => OPS["bazel.query"].invocations({
+        query: expr,
+        output: "xml",
+        outputFile: "out/x",
+        diskCache: path.join(hostHome, "Library", "Caches", "JetBrains", "shared"),
+      }, { ...ctx, env: { HOME: path.join(scratch, "home") } }),
+      (e) => e.code === "unsafe_output" && /JetBrains/.test(e.message),
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  }
+  const alias = path.join(scratch, "alias");
+  fs.symlinkSync(path.join(hostHome, "Library", "Caches", "JetBrains"), alias);
+  assert.throws(
+    () => OPS["bazel.query"].invocations({
+      query: expr,
+      output: "xml",
+      outputFile: "out/x",
+      outputUserRoot: path.join(alias, "output"),
+    }, ctx),
+    (e) => e.code === "unsafe_output",
+  );
+  assert.throws(
+    () => OPS["bazel.cquery"].invocations({
+      query: "deps(//:main)",
+      output: "label",
+      outputFile: "out/x",
+      outputBase: path.join(root, "inside"),
+    }, ctx),
+    (e) => e.code === "unsafe_output",
+  );
+  const cleared = validateOpParams("bazel.query", {
+    query: expr,
+    output: "xml",
+    outputFile: "out/x",
+    remoteCache: "",
+    remoteExecutor: "",
+    besBackend: "",
+  });
+  assert.deepEqual(cleared.errors, []);
+  const parsed = parseOpArgv([
+    "bazel", "query", expr,
+    "--output", "xml",
+    "--output-file", "out/x",
+    "--remote-cache", "",
+    "--remote-executor=",
+    "--bes-backend", "",
+  ]);
+  assert.deepEqual(parsed.errors, []);
+  assert.equal(parsed.params.remoteCache, "");
+  assert.equal(parsed.params.remoteExecutor, "");
+  assert.equal(parsed.params.besBackend, "");
+  assert.throws(
+    () => OPS["bazel.query"].invocations({
+      query: expr,
+      output: "xml",
+      outputFile: "out/x",
+      outputBase: path.join(scratch, "orphan-base"),
+    }, ctx),
+    (e) => e.code === "unsafe_output" && /outputUserRoot/.test(e.message),
+  );
+  const relative = validateOpParams("bazel.query", {
+    query: expr,
+    output: "xml",
+    outputFile: "out/x",
+    outputUserRoot: "scratch/user",
+  });
+  assert.ok(relative.errors.some((e) => e.path === "/outputUserRoot" && e.code === "unsafe_output"));
+  const shellEnv = validateOpParams("bazel.query", {
+    query: expr,
+    output: "xml",
+    outputFile: "out/x",
+    repoEnv: ["PATH=$(id)"],
+  });
+  assert.ok(shellEnv.errors.some((e) => e.code === "pattern_mismatch" && e.forceable === false));
+});
+
+test("private Bazel path: only macOS /var -> /private/var is a root symlink exception", { skip: process.platform === "win32" }, () => {
+  const root = process.platform === "win32" ? "C:\\" : "/";
+  const entries = new Map([
+    ["/", { dir: true }],
+    ["/alias", { link: "/private/scratch" }],
+    ["/private", { dir: true }],
+    ["/private/scratch", { dir: true }],
+    ["/var", { link: "/private/var" }],
+    ["/private/var", { dir: true }],
+    ["/private/var/folders", { dir: true }],
+  ]);
+  const fsImpl = {
+    lstatSync(p) {
+      const hit = entries.get(p);
+      if (!hit) {
+        const err = new Error("missing");
+        err.code = "ENOENT";
+        throw err;
+      }
+      return { isSymbolicLink: () => Boolean(hit.link) };
+    },
+    realpathSync(p) {
+      const hit = entries.get(p);
+      if (hit?.link) return hit.link;
+      if (hit) return p;
+      throw new Error(`unmapped ${p}`);
+    },
+  };
+  const saved = process.platform;
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    assert.throws(
+      () => _canonicalPrivatePathForTest("/alias/output", "outputUserRoot", fsImpl),
+      (e) => e.code === "unsafe_output" && /symlink/.test(e.message),
+    );
+    assert.equal(
+      _canonicalPrivatePathForTest("/var/folders/scratch", "outputUserRoot", fsImpl),
+      "/private/var/folders/scratch",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", { value: saved });
+  }
+  assert.ok(root);
 });
 
 test("bazel.run: timeout required and run args after --", () => {
@@ -436,7 +628,7 @@ test("validateBatchPlan: step fields", () => {
           op: "gradle.tasks",
           tasks: ["x"],
           cwd: "missing-dir",
-          env: { "BAD-KEY": "v", OK: "a b" },
+          env: { "BAD-KEY": "v", OK: "a b", SHELL: "a$(id)" },
           timeoutSec: 0,
           continueOnError: "yes",
           phase: "whatever",
@@ -450,7 +642,7 @@ test("validateBatchPlan: step fields", () => {
   for (const c of [
     "/steps/0/cwd:not_found",
     "/steps/0/env/BAD-KEY:pattern_mismatch",
-    "/steps/0/env/OK:pattern_mismatch",
+    "/steps/0/env/SHELL:pattern_mismatch",
     "/steps/0/timeoutSec:range",
     "/steps/0/continueOnError:type",
     "/steps/0/phase:unknown_field",
@@ -458,6 +650,7 @@ test("validateBatchPlan: step fields", () => {
   ]) {
     assert.ok(codes.includes(c), `${c} in ${codes.join(", ")}`);
   }
+  assert.ok(!codes.some((c) => c.startsWith("/steps/0/env/OK:")), codes.join(", "));
 });
 
 test("validateBatchPlan: step force overrides forceable patterns and is recorded", () => {

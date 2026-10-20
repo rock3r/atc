@@ -32,6 +32,12 @@ export const PATTERNS = Object.freeze({
     label: "a single Bazel query expression ([A-Za-z0-9_.:/@+=,|()'[\\]*?^ -], max 4096 chars; no shell metacharacters)",
     forceable: false,
   },
+  // KEY=VALUE for --repo_env. No shell expansion characters.
+  bazelRepoEnv: {
+    re: /^[A-Za-z_][A-Za-z0-9_]{0,127}=[A-Za-z0-9_.:/@+=, -]{0,4096}$/,
+    label: "a Bazel --repo_env KEY=VALUE ([A-Za-z0-9_.:/@+=,-], no shell metacharacters)",
+    forceable: false,
+  },
   xcodeName: {
     re: /^[A-Za-z0-9_.-]+( [A-Za-z0-9_.-]+)*$/,
     label: "an Xcode scheme/configuration/test plan name ([A-Za-z0-9_.-], single spaces)",
@@ -96,6 +102,13 @@ export const PATTERNS = Object.freeze({
   transportSafe: {
     re: /^[A-Za-z0-9_.:/@+=,-]{1,256}$/,
     label: "a transport-safe value ([A-Za-z0-9_.:/@+=,-], max 256 chars)",
+    forceable: false,
+  },
+  // Batch step env values. Longer than device-transport values because a pinned
+  // JAVA_TOOL_OPTIONS can exceed 256 characters. Still no shell metacharacters.
+  batchEnvValue: {
+    re: /^[A-Za-z0-9_.:/@+=, -]{0,4096}$/,
+    label: "a literal env value ([A-Za-z0-9_.:/@+=, -], max 4096 chars; no shell metacharacters)",
     forceable: false,
   },
   // Claim version selectors, same grammar as `atc claim --api/--os`: 36, >=35, 34..36, 18.2, android-35.

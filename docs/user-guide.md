@@ -127,7 +127,25 @@ atc exec bazel query "kind('rule', deps(//:main))" --output xml --output-file ou
 atc exec bazel cquery "deps(//:main)" --output label --output-file out/main-configured.txt
 ```
 
-The same steps work in a batch plan (`op: "bazel.query"`, `query`, `output`, `outputFile`). Each op takes the workspace lock and a build slot, the same admission as `bazel.build`. ATC writes the file only if Bazel exits 0 and the capture stays within `maxOutputBytes` (default 64 MiB). The JSON result's `artifact` field is `{path, bytes, sha256, maxBytes}`. If the limit is exceeded, Bazel fails, or the write is interrupted, the op fails and no partial file is left behind. Two trees are equivalent for this check only when both captures succeed and their `sha256` values match. Do not pass extra Bazel flags; the catalog has no flag escape hatch.
+The same steps work in a batch plan (`op: "bazel.query"`, `query`, `output`, `outputFile`). Each op takes the workspace lock and a build slot, the same admission as `bazel.build`. ATC writes the file only if Bazel exits 0 and the capture stays within `maxOutputBytes` (default 64 MiB). The JSON result's `artifact` field is `{path, bytes, sha256, maxBytes}`. If the limit is exceeded, Bazel fails, or the write is interrupted, the op fails and no partial file is left behind. Two trees are equivalent for this check only when both captures succeed and their `sha256` values match.
+
+A protected tree whose `.bazelrc` imports a shared IDE cache needs the typed isolation fields. They are not extra flags: ATC places startup options before the verb and command options after it. Private paths must be absolute and outside the workspace and outside `~/Library/Caches/JetBrains`.
+
+```bash
+atc exec bazel query "kind('rule', deps(//:main))" \
+  --workspace /protected/original \
+  --output xml --output-file out/original-rules.xml \
+  --no-system-rc --no-home-rc --bazelrc /dev/null \
+  --output-user-root /private/scratch/bazel-user \
+  --output-base /private/scratch/bazel-user/main \
+  --repository-cache /private/scratch/repository-cache \
+  --disk-cache /private/scratch/disk-cache \
+  --remote-cache '' --remote-executor '' --bes-backend '' \
+  --lockfile-mode error \
+  --executable /opt/pinned/bazel
+```
+
+`--workspace` only selects the locked Bazel root. It does not disable rc files or move caches. Without the isolation fields, a query still loads the tree's `.bazelrc`.
 
 ## One agent claims by profile and runs with a heartbeat
 
