@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { cmdClaim, cmdExec } from "../src/cli.mjs";
 import crypto from "node:crypto";
-import { checkWindowsContract, createQueryCapture, execHelp, planOp, summarizeBriefOutput } from "../src/exec.mjs";
+import { checkWindowsContract, createQueryCapture, execHelp, planOp, resolveQueryOutputFile, summarizeBriefOutput } from "../src/exec.mjs";
 import { readState } from "../src/state.mjs";
 const HOST = { totalRamMb: 65536, availableRamMb: 32768, freeDiskMb: 100000, cpuCores: 8 };
 
@@ -285,6 +285,46 @@ test("exec: query limit, nonzero exit, and cancellation leave no artifact", { sk
     assert.equal(fs.readdirSync(path.join(s.proj, "out")).some((n) => n.startsWith("slow.txt")), false);
   } finally {
     s.cleanup();
+  }
+});
+
+test("query capture: concurrent captures and symlink escapes do not share or leave the workspace", () => {
+  const root = tmp();
+  try {
+    const dest = path.join(root, "out", "rules.xml");
+    const other = path.join(root, "out", "other.xml");
+    const a = createQueryCapture(dest, 64);
+    const b = createQueryCapture(other, 64);
+    a.onChunk(Buffer.from("alpha-capture"));
+    b.onChunk(Buffer.from("beta-capture-longer"));
+    const published = a.finish(0);
+    const second = b.finish(0);
+    assert.equal(published.ok, true);
+    assert.equal(second.ok, true);
+    assert.equal(fs.readFileSync(dest, "utf8"), "alpha-capture");
+    assert.equal(fs.readFileSync(other, "utf8"), "beta-capture-longer");
+    assert.notEqual(published.artifact.sha256, second.artifact.sha256);
+    assert.equal(fs.readdirSync(path.join(root, "out")).filter((n) => n.includes("partial")).length, 0);
+
+    const outside = tmp("atc-query-outside-");
+    fs.symlinkSync(outside, path.join(root, "linked"));
+    assert.throws(
+      () => createQueryCapture(resolveQueryOutputFile(root, "linked/result.xml"), 32),
+      (e) => e.code === "unsafe_output",
+    );
+    assert.equal(fs.readdirSync(outside).length, 0);
+    fs.rmSync(outside, { recursive: true, force: true });
+
+    const ro = path.join(root, "ro");
+    fs.mkdirSync(ro);
+    fs.chmodSync(ro, 0o555);
+    assert.throws(
+      () => createQueryCapture(path.join(ro, "nested", "x.xml"), 32),
+      (e) => e.code === "output_write_failed",
+    );
+    fs.chmodSync(ro, 0o755);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

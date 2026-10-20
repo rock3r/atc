@@ -108,6 +108,21 @@ function boundedAppend(buf, chunk) {
 
 const BAZEL_GRAPH_OPS = new Set(["bazel.query", "bazel.cquery"]);
 
+function realExistingAncestor(start) {
+  let cur = path.resolve(start);
+  for (let i = 0; i < 64; i++) {
+    try {
+      return { real: fs.realpathSync(cur), missing: path.relative(cur, start) };
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+      const parent = path.dirname(cur);
+      if (!parent || parent === cur) throw err;
+      cur = parent;
+    }
+  }
+  throw new OpError("unsafe_output", "outputFile could not be resolved.", "Pass a relative path inside the working directory.");
+}
+
 export function resolveQueryOutputFile(cwd, outputFile) {
   const raw = String(outputFile ?? "");
   if (!raw || path.isAbsolute(raw) || raw.split(/[/\\]/).includes("..")) {
@@ -117,12 +132,29 @@ export function resolveQueryOutputFile(cwd, outputFile) {
       "Pass a relative path such as out/main-rules.xml.",
     );
   }
-  const resolved = path.resolve(cwd, raw);
+  const lexical = path.resolve(cwd, raw);
   const root = path.resolve(cwd);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+  if (lexical !== root && !lexical.startsWith(root + path.sep)) {
     throw new OpError("unsafe_output", `outputFile resolves outside ${root}.`, "Pass a relative path that stays inside the working directory.");
   }
-  return resolved;
+  let rootReal;
+  let dest;
+  try {
+    rootReal = fs.realpathSync(root);
+    dest = realExistingAncestor(lexical);
+  } catch (err) {
+    if (err instanceof OpError) throw err;
+    throw new OpError("output_write_failed", `outputFile could not be resolved: ${err.message}`, "Check that the working directory is readable.");
+  }
+  const realDest = dest.missing ? path.resolve(dest.real, dest.missing) : dest.real;
+  if (realDest !== rootReal && !realDest.startsWith(rootReal + path.sep)) {
+    throw new OpError(
+      "unsafe_output",
+      "outputFile follows a symlink outside the working directory.",
+      "Pass a relative path whose existing parents stay inside the working directory.",
+    );
+  }
+  return lexical;
 }
 
 // Stream a query/cquery result to a file with a hard byte cap. A limit breach, a
@@ -130,10 +162,19 @@ export function resolveQueryOutputFile(cwd, outputFile) {
 // never a valid manifest.
 export function createQueryCapture(filePath, maxBytes) {
   const limit = Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : BAZEL_QUERY_MAX_OUTPUT_BYTES;
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  // Write beside the destination and publish only after a complete, in-limit, zero-exit capture.
-  const partialPath = `${filePath}.atc-partial-${process.pid}`;
-  const fd = fs.openSync(partialPath, "w");
+  let fd;
+  let partialPath;
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    // Exclusive random name: concurrent captures in one process must not share a partial file.
+    partialPath = path.join(
+      path.dirname(filePath),
+      `.${path.basename(filePath)}.atc-partial-${crypto.randomBytes(8).toString("hex")}`,
+    );
+    fd = fs.openSync(partialPath, "wx");
+  } catch (err) {
+    throw new OpError("output_write_failed", `Query output could not be opened: ${err.message}`, "Check that outputFile's directory is writable.");
+  }
   const hash = crypto.createHash("sha256");
   let bytes = 0;
   let exceeded = false;
@@ -381,8 +422,9 @@ export async function execOp(stateDir, request, deps, options = {}) {
         params.maxOutputBytes,
       );
     } catch (err) {
-      if (err instanceof OpError) return invalid([{ path: "/outputFile", code: err.code, message: err.message, hint: err.hint }], { op: opName });
-      throw err;
+      const code = err instanceof OpError ? err.code : "output_write_failed";
+      const message = err instanceof OpError ? err.message : `Query output could not be opened: ${err.message}`;
+      return invalid([{ path: "/outputFile", code, message, hint: err instanceof OpError ? err.hint : null }], { op: opName });
     }
   }
   let stdout = "";
