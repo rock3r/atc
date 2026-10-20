@@ -315,14 +315,16 @@ test("query capture: concurrent captures and symlink escapes do not share or lea
     assert.equal(fs.readdirSync(outside).length, 0);
     fs.rmSync(outside, { recursive: true, force: true });
 
-    const ro = path.join(root, "ro");
-    fs.mkdirSync(ro);
-    fs.chmodSync(ro, 0o555);
-    assert.throws(
-      () => createQueryCapture(path.join(ro, "nested", "x.xml"), 32),
-      (e) => e.code === "output_write_failed",
-    );
-    fs.chmodSync(ro, 0o755);
+    if (process.platform !== "win32") {
+      const ro = path.join(root, "ro");
+      fs.mkdirSync(ro);
+      fs.chmodSync(ro, 0o555);
+      assert.throws(
+        () => createQueryCapture(path.join(ro, "nested", "x.xml"), 32),
+        (e) => e.code === "output_write_failed",
+      );
+      fs.chmodSync(ro, 0o755);
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
