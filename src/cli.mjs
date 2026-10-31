@@ -6768,11 +6768,12 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
     if (exitCode === 0 && op.name === "ios.delete" && check.lease?.leaseId) {
       const deletedKey = check.lease.deviceKey;
       const deletedId = check.lease.leaseId;
-      withStateTransaction(stateDir, (state) => {
+      withStateTransaction(stateDir, (state, { now }) => {
         const { key, lease: cur } = findLeaseEntry(state, deletedKey, deletedId);
         if (!cur || cur.leaseId !== deletedId || cur.sessionId !== check.sessionId) {
           return { mutated: false };
         }
+        recordDeviceStoppedInState(state, cur, now);
         delete state.leases[key];
         return { mutated: true };
       }, options);

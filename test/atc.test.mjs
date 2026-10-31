@@ -8944,7 +8944,11 @@ test("ios.delete removes only the leased simulator and drops that lease", async 
     });
     assert.equal(removed.exitCode, 0, removed.error);
     assert.deepEqual(deleted, [["xcrun", ["simctl", "delete", leased]]]);
-    assert.equal(readState(dir).leases[`sim:${leased}`], undefined);
+    const afterDelete = readState(dir);
+    assert.equal(afterDelete.leases[`sim:${leased}`], undefined);
+    assert.ok(afterDelete.fleetEpoch > 0, "deleting a simulator must advance fleetEpoch");
+    assert.equal(afterDelete.stoppedDevices?.[`sim:${leased}`]?.serial, leased);
+    assert.equal(afterDelete.bootedDevices?.[`sim:${leased}`], undefined);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
