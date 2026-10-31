@@ -275,6 +275,9 @@ function adbShell(ctx, remote) {
   return adb(ctx, "shell", remote);
 }
 
+const IOS_UDID_RE =
+  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
 function simctl(ctx, verb, ...args) {
   if (!ctx.lease?.serial) {
     throw new OpError("claim_required", "This operation needs an active iOS simulator lease.", "Run `atc claim --ios` first.");
@@ -606,6 +609,48 @@ export const OPS = Object.freeze({
     invocations: (p, ctx) => {
       const inv = simctl(ctx, "io", "screenshot", path.resolve(ctx.cwd, p.output));
       return [inv];
+    },
+  },
+  "ios.delete": {
+    name: "ios.delete",
+    system: "ios",
+    kind: "device",
+    platform: "ios",
+    hostOs: "darwin",
+    positional: "udid",
+    params: {
+      udid: {
+        type: "string",
+        pattern: "iosUdid",
+        required: true,
+        description: "UDID of the simulator this session currently leases",
+      },
+    },
+    invocations(params, ctx) {
+      if (!ctx.lease?.serial) {
+        throw new OpError(
+          "claim_required",
+          "Deleting a simulator needs an active iOS simulator lease.",
+          "Run `atc claim --ios` first, then `atc exec ios delete <udid>` for that lease.",
+        );
+      }
+      if (ctx.lease.kind === "physical") {
+        throw new OpError(
+          "simulator_only",
+          "ios.delete removes an iOS Simulator. This session's iOS lease is a physical device.",
+          "Claim the simulator you want to delete.",
+        );
+      }
+      const leased = String(ctx.lease.serial).toLowerCase();
+      const requested = String(params.udid || "").toLowerCase();
+      if (!IOS_UDID_RE.test(params.udid) || requested !== leased) {
+        throw new OpError(
+          "not_leased",
+          `Refusing to delete ${params.udid}: it is not the simulator leased by this session (${ctx.lease.serial}).`,
+          "atc exec ios delete only deletes the simulator you currently hold. Claim it first.",
+        );
+      }
+      return [{ cmd: "xcrun", args: ["simctl", "delete", ctx.lease.serial] }];
     },
   },
   "ios.privacy": {

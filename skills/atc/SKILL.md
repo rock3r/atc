@@ -31,7 +31,7 @@ The `atc` CLI coordinates builds, Android emulators, iOS Simulators, and physica
    atc claim --type phone --api ">=35" --play --wait 300   # Android emulator
    atc claim --ios --type phone --os ">=18.0" --wait 300   # iOS Simulator (macOS)
    ```
-   Never start, boot, stop, or wipe an emulator/simulator directly, and never stop shared build daemons (`./gradlew --stop`, `bazel shutdown`). Default claims target virtual devices (`--kind emulator`) so you never hijack a developer's personal phone unless explicitly asked.
+   Never start, boot, stop, wipe, or delete an emulator/simulator directly, and never stop shared build daemons (`./gradlew --stop`, `bazel shutdown`). Delete only the simulator this session leases, with `atc exec ios delete <udid>`. Default claims target virtual devices (`--kind emulator`) so you never hijack a developer's personal phone unless explicitly asked.
 5. Run device work as typed operations against your lease:
    ```bash
    atc exec android install app/build/outputs/apk/debug/app-debug.apk --replace

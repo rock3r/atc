@@ -483,6 +483,7 @@ test("documented CLI translations (docs/migration-3.0.md, guides) parse and vali
     [["ios", "launch", "com.ex.App"], "ios.launch"],
     [["ios", "open-url", "myapp://settings"], "ios.openUrl"],
     [["ios", "privacy", "--bundle-id", "com.ex.App", "--service", "camera", "--action", "grant"], "ios.privacy"],
+    [["ios", "delete", "11111111-2222-4333-8444-555555555555"], "ios.delete"],
     [["snapshot", "save", "clean"], "snapshot.save"],
   ];
   for (const [argv, expected] of cases) {
@@ -499,6 +500,28 @@ test("documented CLI translations (docs/migration-3.0.md, guides) parse and vali
 });
 
 // ---------------------------------------------------------------- review fixes
+
+test("ios.delete targets only the leased simulator and refuses a foreign UDID", () => {
+  const leased = "11111111-2222-4333-8444-555555555555";
+  const foreign = "99999999-8888-4777-8666-555555555555";
+  const ctx = { cwd: "/", lease: { serial: leased, kind: "emulator", platform: "ios" } };
+  assert.equal(resolveOpName("ios", "delete"), "ios.delete");
+  assert.deepEqual(OPS["ios.delete"].invocations({ udid: leased }, ctx)[0], {
+    cmd: "xcrun",
+    args: ["simctl", "delete", leased],
+  });
+  assert.throws(
+    () => OPS["ios.delete"].invocations({ udid: foreign }, ctx),
+    /not the simulator leased by this session/,
+  );
+  assert.throws(
+    () => OPS["ios.delete"].invocations({}, { cwd: "/", lease: { serial: leased, kind: "physical" } }),
+    /physical device/,
+  );
+  const parsed = parseOpArgv(["ios", "delete", leased]);
+  assert.deepEqual(parsed.errors, []);
+  assert.deepEqual(validateOpParams(parsed.opName, parsed.params).errors, []);
+});
 
 test("parseOpArgv: separated leading-dash passthrough values are consumed for runArgs and launchArgs", () => {
   const b = parseOpArgv(["bazel", "run", "//tools:gen", "--run-arg", "--verbose", "--run-arg", "-n=1", "--timeout-sec", "30"]);

@@ -8809,3 +8809,143 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("iOS create-if-missing passes the parsed device type and runtime to simctl", async () => {
+  const { createIosSimulator, deleteIosSimulator, parseSimctlListJson } = await import("../src/ios.mjs");
+  const dir = makeTempStateDir();
+  const deviceTypeId = "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro";
+  const runtimeId = "com.apple.CoreSimulator.SimRuntime.iOS-18-4";
+  const createdUdid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+  try {
+    const parsed = parseSimctlListJson({
+      runtimes: [
+        {
+          identifier: runtimeId,
+          name: "iOS 18.4",
+          version: "18.4",
+          isAvailable: true,
+          supportedDeviceTypes: [{ identifier: deviceTypeId, name: "iPhone 16 Pro", productFamily: "iPhone" }],
+        },
+      ],
+      devicetypes: [{ identifier: deviceTypeId, name: "iPhone 16 Pro", productFamily: "iPhone" }],
+      devices: {},
+    });
+    assert.equal(parsed.creatable[0].deviceTypeId, deviceTypeId);
+    assert.equal(parsed.creatable[0].runtimeId, runtimeId);
+
+    const createCalls = [];
+    const claim = cmdClaim(
+      dir,
+      { session: "ios-create-sess", ios: true, type: "phone", os: "18.4", createIfMissing: true, wait: 0, force: true },
+      {
+        platform: "darwin",
+        inventory: {
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+          queriedPlatforms: ["ios"],
+          running: [],
+          offline: [],
+          creatable: parsed.creatable,
+          probes: { simctlListOk: true },
+        },
+        runner: (cmd, args) => {
+          createCalls.push([cmd, args]);
+          if (cmd === "xcrun" && args[0] === "simctl" && args[1] === "create") {
+            return { status: 0, stdout: `${createdUdid}\n`, stderr: "" };
+          }
+          if (cmd === "xcrun" && args[0] === "simctl" && args[1] === "bootstatus") {
+            return { status: 0, stdout: "Booted", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    );
+    assert.equal(claim.exitCode, 0, claim.error);
+    const create = createCalls.find((c) => c[0] === "xcrun" && c[1][1] === "create");
+    assert.ok(create, "simctl create was not invoked");
+    assert.equal(create[1][2], "iPhone 16 Pro");
+    assert.equal(create[1][3], deviceTypeId);
+    assert.equal(create[1][4], runtimeId);
+    assert.equal(String(create[1]).includes("undefined"), false);
+    assert.equal(claim.lease.serial, createdUdid);
+    assert.equal(claim.lease.createdByAtc, true);
+
+    const missingType = createIosSimulator("iPhone 16 Pro", undefined, runtimeId, {
+      runner: () => ({ status: 0, stdout: `${createdUdid}\n`, stderr: "" }),
+    });
+    assert.fail(`createIosSimulator accepted a missing device type: ${missingType.udid}`);
+  } catch (err) {
+    if (!/missing device type/i.test(String(err.message))) throw err;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  const udid = "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF";
+  const calls = [];
+  deleteIosSimulator(udid, {
+    runner: (cmd, args) => {
+      calls.push([cmd, args]);
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(calls[0], ["xcrun", ["simctl", "shutdown", udid]]);
+  assert.deepEqual(calls[1], ["xcrun", ["simctl", "delete", udid]]);
+});
+
+test("ios.delete removes only the leased simulator and drops that lease", async () => {
+  const dir = makeTempStateDir();
+  const leased = "CCCCCCCC-DDDD-4EEE-8FFF-000000000001";
+  const foreign = "DDDDDDDD-EEEE-4FFF-8000-000000000002";
+  try {
+    const claim = cmdClaim(
+      dir,
+      { session: "ios-del-sess", ios: true, udid: leased, wait: 0 },
+      {
+        platform: "darwin",
+        inventory: {
+          host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+          queriedPlatforms: ["ios"],
+          running: [
+            {
+              deviceKey: `sim:${leased}`,
+              platform: "ios",
+              kind: "emulator",
+              avd: "ATC Disposable",
+              serial: leased,
+              udid: leased,
+              online: true,
+              profile: { platform: "ios", deviceType: "phone", osVersion: "iOS-18.4", deviceTypeId: "com.apple.CoreSimulator.SimDeviceType.iPhone-16" },
+            },
+          ],
+          offline: [],
+          creatable: [],
+          probes: { simctlListOk: true },
+        },
+      },
+    );
+    assert.equal(claim.exitCode, 0, claim.error);
+
+    const refused = await cmdExec(dir, ["ios", "delete", foreign, "--session", "ios-del-sess"], {
+      platform: "darwin",
+      invocationRunner: () => {
+        throw new Error("simctl must not run for a foreign UDID");
+      },
+    });
+    assert.notEqual(refused.exitCode, 0);
+    assert.match(String(refused.error || ""), /not the simulator leased by this session/);
+    assert.equal(readState(dir).leases[`sim:${leased}`]?.leaseId, claim.lease.leaseId);
+
+    const deleted = [];
+    const removed = await cmdExec(dir, ["ios", "delete", leased, "--session", "ios-del-sess"], {
+      platform: "darwin",
+      invocationRunner: (cmd, args) => {
+        deleted.push([cmd, [...args]]);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.equal(removed.exitCode, 0, removed.error);
+    assert.deepEqual(deleted, [["xcrun", ["simctl", "delete", leased]]]);
+    assert.equal(readState(dir).leases[`sim:${leased}`], undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
