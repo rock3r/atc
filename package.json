@@ -1,6 +1,6 @@
 {
   "name": "@rock3r/atc",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "Daemonless Agent Traffic Control for Android emulators, iOS Simulators, physical devices, and Gradle/Bazel/Xcode builds — leases, co-scheduling, bounded-window warm-affinity wait queue, snapshots, crash recovery, and typed build/device operations (no shell).",
   "license": "Apache-2.0",
   "author": "Sebastiano Poggi <me@sebastiano.dev>",

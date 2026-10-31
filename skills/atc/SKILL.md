@@ -4,7 +4,7 @@ description: Coordinate builds (Gradle, Bazel, Xcode) and exclusive Android (AVD
 license: Apache-2.0
 compatibility: Needs Node.js >= 20 on macOS, Linux, or Windows, plus the Android SDK (`adb`, `emulator`, `android` CLI) and/or Xcode (`xcrun simctl`, `xcodebuild`) on macOS.
 metadata:
-  version: "3.3.0"
+  version: "3.4.0"
   author: "Sebastiano Poggi"
 ---
 
