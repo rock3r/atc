@@ -8,7 +8,7 @@ Guides: `workflow` (this page) · `profiles` · `snapshots` · `multi-agent` · 
 
 Run `atc status` to inspect available RAM, free disk, used Android emulator slots (`emu slots`), used iOS Simulator slots (`sim slots`), used build slots (`build slots`), running devices, offline AVDs/Simulators, active leases, and active builds.
 
-Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`, `xcrun simctl boot`, `xcrun simctl shutdown`, `xcrun simctl erase`, `./gradlew --stop`, or `bazel shutdown`. `atc` owns the virtual device lifecycle and the shared build daemons, and will not do these on request.
+Never run raw `emulator -avd`, `android emulator start`, `adb emu kill`, `adb kill-server`, `xcrun simctl boot`, `xcrun simctl shutdown`, `xcrun simctl erase`, `xcrun simctl delete`, `./gradlew --stop`, or `bazel shutdown`. `atc` owns the virtual device lifecycle and the shared build daemons, and will not do these on request. To remove the simulator this session currently leases, run `atc exec ios delete <udid>`. It refuses any other UDID.
 
 ## 2. Claim, run typed operations, snapshot, and free
 

@@ -345,7 +345,7 @@ No. `atc` is a cooperative system, like real air traffic control ([context threa
 
 At the OS level, `adb` (port `5037`) and `CoreSimulatorService` are shared user-space buses. Code cannot stop a process on the same user account from invoking `adb` or `xcrun simctl` outside `atc`. ATC 2.x tried to inspect and rewrite shell commands in a pre-tool hook; ATC 3.0 dropped that entirely, because shell is not a language anyone can safely parse. Instead, the skill, `atc guide`, and the MCP tools steer agents to request their work through typed operations, and the guarantees apply to work requested through `atc`.
 
-Operations that are deliberately not offered (stopping shared Gradle daemons or the Bazel server, `adb kill-server`, reboots, `emu kill`, booting or erasing simulators outside `atc claim`/`atc free`) are refused even with `--force`.
+Operations that are deliberately not offered (stopping shared Gradle daemons or the Bazel server, `adb kill-server`, reboots, `emu kill`, booting or erasing simulators outside `atc claim`/`atc free`) are refused even with `--force`. Deleting a simulator is offered only as `atc exec ios delete <udid>`, and only for the simulator the current session leases.
 
 ### What if I need an operation that isn't in the catalog?
 

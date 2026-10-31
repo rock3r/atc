@@ -78,6 +78,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 | `ios.openUrl` | `url` (`^[a-zA-Z][a-zA-Z0-9+.-]*:[^\s'"`;|&<>\\]*$`) |
 | `ios.screenshot` | `output` |
 | `ios.privacy` | `bundleId`, `service ∈ {all, calendar, contacts-limited, contacts, location, location-always, photos-add, photos, media-library, microphone, motion, reminders, siri, camera}`, `action ∈ {grant, revoke, reset}` |
+| `ios.delete` | `udid` of the simulator this session currently leases. Refuses a different UDID, a physical lease, and a missing lease. |
 
 ### 2.4 Snapshots (virtual devices only)
 - Ops: `snapshot.list`, and `snapshot.save` / `snapshot.load` / `snapshot.delete` with `name` (CLI: `atc exec snapshot save <name>`, same as `atc snapshot save <name>`).
@@ -89,7 +90,7 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 - **Bazel:** target exclusion patterns.
 
 ### 2.6 Not expressible, by design
-- Arbitrary `adb shell` or `simctl spawn`, `adb kill-server`/`reboot`/`emu kill`, and `simctl boot/shutdown/erase` outside `atc claim`/`atc free`.
+- Arbitrary `adb shell` or `simctl spawn`, `adb kill-server`/`reboot`/`emu kill`, and `simctl boot/shutdown/erase/delete` outside `atc claim`/`atc free`/`atc exec ios delete`.
 - Third-party runners (`maestro`, `flutter`, Detox, scripts).
 
 ## 3. Value validation (strict, KISS)

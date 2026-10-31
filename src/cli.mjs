@@ -33,6 +33,7 @@ import { handlePreToolUseHook, handleStopHook, readStdinSync } from "./hook.mjs"
 import {
   bootIosSimulator,
   createIosSimulator,
+  deleteIosSimulator,
   deleteIosSimulatorSnapshot,
   diagnosePlatformToolingError,
   discoverIosFleet,
@@ -1254,9 +1255,17 @@ export function selectCandidateUnderLock(
             kind: "emulator",
             online: false,
             simDeviceTypeId:
-              matchedCreatable.simDeviceTypeId || baseProfile.deviceTypeIdentifier || null,
+              matchedCreatable.simDeviceTypeId ||
+              matchedCreatable.deviceTypeId ||
+              baseProfile.deviceTypeId ||
+              baseProfile.deviceTypeIdentifier ||
+              null,
             simRuntimeId:
-              matchedCreatable.simRuntimeId || baseProfile.runtimeIdentifier || null,
+              matchedCreatable.simRuntimeId ||
+              matchedCreatable.runtimeId ||
+              baseProfile.runtimeId ||
+              baseProfile.runtimeIdentifier ||
+              null,
             ramSizeMb,
             requiredRamMb: ramSizeMb + simOverhead,
             dataDiskMb: matchedCreatable.dataDiskMb || 4096,
@@ -2900,8 +2909,14 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         assertReservationStillOwned();
         const createdSim = createIosSimulator(
           candidate.avd || req.avd || candidate.profile?.deviceName || "iPhone 16",
-          candidate.simDeviceTypeId || candidate.profile?.deviceTypeIdentifier,
-          candidate.simRuntimeId || candidate.profile?.runtimeIdentifier,
+          candidate.simDeviceTypeId ||
+            candidate.deviceTypeId ||
+            candidate.profile?.deviceTypeId ||
+            candidate.profile?.deviceTypeIdentifier,
+          candidate.simRuntimeId ||
+            candidate.runtimeId ||
+            candidate.profile?.runtimeId ||
+            candidate.profile?.runtimeIdentifier,
           {
             runner,
             timeoutMs: bootTimeoutMs || 180_000,
@@ -2937,6 +2952,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           current.deviceKey = newKey;
           current.udid = createdUdid;
           current.serial = createdUdid;
+          current.createdByAtc = true;
           current.dataPath = createdSim.dataPath || resolveSimulatorDataDir(createdUdid);
           state.leases[newKey] = current;
           return { mutated: true, value: null };
@@ -6759,6 +6775,19 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
         };
       }
       if (exitCode !== 0) break;
+    }
+    if (exitCode === 0 && op.name === "ios.delete" && check.lease?.leaseId) {
+      const deletedKey = check.lease.deviceKey;
+      const deletedId = check.lease.leaseId;
+      withStateTransaction(stateDir, (state, { now }) => {
+        const { key, lease: cur } = findLeaseEntry(state, deletedKey, deletedId);
+        if (!cur || cur.leaseId !== deletedId || cur.sessionId !== check.sessionId) {
+          return { mutated: false };
+        }
+        recordDeviceStoppedInState(state, cur, now);
+        delete state.leases[key];
+        return { mutated: true };
+      }, options);
     }
     return { exitCode, steps, lease: check.lease || null, sessionId: check.sessionId };
   } finally {

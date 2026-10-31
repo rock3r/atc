@@ -503,6 +503,14 @@ export function spawnWithHeartbeat(cmd, args, lease, sessionId, onHeartbeat, opt
   });
 
   const intervalMs = options.heartbeatIntervalMs ?? 30_000;
+  if (typeof options.invocationRunner === "function") {
+    const stub = options.invocationRunner(invocation.cmd, invocation.args, {
+      cwd: invocation.cwd || options.cwd,
+      env: invocation.env,
+    });
+    const status = Number(stub?.status ?? 0);
+    return Promise.resolve(status);
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(spawnCfg.command, spawnCfg.args, spawnCfg.options);
     const onOutput = typeof options.onOutput === "function" ? options.onOutput : null;

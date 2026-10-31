@@ -1109,6 +1109,34 @@ export function shutdownIosSimulator(
   }
 }
 
+export function deleteIosSimulator(
+  udid,
+  { runner = runCommandSync, timeoutMs = 60_000, env = process.env } = {},
+) {
+  if (!udid || String(udid).trim() === "" || String(udid) === "undefined") {
+    throw new Error("Cannot delete an iOS Simulator without a UDID.");
+  }
+  const shutRes = runIosCommandSync(runner, "xcrun", ["simctl", "shutdown", String(udid)], {
+    strictInternal: true,
+    timeoutMs,
+    env,
+  });
+  const shutMsg = `${shutRes.stderr || ""} ${shutRes.stdout || ""}`;
+  if (shutRes.status !== 0 && !/current state:\s*Shutdown/i.test(shutMsg)) {
+    throw new Error(`Failed to shut down simulator ${udid} before delete: ${shutMsg.trim()}`);
+  }
+  const delRes = runIosCommandSync(runner, "xcrun", ["simctl", "delete", String(udid)], {
+    strictInternal: true,
+    timeoutMs,
+    env,
+  });
+  if (delRes.status !== 0) {
+    throw new Error(
+      `Failed to delete simulator ${udid}: ${(delRes.stderr || delRes.stdout || "").trim()}`,
+    );
+  }
+}
+
 export function eraseIosSimulator(
   udid,
   { runner = runCommandSync, timeoutMs = 60_000, env = process.env } = {},
@@ -1131,6 +1159,12 @@ export function createIosSimulator(
   runtimeId,
   { runner = runCommandSync, timeoutMs = 180_000, env = process.env } = {},
 ) {
+  if (deviceTypeId === undefined || deviceTypeId === null || String(deviceTypeId).trim() === "") {
+    throw new Error(
+      `Cannot create iOS Simulator "${name}": missing device type. ` +
+        `Refusing to pass an empty device type to simctl.`,
+    );
+  }
   const args = ["simctl", "create", String(name), String(deviceTypeId)];
   if (runtimeId) {
     args.push(String(runtimeId));

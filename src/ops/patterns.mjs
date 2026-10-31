@@ -83,6 +83,11 @@ export const PATTERNS = Object.freeze({
     label: "a property key ([A-Za-z0-9_.-], max 128 chars)",
     forceable: false,
   },
+  iosUdid: {
+    re: /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/,
+    label: "an iOS simulator UDID (8-4-4-4-12 hex)",
+    forceable: false,
+  },
   snapshotName: {
     re: /^[A-Za-z0-9_.-]{1,64}$/,
     label: "a snapshot name ([A-Za-z0-9_.-], max 64 chars)",
