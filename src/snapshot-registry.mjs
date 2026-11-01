@@ -117,6 +117,18 @@ export function isSnapshotId(name) {
   return ID_RE.test(String(name || ""));
 }
 
+export function resolveSnapshotName(registry, storeId, name) {
+  if (!name) return null;
+  if (isSnapshotId(name)) return rowById(registry, name);
+  return liveRowForLabel(registry, storeId, name) || null;
+}
+
+export function backendNameFor(registry, storeId, name) {
+  const row = resolveSnapshotName(registry, storeId, name);
+  if (!row || row.state !== "live" || (storeId && row.storeId !== storeId)) return name;
+  return row.backendName || name;
+}
+
 export function measuredDirMb(dirPath) {
   if (!dirPath || !fs.existsSync(dirPath)) return null;
   let bytes = 0;
