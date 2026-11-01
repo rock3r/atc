@@ -201,9 +201,9 @@ export function recordLoadedSnapshot(registry, storeId, name, leaseId) {
   return { recorded: Boolean(live), id: live ? row.id : null };
 }
 
-export function backendNameFor(registry, storeId, name) {
+export function backendNameFor(registry, storeId, name, options = {}) {
   const row = resolveSnapshotName(registry, storeId, name);
-  if (row && row.id === name && row.state !== "deleted") {
+  if (options.rejectManagedId && row && row.id === name && row.state !== "deleted") {
     return { error: `${row.id} is a managed snapshot id. It cannot be used as a raw save name.` };
   }
   if (row && row.state !== "live") {

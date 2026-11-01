@@ -924,10 +924,10 @@ function discoverTargetFleet({
   });
 }
 
-function resolvedBackendName(options, storeId, name) {
+function resolvedBackendName(options, storeId, name, resolveOptions = {}) {
   return withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => ({
     mutated: false,
-    value: backendNameFor(registry, storeId, name),
+    value: backendNameFor(registry, storeId, name, resolveOptions),
   }));
 }
 
@@ -2692,7 +2692,9 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               cur.loadedSnapshot = loadedSnap;
               txOutcome.lease.loadedSnapshot = loadedSnap;
               noteLoadedSnapshot(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap, cur.leaseId);
-              cur.loadedSnapshotId = resolvedBackendName(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap).name || loadedSnap;
+              cur.loadedSnapshotId = loadedSnap
+                ? resolvedBackendName(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap).name || loadedSnap
+                : null;
             }
             const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
             cur.renewedAtMs = now;
@@ -4366,6 +4368,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               options,
               (lease.platform || "android") === "ios" ? lease.udid || lease.serial : lease.avd,
               saveSnap,
+              { rejectManagedId: true },
             );
             if (managed.error || (managed.name && managed.name !== saveSnap)) {
               const err = new Error(`Snapshot "${saveSnap}" is managed. Use atc snapshot save --replace. No state was changed.`);
@@ -5392,9 +5395,9 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           cur.state = "active";
           cur.deadlineMs = null;
           cur.loadedSnapshot = markLoaded ? effectiveName : null;
-          if (markLoaded) {
-            cur.loadedSnapshotId = leaseCheck.snapshotPlan?.row?.backendName || leaseCheck.snapshotPlan?.id || effectiveName;
-          }
+          cur.loadedSnapshotId = markLoaded
+            ? leaseCheck.snapshotPlan?.row?.backendName || leaseCheck.snapshotPlan?.id || effectiveName
+            : null;
         } else if (
           markLoaded &&
           effectiveAction === "delete" &&
