@@ -9143,18 +9143,41 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
     );
     assert.equal(replacedAgain.exitCode, 0, replacedAgain.error);
     cmdFree(dir, reclaim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
+    const callsBeforeReplaceClaim = calls.length;
+    const replaceClaim = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "task" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(replaceClaim.exitCode, 0, replaceClaim.error);
+    assert.equal(
+      calls.slice(callsBeforeReplaceClaim).some((call) => call.includes("snapshot load")),
+      true,
+    );
     const callsBeforeStale = calls.length;
     const staleLoad = cmdClaim(
       dir,
       { session: "snap-reg", avd: "Pixel_8", snapshotLoad: first.snapshotId, wait: 0 },
       { inventory, runner, snapshotRegistryDir: registryDir },
     );
-    assert.equal(staleLoad.exitCode, 2, staleLoad.error);
+    assert.equal(staleLoad.exitCode, 1, staleLoad.error);
+    assert.match(staleLoad.error, /does not return newer bytes/);
     assert.equal(
       calls.slice(callsBeforeStale).some((call) => call.includes("snapshot load")),
       false,
     );
 
+    const held = cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory, snapshotRegistryDir: registryDir });
+    assert.equal(held.exitCode, 0, held.error);
+    const callsBeforeFreeSave = calls.length;
+    const freeSave = cmdFree(
+      dir,
+      null,
+      { session: "snap-reg", snapshotSave: "task" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(freeSave.exitCode, 4, freeSave.error);
+    assert.equal(calls.length, callsBeforeFreeSave);
     const afterAbandon = withSnapshotRegistry(registryDir, (registry) => ({
       mutated: false,
       value: registry.snapshots.some((row) => row.id === abandonedId),

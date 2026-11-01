@@ -1817,7 +1817,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               !req.coldBoot
             ) {
               const needsSnapLoad = Boolean(
-                req.snapshotLoad && lease.loadedSnapshot !== req.snapshotLoad,
+                req.snapshotLoad &&
+                  (registryLoad === "live" || lease.loadedSnapshot !== req.snapshotLoad),
               );
               const needsPrep = Boolean(req.resetApp || needsSnapLoad);
               const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
@@ -4360,6 +4361,18 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
 
           const saveSnap =
             flags.snapshotSave || lease.pendingSnapshotSave || lease.saveSnapshotOnFree || null;
+          if (saveSnap) {
+            const managed = resolvedBackendName(
+              options,
+              (lease.platform || "android") === "ios" ? lease.udid || lease.serial : lease.avd,
+              saveSnap,
+            );
+            if (managed.name && managed.name !== saveSnap) {
+              const err = new Error(`Snapshot "${saveSnap}" is managed. Use atc snapshot save --replace. No state was changed.`);
+              err.exitCode = SNAPSHOT_CONFLICT_EXIT;
+              throw err;
+            }
+          }
           const loadSnap = flags.snapshotLoad || lease.pendingSnapshotLoad || null;
           const doStop =
             (parseBoolFlag(flags.stop) ||
@@ -4440,8 +4453,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options,
     );
   } catch (err) {
-    if (err instanceof ResourceError) {
-      return { exitCode: err.exitCode, error: err.message };
+    if (err instanceof ResourceError || err?.exitCode === SNAPSHOT_CONFLICT_EXIT) {
+      return { exitCode: err.exitCode, error: err.message, freed: [] };
     }
     return { exitCode: 1, error: err.message };
   }
