@@ -5,6 +5,8 @@ import { randomBytes } from "node:crypto";
 import { readDiskVolumeInfo } from "./android.mjs";
 import { isPidAlive } from "./lock.mjs";
 
+export { isPidAlive };
+
 export const SNAPSHOT_BUDGET_MB = 16384;
 export const SNAPSHOT_TTL_SEC = 7 * 24 * 60 * 60;
 export const SNAPSHOT_KEEP_MAX = 8;
@@ -90,7 +92,13 @@ function recoverStaleRegistryLock(lock) {
     }
     if (age < LOCK_INIT_GRACE_MS) return false;
   }
-  fs.rmSync(lock, { recursive: true, force: true });
+  const doomed = `${lock}.dead.${process.pid}.${Date.now()}`;
+  try {
+    fs.renameSync(lock, doomed);
+  } catch {
+    return false;
+  }
+  fs.rmSync(doomed, { recursive: true, force: true });
   return true;
 }
 
@@ -115,7 +123,9 @@ export function withSnapshotRegistry(dir, fn) {
   }
   try {
     const registry = readRegistryFile(dir);
+    const recovered = recoverAbandonedSnapshots(registry);
     const result = fn(registry);
+    if (recovered && result && typeof result === "object") result.mutated = true;
     if (result?.mutated) writeRegistryFile(dir, registry);
     return result?.value;
   } finally {
@@ -208,6 +218,26 @@ export function measuredDirMb(dirPath) {
     }
   }
   return Math.max(1, Math.ceil(bytes / (1024 * 1024)));
+}
+
+export function recoverAbandonedSnapshots(registry, pidAlive = isPidAlive) {
+  let changed = false;
+  const abandoned = registry.snapshots.filter(
+    (row) => row.state === "pending" && row.ownerPid && !pidAlive(row.ownerPid),
+  );
+  for (const pending of abandoned) {
+    changed = true;
+    for (const old of registry.snapshots) {
+      if (old.replacedBy === pending.id && old.state === "replaced") {
+        old.state = "live";
+        old.label = pending.label;
+        old.replacedBy = null;
+      }
+    }
+    registry.snapshots = registry.snapshots.filter((row) => row.id !== pending.id);
+    registry.spentIds.push({ id: pending.id, reason: "abandoned", atMs: Date.now() });
+  }
+  return changed;
 }
 
 export function usedMb(registry) {

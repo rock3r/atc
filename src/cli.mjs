@@ -5274,6 +5274,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         storeId,
         backendName: id,
         state: "pending",
+        ownerPid: process.pid,
         keep: parseBoolFlag(flags.keep),
         savedAtMs: now,
         expiresAtMs: now + snapCfg.ttlSec * 1000,

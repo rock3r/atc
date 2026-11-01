@@ -81,7 +81,7 @@ import {
   runCli,
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
-import { withSnapshotRegistry } from "../src/snapshot-registry.mjs";
+import { mintSnapshotId, withSnapshotRegistry } from "../src/snapshot-registry.mjs";
 
 // Keep the suite hermetic: an agent host (e.g. the atc pre-tool hook rewriting the command to
 // `export ATC_SESSION_ID=… ATC_ANCHOR_PID=…; npm run check`) can leak ATC_* identity/coordination
@@ -9118,6 +9118,26 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
     const recovered = withSnapshotRegistry(registryDir, () => ({ mutated: false, value: "recovered" }));
     assert.equal(recovered, "recovered");
     assert.equal(fs.existsSync(staleLock), false);
+
+    const abandonedId = withSnapshotRegistry(registryDir, (registry) => {
+      const id = mintSnapshotId(registry);
+      registry.snapshots.push({
+        id,
+        label: "abandoned",
+        storeId: "Pixel_8",
+        backendName: id,
+        state: "pending",
+        ownerPid: 2_147_483_646,
+        bytes: 2048,
+        references: [],
+      });
+      return { mutated: true, value: id };
+    });
+    const afterAbandon = withSnapshotRegistry(registryDir, (registry) => ({
+      mutated: false,
+      value: registry.snapshots.some((row) => row.id === abandonedId),
+    }));
+    assert.equal(afterAbandon, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
