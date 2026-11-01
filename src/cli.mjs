@@ -3795,6 +3795,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 stoppedExistingEmulator || prepInvalidatedSnapshot
                   ? prepLoadedSnapshot
                   : previousLease.loadedSnapshot,
+              loadedSnapshotId:
+                stoppedExistingEmulator || prepInvalidatedSnapshot
+                  ? null
+                  : previousLease.loadedSnapshotId,
               renewedAtMs: now,
               expiresAtMs: Math.max(previousLease.expiresAtMs || 0, now + ttlMs),
               deadlineMs: null,
@@ -4720,6 +4724,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 cur.releaseOnWorkerExit = false;
                 if (loadSnap) {
                   cur.loadedSnapshot = loadedSnapOnFree ? loadSnap : null;
+                  cur.loadedSnapshotId = loadedSnapOnFree
+                    ? resolvedBackendName(options, cur.avd || cur.udid || cur.serial, loadSnap).name || loadSnap
+                    : null;
                 }
                 if (
                   cur.anchorPid !== null &&
