@@ -9108,6 +9108,7 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       calls.some((call) => call.endsWith(`snapshot load ${other.snapshotId}`)),
       true,
     );
+    cmdFree(dir, claim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
 
     const staleLock = path.join(registryDir, "snapshots.lock");
     fs.mkdirSync(staleLock);
@@ -9133,6 +9134,27 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       });
       return { mutated: true, value: id };
     });
+    const replacedAgain = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg", replace: true },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(replacedAgain.exitCode, 0, replacedAgain.error);
+    cmdFree(dir, reclaim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
+    const callsBeforeStale = calls.length;
+    const staleLoad = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: first.snapshotId, wait: 0 },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(staleLoad.exitCode, 2, staleLoad.error);
+    assert.equal(
+      calls.slice(callsBeforeStale).some((call) => call.includes("snapshot load")),
+      false,
+    );
+
     const afterAbandon = withSnapshotRegistry(registryDir, (registry) => ({
       mutated: false,
       value: registry.snapshots.some((row) => row.id === abandonedId),

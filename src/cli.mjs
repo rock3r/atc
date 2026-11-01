@@ -924,6 +924,13 @@ function discoverTargetFleet({
   });
 }
 
+function resolvedBackendName(options, storeId, name) {
+  return withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => ({
+    mutated: false,
+    value: backendNameFor(registry, storeId, name),
+  }));
+}
+
 function snapshotAwareReq(req, device, options) {
   if (!req?.snapshotLoad || !device || device.kind !== "emulator") return req;
   const storeId = (device.platform || "android") === "ios"
@@ -1777,21 +1784,35 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   const row = resolveSnapshotName(registry, storeId, req.snapshotLoad);
                   return {
                     mutated: false,
-                    value: Boolean(row && row.state === "live" && row.storeId === storeId),
+                    value: row && row.storeId === storeId
+                      ? row.state === "live"
+                        ? "live"
+                        : "dead"
+                      : false,
                   };
                 })
               : false;
+            if (registryLoad === "dead") {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  error: `${req.snapshotLoad} is not live. It does not return newer bytes.`,
+                },
+              };
+            }
             if (
               lease.state === "active" &&
               Boolean(lease.serial) &&
               lease.sessionId === identity.sessionId &&
               matchesProfile(candidateForMatch, { ...req, snapshotLoad: null }) &&
               (!req.snapshotLoad ||
-                registryLoad ||
-                (lease.kind === "emulator" &&
-                  (lease.loadedSnapshot === req.snapshotLoad ||
-                    !Array.isArray(candidateForMatch.snapshots) ||
-                    candidateForMatch.snapshots.includes(req.snapshotLoad)))) &&
+                (registryLoad !== "dead" &&
+                  (registryLoad === "live" ||
+                    (lease.kind === "emulator" &&
+                      (lease.loadedSnapshot === req.snapshotLoad ||
+                        !Array.isArray(candidateForMatch.snapshots) ||
+                        candidateForMatch.snapshots.includes(req.snapshotLoad)))))) &&
               !req.wipeData &&
               !req.coldBoot
             ) {
@@ -2487,7 +2508,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       };
     }
 
-    if (txOutcome.status === "env_error") {
+    if (txOutcome.status === "env_error" || txOutcome.status === "error") {
       return {
         exitCode: 1,
         error: txOutcome.error,
@@ -2562,16 +2583,12 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             const claimStoreId = isIosLease
               ? txOutcome.lease.udid || txOutcome.lease.serial
               : txOutcome.lease.avd;
-            const claimBackendName = withSnapshotRegistry(
-              snapshotRegistryDirFrom(options),
-              (registry) => ({
-                mutated: false,
-                value: backendNameFor(registry, claimStoreId, req.snapshotLoad),
-              }),
-            );
-            if (isIosLease) {
+            const claimResolved = resolvedBackendName(options, claimStoreId, req.snapshotLoad);
+            if (claimResolved.error) {
+              prepError = claimResolved.error;
+            } else if (isIosLease) {
               try {
-                loadIosSimulatorSnapshot(stateDir, txOutcome.lease, claimBackendName, {
+                loadIosSimulatorSnapshot(stateDir, txOutcome.lease, claimResolved.name, {
                   runner,
                   stopTimeoutMs: snapTimeoutMs,
                   bootTimeoutMs: snapTimeoutMs * 2,
@@ -2595,7 +2612,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   "avd",
                   "snapshot",
                   "load",
-                  claimBackendName,
+                  claimResolved.name,
                 ],
                 { strictInternal: true, timeoutMs: snapTimeoutMs },
               );
@@ -3246,12 +3263,13 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
     const bootStoreId = candidatePlat === "ios"
       ? resolvedSerial || candidate.udid || candidate.serial || lease.udid || lease.serial
       : candidate.avd || lease.avd;
-    const bootSnapshotName = req.snapshotLoad
-      ? withSnapshotRegistry(snapshotRegistryDirFrom(execOptions), (registry) => ({
-          mutated: false,
-          value: backendNameFor(registry, bootStoreId, req.snapshotLoad),
-        }))
+    const bootResolved = req.snapshotLoad
+      ? resolvedBackendName(execOptions, bootStoreId, req.snapshotLoad)
       : null;
+    if (bootResolved?.error) {
+      throw new Error(bootResolved.error);
+    }
+    const bootSnapshotName = bootResolved?.name || null;
     if (candidatePlat === "ios") {
       const simUdid = resolvedSerial || candidate.udid || candidate.serial || lease.udid || lease.serial;
       resolvedSerial = simUdid;
@@ -4541,10 +4559,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           );
         } else if (isIosLease) {
           try {
-            loadIosSimulatorSnapshot(stateDir, lease, withSnapshotRegistry(
-              snapshotRegistryDirFrom(options),
-              (registry) => ({ mutated: false, value: backendNameFor(registry, lease.udid || lease.serial, loadSnap) }),
-            ), {
+            const iosResolved = resolvedBackendName(options, lease.udid || lease.serial, loadSnap);
+            if (iosResolved.error) throw new Error(iosResolved.error);
+            loadIosSimulatorSnapshot(stateDir, lease, iosResolved.name, {
               runner,
               stopTimeoutMs,
               bootTimeoutMs: stopTimeoutMs * 2,
@@ -4559,10 +4576,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         } else {
           const loadRes = runner(
             "adb",
-            ["-s", lease.serial, "emu", "avd", "snapshot", "load", withSnapshotRegistry(
-              snapshotRegistryDirFrom(options),
-              (registry) => ({ mutated: false, value: backendNameFor(registry, lease.avd, loadSnap) }),
-            )],
+            ["-s", lease.serial, "emu", "avd", "snapshot", "load", (() => {
+              const resolved = resolvedBackendName(options, lease.avd, loadSnap);
+              if (resolved.error) throw new Error(resolved.error);
+              return resolved.name;
+            })()],
             { strictInternal: true, timeoutMs: stopTimeoutMs },
           );
           if (isAdbEmuFailure(loadRes)) {

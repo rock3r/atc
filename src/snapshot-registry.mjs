@@ -203,8 +203,11 @@ export function recordLoadedSnapshot(registry, storeId, name, leaseId) {
 
 export function backendNameFor(registry, storeId, name) {
   const row = resolveSnapshotName(registry, storeId, name);
-  if (!row || row.state !== "live" || (storeId && row.storeId !== storeId)) return name;
-  return row.backendName || name;
+  if (row && row.state !== "live") {
+    return { error: `${row.id} is ${row.state}${row.replacedBy ? ` by ${row.replacedBy}` : ""}. It does not return newer bytes.` };
+  }
+  if (!row || (storeId && row.storeId !== storeId)) return { name };
+  return { name: row.backendName || name };
 }
 
 export function measuredDirMb(dirPath) {
