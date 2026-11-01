@@ -3652,7 +3652,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             current.loadedSnapshot,
             current.leaseId,
           );
-          current.loadedSnapshotId = bootResolved?.name || current.loadedSnapshot;
+          current.loadedSnapshotId = req.resetApp ? null : bootResolved?.name || current.loadedSnapshot;
         }
         if (bootedNewEmulator) {
           recordDeviceBootedInState(state, current, now);
