@@ -1784,15 +1784,13 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   const row = resolveSnapshotName(registry, storeId, req.snapshotLoad);
                   return {
                     mutated: false,
-                    value: row && row.storeId === storeId
-                      ? row.state === "live"
-                        ? "live"
-                        : "dead"
-                      : false,
+                    value: !row || row.storeId !== storeId
+                      ? { state: false }
+                      : { state: row.state === "live" ? "live" : "dead", id: row.id },
                   };
                 })
               : false;
-            if (registryLoad === "dead") {
+            if (registryLoad?.state === "dead") {
               return {
                 mutated: false,
                 value: {
@@ -1807,8 +1805,8 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               lease.sessionId === identity.sessionId &&
               matchesProfile(candidateForMatch, { ...req, snapshotLoad: null }) &&
               (!req.snapshotLoad ||
-                (registryLoad !== "dead" &&
-                  (registryLoad === "live" ||
+                (registryLoad?.state !== "dead" &&
+                  (registryLoad?.state === "live" ||
                     (lease.kind === "emulator" &&
                       (lease.loadedSnapshot === req.snapshotLoad ||
                         !Array.isArray(candidateForMatch.snapshots) ||
@@ -1818,7 +1816,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             ) {
               const needsSnapLoad = Boolean(
                 req.snapshotLoad &&
-                  (registryLoad === "live" || lease.loadedSnapshot !== req.snapshotLoad),
+                  lease.loadedSnapshotId !== (registryLoad?.id || req.snapshotLoad),
               );
               const needsPrep = Boolean(req.resetApp || needsSnapLoad);
               const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
@@ -2694,6 +2692,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
               cur.loadedSnapshot = loadedSnap;
               txOutcome.lease.loadedSnapshot = loadedSnap;
               noteLoadedSnapshot(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap, cur.leaseId);
+              cur.loadedSnapshotId = resolvedBackendName(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap).name || loadedSnap;
             }
             const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
             cur.renewedAtMs = now;
@@ -3651,6 +3650,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
             current.loadedSnapshot,
             current.leaseId,
           );
+          current.loadedSnapshotId = bootResolved?.name || current.loadedSnapshot;
         }
         if (bootedNewEmulator) {
           recordDeviceBootedInState(state, current, now);
@@ -4367,7 +4367,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               (lease.platform || "android") === "ios" ? lease.udid || lease.serial : lease.avd,
               saveSnap,
             );
-            if (managed.name && managed.name !== saveSnap) {
+            if (managed.error || (managed.name && managed.name !== saveSnap)) {
               const err = new Error(`Snapshot "${saveSnap}" is managed. Use atc snapshot save --replace. No state was changed.`);
               err.exitCode = SNAPSHOT_CONFLICT_EXIT;
               throw err;
@@ -5392,6 +5392,9 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           cur.state = "active";
           cur.deadlineMs = null;
           cur.loadedSnapshot = markLoaded ? effectiveName : null;
+          if (markLoaded) {
+            cur.loadedSnapshotId = leaseCheck.snapshotPlan?.row?.backendName || leaseCheck.snapshotPlan?.id || effectiveName;
+          }
         } else if (
           markLoaded &&
           effectiveAction === "delete" &&
@@ -6242,6 +6245,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
               addLeaseWorker(lease, process.pid, livenessCheck);
               if (!plan.readOnly) {
                 lease.loadedSnapshot = null;
+                lease.loadedSnapshotId = null;
               }
               lease.renewedAtMs = now;
               lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
@@ -6322,6 +6326,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
             if (lease) {
               addLeaseWorker(lease, process.pid, livenessCheck);
               lease.loadedSnapshot = null;
+              lease.loadedSnapshotId = null;
               lease.renewedAtMs = now;
               lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
             }
@@ -6620,6 +6625,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
             if (lease) {
               addLeaseWorker(lease, process.pid, livenessCheck);
               lease.loadedSnapshot = null;
+              lease.loadedSnapshotId = null;
               lease.renewedAtMs = now;
               lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
             }
@@ -6921,6 +6927,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
           }
           addLeaseWorker(curDev, process.pid, livenessCheck);
           curDev.loadedSnapshot = null;
+          curDev.loadedSnapshotId = null;
           curDev.renewedAtMs = now;
           curDev.expiresAtMs = Math.max(curDev.expiresAtMs || 0, now + txRes.ttlMs);
           const reserveWindowMs = (state.config?.buildRamReservationWindowSec ?? 30) * 1000;

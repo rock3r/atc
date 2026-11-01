@@ -203,6 +203,9 @@ export function recordLoadedSnapshot(registry, storeId, name, leaseId) {
 
 export function backendNameFor(registry, storeId, name) {
   const row = resolveSnapshotName(registry, storeId, name);
+  if (row && row.id === name && row.state !== "deleted") {
+    return { error: `${row.id} is a managed snapshot id. It cannot be used as a raw save name.` };
+  }
   if (row && row.state !== "live") {
     return { error: `${row.id} is ${row.state}${row.replacedBy ? ` by ${row.replacedBy}` : ""}. It does not return newer bytes.` };
   }

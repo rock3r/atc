@@ -9154,6 +9154,14 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       calls.slice(callsBeforeReplaceClaim).some((call) => call.includes("snapshot load")),
       true,
     );
+    const callsBeforeSame = calls.length;
+    const sameClaim = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "task" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(sameClaim.exitCode, 0, sameClaim.error);
+    assert.equal(calls.slice(callsBeforeSame).some((call) => call.includes("snapshot load")), false);
     const callsBeforeStale = calls.length;
     const staleLoad = cmdClaim(
       dir,
