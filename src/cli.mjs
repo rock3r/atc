@@ -1044,7 +1044,7 @@ export function selectCandidateUnderLock(
   function doesTicketNeedEmulatorCapacity(earlierReq) {
     if (earlierReq.kind === "physical") return false;
     const hasOfflineMatch = (inventory.offline || []).some(
-      (d) => !isDeviceOccupied(d) && matchesProfile(d, earlierReq),
+      (d) => !isDeviceOccupied(d) && matchesProfile(d, snapshotAwareReq(earlierReq, d, options)),
     );
     if (hasOfflineMatch) return true;
     const hasStoppingMatch = Object.values(state.leases || {}).some(
@@ -1086,7 +1086,7 @@ export function selectCandidateUnderLock(
         serial: earlier.requestedSerial || null,
         ...earlier.requestedProfile,
       };
-      const canUseCandidate = Boolean(device?.kind) && matchesProfile(device, earlierReq);
+      const canUseCandidate = Boolean(device?.kind) && matchesProfile(device, snapshotAwareReq(earlierReq, device, options));
       const samePlatformOrShared =
         earlierReq.platform === "any" || earlierReq.platform === devPlatform;
       const needsEmulatorCapacity =
