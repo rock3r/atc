@@ -2193,7 +2193,7 @@ export function matchesProfile(device, req = {}) {
     return false;
   }
   if (req.snapshotLoad && device.kind === "emulator") {
-    if (device.loadedSnapshot === req.snapshotLoad) {
+    if (device.loadedSnapshot === req.snapshotLoad || req._registrySnapshot) {
       return true;
     }
     if (Array.isArray(device.snapshots) && !device.snapshots.includes(req.snapshotLoad)) {

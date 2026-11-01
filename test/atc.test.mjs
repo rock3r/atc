@@ -9037,6 +9037,16 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       /we are over budget; ask the user what to do/,
     );
 
+    const pinned = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg", replace: true, keep: true },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(pinned.exitCode, 5, pinned.error);
+    assert.equal(calls.length, 0, "a pinned replacement that still exceeds the cap must not call adb");
+
     cmdConfig(dir, "set", "snapshotBudgetMb", "16384");
     const other = cmdSnapshot(
       dir,
@@ -9073,11 +9083,29 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       { inventory, runner, snapshotRegistryDir: registryDir },
     );
     assert.equal(freed.exitCode, 0, freed.error);
-    assert.deepEqual(calls.slice(callsBeforeFree), ["android emulator stop emulator-5554"]);
+    assert.equal(
+      calls.slice(callsBeforeFree).some((call) => /snapshot (save|load)/.test(call)),
+      false,
+    );
     const afterFree = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
     assert.equal(
       afterFree.snapshots.some((row) => (row.references || []).includes(claim.lease.leaseId)),
       false,
+    );
+    cmdFree(dir, claim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
+    const reclaim = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "other", wait: 0 },
+      {
+        inventory,
+        runner,
+        snapshotRegistryDir: registryDir,
+      },
+    );
+    assert.equal(reclaim.exitCode, 0, reclaim.error);
+    assert.equal(
+      calls.some((call) => call.endsWith(`snapshot load ${other.snapshotId}`)),
+      true,
     );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { readDiskVolumeInfo } from "./android.mjs";
+import { isPidAlive } from "./lock.mjs";
 
 export const SNAPSHOT_BUDGET_MB = 16384;
 export const SNAPSHOT_TTL_SEC = 7 * 24 * 60 * 60;
@@ -65,16 +66,38 @@ function writeRegistryFile(dir, registry) {
   fs.renameSync(tmp, file);
 }
 
+function readLockOwner(lock) {
+  try {
+    const owner = JSON.parse(fs.readFileSync(path.join(lock, "owner.json"), "utf8"));
+    if (!owner || typeof owner !== "object") return null;
+    return owner;
+  } catch {
+    return null;
+  }
+}
+
+function recoverStaleRegistryLock(lock) {
+  const owner = readLockOwner(lock);
+  if (!owner || !isPidAlive(owner.pid)) {
+    fs.rmSync(lock, { recursive: true, force: true });
+    return true;
+  }
+  return false;
+}
+
 export function withSnapshotRegistry(dir, fn) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const lock = lockPath(dir);
   const start = Date.now();
+  const owner = { pid: process.pid, createdAtMs: start };
   for (;;) {
     try {
       fs.mkdirSync(lock);
+      fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify(owner), { mode: 0o600 });
       break;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
+      if (recoverStaleRegistryLock(lock)) continue;
       if (Date.now() - start > 5000) {
         throw new Error("Timed out waiting for the snapshot registry lock.");
       }

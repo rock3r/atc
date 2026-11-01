@@ -924,6 +924,23 @@ function discoverTargetFleet({
   });
 }
 
+function snapshotAwareReq(req, device, options) {
+  if (!req?.snapshotLoad || !device || device.kind !== "emulator") return req;
+  const storeId = (device.platform || "android") === "ios"
+    ? device.udid || device.serial
+    : device.avd;
+  const row = withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => ({
+    mutated: false,
+    value: resolveSnapshotName(registry, storeId, req.snapshotLoad),
+  }));
+  if (!row || row.state !== "live" || row.storeId !== storeId) return req;
+  return {
+    ...req,
+    snapshotLoad: row.backendName,
+    _registrySnapshot: true,
+  };
+}
+
 export function selectCandidateUnderLock(
   state,
   inventory,
@@ -1117,7 +1134,7 @@ export function selectCandidateUnderLock(
           !d.avd &&
           hasUnmappedStartingEmulator
         ) &&
-        matchesProfile(d, req),
+        matchesProfile(d, snapshotAwareReq(req, d, options)),
     );
     for (const dev of warmCandidates) {
       if (!isReservedForEarlierTicket(dev, false)) {
@@ -1166,7 +1183,7 @@ export function selectCandidateUnderLock(
       : []),
     ...safeOfflineCandidates,
   ]
-    .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, req))
+    .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, snapshotAwareReq(req, d, options)))
     .sort(
       (a, b) =>
         Number(isCallerOwnedResettable(b)) - Number(isCallerOwnedResettable(a)) ||
@@ -1705,7 +1722,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           const hasMatchingVirtualDevice = [
             ...(effectiveInventory.running || []),
             ...(effectiveInventory.offline || []),
-          ].some((d) => d.kind === "emulator" && matchesProfile(d, req));
+          ].some((d) => d.kind === "emulator" && matchesProfile(d, snapshotAwareReq(req, d, options)));
           const hasBlockedMatchingPhysical = (effectiveInventory.running || []).some(
             (d) => d.kind === "physical" && matchesProfile(d, req) && !isPhysAllowedByPolicy(d),
           );
@@ -2166,7 +2183,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             now,
             identity.sessionId,
             options.livenessCheck || isPidAlive,
-            { suppressResourceError: fellBackFromRecovery && waitSec > 0 },
+            {
+              suppressResourceError: fellBackFromRecovery && waitSec > 0,
+              snapshotRegistryDir: options.snapshotRegistryDir,
+              env: options.env,
+            },
           );
 
           if (selection.priority === 1 && !selection.needsWarmPrep) {
@@ -5183,8 +5204,23 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           },
         };
       }
+      if (effectiveAction === "save" && parseBoolFlag(flags.keep)) {
+        const pinned = registry.snapshots.filter((row) => row.keep && row.state !== "deleted" && row.id !== existing?.id).length;
+        if (pinned >= snapCfg.keepMax) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 5,
+              error: `Pinned snapshot limit is ${snapCfg.keepMax}. Unpin or delete one before saving with --keep. No snapshot was created.`,
+              warnings: collectSnapshotWarnings(registry, preState.config),
+            },
+          };
+        }
+      }
       if (effectiveAction === "save") {
-        const replacedBytes = existing && !existing.bytesDeleted ? Number(existing.bytes) || 0 : 0;
+        const replacedBytes = existing && !existing.bytesDeleted && !existing.keep && (existing.references || []).length === 0
+          ? Number(existing.bytes) || 0
+          : 0;
         const occupied = usedMb(registry);
         const netAddMb = estimateMb;
         if (occupied - replacedBytes + netAddMb > snapCfg.budgetMb) {
@@ -5489,10 +5525,7 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
           old.replacedBy = plan.id;
           old.label = null;
           const protectedOld = old.keep || (old.references || []).length > 0;
-          if (!protectedOld) {
-            old.bytesDeleted = true;
-            deleteReplaced = old.backendName;
-          }
+          if (!protectedOld) deleteReplaced = old.backendName;
         }
       }
       const pending = rowById(registry, plan.id);
@@ -5527,15 +5560,24 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
     config,
   );
   if (recorded.deleteReplaced && action === "save") {
+    let deleted = false;
     try {
       if (leaseCheck.isIosLease) {
         deleteIosSimulatorSnapshot(stateDir, leaseCheck.lease, recorded.deleteReplaced);
-      } else if (leaseCheck.lease.serial) {
-        const runner = flags.runner || null;
-        runner?.("adb", ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", "delete", recorded.deleteReplaced], { timeoutMs: 60000 });
+        deleted = true;
+      } else if (leaseCheck.lease.serial && runner) {
+        const del = runner("adb", ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", "delete", recorded.deleteReplaced], { timeoutMs: 60000 });
+        deleted = del?.status === 0 && !isAdbEmuFailure(del);
       }
     } catch {
-      // The row already says the bytes were deleted. A failed backend delete leaves an unmanaged name, which is not auto-deleted.
+      deleted = false;
+    }
+    if (deleted) {
+      withSnapshotRegistry(registryDir, (registry) => {
+        const old = registry.snapshots.find((row) => row.backendName === recorded.deleteReplaced && row.replacedBy === plan.id);
+        if (old) old.bytesDeleted = true;
+        return { mutated: Boolean(old), value: true };
+      });
     }
   }
   return {
