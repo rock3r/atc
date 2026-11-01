@@ -133,6 +133,17 @@ export function clearLeaseReferences(registry, leaseId, exceptId = null) {
   }
 }
 
+export function recordLoadedSnapshot(registry, storeId, name, leaseId) {
+  if (!leaseId) return { recorded: false };
+  const row = name ? resolveSnapshotName(registry, storeId, name) : null;
+  const live = row && row.state === "live" && (!storeId || row.storeId === storeId);
+  clearLeaseReferences(registry, leaseId, live ? row.id : null);
+  if (live) {
+    row.references = Array.from(new Set([...(row.references || []), leaseId]));
+  }
+  return { recorded: Boolean(live), id: live ? row.id : null };
+}
+
 export function backendNameFor(registry, storeId, name) {
   const row = resolveSnapshotName(registry, storeId, name);
   if (!row || row.state !== "live" || (storeId && row.storeId !== storeId)) return name;

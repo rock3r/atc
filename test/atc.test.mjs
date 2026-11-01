@@ -8981,6 +8981,8 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
     const calls = [];
     const runner = (cmd, args) => {
       calls.push([cmd, ...args].join(" "));
+      if (cmd === "adb" && args.includes("getprop")) return { status: 0, stdout: "1\n", stderr: "" };
+      if (cmd === "android") return { status: 0, stdout: "", stderr: "" };
       return { status: 0, stdout: "OK", stderr: "" };
     };
     const first = cmdSnapshot(
@@ -9027,23 +9029,56 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       { session: "snap-reg", replace: true },
       { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
     );
-    assert.equal(replaced.exitCode, 0, replaced.error);
-    assert.notEqual(replaced.snapshotId, first.snapshotId);
-    assert.ok(replaced.warnings?.some((warning) => warning.code === "over_budget"));
+    assert.equal(replaced.exitCode, 5, replaced.error);
+    assert.match(replaced.error, /No snapshot was created/);
+    assert.equal(calls.length, 0, "a known budget miss must not call adb, even with --replace");
     assert.match(
       replaced.warnings.find((warning) => warning.code === "over_budget").human,
       /we are over budget; ask the user what to do/,
     );
 
-    const stale = cmdSnapshot(
+    cmdConfig(dir, "set", "snapshotBudgetMb", "16384");
+    const other = cmdSnapshot(
+      dir,
+      "save",
+      "other",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(other.exitCode, 0, other.error);
+    const loadedA = cmdSnapshot(
       dir,
       "load",
-      first.snapshotId,
+      "task",
       { session: "snap-reg" },
       { inventory, runner, snapshotRegistryDir: registryDir },
     );
-    assert.equal(stale.exitCode, 1, stale.error);
-    assert.match(stale.error, /does not return newer bytes|replaced/);
+    assert.equal(loadedA.exitCode, 0, loadedA.error);
+    const loadedB = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "other" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(loadedB.exitCode, 0, loadedB.error);
+    const registry = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
+    const task = registry.snapshots.find((row) => row.label === "task");
+    const next = registry.snapshots.find((row) => row.label === "other");
+    assert.equal(task.references.includes(claim.lease.leaseId), false);
+    assert.equal(next.references.includes(claim.lease.leaseId), true);
+    const callsBeforeFree = calls.length;
+    const freed = cmdFree(
+      dir,
+      claim.lease.leaseId,
+      { session: "snap-reg", stop: true },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(freed.exitCode, 0, freed.error);
+    assert.deepEqual(calls.slice(callsBeforeFree), ["android emulator stop emulator-5554"]);
+    const afterFree = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
+    assert.equal(
+      afterFree.snapshots.some((row) => (row.references || []).includes(claim.lease.leaseId)),
+      false,
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
