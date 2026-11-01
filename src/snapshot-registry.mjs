@@ -81,21 +81,33 @@ function readLockOwner(lock) {
 const LOCK_INIT_GRACE_MS = 1000;
 
 function recoverStaleRegistryLock(lock) {
-  const owner = readLockOwner(lock);
-  if (owner && isPidAlive(owner.pid)) return false;
-  if (!owner) {
-    let age = Infinity;
-    try {
-      age = Date.now() - fs.statSync(lock).mtimeMs;
-    } catch {
-      return false;
-    }
-    if (age < LOCK_INIT_GRACE_MS) return false;
-  }
   const doomed = `${lock}.dead.${process.pid}.${Date.now()}`;
   try {
     fs.renameSync(lock, doomed);
   } catch {
+    return false;
+  }
+  const owner = readLockOwner(doomed);
+  let young = false;
+  if (!owner) {
+    try {
+      young = Date.now() - fs.statSync(doomed).mtimeMs < LOCK_INIT_GRACE_MS;
+    } catch {
+      young = true;
+    }
+  }
+  if ((owner && isPidAlive(owner.pid)) || young) {
+    try {
+      fs.renameSync(doomed, lock);
+    } catch (err) {
+      if (err?.code !== "ENOENT" && !fs.existsSync(lock)) {
+        try {
+          fs.renameSync(doomed, lock);
+        } catch {
+          // The original name is occupied or the renamed lock is already gone.
+        }
+      }
+    }
     return false;
   }
   fs.rmSync(doomed, { recursive: true, force: true });
