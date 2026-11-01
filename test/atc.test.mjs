@@ -8619,7 +8619,7 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
         },
       },
     );
-    assert.equal(snapSaveRes.exitCode, 0);
+    assert.equal(snapSaveRes.exitCode, 0, snapSaveRes.error);
 
     const snapListRes = cmdSnapshot(dir, "list", null, { session: "sess-ios" });
     assert.equal(snapListRes.exitCode, 0);
@@ -8949,6 +8949,101 @@ test("ios.delete removes only the leased simulator and drops that lease", async 
     assert.ok(afterDelete.fleetEpoch > 0, "deleting a simulator must advance fleetEpoch");
     assert.equal(afterDelete.stoppedDevices?.[`sim:${leased}`]?.serial, leased);
     assert.equal(afterDelete.bootedDevices?.[`sim:${leased}`], undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot registry: existing label conflicts, budget refusal creates nothing, overrun exits 0", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      running: [
+        {
+          deviceKey: "avd:Pixel_8",
+          avd: "Pixel_8",
+          serial: "emulator-5554",
+          kind: "emulator",
+          online: true,
+          ramSizeMb: 2048,
+          snapshots: [],
+          profile: { deviceType: "phone", apiLevel: "android-35" },
+        },
+      ],
+      offline: [],
+      creatable: [],
+    };
+    const claim = cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory });
+    assert.equal(claim.exitCode, 0, claim.error);
+    const calls = [];
+    const runner = (cmd, args) => {
+      calls.push([cmd, ...args].join(" "));
+      return { status: 0, stdout: "OK", stderr: "" };
+    };
+    const first = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(first.exitCode, 0, first.error);
+    assert.match(first.snapshotId, /^atc-[0-9a-f]{12}$/);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], new RegExp(`snapshot save ${first.snapshotId}$`));
+
+    calls.length = 0;
+    const conflict = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(conflict.exitCode, 4, conflict.error);
+    assert.equal(calls.length, 0, "a conflicting save must not call adb");
+    assert.match(conflict.error, /already exists/);
+
+    const tight = cmdConfig(dir, "set", "snapshotBudgetMb", "1");
+    assert.equal(tight.exitCode, 0, tight.error);
+    const refused = cmdSnapshot(
+      dir,
+      "save",
+      "other",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(refused.exitCode, 5, refused.error);
+    assert.equal(calls.length, 0, "a pre-save budget miss must not create a snapshot");
+    assert.match(refused.error, /No snapshot was created/);
+
+    const replaced = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg", replace: true },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(replaced.exitCode, 0, replaced.error);
+    assert.notEqual(replaced.snapshotId, first.snapshotId);
+    assert.ok(replaced.warnings?.some((warning) => warning.code === "over_budget"));
+    assert.match(
+      replaced.warnings.find((warning) => warning.code === "over_budget").human,
+      /we are over budget; ask the user what to do/,
+    );
+
+    const stale = cmdSnapshot(
+      dir,
+      "load",
+      first.snapshotId,
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(stale.exitCode, 1, stale.error);
+    assert.match(stale.error, /does not return newer bytes|replaced/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

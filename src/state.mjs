@@ -281,6 +281,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   defaultBuildWaitSec: 600,
   buildReorderWindowSec: 120,
   auditLogging: true,
+  snapshotBudgetMb: 16384,
+  snapshotTtlSec: 7 * 24 * 60 * 60,
+  snapshotKeepMax: 8,
+  snapshotLowDiskPct: 10,
 });
 
 export function createDefaultState() {

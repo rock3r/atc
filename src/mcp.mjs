@@ -98,6 +98,8 @@ export const MCP_TOOLS = [
         snapshotLoad: { type: "string" },
         stop: { type: "boolean" },
         force: { type: "boolean" },
+        replace: { type: "boolean", description: "Replace the existing label on this store. Without it, an existing name fails and changes nothing." },
+        keep: { type: "boolean", description: "Pin the saved snapshot. Pins are inside the byte budget." },
         session: { type: "string", description: "Optional explicit session ID override" },
       },
     },
