@@ -107,6 +107,7 @@ import {
   resolveSnapshotRegistryDir,
   rowById,
   backendNameFor,
+  clearLeaseReferences,
   snapshotConfig,
   usedMb,
   volumeFreePct,
@@ -3985,6 +3986,14 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
   }
 }
 
+function clearLeaseReferencesFromDir(registryDir, leaseId) {
+  if (!leaseId) return;
+  withSnapshotRegistry(registryDir, (registry) => {
+    clearLeaseReferences(registry, leaseId);
+    return { mutated: true, value: true };
+  });
+}
+
 export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
   const unknownFlagErr = validateCommandFlags(flags, FREE_ALLOWED_FLAGS, "free");
   if (unknownFlagErr) {
@@ -4260,6 +4269,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 serial: lease.serial,
               });
             }
+            clearLeaseReferencesFromDir(options.snapshotRegistryDir || resolveSnapshotRegistryDir(options.env || process.env), lease.leaseId);
             delete state.leases[lease.deviceKey];
             continue;
           }
@@ -4322,6 +4332,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 serial: lease.serial,
               });
             }
+            clearLeaseReferencesFromDir(options.snapshotRegistryDir || resolveSnapshotRegistryDir(options.env || process.env), lease.leaseId);
             delete state.leases[lease.deviceKey];
           }
         }
@@ -4943,6 +4954,12 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       error: `Invalid snapshot name "${effectiveName}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
     };
   }
+  if (effectiveAction === "save" && isSnapshotId(effectiveName)) {
+    return {
+      exitCode: 1,
+      error: `Snapshot label "${effectiveName}" uses the reserved id shape atc-<12 hex>. Choose another label.`,
+    };
+  }
 
   const preState = readState(stateDir);
   const snapCfg = snapshotConfig(preState.config);
@@ -5451,6 +5468,7 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
       registry.spentIds.push({ id: current.id, reason: "deleted", atMs: now });
       return { mutated: true, value: { exitCode: 0, snapshotId: current.id } };
     }
+    clearLeaseReferences(registry, leaseCheck.lease.leaseId, current.id);
     current.references = Array.from(new Set([...(current.references || []), leaseCheck.lease.leaseId]));
     return { mutated: true, value: { exitCode: 0, snapshotId: current.id } };
   });

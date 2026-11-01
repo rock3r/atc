@@ -123,6 +123,16 @@ export function resolveSnapshotName(registry, storeId, name) {
   return liveRowForLabel(registry, storeId, name) || null;
 }
 
+export function clearLeaseReferences(registry, leaseId, exceptId = null) {
+  if (!leaseId) return;
+  for (const row of registry.snapshots) {
+    if (exceptId && row.id === exceptId) continue;
+    if (Array.isArray(row.references) && row.references.includes(leaseId)) {
+      row.references = row.references.filter((id) => id !== leaseId);
+    }
+  }
+}
+
 export function backendNameFor(registry, storeId, name) {
   const row = resolveSnapshotName(registry, storeId, name);
   if (!row || row.state !== "live" || (storeId && row.storeId !== storeId)) return name;
