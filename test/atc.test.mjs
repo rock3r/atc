@@ -81,6 +81,7 @@ import {
   runCli,
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
+import { withSnapshotRegistry } from "../src/snapshot-registry.mjs";
 
 // Keep the suite hermetic: an agent host (e.g. the atc pre-tool hook rewriting the command to
 // `export ATC_SESSION_ID=… ATC_ANCHOR_PID=…; npm run check`) can leak ATC_* identity/coordination
@@ -9107,6 +9108,16 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       calls.some((call) => call.endsWith(`snapshot load ${other.snapshotId}`)),
       true,
     );
+
+    const staleLock = path.join(registryDir, "snapshots.lock");
+    fs.mkdirSync(staleLock);
+    fs.writeFileSync(
+      path.join(staleLock, "owner.json"),
+      JSON.stringify({ pid: 2_147_483_646, createdAtMs: 1 }),
+    );
+    const recovered = withSnapshotRegistry(registryDir, () => ({ mutated: false, value: "recovered" }));
+    assert.equal(recovered, "recovered");
+    assert.equal(fs.existsSync(staleLock), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

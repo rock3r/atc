@@ -76,13 +76,22 @@ function readLockOwner(lock) {
   }
 }
 
+const LOCK_INIT_GRACE_MS = 1000;
+
 function recoverStaleRegistryLock(lock) {
   const owner = readLockOwner(lock);
-  if (!owner || !isPidAlive(owner.pid)) {
-    fs.rmSync(lock, { recursive: true, force: true });
-    return true;
+  if (owner && isPidAlive(owner.pid)) return false;
+  if (!owner) {
+    let age = Infinity;
+    try {
+      age = Date.now() - fs.statSync(lock).mtimeMs;
+    } catch {
+      return false;
+    }
+    if (age < LOCK_INIT_GRACE_MS) return false;
   }
-  return false;
+  fs.rmSync(lock, { recursive: true, force: true });
+  return true;
 }
 
 export function withSnapshotRegistry(dir, fn) {
@@ -110,7 +119,10 @@ export function withSnapshotRegistry(dir, fn) {
     if (result?.mutated) writeRegistryFile(dir, registry);
     return result?.value;
   } finally {
-    fs.rmSync(lock, { recursive: true, force: true });
+    const current = readLockOwner(lock);
+    if (current && current.pid === owner.pid && current.createdAtMs === owner.createdAtMs) {
+      fs.rmSync(lock, { recursive: true, force: true });
+    }
   }
 }
 
