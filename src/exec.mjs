@@ -7,6 +7,7 @@ import path from "node:path";
 import { BAZEL_QUERY_MAX_OUTPUT_BYTES, OPS, OpError, SYSTEMS, listOps } from "./ops/catalog.mjs";
 import { FEATURE_REQUEST_URL, WINDOWS_BATCH_ARG_RE, WINDOWS_BATCH_PATH_FORBIDDEN_RE } from "./ops/patterns.mjs";
 import { resolveOpBuildRequirements } from "./ops/requirements.mjs";
+import { warningText } from "./snapshot-registry.mjs";
 import { formatErrors, parseOpArgv, validateOpParams } from "./validate.mjs";
 
 export const EXIT_INVALID = 7;
@@ -616,6 +617,8 @@ export function renderExecResult(res, { json = false, write = (s) => process.std
   }
   if (res.snapshots) write(JSON.stringify(res.snapshots, null, 2) + "\n");
   else if (res.op?.startsWith("snapshot.") && res.exitCode === 0) write(`✓ ${res.op} ${res.snapshot || ""}\n`.replace(/ \n$/, "\n"));
+  const warnings = warningText(res.warnings);
+  if (warnings) writeErr(warnings.endsWith("\n") ? warnings : `${warnings}\n`);
 }
 
 export function execHelp(system = null) {

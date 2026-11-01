@@ -82,6 +82,7 @@ import {
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
 import { mintSnapshotId, withSnapshotRegistry } from "../src/snapshot-registry.mjs";
+import { renderExecResult } from "../src/exec.mjs";
 
 // Keep the suite hermetic: an agent host (e.g. the atc pre-tool hook rewriting the command to
 // `export ATC_SESSION_ID=… ATC_ANCHOR_PID=…; npm run check`) can leak ATC_* identity/coordination
@@ -9200,4 +9201,20 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("typed snapshot command prints an over-budget warning", () => {
+  const err = [];
+  const out = [];
+  renderExecResult(
+    {
+      op: "snapshot.save",
+      exitCode: 0,
+      snapshot: "atc-abc",
+      warnings: [{ code: "over_budget", human: "we are over budget; ask the user what to do" }],
+    },
+    { write: (line) => out.push(line), writeErr: (line) => err.push(line) },
+  );
+  assert.match(out.join(""), /snapshot.save/);
+  assert.match(err.join(""), /we are over budget/);
 });
