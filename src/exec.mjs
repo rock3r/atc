@@ -446,7 +446,10 @@ export async function execOp(stateDir, request, deps, options = {}) {
 
   if (op.kind === "snapshot") {
     const snapFlags = {};
-    for (const k of ["serial", "udid", "android", "ios", "session", "anchorPid"]) if (flags[k] !== undefined) snapFlags[k] = flags[k];
+    for (const k of ["serial", "udid", "android", "ios", "session", "anchorPid", "force"]) {
+      if (flags[k] !== undefined) snapFlags[k] = flags[k];
+    }
+    for (const k of ["replace", "keep"]) if (params[k] !== undefined) snapFlags[k] = params[k];
     const res = deps.cmdSnapshot(stateDir, op.action, params.name || null, snapFlags, { ...options, env, cwd });
     return { ...base, ...res, ok: res.exitCode === 0 };
   }

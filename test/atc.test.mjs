@@ -74,6 +74,7 @@ import {
   cmdSnapshot,
   cmdExec,
   cmdStatus,
+  execDeps,
   cmdConfig,
   cmdGc,
   cmdGuide,
@@ -82,7 +83,7 @@ import {
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
 import { mintSnapshotId, withSnapshotRegistry } from "../src/snapshot-registry.mjs";
-import { renderExecResult } from "../src/exec.mjs";
+import { cmdExecTokens, renderExecResult } from "../src/exec.mjs";
 
 // Keep the suite hermetic: an agent host (e.g. the atc pre-tool hook rewriting the command to
 // `export ATC_SESSION_ID=… ATC_ANCHOR_PID=…; npm run check`) can leak ATC_* identity/coordination
@@ -9317,6 +9318,26 @@ test("replacement warning uses bytes left after cleanup", () => {
     const old = after.snapshots.find((row) => row.id === first.snapshotId);
     assert.equal(old.bytesDeleted, true);
     assert.equal((after.notices || []).some((notice) => notice.code === "over_budget"), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("typed snapshot save accepts replace and keep", async () => {
+  const dir = makeTempStateDir();
+  try {
+    const seen = [];
+    const deps = execDeps(dir, {});
+    deps.cmdSnapshot = (_stateDir, action, name, flags) => {
+      seen.push({ action, name, flags });
+      return { exitCode: 0, snapshot: name, snapshotId: "atc-abcdefabcdef" };
+    };
+    const saved = await cmdExecTokens(dir, ["snapshot", "save", "task", "--replace", "--keep", "--session", "typed-snap"], deps);
+    assert.equal(saved.exitCode, 0, saved.error);
+    assert.equal(seen[0].action, "save");
+    assert.equal(seen[0].name, "task");
+    assert.equal(seen[0].flags.replace, true);
+    assert.equal(seen[0].flags.keep, true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
