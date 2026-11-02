@@ -148,7 +148,7 @@ export function withSnapshotRegistry(dir, fn) {
       try {
         fs.linkSync(path.join(staged, "owner.json"), path.join(lock, "owner.json"));
       } catch (err) {
-        if (err.code !== "EEXIST") throw err;
+        if (err.code !== "EEXIST" && err.code !== "ENOENT") throw err;
       }
       const published = readLockOwner(lock);
       if (published && published.pid === owner.pid && published.createdAtMs === owner.createdAtMs) {
@@ -162,7 +162,7 @@ export function withSnapshotRegistry(dir, fn) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
   } finally {
-    if (!acquired) fs.rmSync(staged, { recursive: true, force: true });
+    fs.rmSync(staged, { recursive: true, force: true });
   }
   try {
     const registry = readRegistryFile(dir);
