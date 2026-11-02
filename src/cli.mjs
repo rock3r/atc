@@ -5617,10 +5617,13 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
       });
     }
   }
+  const warningVolume = leaseCheck.isIosLease
+    ? path.join(stateDir, "ios-snapshots")
+    : leaseCheck.lease.avdPath;
   const warnings = action === "save"
     ? withSnapshotRegistry(registryDir, (registry) => ({
         mutated: false,
-        value: collectSnapshotWarnings(registry, config, [leaseCheck.lease.avdPath].filter(Boolean)),
+        value: collectSnapshotWarnings(registry, config, [warningVolume].filter(Boolean)),
       }))
     : [];
   if (warnings.some((warning) => warning.code === "over_budget")) {

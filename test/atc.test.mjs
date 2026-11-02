@@ -9203,6 +9203,63 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
   }
 });
 
+test("iOS snapshot save warns on the snapshot volume", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  const udid = "EEEEEEEE-FFFF-4000-8000-000000000003";
+  const dataPath = path.join(dir, "sim-data");
+  fs.mkdirSync(registryDir, { recursive: true });
+  fs.mkdirSync(dataPath, { recursive: true });
+  fs.writeFileSync(path.join(dataPath, "state"), "x");
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      queriedPlatforms: ["ios"],
+      running: [{
+        deviceKey: `sim:${udid}`,
+        platform: "ios",
+        kind: "emulator",
+        avd: "ATC Disposable",
+        serial: udid,
+        udid,
+        online: true,
+        dataPath,
+        profile: { platform: "ios", deviceType: "phone", osVersion: "iOS-18.4" },
+      }],
+      offline: [],
+      creatable: [],
+      probes: { simctlListOk: true },
+    };
+    const claim = cmdClaim(dir, { session: "ios-snap", ios: true, udid, wait: 0 }, {
+      platform: "darwin",
+      inventory,
+    });
+    assert.equal(claim.exitCode, 0, claim.error);
+    cmdConfig(dir, "set", "snapshotLowDiskPct", "100");
+    const runner = (cmd, args) => {
+      if (cmd === "cp") {
+        fs.cpSync(args[1], args[2], { recursive: true });
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "OK\n", stderr: "" };
+    };
+    const saved = cmdSnapshot(dir, "save", "task", { session: "ios-snap", ios: true }, {
+      platform: "darwin",
+      inventory,
+      runner,
+      snapshotRegistryDir: registryDir,
+      host: { freeDiskMb: 65536 },
+    });
+    assert.equal(saved.exitCode, 0, saved.error);
+    assert.equal(
+      (saved.warnings || []).some((warning) => warning.code === "low_disk" && warning.volume.endsWith("ios-snapshots")),
+      true,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("replacement warning uses bytes left after cleanup", () => {
   const dir = makeTempStateDir();
   const registryDir = path.join(dir, "registry");
