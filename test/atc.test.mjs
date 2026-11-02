@@ -9118,6 +9118,8 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
       path.join(staleLock, "owner.json"),
       JSON.stringify({ pid: 2_147_483_646, createdAtMs: 1 }),
     );
+    const staleTime = new Date(Date.now() - 10_000);
+    fs.utimesSync(staleLock, staleTime, staleTime);
     const recovered = withSnapshotRegistry(registryDir, () => ({ mutated: false, value: "recovered" }));
     assert.equal(recovered, "recovered");
     assert.equal(fs.existsSync(staleLock), false);

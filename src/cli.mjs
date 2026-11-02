@@ -5364,7 +5364,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         stopTimeoutMs,
         isIosLease,
         transitionsToStarting,
-        snapshotPlan: registryDecision,
+        snapshotPlan: { ...registryDecision, avdPath: saveMeta?.avdPath || lease.avdPath || null },
         storeId,
       },
     };
@@ -5547,7 +5547,7 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
       const bytes = measuredDirMb(
         leaseCheck.isIosLease
           ? path.join(stateDir, "ios-snapshots", leaseCheck.storeId, plan.id)
-          : path.join(leaseCheck.lease.avdPath || "", "snapshots", plan.id),
+          : path.join(leaseCheck.snapshotPlan?.avdPath || leaseCheck.lease.avdPath || "", "snapshots", plan.id),
       );
       const row = {
         id: plan.id,

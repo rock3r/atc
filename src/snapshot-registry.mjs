@@ -91,13 +91,27 @@ function lockIsRecoverable(lock) {
   return { unpublished: true };
 }
 
+function claimIsAbandoned(claim) {
+  try {
+    const owner = readLockOwner(claim);
+    if (owner) return !isPidAlive(owner.pid);
+    return Date.now() - fs.statSync(claim).mtimeMs >= LOCK_INIT_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
 function recoverStaleRegistryLock(lock) {
   const seen = lockIsRecoverable(lock);
   if (!seen) return false;
   const claim = `${lock}.claim`;
   try {
     fs.mkdirSync(claim);
-  } catch {
+    fs.writeFileSync(path.join(claim, "owner.json"), JSON.stringify({ pid: process.pid, createdAtMs: Date.now() }), { mode: 0o600 });
+  } catch (err) {
+    if (err?.code === "EEXIST" && claimIsAbandoned(claim)) {
+      fs.rmSync(claim, { recursive: true, force: true });
+    }
     return false;
   }
   const still = lockIsRecoverable(lock);
@@ -109,12 +123,7 @@ function recoverStaleRegistryLock(lock) {
     fs.rmSync(claim, { recursive: true, force: true });
     return false;
   }
-  try {
-    fs.rmSync(lock, { recursive: true, force: true });
-  } catch {
-    fs.rmSync(claim, { recursive: true, force: true });
-    return false;
-  }
+  fs.rmSync(lock, { recursive: true, force: true });
   fs.rmSync(claim, { recursive: true, force: true });
   return !fs.existsSync(lock);
 }
@@ -124,19 +133,27 @@ export function withSnapshotRegistry(dir, fn) {
   const lock = lockPath(dir);
   const start = Date.now();
   const owner = { pid: process.pid, createdAtMs: start };
-  for (;;) {
-    try {
-      fs.mkdirSync(lock);
-      fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify(owner), { mode: 0o600 });
-      break;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      if (recoverStaleRegistryLock(lock)) continue;
-      if (Date.now() - start > 5000) {
-        throw new Error("Timed out waiting for the snapshot registry lock.");
+  const staged = path.join(dir, `.lock-${process.pid}-${start}`);
+  fs.mkdirSync(staged, { mode: 0o700 });
+  fs.writeFileSync(path.join(staged, "owner.json"), JSON.stringify(owner), { mode: 0o600 });
+  let acquired = false;
+  try {
+    for (;;) {
+      try {
+        fs.renameSync(staged, lock);
+        acquired = true;
+        break;
+      } catch (err) {
+        if (err.code !== "EEXIST" && err.code !== "ENOTEMPTY") throw err;
+        if (recoverStaleRegistryLock(lock) && !fs.existsSync(lock)) continue;
+        if (Date.now() - start > 5000) {
+          throw new Error("Timed out waiting for the snapshot registry lock.");
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
+  } finally {
+    if (!acquired) fs.rmSync(staged, { recursive: true, force: true });
   }
   try {
     const registry = readRegistryFile(dir);
