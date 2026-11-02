@@ -81,32 +81,38 @@ function readLockOwner(lock) {
 const LOCK_INIT_GRACE_MS = 1000;
 
 function recoverStaleRegistryLock(lock) {
+  const owner = readLockOwner(lock);
+  if (owner) {
+    if (isPidAlive(owner.pid)) return false;
+  } else {
+    try {
+      if (Date.now() - fs.statSync(lock).mtimeMs < LOCK_INIT_GRACE_MS) return false;
+    } catch {
+      return false;
+    }
+  }
   const doomed = `${lock}.dead.${process.pid}.${Date.now()}`;
   try {
     fs.renameSync(lock, doomed);
   } catch {
     return false;
   }
-  const owner = readLockOwner(doomed);
-  let young = false;
-  if (!owner) {
+  const movedOwner = readLockOwner(doomed);
+  const sameDeadOwner = Boolean(
+    owner && movedOwner && movedOwner.pid === owner.pid && movedOwner.createdAtMs === owner.createdAtMs && !isPidAlive(movedOwner.pid),
+  );
+  const staleUnpublished = !owner && !movedOwner && (() => {
     try {
-      young = Date.now() - fs.statSync(doomed).mtimeMs < LOCK_INIT_GRACE_MS;
+      return Date.now() - fs.statSync(doomed).mtimeMs >= LOCK_INIT_GRACE_MS;
     } catch {
-      young = true;
+      return false;
     }
-  }
-  if ((owner && isPidAlive(owner.pid)) || young) {
+  })();
+  if (!sameDeadOwner && !staleUnpublished) {
     try {
       fs.renameSync(doomed, lock);
-    } catch (err) {
-      if (err?.code !== "ENOENT" && !fs.existsSync(lock)) {
-        try {
-          fs.renameSync(doomed, lock);
-        } catch {
-          // The original name is occupied or the renamed lock is already gone.
-        }
-      }
+    } catch {
+      // The holder released it, or another waiter already owns the name.
     }
     return false;
   }

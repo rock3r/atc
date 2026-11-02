@@ -9204,6 +9204,50 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
   }
 });
 
+test("a live registry lock stays in place while another caller waits", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-lock-"));
+  const ready = path.join(dir, "ready");
+  const release = path.join(dir, "release");
+  const entered = path.join(dir, "entered");
+  const child = `
+    import fs from "node:fs";
+    import { withSnapshotRegistry } from ${JSON.stringify(path.join(process.cwd(), "src/snapshot-registry.mjs"))};
+    const [dir, role, ready, release, entered] = process.argv.slice(1);
+    if (role === "holder") {
+      withSnapshotRegistry(dir, () => {
+        fs.writeFileSync(ready, "1");
+        const start = Date.now();
+        while (!fs.existsSync(release) && Date.now() - start < 3000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        return { mutated: true, value: "held" };
+      });
+    } else {
+      const start = Date.now();
+      while (!fs.existsSync(ready) && Date.now() - start < 2000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      const enteredAt = Date.now();
+      withSnapshotRegistry(dir, () => {
+        fs.writeFileSync(entered, String(Date.now() - enteredAt));
+        return { mutated: false, value: "waited" };
+      });
+    }
+  `;
+  const holder = spawn(process.execPath, ["--input-type=module", "-e", child, dir, "holder", ready, release, entered], { stdio: "ignore" });
+  const waiter = spawn(process.execPath, ["--input-type=module", "-e", child, dir, "waiter", ready, release, entered], { stdio: "ignore" });
+  const start = Date.now();
+  while (!fs.existsSync(ready) && Date.now() - start < 2000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  assert.equal(fs.existsSync(ready), true);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);
+  assert.equal(fs.existsSync(entered), false);
+  assert.equal(fs.existsSync(path.join(dir, "snapshots.lock")), true);
+  fs.writeFileSync(release, "1");
+  const deadline = Date.now() + 3000;
+  while (!fs.existsSync(entered) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  assert.equal(holder.exitCode === null || holder.exitCode === 0, true);
+  assert.ok(Number(fs.readFileSync(entered, "utf8")) >= 70);
+  holder.kill();
+  waiter.kill();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("iOS snapshot save warns on the snapshot volume", () => {
   const dir = makeTempStateDir();
   const registryDir = path.join(dir, "registry");
