@@ -82,13 +82,8 @@ const LOCK_INIT_GRACE_MS = 1000;
 
 function lockIsRecoverable(lock) {
   const owner = readLockOwner(lock);
-  if (owner) return !isPidAlive(owner.pid) ? owner : false;
-  try {
-    if (Date.now() - fs.statSync(lock).mtimeMs < LOCK_INIT_GRACE_MS) return false;
-  } catch {
-    return false;
-  }
-  return { unpublished: true };
+  if (!owner || isPidAlive(owner.pid)) return false;
+  return owner;
 }
 
 function claimIsAbandoned(claim) {
@@ -125,8 +120,7 @@ function recoverStaleRegistryLock(lock) {
   const sameDeadOwner = Boolean(
     seen.pid && still && still.pid === seen.pid && still.createdAtMs === seen.createdAtMs && !isPidAlive(still.pid),
   );
-  const staleUnpublished = Boolean(seen.unpublished && still && still.unpublished);
-  if (!sameDeadOwner && !staleUnpublished) {
+  if (!sameDeadOwner) {
     fs.rmSync(claim, { recursive: true, force: true });
     return false;
   }
