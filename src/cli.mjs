@@ -117,7 +117,7 @@ import {
   withSnapshotRegistry,
 } from "./snapshot-registry.mjs";
 
-export const ATC_VERSION = "3.4.0";
+export const ATC_VERSION = "3.5.0";
 export { GUIDE_TOPICS, cmdGuide };
 
 function isWorkerGroupLeaderAlive(pgid, lease, livenessCheck = isPidAlive, options = {}) {

@@ -1,6 +1,6 @@
 {
   "name": "atc",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "Coordinate exclusive Android emulator (AVD), iOS Simulator, and physical device leases across concurrent coding agents and coordinate Gradle/Bazel/Xcode builds through typed operations (CLI, batch plans, stdio MCP) plus session hooks. ATC never runs shell commands.",
   "author": {
     "name": "Sebastiano Poggi"
