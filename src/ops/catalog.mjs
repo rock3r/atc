@@ -995,6 +995,11 @@ function iosBundleOp(name, verb) {
 }
 
 function snapshotOp(name, action, needsName) {
+  const params = needsName ? { name: { type: "string", pattern: "snapshotName", required: true } } : {};
+  if (action === "save") {
+    params.replace = { type: "boolean" };
+    params.keep = { type: "boolean" };
+  }
   return {
     name,
     system: "snapshot",
@@ -1003,7 +1008,7 @@ function snapshotOp(name, action, needsName) {
     virtualOnly: true,
     readOnly: action === "list",
     positional: needsName ? "name" : null,
-    params: needsName ? { name: { type: "string", pattern: "snapshotName", required: true } } : {},
+    params,
   };
 }
 

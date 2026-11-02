@@ -95,6 +95,27 @@ import {
   syncLeaseWorkers,
   withStateTransaction,
 } from "./state.mjs";
+import {
+  SNAPSHOT_CONFLICT_EXIT,
+  collectSnapshotWarnings,
+  isSnapshotId,
+  liveRowForLabel,
+  resolveSnapshotName,
+  measuredDirMb,
+  mintSnapshotId,
+  noticesForSession,
+  recordNotice,
+  resolveSnapshotRegistryDir,
+  rowById,
+  backendNameFor,
+  clearLeaseReferences,
+  recordLoadedSnapshot,
+  snapshotConfig,
+  usedMb,
+  volumeFreePct,
+  warningText,
+  withSnapshotRegistry,
+} from "./snapshot-registry.mjs";
 
 export const ATC_VERSION = "3.4.0";
 export { GUIDE_TOPICS, cmdGuide };
@@ -188,6 +209,8 @@ const BOOLEAN_FLAG_KEYS = new Set([
   "validate",
   "dryRun",
   "forced",
+  "replace",
+  "keep",
 ]);
 
 const COMMON_ALLOWED_FLAGS = new Set([
@@ -268,6 +291,8 @@ const SNAPSHOT_ALLOWED_FLAGS = new Set([
   "udid",
   "serial",
   "force",
+  "replace",
+  "keep",
 ]);
 
 const BATCH_ALLOWED_FLAGS = new Set([
@@ -899,6 +924,30 @@ function discoverTargetFleet({
   });
 }
 
+function resolvedBackendName(options, storeId, name, resolveOptions = {}) {
+  return withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => ({
+    mutated: false,
+    value: backendNameFor(registry, storeId, name, resolveOptions),
+  }));
+}
+
+function snapshotAwareReq(req, device, options) {
+  if (!req?.snapshotLoad || !device || device.kind !== "emulator") return req;
+  const storeId = (device.platform || "android") === "ios"
+    ? device.udid || device.serial
+    : device.avd;
+  const row = withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => ({
+    mutated: false,
+    value: resolveSnapshotName(registry, storeId, req.snapshotLoad),
+  }));
+  if (!row || row.state !== "live" || row.storeId !== storeId) return req;
+  return {
+    ...req,
+    snapshotLoad: row.backendName,
+    _registrySnapshot: true,
+  };
+}
+
 export function selectCandidateUnderLock(
   state,
   inventory,
@@ -995,7 +1044,7 @@ export function selectCandidateUnderLock(
   function doesTicketNeedEmulatorCapacity(earlierReq) {
     if (earlierReq.kind === "physical") return false;
     const hasOfflineMatch = (inventory.offline || []).some(
-      (d) => !isDeviceOccupied(d) && matchesProfile(d, earlierReq),
+      (d) => !isDeviceOccupied(d) && matchesProfile(d, snapshotAwareReq(earlierReq, d, options)),
     );
     if (hasOfflineMatch) return true;
     const hasStoppingMatch = Object.values(state.leases || {}).some(
@@ -1037,7 +1086,7 @@ export function selectCandidateUnderLock(
         serial: earlier.requestedSerial || null,
         ...earlier.requestedProfile,
       };
-      const canUseCandidate = Boolean(device?.kind) && matchesProfile(device, earlierReq);
+      const canUseCandidate = Boolean(device?.kind) && matchesProfile(device, snapshotAwareReq(earlierReq, device, options));
       const samePlatformOrShared =
         earlierReq.platform === "any" || earlierReq.platform === devPlatform;
       const needsEmulatorCapacity =
@@ -1092,7 +1141,7 @@ export function selectCandidateUnderLock(
           !d.avd &&
           hasUnmappedStartingEmulator
         ) &&
-        matchesProfile(d, req),
+        matchesProfile(d, snapshotAwareReq(req, d, options)),
     );
     for (const dev of warmCandidates) {
       if (!isReservedForEarlierTicket(dev, false)) {
@@ -1141,7 +1190,7 @@ export function selectCandidateUnderLock(
       : []),
     ...safeOfflineCandidates,
   ]
-    .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, req))
+    .filter((d) => (!isDeviceOccupied(d) || isCallerOwnedResettable(d)) && matchesProfile(d, snapshotAwareReq(req, d, options)))
     .sort(
       (a, b) =>
         Number(isCallerOwnedResettable(b)) - Number(isCallerOwnedResettable(a)) ||
@@ -1680,7 +1729,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           const hasMatchingVirtualDevice = [
             ...(effectiveInventory.running || []),
             ...(effectiveInventory.offline || []),
-          ].some((d) => d.kind === "emulator" && matchesProfile(d, req));
+          ].some((d) => d.kind === "emulator" && matchesProfile(d, snapshotAwareReq(req, d, options)));
           const hasBlockedMatchingPhysical = (effectiveInventory.running || []).some(
             (d) => d.kind === "physical" && matchesProfile(d, req) && !isPhysAllowedByPolicy(d),
           );
@@ -1727,21 +1776,47 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             const candidateForMatch = invDev
               ? { ...invDev, ...lease, snapshots: invDev.snapshots }
               : lease;
+            const registryLoad = req.snapshotLoad
+              ? withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => {
+                  const storeId = (lease.platform || "android") === "ios"
+                    ? lease.udid || lease.serial
+                    : lease.avd;
+                  const row = resolveSnapshotName(registry, storeId, req.snapshotLoad);
+                  return {
+                    mutated: false,
+                    value: !row || row.storeId !== storeId
+                      ? { state: false }
+                      : { state: row.state === "live" ? "live" : "dead", id: row.id },
+                  };
+                })
+              : false;
+            if (registryLoad?.state === "dead") {
+              return {
+                mutated: false,
+                value: {
+                  status: "error",
+                  error: `${req.snapshotLoad} is not live. It does not return newer bytes.`,
+                },
+              };
+            }
             if (
               lease.state === "active" &&
               Boolean(lease.serial) &&
               lease.sessionId === identity.sessionId &&
               matchesProfile(candidateForMatch, { ...req, snapshotLoad: null }) &&
               (!req.snapshotLoad ||
-                (lease.kind === "emulator" &&
-                  (lease.loadedSnapshot === req.snapshotLoad ||
-                    !Array.isArray(candidateForMatch.snapshots) ||
-                    candidateForMatch.snapshots.includes(req.snapshotLoad)))) &&
+                (registryLoad?.state !== "dead" &&
+                  (registryLoad?.state === "live" ||
+                    (lease.kind === "emulator" &&
+                      (lease.loadedSnapshot === req.snapshotLoad ||
+                        !Array.isArray(candidateForMatch.snapshots) ||
+                        candidateForMatch.snapshots.includes(req.snapshotLoad)))))) &&
               !req.wipeData &&
               !req.coldBoot
             ) {
               const needsSnapLoad = Boolean(
-                req.snapshotLoad && lease.loadedSnapshot !== req.snapshotLoad,
+                req.snapshotLoad &&
+                  lease.loadedSnapshotId !== (registryLoad?.id || req.snapshotLoad),
               );
               const needsPrep = Boolean(req.resetApp || needsSnapLoad);
               const stopTimeoutMs = (state.config?.stopTimeoutSec || 60) * 1000;
@@ -2128,7 +2203,11 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             now,
             identity.sessionId,
             options.livenessCheck || isPidAlive,
-            { suppressResourceError: fellBackFromRecovery && waitSec > 0 },
+            {
+              suppressResourceError: fellBackFromRecovery && waitSec > 0,
+              snapshotRegistryDir: options.snapshotRegistryDir,
+              env: options.env,
+            },
           );
 
           if (selection.priority === 1 && !selection.needsWarmPrep) {
@@ -2428,7 +2507,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
       };
     }
 
-    if (txOutcome.status === "env_error") {
+    if (txOutcome.status === "env_error" || txOutcome.status === "error") {
       return {
         exitCode: 1,
         error: txOutcome.error,
@@ -2500,9 +2579,15 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
           const isIosLease = (txOutcome.lease.platform || "android") === "ios";
           if (txOutcome.needsSnapLoad && req.snapshotLoad) {
             assertIdempotentPrepOwned();
-            if (isIosLease) {
+            const claimStoreId = isIosLease
+              ? txOutcome.lease.udid || txOutcome.lease.serial
+              : txOutcome.lease.avd;
+            const claimResolved = resolvedBackendName(options, claimStoreId, req.snapshotLoad);
+            if (claimResolved.error) {
+              prepError = claimResolved.error;
+            } else if (isIosLease) {
               try {
-                loadIosSimulatorSnapshot(stateDir, txOutcome.lease, req.snapshotLoad, {
+                loadIosSimulatorSnapshot(stateDir, txOutcome.lease, claimResolved.name, {
                   runner,
                   stopTimeoutMs: snapTimeoutMs,
                   bootTimeoutMs: snapTimeoutMs * 2,
@@ -2526,7 +2611,7 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
                   "avd",
                   "snapshot",
                   "load",
-                  req.snapshotLoad,
+                  claimResolved.name,
                 ],
                 { strictInternal: true, timeoutMs: snapTimeoutMs },
               );
@@ -2606,6 +2691,10 @@ export function cmdClaim(stateDir, flags = {}, options = {}) {
             if (prepUpdatedSnap) {
               cur.loadedSnapshot = loadedSnap;
               txOutcome.lease.loadedSnapshot = loadedSnap;
+              noteLoadedSnapshot(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap, cur.leaseId);
+              cur.loadedSnapshotId = loadedSnap
+                ? resolvedBackendName(options, (cur.platform || "android") === "ios" ? cur.udid || cur.serial : cur.avd, loadedSnap).name || loadedSnap
+                : null;
             }
             const ttlMs = clampTtlSec(rawTtl, state.config) * 1000;
             cur.renewedAtMs = now;
@@ -3173,6 +3262,16 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
     }
 
     // 3. Warm state preparation vs Cold/Wipe boot (§5.3 Step 5.3)
+    const bootStoreId = candidatePlat === "ios"
+      ? resolvedSerial || candidate.udid || candidate.serial || lease.udid || lease.serial
+      : candidate.avd || lease.avd;
+    const bootResolved = req.snapshotLoad
+      ? resolvedBackendName(execOptions, bootStoreId, req.snapshotLoad)
+      : null;
+    if (bootResolved?.error) {
+      throw new Error(bootResolved.error);
+    }
+    const bootSnapshotName = bootResolved?.name || null;
     if (candidatePlat === "ios") {
       const simUdid = resolvedSerial || candidate.udid || candidate.serial || lease.udid || lease.serial;
       resolvedSerial = simUdid;
@@ -3189,7 +3288,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               udid: simUdid,
               dataPath: candidate.dataPath || lease.dataPath,
             },
-            req.snapshotLoad,
+            bootSnapshotName,
             {
               runner,
               stopTimeoutMs: stopTimeoutMs || 60_000,
@@ -3240,7 +3339,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
               udid: simUdid,
               dataPath: candidate.dataPath || lease.dataPath,
             },
-            req.snapshotLoad,
+            bootSnapshotName,
             {
               runner,
               stopTimeoutMs: stopTimeoutMs || 60_000,
@@ -3285,7 +3384,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         prepLoadedSnapshot = null;
         const snapRes = runner(
           "adb",
-          ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
+          ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", bootSnapshotName],
           { strictInternal: true, timeoutMs: bootTimeoutMs },
         );
         if (isAdbEmuFailure(snapRes)) {
@@ -3466,7 +3565,7 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
         prepLoadedSnapshot = null;
         const snapRes = runner(
           "adb",
-          ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", req.snapshotLoad],
+          ["-s", resolvedSerial, "emu", "avd", "snapshot", "load", bootSnapshotName],
           { strictInternal: true, timeoutMs: bootTimeoutMs },
         );
         if (isAdbEmuFailure(snapRes)) {
@@ -3546,6 +3645,15 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
           current.udid = resolvedSerial;
         }
         current.loadedSnapshot = req.resetApp ? null : req.snapshotLoad || null;
+        if (req.snapshotLoad || req.resetApp) {
+          noteLoadedSnapshot(
+            execOptions,
+            candidatePlat === "ios" ? current.udid || resolvedSerial : current.avd,
+            current.loadedSnapshot,
+            current.leaseId,
+          );
+          current.loadedSnapshotId = req.resetApp ? null : bootResolved?.name || current.loadedSnapshot;
+        }
         if (bootedNewEmulator) {
           recordDeviceBootedInState(state, current, now);
         } else {
@@ -3687,6 +3795,10 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
                 stoppedExistingEmulator || prepInvalidatedSnapshot
                   ? prepLoadedSnapshot
                   : previousLease.loadedSnapshot,
+              loadedSnapshotId:
+                stoppedExistingEmulator || prepInvalidatedSnapshot
+                  ? null
+                  : previousLease.loadedSnapshotId,
               renewedAtMs: now,
               expiresAtMs: Math.max(previousLease.expiresAtMs || 0, now + ttlMs),
               deadlineMs: null,
@@ -3951,6 +4063,26 @@ function executeBootOrPrepOutsideLock(stateDir, txOutcome, req, execOptions = {}
     }
     return { exitCode: 1, error: err.message };
   }
+}
+
+function snapshotRegistryDirFrom(options) {
+  return options.snapshotRegistryDir || resolveSnapshotRegistryDir(options.env || process.env);
+}
+
+function clearLeaseReferencesFromDir(registryDir, leaseId) {
+  if (!leaseId) return;
+  withSnapshotRegistry(registryDir, (registry) => {
+    clearLeaseReferences(registry, leaseId);
+    return { mutated: true, value: true };
+  });
+}
+
+function noteLoadedSnapshot(options, storeId, name, leaseId) {
+  if (!leaseId) return;
+  withSnapshotRegistry(snapshotRegistryDirFrom(options), (registry) => {
+    recordLoadedSnapshot(registry, storeId, name, leaseId);
+    return { mutated: true, value: true };
+  });
 }
 
 export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
@@ -4228,12 +4360,26 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 serial: lease.serial,
               });
             }
+            clearLeaseReferencesFromDir(snapshotRegistryDirFrom(options), lease.leaseId);
             delete state.leases[lease.deviceKey];
             continue;
           }
 
           const saveSnap =
             flags.snapshotSave || lease.pendingSnapshotSave || lease.saveSnapshotOnFree || null;
+          if (saveSnap) {
+            const managed = resolvedBackendName(
+              options,
+              (lease.platform || "android") === "ios" ? lease.udid || lease.serial : lease.avd,
+              saveSnap,
+              { rejectManagedId: true },
+            );
+            if (managed.error || (managed.name && managed.name !== saveSnap)) {
+              const err = new Error(`Snapshot "${saveSnap}" is managed. Use atc snapshot save --replace. No state was changed.`);
+              err.exitCode = SNAPSHOT_CONFLICT_EXIT;
+              throw err;
+            }
+          }
           const loadSnap = flags.snapshotLoad || lease.pendingSnapshotLoad || null;
           const doStop =
             (parseBoolFlag(flags.stop) ||
@@ -4290,6 +4436,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 serial: lease.serial,
               });
             }
+            clearLeaseReferencesFromDir(snapshotRegistryDirFrom(options), lease.leaseId);
             delete state.leases[lease.deviceKey];
           }
         }
@@ -4313,8 +4460,8 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
       terminatedPgids.length > 0 ? { ...options, terminatedPgids } : options,
     );
   } catch (err) {
-    if (err instanceof ResourceError) {
-      return { exitCode: err.exitCode, error: err.message };
+    if (err instanceof ResourceError || err?.exitCode === SNAPSHOT_CONFLICT_EXIT) {
+      return { exitCode: err.exitCode, error: err.message, freed: [] };
     }
     return { exitCode: 1, error: err.message };
   }
@@ -4432,13 +4579,16 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
           );
         } else if (isIosLease) {
           try {
-            loadIosSimulatorSnapshot(stateDir, lease, loadSnap, {
+            const iosResolved = resolvedBackendName(options, lease.udid || lease.serial, loadSnap);
+            if (iosResolved.error) throw new Error(iosResolved.error);
+            loadIosSimulatorSnapshot(stateDir, lease, iosResolved.name, {
               runner,
               stopTimeoutMs,
               bootTimeoutMs: stopTimeoutMs * 2,
               env: options.env || process.env,
             });
             loadedSnapOnFree = true;
+            noteLoadedSnapshot(options, lease.udid || lease.serial, loadSnap, lease.leaseId);
           } catch (err) {
             itemFailed = true;
             actionErrors.push(err.message);
@@ -4446,7 +4596,11 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
         } else {
           const loadRes = runner(
             "adb",
-            ["-s", lease.serial, "emu", "avd", "snapshot", "load", loadSnap],
+            ["-s", lease.serial, "emu", "avd", "snapshot", "load", (() => {
+              const resolved = resolvedBackendName(options, lease.avd, loadSnap);
+              if (resolved.error) throw new Error(resolved.error);
+              return resolved.name;
+            })()],
             { strictInternal: true, timeoutMs: stopTimeoutMs },
           );
           if (isAdbEmuFailure(loadRes)) {
@@ -4463,6 +4617,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               }
               waitForEmulatorReady(runner, lease.serial, stopTimeoutMs);
               loadedSnapOnFree = true;
+              noteLoadedSnapshot(options, lease.avd, loadSnap, lease.leaseId);
             } catch (err) {
               itemFailed = true;
               actionErrors.push(err.message);
@@ -4569,6 +4724,9 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
                 cur.releaseOnWorkerExit = false;
                 if (loadSnap) {
                   cur.loadedSnapshot = loadedSnapOnFree ? loadSnap : null;
+                  cur.loadedSnapshotId = loadedSnapOnFree
+                    ? resolvedBackendName(options, cur.avd || cur.udid || cur.serial, loadSnap).name || loadSnap
+                    : null;
                 }
                 if (
                   cur.anchorPid !== null &&
@@ -4586,6 +4744,7 @@ export function cmdFree(stateDir, target = null, flags = {}, options = {}) {
               if (doStop) {
                 recordDeviceStoppedInState(state, cur, now);
               }
+              clearLeaseReferencesFromDir(snapshotRegistryDirFrom(options), cur.leaseId);
               if (Array.isArray(auditEvents)) {
                 auditEvents.push({
                   event: "device_free",
@@ -4754,6 +4913,21 @@ export function cmdRenew(stateDir, target = null, flags = {}, options = {}) {
   }, options);
 }
 
+
+function labelSnapshotNames(registryDir, storeId, names) {
+  return withSnapshotRegistry(registryDir, (registry) => {
+    const byBackend = new Map(
+      registry.snapshots
+        .filter((row) => row.storeId === storeId && row.state === "live" && row.label)
+        .map((row) => [row.backendName, row.label]),
+    );
+    return {
+      mutated: false,
+      value: names.map((name) => byBackend.get(name) || name),
+    };
+  });
+}
+
 export function cmdSnapshot(stateDir, action, name = null, flags = {}, options = {}) {
   const unknownFlagErr = validateCommandFlags(flags, SNAPSHOT_ALLOWED_FLAGS, "snapshot");
   if (unknownFlagErr) {
@@ -4769,6 +4943,8 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   const effectiveName = name || (typeof flags.name === "string" ? flags.name : null);
   const runner = options.runner || runCommandSync;
   const avdHome = options.avdHome || resolveAvdHome(options.env || process.env);
+  const registryDir =
+    options.snapshotRegistryDir || resolveSnapshotRegistryDir(options.env || process.env);
 
   if (effectiveAction === "list") {
     const targetAvd = flags.avd || null;
@@ -4820,7 +4996,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         if ((only.platform || "android") === "ios" && (only.udid || only.serial)) {
           return {
             exitCode: 0,
-            snapshots: listIosSimulatorSnapshots(stateDir, only.udid || only.serial),
+            snapshots: labelSnapshotNames(registryDir, only.udid || only.serial, listIosSimulatorSnapshots(stateDir, only.udid || only.serial)),
           };
         }
         if ((only.platform || "android") === "android" && only.avd && platFilter === "android") {
@@ -4888,7 +5064,15 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       error: `Invalid snapshot name "${effectiveName}". Must match /^[A-Za-z0-9._-]{1,64}$/.`,
     };
   }
+  if (effectiveAction === "save" && isSnapshotId(effectiveName)) {
+    return {
+      exitCode: 1,
+      error: `Snapshot label "${effectiveName}" uses the reserved id shape atc-<12 hex>. Choose another label.`,
+    };
+  }
 
+  const preState = readState(stateDir);
+  const snapCfg = snapshotConfig(preState.config);
   const freeDiskMb =
     options.host?.freeDiskMb ??
     (effectiveAction === "save" && !flags.force ? readFreeDiskMb(avdHome) : 16384);
@@ -4948,6 +5132,24 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           ? { ramSizeMb: 2048, freeDiskMb: readFreeDiskMb(stateDir), fsDev: null }
           : readLocalAvdMetadata(lease.avd, avdHome, state.config)
         : null;
+    const storeId = isIosLease ? lease.udid || lease.serial : lease.avd;
+    if (effectiveAction === "save") {
+      const conflict = withSnapshotRegistry(registryDir, (registry) => {
+        const existing = liveRowForLabel(registry, storeId, effectiveName);
+        if (existing && !parseBoolFlag(flags.replace)) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: SNAPSHOT_CONFLICT_EXIT,
+              error: `Snapshot "${effectiveName}" already exists on ${storeId} as ${existing.id}. Pass --replace to replace it. No state was changed.`,
+              snapshotId: existing.id,
+            },
+          };
+        }
+        return { mutated: false, value: { exitCode: 0 } };
+      });
+      if (conflict.exitCode !== 0) return { mutated: false, value: conflict };
+    }
     if (effectiveAction === "save" && !parseBoolFlag(flags.force) && saveMeta) {
       const meta = saveMeta;
       const minDisk = state.config.minFreeDiskMb ?? 2048;
@@ -5020,6 +5222,135 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         },
       };
     }
+    const estimateMb = isIosLease ? 1536 : (saveMeta?.ramSizeMb || 2048);
+    const registryDecision = withSnapshotRegistry(registryDir, (registry) => {
+      const existing = liveRowForLabel(registry, storeId, effectiveName);
+      if (effectiveAction === "save" && existing?.state === "pending") {
+        return {
+          mutated: false,
+          value: {
+            exitCode: SNAPSHOT_CONFLICT_EXIT,
+            error: `Snapshot "${effectiveName}" is already being saved on ${storeId} as ${existing.id}. No state was changed.`,
+            snapshotId: existing.id,
+          },
+        };
+      }
+      if (effectiveAction === "save" && existing && !parseBoolFlag(flags.replace)) {
+        return {
+          mutated: false,
+          value: {
+            exitCode: SNAPSHOT_CONFLICT_EXIT,
+            error: `Snapshot "${effectiveName}" already exists on ${storeId} as ${existing.id}. Pass --replace to replace it. No state was changed.`,
+            snapshotId: existing.id,
+          },
+        };
+      }
+      if (effectiveAction === "save" && existing && (existing.keep || (existing.references || []).length > 0) && !parseBoolFlag(flags.keep) && !parseBoolFlag(flags.force)) {
+        return {
+          mutated: false,
+          value: {
+            exitCode: SNAPSHOT_CONFLICT_EXIT,
+            error: `Snapshot "${effectiveName}" (${existing.id}) is pinned or loaded. Delete it or pass --keep with --replace. No state was changed.`,
+            snapshotId: existing.id,
+          },
+        };
+      }
+      if (effectiveAction === "save" && parseBoolFlag(flags.keep)) {
+        const keepsExisting = Boolean(existing?.keep || (existing?.references || []).length > 0);
+        const pinned = registry.snapshots.filter((row) => row.keep && row.state !== "deleted" && row.id !== existing?.id).length + (keepsExisting ? 1 : 0);
+        if (pinned >= snapCfg.keepMax) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 5,
+              error: `Pinned snapshot limit is ${snapCfg.keepMax}. Unpin or delete one before saving with --keep. No snapshot was created.`,
+              warnings: collectSnapshotWarnings(registry, preState.config),
+            },
+          };
+        }
+      }
+      if (effectiveAction === "save") {
+        const replacedBytes = existing && !existing.bytesDeleted && !existing.keep && (existing.references || []).length === 0
+          ? Number(existing.bytes) || 0
+          : 0;
+        const occupied = usedMb(registry);
+        const netAddMb = estimateMb;
+        if (occupied - replacedBytes + netAddMb > snapCfg.budgetMb) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 5,
+              error: `Snapshot budget has no reclaimable headroom for "${effectiveName}": ${occupied}MB used, ${estimateMb}MB estimated, ${snapCfg.budgetMb}MB cap. No snapshot was created.`,
+              warnings: collectSnapshotWarnings(registry, preState.config),
+            },
+          };
+        }
+      }
+      if (effectiveAction === "load" || effectiveAction === "delete") {
+        const target = isSnapshotId(effectiveName)
+          ? rowById(registry, effectiveName)
+          : liveRowForLabel(registry, storeId, effectiveName);
+        if (isSnapshotId(effectiveName) && (!target || target.storeId !== storeId)) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: target
+                ? `${effectiveName} belongs to ${target.storeId}, not this device.`
+                : `No snapshot "${effectiveName}" on ${storeId}.`,
+            },
+          };
+        }
+        if (target && target.state !== "live" && !(effectiveAction === "delete" && target.state === "replaced")) {
+          return {
+            mutated: false,
+            value: {
+              exitCode: 1,
+              error: `${target.id} is ${target.state}${target.replacedBy ? ` by ${target.replacedBy}` : ""}. It does not return newer bytes.`,
+              snapshotId: target.id,
+            },
+          };
+        }
+        if (!target && !isSnapshotId(effectiveName)) {
+          return {
+            mutated: false,
+            value: { exitCode: 0, legacyName: effectiveName },
+          };
+        }
+        return { mutated: false, value: { exitCode: 0, row: target } };
+      }
+      const id = mintSnapshotId(registry);
+      registry.snapshots.push({
+        id,
+        label: effectiveName,
+        storeId,
+        backendName: id,
+        state: "pending",
+        ownerPid: process.pid,
+        keep: parseBoolFlag(flags.keep),
+        savedAtMs: now,
+        expiresAtMs: now + snapCfg.ttlSec * 1000,
+        bytes: estimateMb,
+        references: [],
+      });
+      if (existing && parseBoolFlag(flags.replace)) {
+        existing.label = null;
+        existing.replacedBy = id;
+        existing.state = "replaced";
+      }
+      return {
+        mutated: true,
+        value: {
+          exitCode: 0,
+          id,
+          replacing: existing || null,
+          storeId,
+        },
+      };
+    });
+    if (registryDecision.exitCode !== 0) {
+      return { mutated: false, value: registryDecision };
+    }
     addLeaseWorker(lease, process.pid, livenessCheck);
     if (effectiveAction === "save" && saveMeta) {
       lease.pendingSnapshotDiskMb = saveMeta.ramSizeMb || 2048;
@@ -5044,6 +5375,8 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         stopTimeoutMs,
         isIosLease,
         transitionsToStarting,
+        snapshotPlan: { ...registryDecision, avdPath: saveMeta?.avdPath || lease.avdPath || null },
+        storeId,
       },
     };
   }, options);
@@ -5080,6 +5413,9 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
           cur.state = "active";
           cur.deadlineMs = null;
           cur.loadedSnapshot = markLoaded ? effectiveName : null;
+          cur.loadedSnapshotId = markLoaded
+            ? leaseCheck.snapshotPlan?.row?.backendName || leaseCheck.snapshotPlan?.id || effectiveName
+            : null;
         } else if (
           markLoaded &&
           effectiveAction === "delete" &&
@@ -5095,24 +5431,25 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
   if (leaseCheck.isIosLease) {
     try {
       if (effectiveAction === "save") {
-        saveIosSimulatorSnapshot(stateDir, leaseCheck.lease, effectiveName, {
+        saveIosSimulatorSnapshot(stateDir, leaseCheck.lease, leaseCheck.snapshotPlan.id, {
           runner,
           stopTimeoutMs: leaseCheck.stopTimeoutMs,
           bootTimeoutMs: leaseCheck.stopTimeoutMs * 2,
           env: options.env || process.env,
         });
       } else if (effectiveAction === "load") {
-        loadIosSimulatorSnapshot(stateDir, leaseCheck.lease, effectiveName, {
+        loadIosSimulatorSnapshot(stateDir, leaseCheck.lease, leaseCheck.snapshotPlan.row?.backendName || leaseCheck.snapshotPlan.legacyName, {
           runner,
           stopTimeoutMs: leaseCheck.stopTimeoutMs,
           bootTimeoutMs: leaseCheck.stopTimeoutMs * 2,
           env: options.env || process.env,
         });
       } else if (effectiveAction === "delete") {
-        deleteIosSimulatorSnapshot(stateDir, leaseCheck.lease, effectiveName);
+        deleteIosSimulatorSnapshot(stateDir, leaseCheck.lease, leaseCheck.snapshotPlan.row?.backendName || leaseCheck.snapshotPlan.legacyName);
       }
     } catch (err) {
       clearSnapshotWorker(false);
+      if (effectiveAction === "save") releasePendingSnapshot(registryDir, leaseCheck.snapshotPlan);
       return { exitCode: 1, error: err.message };
     }
     const finalLease = clearSnapshotWorker(true);
@@ -5122,22 +5459,28 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         error: `Lease ${leaseCheck.lease.leaseId} was lost during snapshot ${effectiveAction}.`,
       };
     }
-    return { exitCode: 0, lease: finalLease, snapshot: effectiveName, action: effectiveAction };
+    return finishSnapshotRecord(stateDir, registryDir, leaseCheck, effectiveName, effectiveAction, flags, finalLease, preState.config, runner);
   }
 
+  const backendName =
+    effectiveAction === "save"
+      ? leaseCheck.snapshotPlan.id
+      : leaseCheck.snapshotPlan.row?.backendName || leaseCheck.snapshotPlan.legacyName;
   let res;
   try {
     res = runner(
       "adb",
-      ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", effectiveAction, effectiveName],
+      ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", effectiveAction, backendName],
       { strictInternal: true, timeoutMs: leaseCheck.stopTimeoutMs },
     );
   } catch (err) {
     clearSnapshotWorker(false);
+    if (effectiveAction === "save") releasePendingSnapshot(registryDir, leaseCheck.snapshotPlan);
     return { exitCode: 1, error: err.message };
   }
   if (isAdbEmuFailure(res)) {
     clearSnapshotWorker(false);
+    if (effectiveAction === "save") releasePendingSnapshot(registryDir, leaseCheck.snapshotPlan);
     return {
       exitCode: 1,
       error: `adb snapshot ${effectiveAction} "${effectiveName}" failed: ${res.stderr || res.stdout}`,
@@ -5172,6 +5515,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
       waitForEmulatorReady(runner, leaseCheck.lease.serial, leaseCheck.stopTimeoutMs);
     } catch (err) {
       clearSnapshotWorker(false);
+      if (effectiveAction === "save") releasePendingSnapshot(registryDir, leaseCheck.snapshotPlan);
       return { exitCode: 1, error: err.message };
     }
   }
@@ -5184,7 +5528,129 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     };
   }
 
-  return { exitCode: 0, lease: finalLease, snapshot: effectiveName, action: effectiveAction };
+  return finishSnapshotRecord(stateDir, registryDir, leaseCheck, effectiveName, effectiveAction, flags, finalLease, preState.config, runner);
+}
+
+function releasePendingSnapshot(registryDir, plan) {
+  if (!plan?.id) return;
+  withSnapshotRegistry(registryDir, (registry) => {
+    const pending = rowById(registry, plan.id);
+    if (pending && pending.state === "pending") {
+      registry.snapshots = registry.snapshots.filter((row) => row.id !== plan.id);
+      if (plan.replacing) {
+        const old = rowById(registry, plan.replacing.id);
+        if (old && old.replacedBy === plan.id) {
+          old.state = "live";
+          old.label = pending.label;
+          old.replacedBy = null;
+        }
+      }
+    }
+    return { mutated: true, value: true };
+  });
+}
+
+function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, flags, finalLease, config, runner) {
+  const now = Date.now();
+  const plan = leaseCheck.snapshotPlan;
+  const recorded = withSnapshotRegistry(registryDir, (registry) => {
+    if (action === "save") {
+      const bytes = measuredDirMb(
+        leaseCheck.isIosLease
+          ? path.join(stateDir, "ios-snapshots", leaseCheck.storeId, plan.id)
+          : path.join(leaseCheck.snapshotPlan?.avdPath || leaseCheck.lease.avdPath || "", "snapshots", plan.id),
+      );
+      const row = {
+        id: plan.id,
+        label,
+        storeId: leaseCheck.storeId,
+        backendName: plan.id,
+        runtime: leaseCheck.lease.profile?.apiLevel || leaseCheck.lease.platform || "unknown",
+        keep: parseBoolFlag(flags.keep),
+        state: "live",
+        savedAtMs: now,
+        expiresAtMs: now + snapshotConfig(config).ttlSec * 1000,
+        bytes: bytes || leaseCheck.lease.pendingSnapshotDiskMb || 1,
+        references: [],
+      };
+      let deleteReplaced = null;
+      if (plan.replacing) {
+        const old = rowById(registry, plan.replacing.id);
+        if (old) {
+          old.state = "replaced";
+          old.replacedBy = plan.id;
+          old.label = null;
+          const protectedOld = old.keep || (old.references || []).length > 0;
+          if (!protectedOld) deleteReplaced = old.backendName;
+        }
+      }
+      const pending = rowById(registry, plan.id);
+      if (pending) Object.assign(pending, row);
+      else registry.snapshots.push(row);
+      return { mutated: true, value: { exitCode: 0, snapshotId: plan.id, label, deleteReplaced } };
+    }
+    if (!plan.row) {
+      if (action === "load") clearLeaseReferences(registry, leaseCheck.lease.leaseId);
+      return { mutated: true, value: { exitCode: 0, snapshotId: null, legacy: true } };
+    }
+    const current = rowById(registry, plan.row.id);
+    if (!current) return { mutated: false, value: { exitCode: 1, error: `Snapshot ${plan.row.id} disappeared.` } };
+    if (action === "delete") {
+      current.state = "deleted";
+      current.bytesDeleted = true;
+      current.label = null;
+      registry.spentIds.push({ id: current.id, reason: "deleted", atMs: now });
+      return { mutated: true, value: { exitCode: 0, snapshotId: current.id } };
+    }
+    clearLeaseReferences(registry, leaseCheck.lease.leaseId, current.id);
+    current.references = Array.from(new Set([...(current.references || []), leaseCheck.lease.leaseId]));
+    return { mutated: true, value: { exitCode: 0, snapshotId: current.id } };
+  });
+  if (recorded.exitCode !== 0) return recorded;
+  if (recorded.deleteReplaced && action === "save") {
+    let deleted = false;
+    try {
+      if (leaseCheck.isIosLease) {
+        deleteIosSimulatorSnapshot(stateDir, leaseCheck.lease, recorded.deleteReplaced);
+        deleted = true;
+      } else if (leaseCheck.lease.serial && runner) {
+        const del = runner("adb", ["-s", leaseCheck.lease.serial, "emu", "avd", "snapshot", "delete", recorded.deleteReplaced], { timeoutMs: 60000 });
+        deleted = del?.status === 0 && !isAdbEmuFailure(del);
+      }
+    } catch {
+      deleted = false;
+    }
+    if (deleted) {
+      withSnapshotRegistry(registryDir, (registry) => {
+        const old = registry.snapshots.find((row) => row.backendName === recorded.deleteReplaced && row.replacedBy === plan.id);
+        if (old) old.bytesDeleted = true;
+        return { mutated: Boolean(old), value: true };
+      });
+    }
+  }
+  const warningVolume = leaseCheck.isIosLease
+    ? path.join(stateDir, "ios-snapshots")
+    : leaseCheck.lease.avdPath;
+  const warnings = action === "save"
+    ? withSnapshotRegistry(registryDir, (registry) => ({
+        mutated: false,
+        value: collectSnapshotWarnings(registry, config, [warningVolume].filter(Boolean)),
+      }))
+    : [];
+  if (warnings.some((warning) => warning.code === "over_budget")) {
+    withSnapshotRegistry(registryDir, (registry) => {
+      recordNotice(registry, leaseCheck.lease.sessionId, warnings.find((warning) => warning.code === "over_budget"));
+      return { mutated: true, value: true };
+    });
+  }
+  return {
+    exitCode: 0,
+    lease: finalLease,
+    snapshot: label,
+    snapshotId: recorded.snapshotId,
+    action,
+    warnings,
+  };
 }
 
 // Internal runner for typed ops: admission (build slots, workspace locks, RAM), device lease
@@ -5807,6 +6273,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
               addLeaseWorker(lease, process.pid, livenessCheck);
               if (!plan.readOnly) {
                 lease.loadedSnapshot = null;
+                lease.loadedSnapshotId = null;
               }
               lease.renewedAtMs = now;
               lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
@@ -5887,6 +6354,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
             if (lease) {
               addLeaseWorker(lease, process.pid, livenessCheck);
               lease.loadedSnapshot = null;
+              lease.loadedSnapshotId = null;
               lease.renewedAtMs = now;
               lease.expiresAtMs = Math.max(lease.expiresAtMs, now + ttlMs);
             }
@@ -6185,6 +6653,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
             if (lease) {
               addLeaseWorker(lease, process.pid, livenessCheck);
               lease.loadedSnapshot = null;
+              lease.loadedSnapshotId = null;
               lease.renewedAtMs = now;
               lease.expiresAtMs = Math.max(lease.expiresAtMs || 0, now + ttlMs);
             }
@@ -6486,6 +6955,7 @@ export async function runOpInvocations(stateDir, plan, flags = {}, options = {})
           }
           addLeaseWorker(curDev, process.pid, livenessCheck);
           curDev.loadedSnapshot = null;
+          curDev.loadedSnapshotId = null;
           curDev.renewedAtMs = now;
           curDev.expiresAtMs = Math.max(curDev.expiresAtMs || 0, now + txRes.ttlMs);
           const reserveWindowMs = (state.config?.buildRamReservationWindowSec ?? 30) * 1000;
@@ -7713,6 +8183,9 @@ export async function runCli(argv = process.argv.slice(2), env = process.env, op
       }
       const [action, name] = parsed.positionals;
       const res = cmdSnapshot(stateDir, action, name, parsed.flags, { env });
+      if (res.warnings?.length) {
+        process.stderr.write(warningText(res.warnings).split("\n").map((line) => `[atc] ${line}`).join("\n") + "\n");
+      }
       if (res.exitCode !== 0) {
         process.stderr.write(`[atc] ${res.error}\n`);
         return res.exitCode;

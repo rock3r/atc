@@ -7,6 +7,7 @@ import path from "node:path";
 import { BAZEL_QUERY_MAX_OUTPUT_BYTES, OPS, OpError, SYSTEMS, listOps } from "./ops/catalog.mjs";
 import { FEATURE_REQUEST_URL, WINDOWS_BATCH_ARG_RE, WINDOWS_BATCH_PATH_FORBIDDEN_RE } from "./ops/patterns.mjs";
 import { resolveOpBuildRequirements } from "./ops/requirements.mjs";
+import { warningText } from "./snapshot-registry.mjs";
 import { formatErrors, parseOpArgv, validateOpParams } from "./validate.mjs";
 
 export const EXIT_INVALID = 7;
@@ -445,7 +446,10 @@ export async function execOp(stateDir, request, deps, options = {}) {
 
   if (op.kind === "snapshot") {
     const snapFlags = {};
-    for (const k of ["serial", "udid", "android", "ios", "session", "anchorPid"]) if (flags[k] !== undefined) snapFlags[k] = flags[k];
+    for (const k of ["serial", "udid", "android", "ios", "session", "anchorPid", "force"]) {
+      if (flags[k] !== undefined) snapFlags[k] = flags[k];
+    }
+    for (const k of ["replace", "keep"]) if (params[k] !== undefined) snapFlags[k] = params[k];
     const res = deps.cmdSnapshot(stateDir, op.action, params.name || null, snapFlags, { ...options, env, cwd });
     return { ...base, ...res, ok: res.exitCode === 0 };
   }
@@ -596,6 +600,8 @@ export async function execOp(stateDir, request, deps, options = {}) {
 }
 
 export function renderExecResult(res, { json = false, write = (s) => process.stdout.write(s), writeErr = (s) => process.stderr.write(s) } = {}) {
+  const warnings = warningText(res.warnings);
+  if (warnings) writeErr(warnings.endsWith("\n") ? warnings : `${warnings}\n`);
   if (json) {
     const { json: _json, ...payload } = res;
     write(JSON.stringify(payload, null, 2) + "\n");

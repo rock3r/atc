@@ -74,6 +74,7 @@ import {
   cmdSnapshot,
   cmdExec,
   cmdStatus,
+  execDeps,
   cmdConfig,
   cmdGc,
   cmdGuide,
@@ -81,6 +82,8 @@ import {
   runCli,
   selectCandidateUnderLock,
 } from "../src/cli.mjs";
+import { mintSnapshotId, withSnapshotRegistry } from "../src/snapshot-registry.mjs";
+import { cmdExecTokens, renderExecResult } from "../src/exec.mjs";
 
 // Keep the suite hermetic: an agent host (e.g. the atc pre-tool hook rewriting the command to
 // `export ATC_SESSION_ID=… ATC_ANCHOR_PID=…; npm run check`) can leak ATC_* identity/coordination
@@ -8619,7 +8622,7 @@ test("ATC 2.0: watch/wear normalization, virtual crash recovery, physical discon
         },
       },
     );
-    assert.equal(snapSaveRes.exitCode, 0);
+    assert.equal(snapSaveRes.exitCode, 0, snapSaveRes.error);
 
     const snapListRes = cmdSnapshot(dir, "list", null, { session: "sess-ios" });
     assert.equal(snapListRes.exitCode, 0);
@@ -8951,5 +8954,497 @@ test("ios.delete removes only the leased simulator and drops that lease", async 
     assert.equal(afterDelete.bootedDevices?.[`sim:${leased}`], undefined);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshot registry: existing label conflicts, budget refusal creates nothing, overrun exits 0", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      running: [
+        {
+          deviceKey: "avd:Pixel_8",
+          avd: "Pixel_8",
+          serial: "emulator-5554",
+          kind: "emulator",
+          online: true,
+          ramSizeMb: 2048,
+          snapshots: [],
+          profile: { deviceType: "phone", apiLevel: "android-35" },
+        },
+      ],
+      offline: [],
+      creatable: [],
+    };
+    const claim = cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory });
+    assert.equal(claim.exitCode, 0, claim.error);
+    const calls = [];
+    const runner = (cmd, args) => {
+      calls.push([cmd, ...args].join(" "));
+      if (cmd === "adb" && args.includes("getprop")) return { status: 0, stdout: "1\n", stderr: "" };
+      if (cmd === "android") return { status: 0, stdout: "", stderr: "" };
+      return { status: 0, stdout: "OK", stderr: "" };
+    };
+    const first = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(first.exitCode, 0, first.error);
+    assert.match(first.snapshotId, /^atc-[0-9a-f]{12}$/);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], new RegExp(`snapshot save ${first.snapshotId}$`));
+
+    calls.length = 0;
+    const conflict = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(conflict.exitCode, 4, conflict.error);
+    assert.equal(calls.length, 0, "a conflicting save must not call adb");
+    assert.match(conflict.error, /already exists/);
+
+    const tight = cmdConfig(dir, "set", "snapshotBudgetMb", "1");
+    assert.equal(tight.exitCode, 0, tight.error);
+    const refused = cmdSnapshot(
+      dir,
+      "save",
+      "other",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(refused.exitCode, 5, refused.error);
+    assert.equal(calls.length, 0, "a pre-save budget miss must not create a snapshot");
+    assert.match(refused.error, /No snapshot was created/);
+
+    const replaced = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg", replace: true },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(replaced.exitCode, 5, replaced.error);
+    assert.match(replaced.error, /No snapshot was created/);
+    assert.equal(calls.length, 0, "a known budget miss must not call adb, even with --replace");
+    assert.match(
+      replaced.warnings.find((warning) => warning.code === "over_budget").human,
+      /we are over budget; ask the user what to do/,
+    );
+
+    const pinned = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg", replace: true, keep: true },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(pinned.exitCode, 5, pinned.error);
+    assert.equal(calls.length, 0, "a pinned replacement that still exceeds the cap must not call adb");
+
+    cmdConfig(dir, "set", "snapshotBudgetMb", "16384");
+    const other = cmdSnapshot(
+      dir,
+      "save",
+      "other",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(other.exitCode, 0, other.error);
+    const loadedA = cmdSnapshot(
+      dir,
+      "load",
+      "task",
+      { session: "snap-reg" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(loadedA.exitCode, 0, loadedA.error);
+    const loadedB = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "other" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(loadedB.exitCode, 0, loadedB.error);
+    const registry = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
+    const task = registry.snapshots.find((row) => row.label === "task");
+    const next = registry.snapshots.find((row) => row.label === "other");
+    assert.equal(task.references.includes(claim.lease.leaseId), false);
+    assert.equal(next.references.includes(claim.lease.leaseId), true);
+    const callsBeforeFree = calls.length;
+    const freed = cmdFree(
+      dir,
+      claim.lease.leaseId,
+      { session: "snap-reg", stop: true },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(freed.exitCode, 0, freed.error);
+    assert.equal(
+      calls.slice(callsBeforeFree).some((call) => /snapshot (save|load)/.test(call)),
+      false,
+    );
+    const afterFree = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
+    assert.equal(
+      afterFree.snapshots.some((row) => (row.references || []).includes(claim.lease.leaseId)),
+      false,
+    );
+    cmdFree(dir, claim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
+    const reclaim = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "other", wait: 0 },
+      {
+        inventory,
+        runner,
+        snapshotRegistryDir: registryDir,
+      },
+    );
+    assert.equal(reclaim.exitCode, 0, reclaim.error);
+    assert.equal(
+      calls.some((call) => call.endsWith(`snapshot load ${other.snapshotId}`)),
+      true,
+    );
+    cmdFree(dir, claim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
+
+    const staleLock = path.join(registryDir, "snapshots.lock");
+    fs.mkdirSync(staleLock);
+    fs.writeFileSync(
+      path.join(staleLock, "owner.json"),
+      JSON.stringify({ pid: 2_147_483_646, createdAtMs: 1 }),
+    );
+    const staleTime = new Date(Date.now() - 10_000);
+    fs.utimesSync(staleLock, staleTime, staleTime);
+    const recovered = withSnapshotRegistry(registryDir, () => ({ mutated: false, value: "recovered" }));
+    assert.equal(recovered, "recovered");
+    assert.equal(fs.existsSync(staleLock), false);
+
+    const abandonedId = withSnapshotRegistry(registryDir, (registry) => {
+      const id = mintSnapshotId(registry);
+      registry.snapshots.push({
+        id,
+        label: "abandoned",
+        storeId: "Pixel_8",
+        backendName: id,
+        state: "pending",
+        ownerPid: 2_147_483_646,
+        bytes: 2048,
+        references: [],
+      });
+      return { mutated: true, value: id };
+    });
+    const replacedAgain = cmdSnapshot(
+      dir,
+      "save",
+      "task",
+      { session: "snap-reg", replace: true },
+      { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } },
+    );
+    assert.equal(replacedAgain.exitCode, 0, replacedAgain.error);
+    cmdFree(dir, reclaim.lease.leaseId, { session: "snap-reg" }, { inventory, snapshotRegistryDir: registryDir });
+    const callsBeforeReplaceClaim = calls.length;
+    const replaceClaim = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "task" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(replaceClaim.exitCode, 0, replaceClaim.error);
+    assert.equal(
+      calls.slice(callsBeforeReplaceClaim).some((call) => call.includes("snapshot load")),
+      true,
+    );
+    const byId = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: replacedAgain.snapshotId, wait: 0 },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(byId.exitCode, 0, byId.error);
+    const callsBeforeSame = calls.length;
+    const sameClaim = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: "task" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(sameClaim.exitCode, 0, sameClaim.error);
+    assert.equal(calls.slice(callsBeforeSame).some((call) => call.includes("snapshot load")), false);
+    const callsBeforeStale = calls.length;
+    const staleLoad = cmdClaim(
+      dir,
+      { session: "snap-reg", avd: "Pixel_8", snapshotLoad: first.snapshotId, wait: 0 },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(staleLoad.exitCode, 1, staleLoad.error);
+    assert.match(staleLoad.error, /does not return newer bytes/);
+    assert.equal(
+      calls.slice(callsBeforeStale).some((call) => call.includes("snapshot load")),
+      false,
+    );
+
+    const held = cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory, snapshotRegistryDir: registryDir });
+    assert.equal(held.exitCode, 0, held.error);
+    const callsBeforeFreeSave = calls.length;
+    const freeSave = cmdFree(
+      dir,
+      null,
+      { session: "snap-reg", snapshotSave: "task" },
+      { inventory, runner, snapshotRegistryDir: registryDir },
+    );
+    assert.equal(freeSave.exitCode, 4, freeSave.error);
+    assert.equal(calls.length, callsBeforeFreeSave);
+    const afterAbandon = withSnapshotRegistry(registryDir, (registry) => ({
+      mutated: false,
+      value: registry.snapshots.some((row) => row.id === abandonedId),
+    }));
+    assert.equal(afterAbandon, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pending label, retained pin, and replaced delete stay exclusive", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      running: [{
+        deviceKey: "avd:Pixel_8", avd: "Pixel_8", serial: "emulator-5554", kind: "emulator",
+        online: true, ramSizeMb: 2048, snapshots: [], profile: { deviceType: "phone", apiLevel: "android-35" },
+      }],
+      offline: [], creatable: [],
+    };
+    assert.equal(cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory }).exitCode, 0);
+    const runner = (cmd, args) => {
+      if (cmd === "adb" && args.includes("getprop")) return { status: 0, stdout: "1\n", stderr: "" };
+      return { status: 0, stdout: "OK\n", stderr: "" };
+    };
+    const opts = { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } };
+    const first = cmdSnapshot(dir, "save", "task", { session: "snap-reg", keep: true }, opts);
+    assert.equal(first.exitCode, 0, first.error);
+    cmdConfig(dir, "set", "snapshotKeepMax", "1");
+    const secondPin = cmdSnapshot(dir, "save", "task", { session: "snap-reg", replace: true, keep: true }, opts);
+    assert.equal(secondPin.exitCode, 5, secondPin.error);
+    cmdConfig(dir, "set", "snapshotKeepMax", "8");
+    const replaced = cmdSnapshot(dir, "save", "task", { session: "snap-reg", replace: true, keep: true }, opts);
+    assert.equal(replaced.exitCode, 0, replaced.error);
+    const removed = cmdSnapshot(dir, "delete", first.snapshotId, { session: "snap-reg" }, opts);
+    assert.equal(removed.exitCode, 0, removed.error);
+    const pendingId = withSnapshotRegistry(registryDir, (registry) => {
+      const id = mintSnapshotId(registry);
+      registry.snapshots.push({ id, label: "racing", storeId: "Pixel_8", state: "pending", bytes: 1, references: [] });
+      return { mutated: true, value: id };
+    });
+    const raced = cmdSnapshot(dir, "save", "racing", { session: "snap-reg", replace: true }, opts);
+    assert.equal(raced.exitCode, 4, raced.error);
+    assert.equal(raced.snapshotId, pendingId);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a live registry lock stays in place while another caller waits", () => {
+  if (process.platform === "win32") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-lock-"));
+  const ready = path.join(dir, "ready");
+  const release = path.join(dir, "release");
+  const entered = path.join(dir, "entered");
+  const child = `
+    import fs from "node:fs";
+    import { withSnapshotRegistry } from ${JSON.stringify(path.join(process.cwd(), "src/snapshot-registry.mjs"))};
+    const [dir, role, ready, release, entered] = process.argv.slice(1);
+    if (role === "holder") {
+      withSnapshotRegistry(dir, () => {
+        fs.writeFileSync(ready, "1");
+        const start = Date.now();
+        while (!fs.existsSync(release) && Date.now() - start < 3000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        return { mutated: true, value: "held" };
+      });
+    } else {
+      const start = Date.now();
+      while (!fs.existsSync(ready) && Date.now() - start < 2000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      const enteredAt = Date.now();
+      withSnapshotRegistry(dir, () => {
+        fs.writeFileSync(entered, String(Date.now() - enteredAt));
+        return { mutated: false, value: "waited" };
+      });
+    }
+  `;
+  const holder = spawn(process.execPath, ["--input-type=module", "-e", child, dir, "holder", ready, release, entered], { stdio: "ignore" });
+  const waiter = spawn(process.execPath, ["--input-type=module", "-e", child, dir, "waiter", ready, release, entered], { stdio: "ignore" });
+  try {
+    const start = Date.now();
+    while (!fs.existsSync(ready) && Date.now() - start < 2000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    assert.equal(fs.existsSync(ready), true);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);
+    assert.equal(fs.existsSync(entered), false);
+    assert.equal(fs.existsSync(path.join(dir, "snapshots.lock")), true);
+    fs.writeFileSync(release, "1");
+    const deadline = Date.now() + 3000;
+    while (!fs.existsSync(entered) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    assert.ok(Number(fs.readFileSync(entered, "utf8")) >= 70);
+  } finally {
+    holder.kill();
+    waiter.kill();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("iOS snapshot save warns on the snapshot volume", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  const udid = "EEEEEEEE-FFFF-4000-8000-000000000003";
+  const dataPath = path.join(dir, "sim-data");
+  fs.mkdirSync(registryDir, { recursive: true });
+  fs.mkdirSync(dataPath, { recursive: true });
+  fs.writeFileSync(path.join(dataPath, "state"), "x");
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      queriedPlatforms: ["ios"],
+      running: [{
+        deviceKey: `sim:${udid}`,
+        platform: "ios",
+        kind: "emulator",
+        avd: "ATC Disposable",
+        serial: udid,
+        udid,
+        online: true,
+        dataPath,
+        profile: { platform: "ios", deviceType: "phone", osVersion: "iOS-18.4" },
+      }],
+      offline: [],
+      creatable: [],
+      probes: { simctlListOk: true },
+    };
+    const claim = cmdClaim(dir, { session: "ios-snap", ios: true, udid, wait: 0 }, {
+      platform: "darwin",
+      inventory,
+    });
+    assert.equal(claim.exitCode, 0, claim.error);
+    cmdConfig(dir, "set", "snapshotLowDiskPct", "100");
+    const runner = (cmd, args) => {
+      if (cmd === "cp") {
+        fs.cpSync(args[1], args[2], { recursive: true });
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "OK\n", stderr: "" };
+    };
+    const saved = cmdSnapshot(dir, "save", "task", { session: "ios-snap", ios: true }, {
+      platform: "darwin",
+      inventory,
+      runner,
+      snapshotRegistryDir: registryDir,
+      host: { freeDiskMb: 65536 },
+    });
+    assert.equal(saved.exitCode, 0, saved.error);
+    assert.equal(
+      (saved.warnings || []).some((warning) => warning.code === "low_disk" && warning.volume.endsWith("ios-snapshots")),
+      true,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("replacement warning uses bytes left after cleanup", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      running: [{
+        deviceKey: "avd:Pixel_8",
+        avd: "Pixel_8",
+        serial: "emulator-5554",
+        kind: "emulator",
+        online: true,
+        ramSizeMb: 2048,
+        snapshots: [],
+        profile: { deviceType: "phone", apiLevel: "android-35" },
+      }],
+      offline: [],
+      creatable: [],
+    };
+    const claim = cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory });
+    assert.equal(claim.exitCode, 0, claim.error);
+    const runner = (cmd, args) => {
+      if (cmd === "adb" && args.includes("snapshot") && args.includes("save")) {
+        const id = args.at(-1);
+        const snapDir = path.join(dir, "avds", "Pixel_8.avd", "snapshots", id);
+        fs.mkdirSync(snapDir, { recursive: true });
+        fs.writeFileSync(path.join(snapDir, "ram.bin"), Buffer.alloc(64));
+      }
+      if (cmd === "adb" && args.includes("getprop")) return { status: 0, stdout: "1\n", stderr: "" };
+      return { status: 0, stdout: "OK\n", stderr: "" };
+    };
+    const avdPath = path.join(dir, "avds", "Pixel_8.avd");
+    fs.mkdirSync(avdPath, { recursive: true });
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    const lease = Object.values(state.leases)[0];
+    lease.avdPath = avdPath;
+    fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(state));
+    const first = cmdSnapshot(dir, "save", "task", { session: "snap-reg" }, {
+      inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 },
+    });
+    assert.equal(first.exitCode, 0, first.error);
+    withSnapshotRegistry(registryDir, (registry) => {
+      const row = registry.snapshots.find((item) => item.id === first.snapshotId);
+      row.bytes = 2048;
+      return { mutated: true, value: true };
+    });
+    cmdConfig(dir, "set", "snapshotBudgetMb", "2048");
+    const replaced = cmdSnapshot(dir, "save", "task", { session: "snap-reg", replace: true }, {
+      inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 },
+    });
+    assert.equal(replaced.exitCode, 0, replaced.error);
+    assert.equal((replaced.warnings || []).some((warning) => warning.code === "over_budget"), false);
+    const after = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
+    const old = after.snapshots.find((row) => row.id === first.snapshotId);
+    assert.equal(old.bytesDeleted, true);
+    assert.equal((after.notices || []).some((notice) => notice.code === "over_budget"), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("typed snapshot save accepts replace and keep", async () => {
+  const dir = makeTempStateDir();
+  try {
+    const seen = [];
+    const deps = execDeps(dir, {});
+    deps.cmdSnapshot = (_stateDir, action, name, flags) => {
+      seen.push({ action, name, flags });
+      return { exitCode: 0, snapshot: name, snapshotId: "atc-abcdefabcdef" };
+    };
+    const saved = await cmdExecTokens(dir, ["snapshot", "save", "task", "--replace", "--keep", "--session", "typed-snap"], deps);
+    assert.equal(saved.exitCode, 0, saved.error);
+    assert.equal(seen[0].action, "save");
+    assert.equal(seen[0].name, "task");
+    assert.equal(seen[0].flags.replace, true);
+    assert.equal(seen[0].flags.keep, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("typed snapshot command prints an over-budget warning", () => {
+  const warning = { code: "over_budget", human: "we are over budget; ask the user what to do" };
+  for (const json of [false, true]) {
+    const err = [];
+    const out = [];
+    renderExecResult(
+      { op: "snapshot.save", exitCode: 0, snapshot: "atc-abc", warnings: [warning] },
+      { json, write: (line) => out.push(line), writeErr: (line) => err.push(line) },
+    );
+    assert.match(err.join(""), /we are over budget/);
+    if (json) assert.match(out.join(""), /"code": "over_budget"/);
+    else assert.match(out.join(""), /snapshot.save/);
   }
 });

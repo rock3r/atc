@@ -55,3 +55,15 @@ atc free --snapshot-load default_boot
 | Heavy builds (`maxConcurrentBuilds`) | `"auto"` (1-4 by CPU/RAM, `+1` burst) | One build per workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, `xcode:dd:<derivedData>`) plus a RAM check (`buildRamEstimateMb = 3072 MB` for cold daemons + `minFreeRamMb`). |
 
 If either check fails, `atc` exits with code `5` (`ERESOURCE_EXCEEDED`). Stop idle virtual devices with `atc free --stop` first. For emulator/simulator boots and snapshot saves, use `--force` on `atc claim` / `atc snapshot` only with user approval to bypass host resource limits. Build RAM admission is never bypassed: `--force` on a build op only overrides value patterns, so free resources or wait for running builds instead.
+
+## Identity and budget
+
+`atc snapshot save <label>` creates a new id, `atc-<12 hex>`. The label is one live snapshot per store. Saving a label that already exists on this store fails and changes nothing unless you pass `--replace`. `--replace` does not let the old id load the new bytes. Load of a replaced id fails and names the replacement.
+
+`--keep` pins the snapshot. A pin or a snapshot loaded by a live lease is not deleted to meet the cap. TTL defaults to 7 days (`snapshotTtlSec`, 604800). TTL marks a temporary snapshot eligible for GC. It does not promise the bytes stay for 7 days if the machine-wide byte budget is already full and the snapshot is not pinned or loaded. Pressure eviction can remove an eligible temporary snapshot sooner. It cannot remove a pin or a loaded snapshot.
+
+`snapshotBudgetMb` defaults to 16384. `snapshotKeepMax` defaults to 8. `snapshotLowDiskPct` defaults to 10. Set them with `atc config set`. A lower cap does not delete and does not raise itself to match usage.
+
+If the budget cannot fit the estimate before the save, the command rejects and creates nothing. If the save succeeds and the measured size still exceeds the cap because protected snapshots block reclaim, the command exits 0, returns the id, and warns `we are over budget; ask the user what to do`. Further saves fail while no reclaimable headroom remains. Exit 5 remains the disk-reserve and no-headroom rejection. It does not mean a snapshot was created.
+
+Unmanaged snapshots, including `default_boot`, are outside the budget. ATC does not hash snapshot bytes. A notice is attached to the next ATC command. There is no push.

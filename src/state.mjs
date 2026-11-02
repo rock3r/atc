@@ -281,6 +281,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   defaultBuildWaitSec: 600,
   buildReorderWindowSec: 120,
   auditLogging: true,
+  snapshotBudgetMb: 16384,
+  snapshotTtlSec: 7 * 24 * 60 * 60,
+  snapshotKeepMax: 8,
+  snapshotLowDiskPct: 10,
 });
 
 export function createDefaultState() {
@@ -2189,7 +2193,7 @@ export function matchesProfile(device, req = {}) {
     return false;
   }
   if (req.snapshotLoad && device.kind === "emulator") {
-    if (device.loadedSnapshot === req.snapshotLoad) {
+    if (device.loadedSnapshot === req.snapshotLoad || req._registrySnapshot) {
       return true;
     }
     if (Array.isArray(device.snapshots) && !device.snapshots.includes(req.snapshotLoad)) {
