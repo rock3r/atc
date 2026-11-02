@@ -148,17 +148,24 @@ export function withSnapshotRegistry(dir, fn) {
     for (;;) {
       try {
         fs.mkdirSync(lock);
-        fs.renameSync(path.join(staged, "owner.json"), path.join(lock, "owner.json"));
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+      }
+      try {
+        fs.linkSync(path.join(staged, "owner.json"), path.join(lock, "owner.json"));
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+      }
+      const published = readLockOwner(lock);
+      if (published && published.pid === owner.pid && published.createdAtMs === owner.createdAtMs) {
         acquired = true;
         break;
-      } catch (err) {
-        if (err.code !== "EEXIST" && err.code !== "ENOTEMPTY" && err.code !== "EPERM") throw err;
-        if (recoverStaleRegistryLock(lock) && !fs.existsSync(lock)) continue;
-        if (Date.now() - start > 5000) {
-          throw new Error("Timed out waiting for the snapshot registry lock.");
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
       }
+      if (recoverStaleRegistryLock(lock) && !fs.existsSync(lock)) continue;
+      if (Date.now() - start > 5000) {
+        throw new Error("Timed out waiting for the snapshot registry lock.");
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
   } finally {
     if (!acquired) fs.rmSync(staged, { recursive: true, force: true });
