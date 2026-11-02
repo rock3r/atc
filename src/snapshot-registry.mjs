@@ -110,7 +110,14 @@ function recoverStaleRegistryLock(lock) {
     fs.writeFileSync(path.join(claim, "owner.json"), JSON.stringify({ pid: process.pid, createdAtMs: Date.now() }), { mode: 0o600 });
   } catch (err) {
     if (err?.code === "EEXIST" && claimIsAbandoned(claim)) {
-      fs.rmSync(claim, { recursive: true, force: true });
+      const aside = `${claim}.dead.${process.pid}.${Date.now()}`;
+      try {
+        fs.renameSync(claim, aside);
+        const moved = readLockOwner(aside);
+        if (!moved || !isPidAlive(moved.pid)) fs.rmSync(aside, { recursive: true, force: true });
+      } catch {
+        // Another waiter owns the claim or already moved it.
+      }
     }
     return false;
   }
@@ -133,18 +140,19 @@ export function withSnapshotRegistry(dir, fn) {
   const lock = lockPath(dir);
   const start = Date.now();
   const owner = { pid: process.pid, createdAtMs: start };
-  const staged = path.join(dir, `.lock-${process.pid}-${start}`);
+  const staged = path.join(dir, `.lock-${process.pid}-${start}-${randomBytes(3).toString("hex")}`);
   fs.mkdirSync(staged, { mode: 0o700 });
   fs.writeFileSync(path.join(staged, "owner.json"), JSON.stringify(owner), { mode: 0o600 });
   let acquired = false;
   try {
     for (;;) {
       try {
-        fs.renameSync(staged, lock);
+        fs.mkdirSync(lock);
+        fs.renameSync(path.join(staged, "owner.json"), path.join(lock, "owner.json"));
         acquired = true;
         break;
       } catch (err) {
-        if (err.code !== "EEXIST" && err.code !== "ENOTEMPTY") throw err;
+        if (err.code !== "EEXIST" && err.code !== "ENOTEMPTY" && err.code !== "EPERM") throw err;
         if (recoverStaleRegistryLock(lock) && !fs.existsSync(lock)) continue;
         if (Date.now() - start > 5000) {
           throw new Error("Timed out waiting for the snapshot registry lock.");
