@@ -5225,6 +5225,16 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
     const estimateMb = isIosLease ? 1536 : (saveMeta?.ramSizeMb || 2048);
     const registryDecision = withSnapshotRegistry(registryDir, (registry) => {
       const existing = liveRowForLabel(registry, storeId, effectiveName);
+      if (effectiveAction === "save" && existing?.state === "pending") {
+        return {
+          mutated: false,
+          value: {
+            exitCode: SNAPSHOT_CONFLICT_EXIT,
+            error: `Snapshot "${effectiveName}" is already being saved on ${storeId} as ${existing.id}. No state was changed.`,
+            snapshotId: existing.id,
+          },
+        };
+      }
       if (effectiveAction === "save" && existing && !parseBoolFlag(flags.replace)) {
         return {
           mutated: false,

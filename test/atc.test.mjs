@@ -9240,7 +9240,7 @@ test("pending label, retained pin, and replaced delete stay exclusive", () => {
       registry.snapshots.push({ id, label: "racing", storeId: "Pixel_8", state: "pending", bytes: 1, references: [] });
       return { mutated: true, value: id };
     });
-    const raced = cmdSnapshot(dir, "save", "racing", { session: "snap-reg" }, opts);
+    const raced = cmdSnapshot(dir, "save", "racing", { session: "snap-reg", replace: true }, opts);
     assert.equal(raced.exitCode, 4, raced.error);
     assert.equal(raced.snapshotId, pendingId);
   } finally {
