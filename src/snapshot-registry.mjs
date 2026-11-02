@@ -193,7 +193,7 @@ export function mintSnapshotId(registry) {
 
 export function liveRowForLabel(registry, storeId, label) {
   return registry.snapshots.find(
-    (row) => row.storeId === storeId && row.label === label && row.state === "live",
+    (row) => row.storeId === storeId && row.label === label && (row.state === "live" || row.state === "pending"),
   );
 }
 

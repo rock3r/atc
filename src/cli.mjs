@@ -5246,7 +5246,8 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
         };
       }
       if (effectiveAction === "save" && parseBoolFlag(flags.keep)) {
-        const pinned = registry.snapshots.filter((row) => row.keep && row.state !== "deleted" && row.id !== existing?.id).length;
+        const keepsExisting = Boolean(existing?.keep || (existing?.references || []).length > 0);
+        const pinned = registry.snapshots.filter((row) => row.keep && row.state !== "deleted" && row.id !== existing?.id).length + (keepsExisting ? 1 : 0);
         if (pinned >= snapCfg.keepMax) {
           return {
             mutated: false,
@@ -5290,7 +5291,7 @@ export function cmdSnapshot(stateDir, action, name = null, flags = {}, options =
             },
           };
         }
-        if (target && target.state !== "live") {
+        if (target && target.state !== "live" && !(effectiveAction === "delete" && target.state === "replaced")) {
           return {
             mutated: false,
             value: {

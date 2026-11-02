@@ -9206,6 +9206,48 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
   }
 });
 
+test("pending label, retained pin, and replaced delete stay exclusive", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      running: [{
+        deviceKey: "avd:Pixel_8", avd: "Pixel_8", serial: "emulator-5554", kind: "emulator",
+        online: true, ramSizeMb: 2048, snapshots: [], profile: { deviceType: "phone", apiLevel: "android-35" },
+      }],
+      offline: [], creatable: [],
+    };
+    assert.equal(cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory }).exitCode, 0);
+    const runner = (cmd, args) => {
+      if (cmd === "adb" && args.includes("getprop")) return { status: 0, stdout: "1\n", stderr: "" };
+      return { status: 0, stdout: "OK\n", stderr: "" };
+    };
+    const opts = { inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 } };
+    const first = cmdSnapshot(dir, "save", "task", { session: "snap-reg", keep: true }, opts);
+    assert.equal(first.exitCode, 0, first.error);
+    cmdConfig(dir, "set", "snapshotKeepMax", "1");
+    const secondPin = cmdSnapshot(dir, "save", "task", { session: "snap-reg", replace: true, keep: true }, opts);
+    assert.equal(secondPin.exitCode, 5, secondPin.error);
+    cmdConfig(dir, "set", "snapshotKeepMax", "8");
+    const replaced = cmdSnapshot(dir, "save", "task", { session: "snap-reg", replace: true, keep: true }, opts);
+    assert.equal(replaced.exitCode, 0, replaced.error);
+    const removed = cmdSnapshot(dir, "delete", first.snapshotId, { session: "snap-reg" }, opts);
+    assert.equal(removed.exitCode, 0, removed.error);
+    const pendingId = withSnapshotRegistry(registryDir, (registry) => {
+      const id = mintSnapshotId(registry);
+      registry.snapshots.push({ id, label: "racing", storeId: "Pixel_8", state: "pending", bytes: 1, references: [] });
+      return { mutated: true, value: id };
+    });
+    const raced = cmdSnapshot(dir, "save", "racing", { session: "snap-reg" }, opts);
+    assert.equal(raced.exitCode, 4, raced.error);
+    assert.equal(raced.snapshotId, pendingId);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a live registry lock stays in place while another caller waits", () => {
   if (process.platform === "win32") return;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "atc-lock-"));
