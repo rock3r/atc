@@ -80,44 +80,43 @@ function readLockOwner(lock) {
 
 const LOCK_INIT_GRACE_MS = 1000;
 
-function recoverStaleRegistryLock(lock) {
+function lockIsRecoverable(lock) {
   const owner = readLockOwner(lock);
-  if (owner) {
-    if (isPidAlive(owner.pid)) return false;
-  } else {
-    try {
-      if (Date.now() - fs.statSync(lock).mtimeMs < LOCK_INIT_GRACE_MS) return false;
-    } catch {
-      return false;
-    }
-  }
-  const doomed = `${lock}.dead.${process.pid}.${Date.now()}`;
+  if (owner) return !isPidAlive(owner.pid) ? owner : false;
   try {
-    fs.renameSync(lock, doomed);
+    if (Date.now() - fs.statSync(lock).mtimeMs < LOCK_INIT_GRACE_MS) return false;
   } catch {
     return false;
   }
-  const movedOwner = readLockOwner(doomed);
-  const sameDeadOwner = Boolean(
-    owner && movedOwner && movedOwner.pid === owner.pid && movedOwner.createdAtMs === owner.createdAtMs && !isPidAlive(movedOwner.pid),
-  );
-  const staleUnpublished = !owner && !movedOwner && (() => {
-    try {
-      return Date.now() - fs.statSync(doomed).mtimeMs >= LOCK_INIT_GRACE_MS;
-    } catch {
-      return false;
-    }
-  })();
-  if (!sameDeadOwner && !staleUnpublished) {
-    try {
-      fs.renameSync(doomed, lock);
-    } catch {
-      // The holder released it, or another waiter already owns the name.
-    }
+  return { unpublished: true };
+}
+
+function recoverStaleRegistryLock(lock) {
+  const seen = lockIsRecoverable(lock);
+  if (!seen) return false;
+  const claim = `${lock}.claim`;
+  try {
+    fs.mkdirSync(claim);
+  } catch {
     return false;
   }
-  fs.rmSync(doomed, { recursive: true, force: true });
-  return true;
+  const still = lockIsRecoverable(lock);
+  const sameDeadOwner = Boolean(
+    seen.pid && still && still.pid === seen.pid && still.createdAtMs === seen.createdAtMs && !isPidAlive(still.pid),
+  );
+  const staleUnpublished = Boolean(seen.unpublished && still && still.unpublished);
+  if (!sameDeadOwner && !staleUnpublished) {
+    fs.rmSync(claim, { recursive: true, force: true });
+    return false;
+  }
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+  } catch {
+    fs.rmSync(claim, { recursive: true, force: true });
+    return false;
+  }
+  fs.rmSync(claim, { recursive: true, force: true });
+  return !fs.existsSync(lock);
 }
 
 export function withSnapshotRegistry(dir, fn) {
