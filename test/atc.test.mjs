@@ -9203,18 +9203,79 @@ test("snapshot registry: existing label conflicts, budget refusal creates nothin
   }
 });
 
+test("replacement warning uses bytes left after cleanup", () => {
+  const dir = makeTempStateDir();
+  const registryDir = path.join(dir, "registry");
+  fs.mkdirSync(registryDir, { recursive: true });
+  try {
+    const inventory = {
+      host: { totalRamMb: 32768, availableRamMb: 16384, freeDiskMb: 65536, cpuCores: 8 },
+      running: [{
+        deviceKey: "avd:Pixel_8",
+        avd: "Pixel_8",
+        serial: "emulator-5554",
+        kind: "emulator",
+        online: true,
+        ramSizeMb: 2048,
+        snapshots: [],
+        profile: { deviceType: "phone", apiLevel: "android-35" },
+      }],
+      offline: [],
+      creatable: [],
+    };
+    const claim = cmdClaim(dir, { session: "snap-reg", avd: "Pixel_8" }, { inventory });
+    assert.equal(claim.exitCode, 0, claim.error);
+    const runner = (cmd, args) => {
+      if (cmd === "adb" && args.includes("snapshot") && args.includes("save")) {
+        const id = args.at(-1);
+        const snapDir = path.join(dir, "avds", "Pixel_8.avd", "snapshots", id);
+        fs.mkdirSync(snapDir, { recursive: true });
+        fs.writeFileSync(path.join(snapDir, "ram.bin"), Buffer.alloc(64));
+      }
+      if (cmd === "adb" && args.includes("getprop")) return { status: 0, stdout: "1\n", stderr: "" };
+      return { status: 0, stdout: "OK\n", stderr: "" };
+    };
+    const avdPath = path.join(dir, "avds", "Pixel_8.avd");
+    fs.mkdirSync(avdPath, { recursive: true });
+    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    const lease = Object.values(state.leases)[0];
+    lease.avdPath = avdPath;
+    fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify(state));
+    const first = cmdSnapshot(dir, "save", "task", { session: "snap-reg" }, {
+      inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 },
+    });
+    assert.equal(first.exitCode, 0, first.error);
+    withSnapshotRegistry(registryDir, (registry) => {
+      const row = registry.snapshots.find((item) => item.id === first.snapshotId);
+      row.bytes = 2048;
+      return { mutated: true, value: true };
+    });
+    cmdConfig(dir, "set", "snapshotBudgetMb", "2048");
+    const replaced = cmdSnapshot(dir, "save", "task", { session: "snap-reg", replace: true }, {
+      inventory, runner, snapshotRegistryDir: registryDir, host: { freeDiskMb: 65536 },
+    });
+    assert.equal(replaced.exitCode, 0, replaced.error);
+    assert.equal((replaced.warnings || []).some((warning) => warning.code === "over_budget"), false);
+    const after = JSON.parse(fs.readFileSync(path.join(registryDir, "snapshots.json"), "utf8"));
+    const old = after.snapshots.find((row) => row.id === first.snapshotId);
+    assert.equal(old.bytesDeleted, true);
+    assert.equal((after.notices || []).some((notice) => notice.code === "over_budget"), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("typed snapshot command prints an over-budget warning", () => {
-  const err = [];
-  const out = [];
-  renderExecResult(
-    {
-      op: "snapshot.save",
-      exitCode: 0,
-      snapshot: "atc-abc",
-      warnings: [{ code: "over_budget", human: "we are over budget; ask the user what to do" }],
-    },
-    { write: (line) => out.push(line), writeErr: (line) => err.push(line) },
-  );
-  assert.match(out.join(""), /snapshot.save/);
-  assert.match(err.join(""), /we are over budget/);
+  const warning = { code: "over_budget", human: "we are over budget; ask the user what to do" };
+  for (const json of [false, true]) {
+    const err = [];
+    const out = [];
+    renderExecResult(
+      { op: "snapshot.save", exitCode: 0, snapshot: "atc-abc", warnings: [warning] },
+      { json, write: (line) => out.push(line), writeErr: (line) => err.push(line) },
+    );
+    assert.match(err.join(""), /we are over budget/);
+    if (json) assert.match(out.join(""), /"code": "over_budget"/);
+    else assert.match(out.join(""), /snapshot.save/);
+  }
 });

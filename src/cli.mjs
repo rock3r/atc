@@ -5576,11 +5576,7 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
       const pending = rowById(registry, plan.id);
       if (pending) Object.assign(pending, row);
       else registry.snapshots.push(row);
-      const warnings = collectSnapshotWarnings(registry, config, [leaseCheck.lease.avdPath].filter(Boolean));
-      if (warnings.some((warning) => warning.code === "over_budget")) {
-        recordNotice(registry, leaseCheck.lease.sessionId, warnings.find((warning) => warning.code === "over_budget"));
-      }
-      return { mutated: true, value: { exitCode: 0, snapshotId: plan.id, label, warnings, deleteReplaced } };
+      return { mutated: true, value: { exitCode: 0, snapshotId: plan.id, label, deleteReplaced } };
     }
     if (!plan.row) {
       if (action === "load") clearLeaseReferences(registry, leaseCheck.lease.leaseId);
@@ -5600,10 +5596,6 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
     return { mutated: true, value: { exitCode: 0, snapshotId: current.id } };
   });
   if (recorded.exitCode !== 0) return recorded;
-  const warnings = recorded.warnings || collectSnapshotWarnings(
-    { snapshots: [], spentIds: [], notices: [] },
-    config,
-  );
   if (recorded.deleteReplaced && action === "save") {
     let deleted = false;
     try {
@@ -5624,6 +5616,18 @@ function finishSnapshotRecord(stateDir, registryDir, leaseCheck, label, action, 
         return { mutated: Boolean(old), value: true };
       });
     }
+  }
+  const warnings = action === "save"
+    ? withSnapshotRegistry(registryDir, (registry) => ({
+        mutated: false,
+        value: collectSnapshotWarnings(registry, config, [leaseCheck.lease.avdPath].filter(Boolean)),
+      }))
+    : [];
+  if (warnings.some((warning) => warning.code === "over_budget")) {
+    withSnapshotRegistry(registryDir, (registry) => {
+      recordNotice(registry, leaseCheck.lease.sessionId, warnings.find((warning) => warning.code === "over_budget"));
+      return { mutated: true, value: true };
+    });
   }
   return {
     exitCode: 0,

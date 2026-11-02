@@ -597,6 +597,8 @@ export async function execOp(stateDir, request, deps, options = {}) {
 }
 
 export function renderExecResult(res, { json = false, write = (s) => process.stdout.write(s), writeErr = (s) => process.stderr.write(s) } = {}) {
+  const warnings = warningText(res.warnings);
+  if (warnings) writeErr(warnings.endsWith("\n") ? warnings : `${warnings}\n`);
   if (json) {
     const { json: _json, ...payload } = res;
     write(JSON.stringify(payload, null, 2) + "\n");
@@ -617,8 +619,6 @@ export function renderExecResult(res, { json = false, write = (s) => process.std
   }
   if (res.snapshots) write(JSON.stringify(res.snapshots, null, 2) + "\n");
   else if (res.op?.startsWith("snapshot.") && res.exitCode === 0) write(`✓ ${res.op} ${res.snapshot || ""}\n`.replace(/ \n$/, "\n"));
-  const warnings = warningText(res.warnings);
-  if (warnings) writeErr(warnings.endsWith("\n") ? warnings : `${warnings}\n`);
 }
 
 export function execHelp(system = null) {
