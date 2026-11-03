@@ -203,6 +203,19 @@ export function validateOpParams(opName, params, { force = false, basePath = "" 
       value: String(params.executable),
     });
   }
+  // Caller-supplied tool flags are a force-like override in and by themselves, like executable.
+  const flagSites = [];
+  if (Array.isArray(params?.flags)) flagSites.push([`${basePath}/flags`, params.flags]);
+  if (Array.isArray(params?.series)) {
+    params.series.forEach((entry, i) => {
+      if (Array.isArray(entry?.flags)) flagSites.push([`${basePath}/series/${i}/flags`, entry.flags]);
+    });
+  }
+  for (const [p, flags] of flagSites) {
+    if (flags.length > 0 && !errors.some((e) => e.path === p || e.path.startsWith(`${p}/`))) {
+      overridden.push({ path: p, check: "custom_flags", value: flags.map(String).join(" ") });
+    }
+  }
   if (errors.length === 0 && typeof op.check === "function") {
     errors.push(...op.check(params).map((e) => ({ ...e, path: `${basePath}${e.path}` })));
   }

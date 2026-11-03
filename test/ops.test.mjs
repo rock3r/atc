@@ -417,6 +417,114 @@ test("bazel.run: timeout required and run args after --", () => {
   assert.equal(inv.timeoutSec, 60);
 });
 
+// ---------------------------------------------------------------- flags and exclusions
+
+test("patterns: bazel and gradle flags are one shape-checked token", () => {
+  for (const ok of ["--keep_going", "--nokeep_going", "--test_output=errors", "--copt=-O2", "--define=x=y", "--remote_cache=", "--platforms=//p:arm64", "--test_tag_filters=-flaky,smoke", "--run_under=//tools:wrap"]) {
+    assert.ok(checkPattern("bazelFlag", ok), ok);
+  }
+  for (const bad of ["--", "-k", "build", "//...", "--Foo", "--x y", "--x=a b", "--x=$(id)", "--x=`id`", "--x=\"q\"", "--x=a;b", "---x"]) {
+    assert.ok(!checkPattern("bazelFlag", bad), bad);
+  }
+  for (const ok of ["--scan", "--build-cache", "--console=plain", "--warning-mode=all", "-Dorg.gradle.caching=true", "-Dfoo", "--init-script=ci/init.gradle"]) {
+    assert.ok(checkPattern("gradleFlag", ok), ok);
+  }
+  for (const bad of ["--", "-x", "-t", "assemble", "-Pfoo=bar", "--x=a b", "-D", "-Dfoo bar", "--exclude-task foo"]) {
+    assert.ok(!checkPattern("gradleFlag", bad), bad);
+  }
+  assert.equal(PATTERNS.bazelFlag.forceable, false);
+  assert.equal(PATTERNS.gradleFlag.forceable, false);
+});
+
+test("bazel flags and excludeTargets: placement, owned flags and forced-run accounting", () => {
+  const root = tmpDir();
+  touch(path.join(root, "MODULE.bazel"), 0o644);
+  const ctx = { cwd: root, platform: "darwin", which: () => null };
+  // Configs, then caller flags (explicit flags win over a config), then targets. Exclusions are
+  // negative patterns after "--" so "-//x" is never read as an option.
+  assert.deepEqual(
+    OPS["bazel.test"].invocations({ targets: ["//..."], excludeTargets: ["//slow/...", "@ext//x:y"], configs: ["ci"], flags: ["--test_output=errors"] }, ctx)[0].args,
+    ["test", "--config=ci", "--test_output=errors", "--", "//...", "-//slow/...", "-@ext//x:y"],
+  );
+  assert.deepEqual(OPS["bazel.build"].invocations({ targets: ["//a"] }, ctx)[0].args, ["build", "//a"], "no -- without exclusions");
+  assert.deepEqual(
+    OPS["bazel.run"].invocations({ target: "//tools:gen", flags: ["--run_under=//tools:wrap"], runArgs: ["--x"], timeoutSec: 5 }, ctx)[0].args,
+    ["run", "--run_under=//tools:wrap", "//tools:gen", "--", "--x"],
+  );
+  assert.deepEqual(
+    OPS["bazel.series"].invocations(
+      { series: [{ command: "clean", flags: ["--async"] }, { command: "test", targets: ["//..."], excludeTargets: ["//slow/..."], flags: ["--flaky_test_attempts=2"] }] },
+      ctx,
+    ).map((i) => i.args),
+    [["clean", "--async"], ["test", "--flaky_test_attempts=2", "--", "//...", "-//slow/..."]],
+  );
+  assert.deepEqual(OPS["bazel.clean"].invocations({ expunge: true, flags: ["--async"] }, ctx)[0].args, ["clean", "--expunge", "--async"]);
+
+  const ok = validateOpParams("bazel.test", { targets: ["//..."], flags: ["--test_output=errors", "--run_under=//tools:wrap"] });
+  assert.deepEqual(ok.errors, []);
+  assert.deepEqual(ok.overridden, [{ path: "/flags", check: "custom_flags", value: "--test_output=errors --run_under=//tools:wrap" }]);
+
+  const owned = validateOpParams("bazel.build", { targets: ["//..."], flags: ["--jobs=64", "--local_resources=memory=99999", "--local_ram_resources=1", "--nojobs", "--config=ci"] });
+  assert.deepEqual(owned.errors.map((e) => [e.path, e.code]), [
+    ["/flags/0", "flag_owned_by_atc"],
+    ["/flags/1", "flag_owned_by_atc"],
+    ["/flags/2", "flag_owned_by_atc"],
+    ["/flags/3", "flag_owned_by_atc"],
+    ["/flags/4", "flag_has_param"],
+  ]);
+  const forcedOwned = validateOpParams("bazel.build", { targets: ["//..."], flags: ["--jobs=64"] }, { force: true });
+  assert.equal(forcedOwned.errors[0].code, "flag_owned_by_atc", "--force never unlocks an ATC-owned flag");
+  const badShape = validateOpParams("bazel.build", { targets: ["//..."], flags: ["--x=a b"] }, { force: true });
+  assert.equal(badShape.errors[0].code, "pattern_mismatch");
+  assert.deepEqual(badShape.overridden, [], "a rejected flag list is not recorded as overridden");
+
+  const series = validateOpParams("bazel.series", {
+    series: [{ command: "build", targets: ["//a"], flags: ["--keep_going"] }, { command: "clean", excludeTargets: ["//b"] }, { command: "test", targets: ["//t"], flags: ["--local_cpu_resources=1"] }],
+  });
+  assert.deepEqual(series.errors.map((e) => [e.path, e.code]), [
+    ["/series/1/excludeTargets", "not_allowed"],
+    ["/series/2/flags/0", "flag_owned_by_atc"],
+  ]);
+  assert.ok(series.overridden.some((o) => o.path === "/series/0/flags" && o.check === "custom_flags"));
+});
+
+test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting", () => {
+  const root = tmpDir();
+  const wrapper = touch(path.join(root, "gradlew"));
+  const [inv] = OPS["gradle.tasks"].invocations(
+    { tasks: ["build"], excludeTasks: ["lint", ":app:test"], flags: ["--scan", "-Dorg.gradle.caching=true"], properties: { a: "b" } },
+    { cwd: root, platform: "darwin" },
+  );
+  assert.deepEqual(inv, { cmd: wrapper, args: ["build", "-Pa=b", "--exclude-task", "lint", "--exclude-task", ":app:test", "--scan", "-Dorg.gradle.caching=true"], cwd: root });
+
+  const ok = validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["lint"], flags: ["--scan"] });
+  assert.deepEqual(ok.errors, []);
+  assert.deepEqual(ok.overridden, [{ path: "/flags", check: "custom_flags", value: "--scan" }]);
+  assert.deepEqual(validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["lint"] }).overridden, [], "exclusions alone are not a forced run");
+
+  const owned = validateOpParams("gradle.tasks", {
+    tasks: ["build"],
+    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--gradle-user-home=/y", "--exclude-task=lint"],
+  });
+  assert.deepEqual(
+    owned.errors.map((e) => e.code),
+    [...new Array(8).fill("flag_owned_by_atc"), "flag_has_param"],
+  );
+  assert.ok(owned.errors.every((e) => e.hint));
+  assert.ok(validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["-x"] }).errors.length > 0, "excluded tasks use the task pattern");
+});
+
+test("parseOpArgv: repeated --flag takes dash-leading values; exclusions map to plural params", () => {
+  const b = parseOpArgv(["bazel", "test", "//...", "--flag", "--test_output=errors", "--flag=--copt=-O2", "--exclude-target", "//slow/..."]);
+  assert.deepEqual(b.errors, []);
+  assert.deepEqual(b.params.flags, ["--test_output=errors", "--copt=-O2"]);
+  assert.deepEqual(b.params.excludeTargets, ["//slow/..."]);
+  const g = parseOpArgv(["gradle", "tasks", "build", "--exclude-task", "lint", "--flag", "--scan"]);
+  assert.deepEqual(g.errors, []);
+  assert.deepEqual(g.params.excludeTasks, ["lint"]);
+  assert.deepEqual(g.params.flags, ["--scan"]);
+});
+
 test("xcode: destination only for test actions on the leased simulator", () => {
   const op = OPS["xcode.test"];
   const ctx = { cwd: "/w", lease: iosLease };

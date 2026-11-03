@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isGradleDeviceTaskName } from "../build.mjs";
+import { checkToolFlags } from "./flags.mjs";
 import { quoteRemote } from "./patterns.mjs";
 
 export class OpError extends Error {
@@ -28,6 +29,43 @@ const EXECUTABLE_PARAM = {
     description: "Custom wrapper or executable to run (you take responsibility, same as --force)",
   },
 };
+
+// Caller-supplied tool flags: shape-checked, ATC-owned flags refused, everything else left to the
+// tool and recorded as a forced run (see src/ops/flags.mjs and docs/scope.md §2.1).
+const BAZEL_FLAGS_PARAM = {
+  flags: {
+    type: "string[]",
+    pattern: "bazelFlag",
+    maxItems: 64,
+    description: "Extra Bazel command options, one token each (--name or --name=value). Placed after configs; recorded as a forced run.",
+  },
+};
+
+const GRADLE_FLAGS_PARAM = {
+  flags: {
+    type: "string[]",
+    pattern: "gradleFlag",
+    maxItems: 64,
+    description: "Extra Gradle options, one token each (--name, --name=value or -Dkey=value). Recorded as a forced run.",
+  },
+};
+
+const BAZEL_EXCLUDE_PARAM = {
+  excludeTargets: {
+    type: "string[]",
+    pattern: "bazelTarget",
+    maxItems: 256,
+    description: "Target patterns to subtract (passed as -<pattern> after --)",
+  },
+};
+
+// Bazel target patterns, with exclusions as negative patterns after "--" so a leading "-" is never
+// read as an option.
+function bazelTargetArgs(targets, excludeTargets) {
+  const excludes = excludeTargets || [];
+  if (excludes.length === 0) return [...targets];
+  return ["--", ...targets, ...excludes.map((t) => `-${t}`)];
+}
 
 const XCODE_COMMON = {
   scheme: { type: "string", pattern: "xcodeName", required: true },
@@ -335,6 +373,8 @@ export const OPS = Object.freeze({
       rerunTasks: { type: "boolean" },
       continueAfterFailure: { type: "boolean" },
       properties: { type: "map", keyPattern: "gradlePropertyKey", valuePattern: "transportSafe" },
+      excludeTasks: { type: "string[]", pattern: "gradleTask", maxItems: 64, description: "Tasks to exclude (--exclude-task)" },
+      ...GRADLE_FLAGS_PARAM,
       ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
@@ -349,7 +389,12 @@ export const OPS = Object.freeze({
       if (params.rerunTasks) args.push("--rerun-tasks");
       if (params.continueAfterFailure) args.push("--continue");
       for (const [k, v] of Object.entries(params.properties || {})) args.push(`-P${k}=${v}`);
+      for (const t of params.excludeTasks || []) args.push("--exclude-task", t);
+      args.push(...(params.flags || []));
       return [{ cmd, args, cwd }];
+    },
+    check(params) {
+      return checkToolFlags("gradle", params.flags, "/flags");
     },
     notices(params) {
       const tasks = params.tasks || [];
@@ -380,14 +425,18 @@ export const OPS = Object.freeze({
       runArgs: { type: "string[]", pattern: "passthroughArg", maxItems: 64 },
       configs: { type: "string[]", pattern: "bazelConfig" },
       timeoutSec: { type: "integer", min: 1, max: 86400, required: true },
+      ...BAZEL_FLAGS_PARAM,
       ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
-      const args = ["run", ...bazelCommonArgs(params), params.target];
+      const args = ["run", ...bazelCommonArgs(params), ...(params.flags || []), params.target];
       if ((params.runArgs || []).length > 0) args.push("--", ...params.runArgs);
       return [{ cmd, args, cwd: wsRoot, timeoutSec: params.timeoutSec }];
+    },
+    check(params) {
+      return checkToolFlags("bazel", params.flags, "/flags");
     },
   },
   "bazel.series": {
@@ -405,6 +454,8 @@ export const OPS = Object.freeze({
           targets: { type: "string[]", pattern: "bazelTarget" },
           configs: { type: "string[]", pattern: "bazelConfig" },
           expunge: { type: "boolean" },
+          ...BAZEL_EXCLUDE_PARAM,
+          ...BAZEL_FLAGS_PARAM,
         },
       },
       ...EXECUTABLE_PARAM,
@@ -414,11 +465,12 @@ export const OPS = Object.freeze({
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
       return params.series.map((entry) => {
         if (entry.command === "clean") {
-          return { cmd, args: ["clean", ...(entry.expunge ? ["--expunge"] : [])], cwd: wsRoot };
+          return { cmd, args: ["clean", ...(entry.expunge ? ["--expunge"] : []), ...(entry.flags || [])], cwd: wsRoot };
         }
         const args = [entry.command];
         for (const c of entry.configs || []) args.push(`--config=${c}`);
-        args.push(...(entry.targets || []));
+        args.push(...(entry.flags || []));
+        args.push(...bazelTargetArgs(entry.targets || [], entry.excludeTargets));
         return { cmd, args, cwd: wsRoot };
       });
     },
@@ -434,6 +486,10 @@ export const OPS = Object.freeze({
         if (e.command !== "clean" && e.expunge) {
           errs.push({ path: `/series/${i}/expunge`, code: "not_allowed", message: "expunge only applies to clean." });
         }
+        if (e.command === "clean" && e.excludeTargets?.length) {
+          errs.push({ path: `/series/${i}/excludeTargets`, code: "not_allowed", message: "clean takes no targets." });
+        }
+        errs.push(...checkToolFlags("bazel", e.flags, `/series/${i}/flags`));
       });
       return errs;
     },
@@ -457,10 +513,13 @@ export const OPS = Object.freeze({
     name: "bazel.clean",
     system: "bazel",
     kind: "build",
-    params: { expunge: { type: "boolean" }, ...EXECUTABLE_PARAM, ...BUILD_COMMON },
+    params: { expunge: { type: "boolean" }, ...BAZEL_FLAGS_PARAM, ...EXECUTABLE_PARAM, ...BUILD_COMMON },
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
-      return [{ cmd, args: ["clean", ...(params.expunge ? ["--expunge"] : [])], cwd: wsRoot }];
+      return [{ cmd, args: ["clean", ...(params.expunge ? ["--expunge"] : []), ...(params.flags || [])], cwd: wsRoot }];
+    },
+    check(params) {
+      return checkToolFlags("bazel", params.flags, "/flags");
     },
   },
   "bazel.query": bazelQueryOp("query", BAZEL_QUERY_OUTPUTS),
@@ -971,12 +1030,17 @@ function bazelSimple(command) {
       configs: { type: "string[]", pattern: "bazelConfig" },
       ...(command === "test" || command === "coverage" ? { testFilter: { type: "string", pattern: "transportSafe" } } : {}),
       keepGoing: { type: "boolean" },
+      ...BAZEL_EXCLUDE_PARAM,
+      ...BAZEL_FLAGS_PARAM,
       ...EXECUTABLE_PARAM,
       ...BUILD_COMMON,
     },
     invocations(params, ctx) {
       const { cmd, wsRoot } = resolveBazelExecutable(params, ctx);
-      return [{ cmd, args: [command, ...bazelCommonArgs(params), ...params.targets], cwd: wsRoot }];
+      return [{ cmd, args: [command, ...bazelCommonArgs(params), ...(params.flags || []), ...bazelTargetArgs(params.targets, params.excludeTargets)], cwd: wsRoot }];
+    },
+    check(params) {
+      return checkToolFlags("bazel", params.flags, "/flags");
     },
   };
 }

@@ -193,7 +193,9 @@ test("exec: bazel.run honours timeoutSec (exit 124)", { skip: !posix }, async ()
     assert.equal(res.steps[0].timedOut, true);
     assert.ok(Date.now() - started < 15000);
     assert.equal(res.steps[0].args[0], "run");
-    assert.match(res.steps[0].args[1], /^--jobs=/);
+    assert.equal(res.steps[0].args[1], "//tools:gen");
+    assert.match(res.steps[0].args[2], /^--jobs=\d+$/, "the cap goes after the target, at the end of the option section");
+    assert.ok(!res.steps[0].args.some((a) => /local_ram_resources|local_resources/.test(a)), "no version-specific RAM flag");
   } finally {
     s.cleanup();
   }
@@ -533,7 +535,8 @@ test("exec: custom --executable runs polyglot bazel.cmd without shebang and reco
       { env: s.env, cwd: sub, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    assert.match(res.stdout, /POLYGLOT_BAZEL:build --jobs=\d+ --local_ram_resources=\d+ \/\/platform\/jewel\/\.\.\./);
+    assert.match(res.stdout, /POLYGLOT_BAZEL:build \/\/platform\/jewel\/\.\.\. --jobs=\d+\n/);
+    assert.doesNotMatch(res.stdout, /local_ram_resources|local_resources/, "no Bazel-version-specific RAM flag (#32)");
     assert.ok(res.forcedRunId, "custom executable records a forcedRunId in and by itself");
     assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: "./bazel.cmd" }]);
     const st = readState(s.stateDir);
@@ -547,6 +550,68 @@ test("exec: custom --executable runs polyglot bazel.cmd without shebang and reco
     const later = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--session", "agent-other", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(later.exitCode, 2);
     assert.equal(later.attribution?.[0]?.runId, res.forcedRunId);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec: bazel flags and excludeTargets reach Bazel in order, with ATC's cap last, as a forced run", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), 'echo "ARGS:$*"');
+    const res = await cmdExec(
+      s.stateDir,
+      ["bazel", "test", "//...", "--config", "ci", "--flag", "--test_output=errors", "--flag=--jobs_is_not_this", "--exclude-target", "//slow/...", "--session", "agent-f", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    // --config first, caller flags next, ATC's --jobs last before "--" so neither can loosen it.
+    assert.match(res.stdout, /ARGS:test --config=ci --test_output=errors --jobs_is_not_this --jobs=\d+ -- \/\/\.\.\. -\/\/slow\/\.\.\.\n/);
+    assert.deepEqual(res.overridden, [{ path: "/flags", check: "custom_flags", value: "--test_output=errors --jobs_is_not_this" }]);
+    assert.ok(res.forcedRunId, "flags are a forced run in and by themselves");
+    const st = readState(s.stateDir);
+    assert.equal(st.forcedRuns.length, 1);
+    assert.equal(st.forcedRuns[0].sessionId, "agent-f");
+    assert.match(st.forcedRuns[0].reason, /custom flags \(--test_output=errors --jobs_is_not_this\)/);
+
+    // Exclusions alone are typed, not a forced run.
+    const excl = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--exclude-target", "//slow/...", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    assert.equal(excl.exitCode, 0, excl.error);
+    assert.equal(excl.forcedRunId, null);
+    assert.match(excl.stdout, /ARGS:build --jobs=\d+ -- \/\/\.\.\. -\/\/slow\/\.\.\.\n/);
+
+    // ATC-owned flags are refused before anything runs, even with --force.
+    const marker = path.join(s.root, "ran");
+    script(path.join(s.proj, "bazelw"), `touch ${marker}`);
+    const owned = await cmdExec(
+      s.stateDir,
+      ["bazel", "build", "//...", "--flag", "--local_resources=memory=999999", "--force", "--reason", "need more ram", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(owned.exitCode, 7);
+    assert.equal(owned.errors[0].code, "flag_owned_by_atc");
+    assert.ok(!fs.existsSync(marker));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec: gradle excludeTasks and flags reach the wrapper before ATC's worker cap", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    script(path.join(s.proj, "gradlew"), 'echo "ARGS:$*"');
+    const res = await cmdExec(
+      s.stateDir,
+      ["gradle", "tasks", "build", "--exclude-task", "lint", "--flag", "--scan", "--flag", "-Dorg.gradle.caching=true", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    assert.match(res.stdout, /ARGS:build --exclude-task lint --scan -Dorg\.gradle\.caching=true -Dorg\.gradle\.workers\.max=\d+\n/);
+    assert.ok(res.forcedRunId);
+    const owned = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--flag", "--no-daemon", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    assert.equal(owned.exitCode, 7);
+    assert.equal(owned.errors[0].code, "flag_owned_by_atc");
   } finally {
     s.cleanup();
   }

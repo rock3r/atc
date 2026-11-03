@@ -5,7 +5,7 @@ This document is the source of truth for what ATC 3.x supports. Anything not lis
 ## Principles
 1. **Domain:** device/emulator/simulator management and communication, plus builds. Nothing else.
 2. **No shell, anywhere.** ATC never receives, inspects or runs shell commands. Agents request **allowlisted typed ops**, and ATC builds every invocation itself as literal argv.
-3. **Closed grammar.** A fixed op catalog with closed enums and strict value patterns. There are no free-form arguments and no passthrough flags.
+3. **Closed grammar.** A fixed op catalog with closed enums and strict value patterns. There are no free-form arguments. The one exception is the build `flags` param (§2.1): single shape-checked tokens that ATC never interprets, recorded as a forced run, and never able to touch what ATC owns (resource caps, daemon lifecycle, workspace identity).
 4. **ATC never changes the semantics of a request.** It doesn't split, merge, reorder or coalesce. It only adds **efficiency notices** for next time.
 5. **Refusals explain themselves:** what was unsupported, the supported alternative, and `https://github.com/rock3r/atc/issues`.
 6. **Pessimistic assumptions are reported** as `{assumption, consequence, fix}`.
@@ -29,11 +29,11 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 
 | Op | Params / flags |
 |---|---|
-| `gradle.tasks` | `tasks[]` (any task name/path), run as **one** wrapper invocation · `offline`, `info`, `stacktrace`, `rerunTasks`, `continueAfterFailure`, `properties{}` (`-P`), `executable` |
-| `bazel.build` / `bazel.test` / `bazel.coverage` | `targets[]` · `configs[]`, `testFilter` (test/coverage), `keepGoing`, `executable` |
-| `bazel.run` | `target`, `runArgs[]` (after `--`) · `timeoutSec` **required**, `executable` |
-| `bazel.series` | ordered `series: [{command, targets[], configs[]?, expunge?}]` with `command ∈ {build, test, coverage, clean}` (closed enum; `run` is not allowed in a series) · `executable`. Run exactly as given: one invocation per entry, in order, stopping at the first failure. Batch/MCP only. |
-| `bazel.clean` | `expunge` (bool), `executable` |
+| `gradle.tasks` | `tasks[]` (any task name/path), run as **one** wrapper invocation · `offline`, `info`, `stacktrace`, `rerunTasks`, `continueAfterFailure`, `properties{}` (`-P`), `excludeTasks[]` (`--exclude-task`), `flags[]`, `executable` |
+| `bazel.build` / `bazel.test` / `bazel.coverage` | `targets[]` · `excludeTargets[]` (negative patterns after `--`), `configs[]`, `testFilter` (test/coverage), `keepGoing`, `flags[]`, `executable` |
+| `bazel.run` | `target`, `runArgs[]` (after `--`) · `timeoutSec` **required**, `flags[]`, `executable` |
+| `bazel.series` | ordered `series: [{command, targets[], excludeTargets[]?, configs[]?, flags[]?, expunge?}]` with `command ∈ {build, test, coverage, clean}` (closed enum; `run` is not allowed in a series) · `executable`. Run exactly as given: one invocation per entry, in order, stopping at the first failure. Batch/MCP only. |
+| `bazel.clean` | `expunge` (bool), `flags[]`, `executable` |
 | `bazel.query` | one literal `query` expression · `output ∈ {label, label_kind, xml, proto, streamed_jsonproto, graph, minrank, maxrank, location, package, build}` · required relative `outputFile` · optional `maxOutputBytes` (1…64 MiB, default 64 MiB), `keepGoing`, `executable`, plus the isolation fields below |
 | `bazel.cquery` | one literal `query` expression · `output ∈ {label, starlark, proto, jsonproto, textproto, files, graph}` · required relative `outputFile` · optional `maxOutputBytes`, `keepGoing`, `executable`. Formats Bazel does not implement for cquery (`label_kind`, `xml`, `streamed_jsonproto`) and `transitions` (it needs a companion `--transitions` mode) are rejected. |
 | `xcode.build` / `xcode.test` / `xcode.buildForTesting` / `xcode.testWithoutBuilding` / `xcode.archive` / `xcode.clean` | `scheme`, `workspaceFile` or `project` · `configuration`, `testPlan`, `onlyTesting[]`, `skipTesting[]`, `derivedDataPath`, `testDestination ∈ {simulator, macos}` |
@@ -42,7 +42,13 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 **ATC derives:**
 - the executable: by default, the project's Gradle wrapper (`gradlew` / `gradlew.bat`, found by walking up from `workspace`/cwd) and Bazel as `./bazelw` at the workspace root, else `bazelisk`, else `bazel`; `xcodebuild`. Gradle and Bazel ops also accept an explicit `executable` (e.g. `./bazel.cmd` in `intellij-community` or a custom Gradle wrapper), which acts as a force-like override in and by itself (echoed in `overridden`, logged to `state.forcedRuns`, and attributed on later workspace failures);
 - device vs pure build (Gradle device task names such as `connected*`, `install*`, `uninstall*`; Xcode `test`/`test-without-building` unless `testDestination: "macos"`);
-- worker/job/RAM limits (`-Dorg.gradle.workers.max`, `--jobs` + `--local_ram_resources`, `-jobs`), the workspace resource key, the Bazel output base, and the device destination/serial from the claim.
+- worker/job limits (`-Dorg.gradle.workers.max`, Bazel `--jobs`, `-jobs`), the workspace resource key, the Bazel output base, and the device destination/serial from the claim. ATC injects only caps that are stable across every supported tool version, so it never needs to detect the version. RAM is enforced by ATC's own admission before the build starts; Bazel's RAM flag changed incompatibly across majors (`--local_ram_resources` is gone in Bazel 9, `--local_resources=memory=` does not exist in Bazel 7), so ATC does not inject it. ATC's caps are appended last (for Bazel: at the end of the command options, before `--`), so `--config`, `.bazelrc` and caller `flags` cannot loosen them.
+
+**Flags.** Gradle and Bazel build ops accept `flags[]` for tool options the catalog does not model. ATC does not keep a list of valid flags per tool version; the tool rejects flags it does not know. ATC checks only:
+- **shape:** each entry is one argv token with any value attached by `=`. Bazel: `--name` or `--name=value`. Gradle: `--name`, `--name=value` or `-Dkey=value`. Values use the transport-safe charset. Short options and separate-value options are rejected, so a flag can never consume the next token. Bazel flags are placed after the verb (after `configs`), so startup options such as `--output_base` or `--bazelrc` cannot be expressed: Bazel rejects them in that position;
+- **ownership:** flags that would defeat what ATC coordinates are refused, even with `--force`. Bazel: `--jobs`, `--local_resources`, `--local_ram_resources`, `--local_cpu_resources` (and their `--no` forms), and `--config` (use `configs`). Gradle: `--max-workers`, `-Dorg.gradle.workers.max`, daemon lifecycle (`--daemon`, `--no-daemon`, `--foreground`, `--stop`, `--status`, `-Dorg.gradle.daemon`), `--continuous`, `-Dorg.gradle.jvmargs` (daemon reuse and heap accounting; use `gradle.properties`), `--project-dir` (use `workspace`), `--gradle-user-home` / `-Dgradle.user.home`, and `--exclude-task` (use `excludeTasks`).
+
+Everything else is allowed, including options that run tools (e.g. Bazel `--run_under`), because builds already run arbitrary project code. Passing `flags` is a force-like override in and by itself (§5).
 
 **Serialization:** builds on the same workspace key (`gradle:<root>`, `bazel:ws:<root>`, `xcode:<root>`, `xcode:dd:<derivedData>`) are serialized, and heavy builds share the host build-slot pool. A clean therefore never races another build in the same workspace. Multi-invocation ops (`bazel.series`) hold their slot and locks for the whole run. `bazel.query` and `bazel.cquery` use that same workspace lock and heavy slot; they do not bypass admission.
 
@@ -87,7 +93,6 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 ### 2.5 Candidates, not in v1 (added only on request)
 - **Android:** `stop`, `push`/`pull`, `screenrecord`, `setting`, `input`, `instrument`, launch-by-intent, streaming logcat.
 - **iOS:** `recordVideo`, `location`, `log`.
-- **Bazel:** target exclusion patterns.
 
 ### 2.6 Not expressible, by design
 - Arbitrary `adb shell` or `simctl spawn`, `adb kill-server`/`reboot`/`emu kill`, and `simctl boot/shutdown/erase/delete` outside `atc claim`/`atc free`/`atc exec ios delete`.
@@ -169,9 +174,11 @@ All systems share the concepts **run a task**, **run a series of tasks** and **c
 
 **`executable` (Gradle and Bazel ops):** specifying a custom wrapper/executable (`--executable <path>` / `"executable": "<path>"`, such as `./bazel.cmd`) is a force-like override in and by itself. It does not require `--force`, and carries the same "you take responsibility" notice, audit entry, and failure attribution.
 
+**`flags` (Gradle and Bazel build ops):** caller-supplied tool flags (`--flag <token>` / `"flags": [...]`, §2.1) are a force-like override in the same way: echoed in `overridden` as `custom_flags`, recorded in `state.forcedRuns`, and attributed on later workspace failures. `--force` does not unlock a malformed or ATC-owned flag.
+
 **Never overrides:**
 - shell, unknown ops or params;
-- extra arguments (**there is no `extraArgs`**), or any value starting with `-`;
+- extra arguments outside `flags` (**there is no `extraArgs`**), or any other value starting with `-`;
 - the device-side transport charset and the Windows batch-transport charset;
 - device selectors or claims, locks, slots, and RAM admission;
 - hard-denied actions (§2.1).

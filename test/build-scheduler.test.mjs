@@ -345,11 +345,12 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
   const caps = { jobsLimit: 4, reservedRamMb: 4096 };
   assert.deepEqual(
     prepareOpChildInvocation({ cmd: "bazel", args: ["build", "//app:main"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
-    ["build", "--jobs=4", "--local_ram_resources=4096", "//app:main"],
+    ["build", "//app:main", "--jobs=4"],
+    "only the version-stable --jobs cap is injected (no Bazel RAM flag, #32)",
   );
   assert.deepEqual(
     prepareOpChildInvocation({ cmd: "bazel", args: ["run", "//tools:gen", "--", "--flag"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
-    ["run", "--jobs=4", "--local_ram_resources=4096", "//tools:gen", "--", "--flag"],
+    ["run", "//tools:gen", "--jobs=4", "--", "--flag"],
     "resource flags stay before the run args separator",
   );
   assert.deepEqual(
@@ -369,7 +370,29 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
     ["-scheme", "App", "clean"],
   );
   const minCaps = prepareOpChildInvocation({ cmd: "bazel", args: ["test", "//..."] }, { baseEnv: {}, buildLease: { jobsLimit: 1, reservedRamMb: 10 }, tool: "bazel" });
-  assert.deepEqual(minCaps.args, ["test", "--jobs=2", "--local_ram_resources=1024", "//..."], "caps are clamped to sane minimums");
+  assert.deepEqual(minCaps.args, ["test", "//...", "--jobs=2"], "caps are clamped to sane minimums");
+
+  // Startup options before the subcommand: the subcommand is located, not assumed at args[0].
+  assert.deepEqual(
+    prepareOpChildInvocation(
+      { cmd: "bazel", args: ["--nosystem_rc", "--output_user_root", "/tmp/r", "build", "//app:main"] },
+      { baseEnv: {}, buildLease: caps, tool: "bazel" },
+    ).args,
+    ["--nosystem_rc", "--output_user_root", "/tmp/r", "build", "//app:main", "--jobs=4"],
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "bazel", args: ["--nosystem_rc", "query", "//..."] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
+    ["--nosystem_rc", "query", "//..."],
+    "non-resource subcommands behind startup options stay untouched",
+  );
+  // --config and caller flags come first; ATC's cap is last so it wins (Bazel: last value wins).
+  assert.deepEqual(
+    prepareOpChildInvocation(
+      { cmd: "bazel", args: ["test", "--config=ci", "--test_output=errors", "--", "//...", "-//slow/..."] },
+      { baseEnv: {}, buildLease: caps, tool: "bazel" },
+    ).args,
+    ["test", "--config=ci", "--test_output=errors", "--jobs=4", "--", "//...", "-//slow/..."],
+  );
 
   const android = prepareOpChildInvocation(
     { cmd: "/repo/gradlew", args: ["connectedCheck"] },
