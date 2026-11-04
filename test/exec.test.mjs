@@ -566,8 +566,8 @@ test("exec: bazel flags and excludeTargets reach Bazel in order, with ATC's cap 
       { env: s.env, cwd: s.proj, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    // --config first, caller flags next, ATC's --jobs last before "--" so neither can loosen it.
-    assert.match(res.stdout, /ARGS:test --config=ci --test_output=errors --jobs_is_not_this --jobs=\d+ -- \/\/\.\.\. -\/\/slow\/\.\.\.\n/);
+    // --config first, caller flags next, then targets, ATC's --jobs last before "--" so neither can loosen it.
+    assert.match(res.stdout, /ARGS:test --config=ci --test_output=errors --jobs_is_not_this \/\/\.\.\. --jobs=\d+ -- -\/\/slow\/\.\.\.\n/);
     assert.deepEqual(res.overridden, [{ path: "/flags", check: "custom_flags", value: "--test_output=errors --jobs_is_not_this" }]);
     assert.ok(res.forcedRunId, "flags are a forced run in and by themselves");
     const st = readState(s.stateDir);
@@ -591,7 +591,7 @@ test("exec: bazel flags and excludeTargets reach Bazel in order, with ATC's cap 
     const excl = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--exclude-target", "//slow/...", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(excl.exitCode, 0, excl.error);
     assert.equal(excl.forcedRunId, null);
-    assert.match(excl.stdout, /ARGS:build --jobs=\d+ -- \/\/\.\.\. -\/\/slow\/\.\.\.\n/);
+    assert.match(excl.stdout, /ARGS:build \/\/\.\.\. --jobs=\d+ -- -\/\/slow\/\.\.\.\n/);
 
     // ATC-owned flags are refused before anything runs, even with --force.
     const marker = path.join(s.root, "ran");
@@ -619,7 +619,7 @@ test("exec: gradle excludeTasks and flags reach the wrapper before ATC's worker 
       { env: s.env, cwd: s.proj, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    assert.match(res.stdout, /ARGS:build --exclude-task lint --scan -Dorg\.gradle\.caching=true -Dorg\.gradle\.workers\.max=\d+\n/);
+    assert.match(res.stdout, /ARGS:--scan -Dorg\.gradle\.caching=true build --exclude-task lint -Dorg\.gradle\.workers\.max=\d+\n/);
     assert.ok(res.forcedRunId);
     const owned = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--flag", "--no-daemon", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(owned.exitCode, 7);

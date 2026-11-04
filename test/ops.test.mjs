@@ -444,7 +444,7 @@ test("bazel flags and excludeTargets: placement, owned flags and forced-run acco
   // negative patterns after "--" so "-//x" is never read as an option.
   assert.deepEqual(
     OPS["bazel.test"].invocations({ targets: ["//..."], excludeTargets: ["//slow/...", "@ext//x:y"], configs: ["ci"], flags: ["--test_output=errors"] }, ctx)[0].args,
-    ["test", "--config=ci", "--test_output=errors", "--", "//...", "-//slow/...", "-@ext//x:y"],
+    ["test", "--config=ci", "--test_output=errors", "//...", "--", "-//slow/...", "-@ext//x:y"],
   );
   assert.deepEqual(OPS["bazel.build"].invocations({ targets: ["//a"] }, ctx)[0].args, ["build", "//a"], "no -- without exclusions");
   assert.deepEqual(
@@ -456,7 +456,7 @@ test("bazel flags and excludeTargets: placement, owned flags and forced-run acco
       { series: [{ command: "clean", flags: ["--async"] }, { command: "test", targets: ["//..."], excludeTargets: ["//slow/..."], flags: ["--flaky_test_attempts=2"] }] },
       ctx,
     ).map((i) => i.args),
-    [["clean", "--async"], ["test", "--flaky_test_attempts=2", "--", "//...", "-//slow/..."]],
+    [["clean", "--async"], ["test", "--flaky_test_attempts=2", "//...", "--", "-//slow/..."]],
   );
   assert.deepEqual(OPS["bazel.clean"].invocations({ expunge: true, flags: ["--async"] }, ctx)[0].args, ["clean", "--expunge", "--async"]);
 
@@ -498,7 +498,8 @@ test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting
     { tasks: ["build"], excludeTasks: ["lint", ":app:test"], flags: ["--scan", "-Dorg.gradle.caching=true"], properties: { a: "b" } },
     { cwd: root, platform: "darwin" },
   );
-  assert.deepEqual(inv, { cmd: wrapper, args: ["build", "-Pa=b", "--exclude-task", "lint", "--exclude-task", ":app:test", "--scan", "-Dorg.gradle.caching=true"], cwd: root });
+  // Caller flags first, so a bare value-taking flag can only consume a caller task (never ATC's cap).
+  assert.deepEqual(inv, { cmd: wrapper, args: ["--scan", "-Dorg.gradle.caching=true", "build", "-Pa=b", "--exclude-task", "lint", "--exclude-task", ":app:test"], cwd: root });
 
   const ok = validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["lint"], flags: ["--scan"] });
   assert.deepEqual(ok.errors, []);
@@ -507,12 +508,13 @@ test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting
 
   const owned = validateOpParams("gradle.tasks", {
     tasks: ["build"],
-    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--gradle-user-home=/y", "--exclude-task=lint"],
+    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--gradle-user-home=/y", "--system-prop=org.gradle.jvmargs=-Xmx64g", "--system-prop=org.gradle.workers.max=64", "--system-prop=gradle.user.home=/z", "--exclude-task=lint"],
   });
   assert.deepEqual(
     owned.errors.map((e) => e.code),
-    [...new Array(9).fill("flag_owned_by_atc"), "flag_has_param"],
+    [...new Array(12).fill("flag_owned_by_atc"), "flag_has_param"],
   );
+  assert.deepEqual(validateOpParams("gradle.tasks", { tasks: ["build"], flags: ["--system-prop=org.gradle.caching=true"] }).errors, [], "other system properties stay allowed");
   assert.deepEqual(owned.overridden, []);
   assert.ok(owned.errors.every((e) => e.hint));
   assert.ok(validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["-x"] }).errors.length > 0, "excluded tasks use the task pattern");

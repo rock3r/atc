@@ -60,11 +60,13 @@ const BAZEL_EXCLUDE_PARAM = {
 };
 
 // Bazel target patterns, with exclusions as negative patterns after "--" so a leading "-" is never
-// read as an option.
+// read as an option. Positive targets stay before "--": callers' flags are placed right before the
+// targets, so a value-taking flag passed without "=value" (e.g. a bare --test_arg) can only consume
+// a caller target, never ATC's resource cap, which is inserted after the targets (src/spawn.mjs).
 function bazelTargetArgs(targets, excludeTargets) {
   const excludes = excludeTargets || [];
   if (excludes.length === 0) return [...targets];
-  return ["--", ...targets, ...excludes.map((t) => `-${t}`)];
+  return [...targets, "--", ...excludes.map((t) => `-${t}`)];
 }
 
 const XCODE_COMMON = {
@@ -382,7 +384,10 @@ export const OPS = Object.freeze({
     deviceCoupled: (p) => Array.isArray(p.tasks) && p.tasks.some((t) => isGradleDeviceTaskName(String(t).split(":").pop())),
     invocations(params, ctx) {
       const { cmd, cwd } = resolveGradleExecutable(params, ctx);
-      const args = [...params.tasks];
+      // Caller flags go first, before the tasks: a value-taking flag passed without "=value"
+      // (e.g. a bare --system-prop) can then only consume a caller task, never an ATC token such
+      // as the worker cap appended at the end (src/spawn.mjs).
+      const args = [...(params.flags || []), ...params.tasks];
       if (params.offline) args.push("--offline");
       if (params.info) args.push("--info");
       if (params.stacktrace) args.push("--stacktrace");
@@ -390,7 +395,6 @@ export const OPS = Object.freeze({
       if (params.continueAfterFailure) args.push("--continue");
       for (const [k, v] of Object.entries(params.properties || {})) args.push(`-P${k}=${v}`);
       for (const t of params.excludeTasks || []) args.push("--exclude-task", t);
-      args.push(...(params.flags || []));
       return [{ cmd, args, cwd }];
     },
     check(params) {

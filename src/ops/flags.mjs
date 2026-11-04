@@ -39,6 +39,9 @@ const GRADLE_USE_PARAM = new Map([["--exclude-task", "excludeTasks"]]);
 
 function flagName(flag) {
   const s = String(flag);
+  // Gradle's long alias for -D: --system-prop=key=value is checked as -Dkey.
+  const sysProp = /^--system-prop=([^=]*)/.exec(s);
+  if (sysProp) return `-D${sysProp[1]}`;
   const eq = s.indexOf("=");
   return eq === -1 ? s : s.slice(0, eq);
 }

@@ -388,10 +388,10 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
   // --config and caller flags come first; ATC's cap is last so it wins (Bazel: last value wins).
   assert.deepEqual(
     prepareOpChildInvocation(
-      { cmd: "bazel", args: ["test", "--config=ci", "--test_output=errors", "--", "//...", "-//slow/..."] },
+      { cmd: "bazel", args: ["test", "--config=ci", "--test_output=errors", "//...", "--", "-//slow/..."] },
       { baseEnv: {}, buildLease: caps, tool: "bazel" },
     ).args,
-    ["test", "--config=ci", "--test_output=errors", "--jobs=4", "--", "//...", "-//slow/..."],
+    ["test", "--config=ci", "--test_output=errors", "//...", "--jobs=4", "--", "-//slow/..."],
   );
 
   // bazel.series end to end: planned argv per entry, then ATC's cap after configs and caller flags.
@@ -415,10 +415,17 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
       [
         ["clean", "--async"],
         ["build", "--config=ci", "--keep_going", "//app", "--jobs=4"],
-        ["test", "--test_output=errors", "--jobs=4", "--", "//...", "-//slow/..."],
+        ["test", "--test_output=errors", "//...", "--jobs=4", "--", "-//slow/..."],
       ],
     );
     assert.deepEqual(plan.overridden.map((o) => o.path), ["/series/0/flags", "/series/1/flags", "/series/2/flags"]);
+
+    // A value-taking flag passed without "=value" makes the tool consume the next token. That token
+    // is always a caller target or task, never ATC's cap, so the cap cannot be swallowed.
+    const bare = planOp("bazel.test", { targets: ["//a"], excludeTargets: ["//slow/..."], flags: ["--test_arg"] }, { cwd: seriesWs, env: { PATH: "" } });
+    const bareArgs = prepareOpChildInvocation(bare.makeInvocations(null)[0], { baseEnv: {}, buildLease: caps, tool: "bazel" }).args;
+    assert.deepEqual(bareArgs, ["test", "--test_arg", "//a", "--jobs=4", "--", "-//slow/..."]);
+    assert.equal(bareArgs[bareArgs.indexOf("--test_arg") + 1], "//a");
   } finally {
     fs.rmSync(seriesWs, { recursive: true, force: true });
   }
