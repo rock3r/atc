@@ -206,6 +206,20 @@ export function validateOpParams(opName, params, { force = false, basePath = "" 
   if (errors.length === 0 && typeof op.check === "function") {
     errors.push(...op.check(params).map((e) => ({ ...e, path: `${basePath}${e.path}` })));
   }
+  // Caller-supplied tool flags are a force-like override in and by themselves, like executable.
+  // Only flag lists that passed every check (shape and ATC-owned flags) are recorded.
+  const flagSites = [];
+  if (Array.isArray(params?.flags)) flagSites.push([`${basePath}/flags`, params.flags]);
+  if (Array.isArray(params?.series)) {
+    params.series.forEach((entry, i) => {
+      if (Array.isArray(entry?.flags)) flagSites.push([`${basePath}/series/${i}/flags`, entry.flags]);
+    });
+  }
+  for (const [p, flags] of flagSites) {
+    if (flags.length > 0 && !errors.some((e) => e.path === p || e.path.startsWith(`${p}/`))) {
+      overridden.push({ path: p, check: "custom_flags", value: flags.map(String).join(" ") });
+    }
+  }
   if (op.system === "xcode" && params?.workspaceFile && params?.project) {
     errors.push(err(`${basePath}/project`, "conflict", "Pass either workspaceFile or project, not both."));
   }
@@ -342,8 +356,27 @@ export function parseOpArgv(tokens) {
     }
     const pKey = paramKeyFor(name);
     const allowLeadingDash = Boolean(pKey && op.params[pKey]?.pattern && PATTERNS[op.params[pKey].pattern]?.allowLeadingDash);
+    // `--flag --json`: a dash-leading value that is itself an ATC option is almost certainly a
+    // missing value, so refuse instead of silently passing --json to the tool.
+    const isAtcOptionToken = (t) => {
+      if (!t.startsWith("--")) return false;
+      const n = camelCase(t.slice(2).split("=")[0]);
+      const positive = /^no[A-Z]/.test(n) ? n[2].toLowerCase() + n.slice(3) : n;
+      return Boolean(EXEC_LEVEL_FLAGS[n] || EXEC_LEVEL_FLAGS[positive] || paramKeyFor(n) || paramKeyFor(positive) || n === "ramMb");
+    };
     const takeValue = () => {
       if (inlineVal !== undefined) return inlineVal;
+      if (i + 1 < rest.length && allowLeadingDash && isAtcOptionToken(rest[i + 1])) {
+        errors.push(
+          err(
+            `/${name}`,
+            "ambiguous_value",
+            `--${rawName} is followed by ${JSON.stringify(rest[i + 1])}, which is an atc option, not a value.`,
+            `Attach the value with "=", e.g. --${rawName}=${rest[i + 1]}, if you really mean to pass it through.`,
+          ),
+        );
+        return null;
+      }
       if (i + 1 < rest.length && (allowLeadingDash || !rest[i + 1].startsWith("--"))) return rest[++i];
       errors.push(err(`/${name}`, "missing_value", `--${rawName} requires a value.`));
       return null;

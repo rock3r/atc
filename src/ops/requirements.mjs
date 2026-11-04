@@ -62,6 +62,11 @@ export function resolveOpBuildRequirements(op, params, invocations, { env = proc
   merged.kind = deviceCoupled ? "device_coupled_build" : "pure_build";
   merged.targetPlatform = deviceCoupled ? op.devicePlatform || null : null;
   if (params.ramMb) merged.requestedHeapMb = Math.max(merged.requestedHeapMb || 0, params.ramMb);
+  // Caller-supplied Gradle flags are opaque to ATC and some select a different daemon (e.g.
+  // --priority, -Dorg.gradle.java.home). ATC cannot prove an idle daemon is compatible, so the
+  // build gets no warm-daemon RAM credit and is admitted as cold. Bazel flags are command options
+  // only (startup options cannot be expressed), and they never select a different server.
+  if (op.system === "gradle" && Array.isArray(params.flags) && params.flags.length > 0) merged.disablesDaemon = true;
   delete merged.reason;
   delete merged.rejectReason;
   return merged;

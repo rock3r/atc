@@ -383,6 +383,18 @@ export function planOp(opName, params, { force = false, reason = null, cwd = pro
   };
 }
 
+// Reason recorded for a forced run when the caller gave none: name the force-like overrides.
+function defaultForcedReason(overridden, params) {
+  const parts = [];
+  if (overridden.some((o) => o.check === "custom_executable")) parts.push(`custom executable (${params.executable})`);
+  const flagSites = overridden.filter((o) => o.check === "custom_flags");
+  if (flagSites.length > 0) {
+    const describe = (o) => (/\/series\/\d+\/flags$/.test(o.path) ? `${o.path.replace(/^.*\/series\//, "series[").replace(/\/flags$/, "]")}: ${o.value}` : o.value);
+    parts.push(`custom flags (${flagSites.map(describe).join("; ")})`);
+  }
+  return parts.join(", ") || "forced run";
+}
+
 const RUNNER_FLAG_KEYS = ["claim", "serial", "udid", "android", "ios", "wait", "session", "anchorPid", "type", "api", "os", "kind", "play", "abi", "services", "ttl"];
 
 // Execute a typed op. deps = { runOpInvocations, cmdSnapshot, readConfig, recordForcedRun }.
@@ -426,7 +438,7 @@ export async function execOp(stateDir, request, deps, options = {}) {
     const effectiveReason =
       flags.reason && String(flags.reason).trim()
         ? String(flags.reason).trim()
-        : `custom executable (${params.executable})`;
+        : defaultForcedReason(plan.overridden, params);
     forcedRunId = deps.recordForcedRun
       ? deps.recordForcedRun(
           { op: opName, reason: effectiveReason, overridden: plan.overridden, cwd: effectiveWorkspaceDir },

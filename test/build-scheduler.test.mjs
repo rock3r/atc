@@ -274,6 +274,19 @@ test("typed build ops derive device coupling, platform and workspace keys from t
     assert.equal(computeColdBuildRamDemandMb(ramHint.buildReqs, 3072), 6144);
     assert.equal(computeColdBuildRamDemandMb(pure.buildReqs, 3072), 3072);
 
+    // Caller Gradle flags may select a different daemon (--priority, -Dorg.gradle.java.home, ...):
+    // no warm-daemon credit, admitted as cold. Bazel command flags never select another server.
+    assert.notEqual(pure.buildReqs.disablesDaemon, true);
+    const withFlags = planOp("gradle.tasks", { tasks: ["build"], flags: ["--priority=low"] }, { cwd: wsDir });
+    assert.deepEqual(withFlags.errors, []);
+    assert.equal(withFlags.buildReqs.disablesDaemon, true);
+    assert.deepEqual(
+      probeWarmBuildDaemons(withFlags.buildReqs, { runner: () => ({ stdout: `4242 java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.14\n` }) }),
+      { warm: false, daemonPids: [] },
+    );
+    const bazelFlags = planOp("bazel.build", { targets: ["//..."], flags: ["--keep_going"] }, { cwd: wsDir, env: { PATH: "" } });
+    assert.notEqual(bazelFlags.buildReqs.disablesDaemon, true);
+
     for (const [opName, params] of [
       ["bazel.build", { targets: ["//app:main"] }],
       ["bazel.clean", { expunge: true }],
@@ -323,11 +336,16 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
     },
   );
   assert.deepEqual(inv.args, [
+    "-Dorg.gradle.workers.max=4",
     "assembleDebug",
     "-Pfilter=a|b;c&&d",
     "-Pnote=-Dorg.gradle.workers.max=99",
-    "-Dorg.gradle.workers.max=4",
   ]);
+  // Caller flags come last; a value-taking flag without "=value" has no ATC token after it to consume.
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "/repo/gradlew", args: ["test", "--tests=example.Test", "--init-script"] }, { baseEnv: {}, buildLease: { jobsLimit: 4 }, tool: "gradle" }).args,
+    ["-Dorg.gradle.workers.max=4", "test", "--tests=example.Test", "--init-script"],
+  );
   assert.equal(inv.env.ATC_BUILD_OP_ID, "op_fresh");
   assert.equal(inv.env.ATC_BUILD_OP_NONCE, "nonce_fresh");
   assert.equal(inv.env.ATC_BUILD_ID, "build_123");
@@ -345,11 +363,12 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
   const caps = { jobsLimit: 4, reservedRamMb: 4096 };
   assert.deepEqual(
     prepareOpChildInvocation({ cmd: "bazel", args: ["build", "//app:main"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
-    ["build", "--jobs=4", "--local_ram_resources=4096", "//app:main"],
+    ["build", "//app:main", "--jobs=4"],
+    "only the version-stable --jobs cap is injected (no Bazel RAM flag, #32)",
   );
   assert.deepEqual(
     prepareOpChildInvocation({ cmd: "bazel", args: ["run", "//tools:gen", "--", "--flag"] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
-    ["run", "--jobs=4", "--local_ram_resources=4096", "//tools:gen", "--", "--flag"],
+    ["run", "//tools:gen", "--jobs=4", "--", "--flag"],
     "resource flags stay before the run args separator",
   );
   assert.deepEqual(
@@ -369,7 +388,65 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
     ["-scheme", "App", "clean"],
   );
   const minCaps = prepareOpChildInvocation({ cmd: "bazel", args: ["test", "//..."] }, { baseEnv: {}, buildLease: { jobsLimit: 1, reservedRamMb: 10 }, tool: "bazel" });
-  assert.deepEqual(minCaps.args, ["test", "--jobs=2", "--local_ram_resources=1024", "//..."], "caps are clamped to sane minimums");
+  assert.deepEqual(minCaps.args, ["test", "//...", "--jobs=2"], "caps are clamped to sane minimums");
+
+  // Startup options before the subcommand: the subcommand is located, not assumed at args[0].
+  assert.deepEqual(
+    prepareOpChildInvocation(
+      { cmd: "bazel", args: ["--nosystem_rc", "--output_user_root", "/tmp/r", "build", "//app:main"] },
+      { baseEnv: {}, buildLease: caps, tool: "bazel" },
+    ).args,
+    ["--nosystem_rc", "--output_user_root", "/tmp/r", "build", "//app:main", "--jobs=4"],
+  );
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "bazel", args: ["--nosystem_rc", "query", "//..."] }, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args,
+    ["--nosystem_rc", "query", "//..."],
+    "non-resource subcommands behind startup options stay untouched",
+  );
+  // --config and caller flags come first; ATC's cap is last so it wins (Bazel: last value wins).
+  assert.deepEqual(
+    prepareOpChildInvocation(
+      { cmd: "bazel", args: ["test", "--config=ci", "--test_output=errors", "//...", "--", "-//slow/..."] },
+      { baseEnv: {}, buildLease: caps, tool: "bazel" },
+    ).args,
+    ["test", "--config=ci", "--test_output=errors", "//...", "--jobs=4", "--", "-//slow/..."],
+  );
+
+  // bazel.series end to end: planned argv per entry, then ATC's cap after configs and caller flags.
+  const seriesWs = fs.mkdtempSync(path.join(os.tmpdir(), "atc-series-caps-"));
+  try {
+    fs.writeFileSync(path.join(seriesWs, "MODULE.bazel"), "");
+    const plan = planOp(
+      "bazel.series",
+      {
+        series: [
+          { command: "clean", flags: ["--async"] },
+          { command: "build", targets: ["//app"], configs: ["ci"], flags: ["--keep_going"] },
+          { command: "test", targets: ["//..."], excludeTargets: ["//slow/..."], flags: ["--test_output=errors"] },
+        ],
+      },
+      { cwd: seriesWs, env: { PATH: "" } },
+    );
+    assert.deepEqual(plan.errors, []);
+    assert.deepEqual(
+      plan.makeInvocations(null).map((i) => prepareOpChildInvocation(i, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args),
+      [
+        ["clean", "--async"],
+        ["build", "--config=ci", "--keep_going", "//app", "--jobs=4"],
+        ["test", "--test_output=errors", "//...", "--jobs=4", "--", "-//slow/..."],
+      ],
+    );
+    assert.deepEqual(plan.overridden.map((o) => o.path), ["/series/0/flags", "/series/1/flags", "/series/2/flags"]);
+
+    // A value-taking flag passed without "=value" makes the tool consume the next token. That token
+    // is always a caller target or task, never ATC's cap, so the cap cannot be swallowed.
+    const bare = planOp("bazel.test", { targets: ["//a"], excludeTargets: ["//slow/..."], flags: ["--test_arg"] }, { cwd: seriesWs, env: { PATH: "" } });
+    const bareArgs = prepareOpChildInvocation(bare.makeInvocations(null)[0], { baseEnv: {}, buildLease: caps, tool: "bazel" }).args;
+    assert.deepEqual(bareArgs, ["test", "--test_arg", "//a", "--jobs=4", "--", "-//slow/..."]);
+    assert.equal(bareArgs[bareArgs.indexOf("--test_arg") + 1], "//a");
+  } finally {
+    fs.rmSync(seriesWs, { recursive: true, force: true });
+  }
 
   const android = prepareOpChildInvocation(
     { cmd: "/repo/gradlew", args: ["connectedCheck"] },
@@ -1826,7 +1903,7 @@ test("exec gradle tasks coordinates pure builds via a build lease and writes str
       inventory: hostInventory(),
     });
     assert.equal(execRes.exitCode, 0, execRes.error);
-    assert.match(execRes.stdout, /ARGS:assembleDebug -Dorg\.gradle\.workers\.max=\d+/);
+    assert.match(execRes.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ assembleDebug/);
     assert.match(execRes.stdout, /OP:\S+/, "child receives its build op identity");
 
     const afterState = readState(s.stateDir);
@@ -1966,7 +2043,7 @@ test("exec serializes concurrent builds on the same workspace key", { skip: !pos
   const s = setupProject();
   try {
     const log = path.join(s.root, "order.log");
-    script(path.join(s.proj, "gradlew"), `echo "start $1" >> ${log}; sleep 1; echo "end $1" >> ${log}`);
+    script(path.join(s.proj, "gradlew"), `echo "start $2" >> ${log}; sleep 1; echo "end $2" >> ${log}`);
     // Each waiter runs in its own process, as real agents do (the in-process queue wait is synchronous).
     const cliUrl = new URL("../src/cli.mjs", import.meta.url).href;
     const run = (task, session) =>
@@ -2183,7 +2260,7 @@ test("batch runs typed build steps in dependency order and rejects invalid plans
   const s = setupProject();
   try {
     const orderLog = path.join(s.root, "dag-order.txt");
-    script(path.join(s.proj, "gradlew"), `echo "$1" >> ${orderLog}`);
+    script(path.join(s.proj, "gradlew"), `echo "$2" >> ${orderLog}`);
     const run = (plan, flags = {}) =>
       cmdBatch(s.stateDir, { session: "sess-batch", json: true, ...flags }, { env: s.env, cwd: s.proj, plan, inventory: hostInventory() });
 

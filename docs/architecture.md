@@ -36,7 +36,7 @@ flowchart LR
 2. **Validate.** `validateOpParams` checks unknown fields, types, closed enums, ranges and value patterns (`src/ops/patterns.mjs`), collecting every problem as `{path, code, message, hint}`. `--force --reason` overrides only forceable build-value patterns, and never a leading `-`.
 3. **Plan.** `planOp` resolves the build executable (Gradle wrapper walking up from `workspace`/cwd; `./bazelw` → `bazelisk` → `bazel`; `xcodebuild`), checks the host OS and the Windows batch contract, collects efficiency notices, and derives build requirements (`src/ops/requirements.mjs`: workspace resource keys, Gradle heap/daemon properties, Bazel output base) by calling `resolveBuildResources` on the generated argv.
 4. **Admit.** `runOpInvocations` reserves a build slot and workspace lock, checks RAM, finds or co-allocates the device lease, and queues when busy, all in short `withStateTransaction` critical sections.
-5. **Run.** Invocations are generated against the admitted lease (`adb -s <serial>`, `xcrun simctl <verb> <udid>`, `-destination id=<udid>`), resource caps are appended (`-Dorg.gradle.workers.max`, `--jobs`/`--local_ram_resources`, `-jobs`), and each invocation is spawned in order with lease/session env vars, a heartbeat, optional `timeoutSec`, and stop-at-first-failure. Build leases enter a short `"draining"` cooldown when aborted.
+5. **Run.** Invocations are generated against the admitted lease (`adb -s <serial>`, `xcrun simctl <verb> <udid>`, `-destination id=<udid>`), resource caps are appended (`-Dorg.gradle.workers.max`, Bazel `--jobs` at the end of the command options before `--`, `-jobs`; only version-stable caps, so no tool-version detection is needed and RAM stays with ATC's admission), and each invocation is spawned in order with lease/session env vars, a heartbeat, optional `timeoutSec`, and stop-at-first-failure. Build leases enter a short `"draining"` cooldown when aborted.
 
 `atc batch` runs the same pipeline per step, sequentially in topological order, with per-step `cwd`/`env`, claims that are held for downstream `claim: {reuse}` consumers and renewed while held, and dependents skipped on failure.
 
@@ -59,7 +59,7 @@ Android ops that need a remote shell (`launch`, `clear-data`, `permission`, `pro
 | Module | Path | Responsibility |
 |---|---|---|
 | CLI entrypoint | `bin/atc.mjs`, `src/cli.mjs` | Flag parsing and command handlers (`guide`, `claim`, `free`, `renew`, `snapshot`, `exec`, `batch`, `status`, `config`, `gc`, `hook`, `mcp`), and the internal runner `runOpInvocations`. |
-| Op catalog | `src/ops/catalog.mjs`, `src/ops/patterns.mjs` | Closed list of typed ops, their params, value patterns, invocation templates and notices. |
+| Op catalog | `src/ops/catalog.mjs`, `src/ops/patterns.mjs`, `src/ops/flags.mjs` | Closed list of typed ops, their params, value patterns, invocation templates and notices; the ATC-owned flag policy for caller `flags`. |
 | Validation | `src/validate.mjs` | CLI op parsing, param validation, batch plan validation (structure, deps, cycles, claims). |
 | Exec front-end | `src/exec.mjs` | `planOp`, `execOp`, Windows contract, `--brief` logs, forced-run attribution, `atc exec --help`. |
 | Batch executor | `src/batch.mjs` | Sequential DAG execution, claim reuse and release, `--validate` dry runs. |

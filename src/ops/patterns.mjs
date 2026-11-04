@@ -130,6 +130,21 @@ export const PATTERNS = Object.freeze({
     forceable: false,
     allowLeadingDash: true,
   },
+  // Caller-supplied tool flags (see docs/scope.md §2.1 "Flags"). The shape is checked here;
+  // whether the flag exists is left to the tool itself, so ATC never tracks per-version flag lists.
+  // One argv token each, value attached with "=", so a flag can never swallow the next token.
+  bazelFlag: {
+    re: /^--[a-z][a-z0-9_]*(=[A-Za-z0-9_.:/@+=,-]{0,512})?$/,
+    label: "a Bazel command option as one token (--name or --name=value; value uses [A-Za-z0-9_.:/@+=,-])",
+    forceable: false,
+    allowLeadingDash: true,
+  },
+  gradleFlag: {
+    re: /^(--[a-z][a-z0-9-]*|-D[A-Za-z0-9_.-]{1,128})(=[A-Za-z0-9_.:/@+=,-]{0,512})?$/,
+    label: "a Gradle option as one token (--name, --name=value or -Dkey=value; value uses [A-Za-z0-9_.:/@+=,-])",
+    forceable: false,
+    allowLeadingDash: true,
+  },
 });
 
 // Windows: every argument passed through cmd.exe to a .bat/.cmd wrapper must match this.

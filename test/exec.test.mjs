@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cmdClaim, cmdExec } from "../src/cli.mjs";
+import { cmdBatch, cmdClaim, cmdExec } from "../src/cli.mjs";
 import crypto from "node:crypto";
 import { checkWindowsContract, createQueryCapture, execHelp, planOp, resolveQueryOutputFile, summarizeBriefOutput } from "../src/exec.mjs";
 import { readState } from "../src/state.mjs";
@@ -60,10 +60,10 @@ test("exec: gradle.tasks runs the wrapper with literal argv and resource caps", 
     const res = await cmdExec(s.stateDir, ["gradle", "tasks", ":app:assembleDebug", "--offline", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 0, res.error);
     assert.equal(res.steps.length, 1);
-    assert.equal(res.steps[0].args[0], ":app:assembleDebug");
-    assert.equal(res.steps[0].args[1], "--offline");
-    assert.match(res.steps[0].args[2], /^-Dorg\.gradle\.workers\.max=\d+$/);
-    assert.match(res.stdout, /ARGS::app:assembleDebug --offline -Dorg/);
+    assert.match(res.steps[0].args[0], /^-Dorg\.gradle\.workers\.max=\d+$/);
+    assert.equal(res.steps[0].args[1], ":app:assembleDebug");
+    assert.equal(res.steps[0].args[2], "--offline");
+    assert.match(res.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ :app:assembleDebug --offline\n/);
     const st = readState(s.stateDir);
     assert.deepEqual(Object.keys(st.buildLeases || {}), [], "build lease released");
   } finally {
@@ -193,7 +193,9 @@ test("exec: bazel.run honours timeoutSec (exit 124)", { skip: !posix }, async ()
     assert.equal(res.steps[0].timedOut, true);
     assert.ok(Date.now() - started < 15000);
     assert.equal(res.steps[0].args[0], "run");
-    assert.match(res.steps[0].args[1], /^--jobs=/);
+    assert.equal(res.steps[0].args[1], "//tools:gen");
+    assert.match(res.steps[0].args[2], /^--jobs=\d+$/, "the cap goes after the target, at the end of the option section");
+    assert.ok(!res.steps[0].args.some((a) => /local_ram_resources|local_resources/.test(a)), "no version-specific RAM flag");
   } finally {
     s.cleanup();
   }
@@ -533,7 +535,8 @@ test("exec: custom --executable runs polyglot bazel.cmd without shebang and reco
       { env: s.env, cwd: sub, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    assert.match(res.stdout, /POLYGLOT_BAZEL:build --jobs=\d+ --local_ram_resources=\d+ \/\/platform\/jewel\/\.\.\./);
+    assert.match(res.stdout, /POLYGLOT_BAZEL:build \/\/platform\/jewel\/\.\.\. --jobs=\d+\n/);
+    assert.doesNotMatch(res.stdout, /local_ram_resources|local_resources/, "no Bazel-version-specific RAM flag (#32)");
     assert.ok(res.forcedRunId, "custom executable records a forcedRunId in and by itself");
     assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: "./bazel.cmd" }]);
     const st = readState(s.stateDir);
@@ -552,6 +555,81 @@ test("exec: custom --executable runs polyglot bazel.cmd without shebang and reco
   }
 });
 
+test("exec: bazel flags and excludeTargets reach Bazel in order, with ATC's cap last, as a forced run", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    fs.writeFileSync(path.join(s.proj, "MODULE.bazel"), "");
+    script(path.join(s.proj, "bazelw"), 'echo "ARGS:$*"');
+    const res = await cmdExec(
+      s.stateDir,
+      ["bazel", "test", "//...", "--config", "ci", "--flag", "--test_output=errors", "--flag=--jobs_is_not_this", "--exclude-target", "//slow/...", "--session", "agent-f", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    // --config first, caller flags next, then targets, ATC's --jobs last before "--" so neither can loosen it.
+    assert.match(res.stdout, /ARGS:test --config=ci --test_output=errors --jobs_is_not_this \/\/\.\.\. --jobs=\d+ -- -\/\/slow\/\.\.\.\n/);
+    assert.deepEqual(res.overridden, [{ path: "/flags", check: "custom_flags", value: "--test_output=errors --jobs_is_not_this" }]);
+    assert.ok(res.forcedRunId, "flags are a forced run in and by themselves");
+    const st = readState(s.stateDir);
+    assert.equal(st.forcedRuns.length, 1);
+    assert.equal(st.forcedRuns[0].sessionId, "agent-f");
+    assert.match(st.forcedRuns[0].reason, /custom flags \(--test_output=errors --jobs_is_not_this\)/);
+    const amb = await cmdExec(s.stateDir, ["bazel", "test", "//...", "--flag", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    // Series flags are named by entry in the default forced-run reason.
+    const seriesRes = await cmdBatch(s.stateDir, { session: "agent-f", json: true }, {
+      env: s.env,
+      cwd: s.proj,
+      host: HOST,
+      plan: { version: 1, steps: [{ id: "s", op: "bazel.series", series: [{ command: "build", targets: ["//a"] }, { command: "test", targets: ["//t"], flags: ["--test_output=errors"] }] }] },
+    });
+    assert.equal(seriesRes.exitCode, 0, seriesRes.error);
+    assert.match(readState(s.stateDir).forcedRuns.at(-1).reason, /custom flags \(series\[1\]: --test_output=errors\)/);
+    assert.equal(amb.exitCode, 7, "--flag --json is refused instead of passing --json to Bazel");
+    assert.equal(amb.errors[0].code, "ambiguous_value");
+
+    // Exclusions alone are typed, not a forced run.
+    const excl = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--exclude-target", "//slow/...", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    assert.equal(excl.exitCode, 0, excl.error);
+    assert.equal(excl.forcedRunId, null);
+    assert.match(excl.stdout, /ARGS:build \/\/\.\.\. --jobs=\d+ -- -\/\/slow\/\.\.\.\n/);
+
+    // ATC-owned flags are refused before anything runs, even with --force.
+    const marker = path.join(s.root, "ran");
+    script(path.join(s.proj, "bazelw"), `touch ${marker}`);
+    const owned = await cmdExec(
+      s.stateDir,
+      ["bazel", "build", "//...", "--flag", "--local_resources=memory=999999", "--force", "--reason", "need more ram", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(owned.exitCode, 7);
+    assert.equal(owned.errors[0].code, "flag_owned_by_atc");
+    assert.ok(!fs.existsSync(marker));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("exec: gradle excludeTasks and flags reach the wrapper after the tasks, with ATC's worker cap first", { skip: !posix }, async () => {
+  const s = setup();
+  try {
+    script(path.join(s.proj, "gradlew"), 'echo "ARGS:$*"');
+    const res = await cmdExec(
+      s.stateDir,
+      ["gradle", "tasks", "build", "--exclude-task", "lint", "--flag", "--scan", "--flag", "-Dorg.gradle.caching=true", "--json"],
+      { env: s.env, cwd: s.proj, host: HOST },
+    );
+    assert.equal(res.exitCode, 0, res.error);
+    assert.match(res.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ build --exclude-task lint --scan -Dorg\.gradle\.caching=true\n/);
+    assert.ok(res.notices.some((n) => /full build RAM/.test(n.consequence)), "the cold-admission assumption is reported to the agent");
+    assert.ok(res.forcedRunId);
+    const owned = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--flag", "--no-daemon", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    assert.equal(owned.exitCode, 7);
+    assert.equal(owned.errors[0].code, "flag_owned_by_atc");
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("exec: custom gradle --executable runs in project root and records responsibility", { skip: !posix }, async () => {
   const s = setup();
   try {
@@ -563,7 +641,7 @@ test("exec: custom gradle --executable runs in project root and records responsi
       { env: s.env, cwd: s.proj, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    assert.match(res.stdout, new RegExp(`CWD:${fs.realpathSync(s.proj).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ARGS::app:test -Dorg\\.gradle\\.workers\\.max=`));
+    assert.match(res.stdout, new RegExp(`CWD:${fs.realpathSync(s.proj).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ARGS:-Dorg\\.gradle\\.workers\\.max=\\d+ :app:test`));
     assert.ok(res.forcedRunId);
     assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: custom }]);
 

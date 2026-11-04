@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { findBazelSubcommandIndex } from "./build.mjs";
 import {
   archiveWindowsProcessGroupGeneration,
   clearKnownPosixPgidStartTokens,
@@ -432,6 +433,30 @@ function terminateChildTree(childPid, signal = "SIGTERM", options = {}) {
 
 const BAZEL_RESOURCE_SUBCOMMANDS = new Set(["build", "test", "run", "coverage"]);
 
+// Per-build caps ATC injects. Only flags that are stable across every supported tool version are
+// used, so no version detection is needed: Bazel --jobs, Gradle -Dorg.gradle.workers.max and
+// xcodebuild -jobs. RAM is enforced by ATC's own admission (build slots + host RAM) before the
+// build starts; Bazel's RAM flag changed incompatibly across majors (--local_ram_resources was
+// removed in Bazel 9; --local_resources=memory= does not exist in Bazel 7), so it is not injected.
+function renderBuildCaps(tool, args, jobsLimit) {
+  // Gradle: prepend. A command-line -D applies wherever it appears, every flag that could override
+  // it is ATC-owned (src/ops/flags.mjs), and caller flags come last (task options such as --tests
+  // must follow their task), so a value-taking caller flag without "=value" cannot consume the cap.
+  if (tool === "gradle") return [`-Dorg.gradle.workers.max=${jobsLimit}`, ...args];
+  if (tool === "bazel") {
+    const subIdx = findBazelSubcommandIndex(args);
+    if (subIdx < 0 || !BAZEL_RESOURCE_SUBCOMMANDS.has(args[subIdx].toLowerCase())) return args;
+    // Bazel reads command options left to right with the last value winning. Appending the cap at
+    // the end of the option section (before "--" when present) keeps it after --config and any
+    // caller flags, so neither a config nor a .bazelrc can loosen it.
+    const dashDash = args.indexOf("--", subIdx + 1);
+    const cap = `--jobs=${jobsLimit}`;
+    return dashDash === -1 ? [...args, cap] : [...args.slice(0, dashDash), cap, ...args.slice(dashDash)];
+  }
+  if (tool === "xcodebuild" && !args.includes("clean")) return [...args, "-jobs", String(jobsLimit)];
+  return args;
+}
+
 // Build the child process env and argv for a typed-op invocation (see docs/scope.md §6).
 // Invocations are already literal argv generated from validated params; the only additions
 // are lease/session env vars and per-build resource caps for heavy build tools.
@@ -442,17 +467,7 @@ export function prepareOpChildInvocation(invocation, { lease = null, sessionId =
     const hostCpus = Math.max(1, os.cpus()?.length || 4);
     const maxConcurrent = Math.max(1, Number(buildLease.maxConcurrentBuilds || 2));
     const jobsLimit = Math.max(2, Number(buildLease.jobsLimit || Math.floor(hostCpus / maxConcurrent)));
-    const ramLimitMb = Math.max(1024, Number(buildLease.reservedRamMb || 3072));
-    if (tool === "gradle") {
-      args = [...args, `-Dorg.gradle.workers.max=${jobsLimit}`];
-    } else if (tool === "bazel" && BAZEL_RESOURCE_SUBCOMMANDS.has(args[0])) {
-      const dashDash = args.indexOf("--");
-      const head = dashDash === -1 ? args : args.slice(0, dashDash);
-      const tail = dashDash === -1 ? [] : args.slice(dashDash);
-      args = [head[0], `--jobs=${jobsLimit}`, `--local_ram_resources=${ramLimitMb}`, ...head.slice(1), ...tail];
-    } else if (tool === "xcodebuild" && !args.includes("clean")) {
-      args = [...args, "-jobs", String(jobsLimit)];
-    }
+    args = renderBuildCaps(tool, args, jobsLimit);
   }
   const sanitizedBaseEnv = { ...baseEnv };
   delete sanitizedBaseEnv.ATC_BUILD_OP_ID;
