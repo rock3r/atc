@@ -330,8 +330,8 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
   ]);
   // Caller flags come last; a value-taking flag without "=value" has no ATC token after it to consume.
   assert.deepEqual(
-    prepareOpChildInvocation({ cmd: "/repo/gradlew", args: ["test", "--tests=example.Test", "--system-prop"] }, { baseEnv: {}, buildLease: { jobsLimit: 4 }, tool: "gradle" }).args,
-    ["-Dorg.gradle.workers.max=4", "test", "--tests=example.Test", "--system-prop"],
+    prepareOpChildInvocation({ cmd: "/repo/gradlew", args: ["test", "--tests=example.Test", "--init-script"] }, { baseEnv: {}, buildLease: { jobsLimit: 4 }, tool: "gradle" }).args,
+    ["-Dorg.gradle.workers.max=4", "test", "--tests=example.Test", "--init-script"],
   );
   assert.equal(inv.env.ATC_BUILD_OP_ID, "op_fresh");
   assert.equal(inv.env.ATC_BUILD_OP_NONCE, "nonce_fresh");

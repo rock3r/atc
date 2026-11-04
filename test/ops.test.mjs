@@ -512,13 +512,22 @@ test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting
 
   const owned = validateOpParams("gradle.tasks", {
     tasks: ["build"],
-    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--build-file=/other/build.gradle", "--include-build=../lib", "--gradle-user-home=/y", "--system-prop=org.gradle.jvmargs=-Xmx64g", "--system-prop=org.gradle.workers.max=64", "--system-prop=gradle.user.home=/z", "--exclude-task=lint"],
+    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--build-file=/other/build.gradle", "--include-build=../lib", "--gradle-user-home=/y", "--exclude-task=lint"],
   });
   assert.deepEqual(
     owned.errors.map((e) => e.code),
-    [...new Array(14).fill("flag_owned_by_atc"), "flag_has_param"],
+    [...new Array(11).fill("flag_owned_by_atc"), "flag_has_param"],
   );
-  assert.deepEqual(validateOpParams("gradle.tasks", { tasks: ["build"], flags: ["--system-prop=org.gradle.caching=true"] }).errors, [], "other system properties stay allowed");
+  // Long aliases for -D/-P are refused, so every ATC check sees one spelling
+  // (e.g. --system-prop=org.gradle.java.home must not dodge warm-daemon detection).
+  const aliases = validateOpParams("gradle.tasks", { tasks: ["build"], flags: ["--system-prop=org.gradle.java.home=/jdk", "--system-prop=org.gradle.caching=true", "--system-prop", "--project-prop=a=b"] });
+  assert.deepEqual(aliases.errors.map((e) => e.code), ["flag_alias", "flag_alias", "flag_alias", "flag_alias"]);
+  assert.match(aliases.errors[0].hint, /-Dkey=value/);
+  assert.deepEqual(validateOpParams("gradle.tasks", { tasks: ["build"], flags: ["-Dorg.gradle.caching=true"] }).errors, [], "the -D spelling stays allowed");
+  assert.deepEqual(
+    validateOpParams("gradle.tasks", { tasks: ["build"], flags: ["-Dorg.gradle.daemon.idletimeout=1", "-Dorg.gradle.daemon.registry.base=/tmp/r"] }).errors.map((e) => e.code),
+    ["flag_owned_by_atc", "flag_owned_by_atc"],
+  );
   assert.deepEqual(owned.overridden, []);
   assert.ok(owned.errors.every((e) => e.hint));
   assert.ok(validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["-x"] }).errors.length > 0, "excluded tasks use the task pattern");

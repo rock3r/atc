@@ -39,11 +39,15 @@ const GRADLE_OWNED = new Map([
 
 const GRADLE_USE_PARAM = new Map([["--exclude-task", "excludeTasks"]]);
 
+// Gradle's long aliases for -D and -P. ATC's checks (owned flags, daemon reuse, heap accounting)
+// read one spelling only, so the aliases are refused with a pointer to that spelling.
+const GRADLE_ALIASES = new Map([
+  ["--system-prop", "Write system properties as -Dkey=value."],
+  ["--project-prop", 'Pass project properties through the "properties" param.'],
+]);
+
 function flagName(flag) {
   const s = String(flag);
-  // Gradle's long alias for -D: --system-prop=key=value is checked as -Dkey.
-  const sysProp = /^--system-prop=([^=]*)/.exec(s);
-  if (sysProp) return `-D${sysProp[1]}`;
   const eq = s.indexOf("=");
   return eq === -1 ? s : s.slice(0, eq);
 }
@@ -82,7 +86,17 @@ export function checkToolFlags(tool, flags, basePath) {
       return;
     }
     if (tool === "gradle") {
-      if (GRADLE_OWNED.has(name)) errors.push(ownedError(p, flag, GRADLE_OWNED.get(name)));
+      if (GRADLE_ALIASES.has(name)) {
+        errors.push({
+          path: p,
+          code: "flag_alias",
+          message: `${JSON.stringify(String(flag))} is an alias ATC does not accept.`,
+          hint: GRADLE_ALIASES.get(name),
+        });
+      } else if (GRADLE_OWNED.has(name)) errors.push(ownedError(p, flag, GRADLE_OWNED.get(name)));
+      // Every org.gradle.daemon.* property (idle timeout, registry location, ...) tunes daemons
+      // that are shared across sessions; the registry location also hides them from ATC's probe.
+      else if (name.startsWith("-Dorg.gradle.daemon.")) errors.push(ownedError(p, flag, GRADLE_OWNED.get("-Dorg.gradle.daemon")));
       else if (GRADLE_USE_PARAM.has(name)) errors.push(useParamError(p, flag, GRADLE_USE_PARAM.get(name)));
     }
   });
