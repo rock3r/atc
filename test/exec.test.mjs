@@ -609,7 +609,7 @@ test("exec: bazel flags and excludeTargets reach Bazel in order, with ATC's cap 
   }
 });
 
-test("exec: gradle excludeTasks and flags reach the wrapper before ATC's worker cap", { skip: !posix }, async () => {
+test("exec: gradle excludeTasks and flags reach the wrapper after the tasks, with ATC's worker cap first", { skip: !posix }, async () => {
   const s = setup();
   try {
     script(path.join(s.proj, "gradlew"), 'echo "ARGS:$*"');
