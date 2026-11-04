@@ -472,8 +472,11 @@ test("bazel flags and excludeTargets: placement, owned flags and forced-run acco
     ["/flags/3", "flag_owned_by_atc"],
     ["/flags/4", "flag_has_param"],
   ]);
+  assert.deepEqual(owned.overridden, [], "a refused flag list is not recorded as overridden");
+  assert.equal(validateOpParams("bazel.build", { targets: ["//..."], flags: ["--ram_utilization_factor=400"] }).errors[0].code, "flag_owned_by_atc");
   const forcedOwned = validateOpParams("bazel.build", { targets: ["//..."], flags: ["--jobs=64"] }, { force: true });
   assert.equal(forcedOwned.errors[0].code, "flag_owned_by_atc", "--force never unlocks an ATC-owned flag");
+  assert.deepEqual(forcedOwned.overridden, []);
   const badShape = validateOpParams("bazel.build", { targets: ["//..."], flags: ["--x=a b"] }, { force: true });
   assert.equal(badShape.errors[0].code, "pattern_mismatch");
   assert.deepEqual(badShape.overridden, [], "a rejected flag list is not recorded as overridden");
@@ -504,12 +507,13 @@ test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting
 
   const owned = validateOpParams("gradle.tasks", {
     tasks: ["build"],
-    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--gradle-user-home=/y", "--exclude-task=lint"],
+    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--gradle-user-home=/y", "--exclude-task=lint"],
   });
   assert.deepEqual(
     owned.errors.map((e) => e.code),
-    [...new Array(8).fill("flag_owned_by_atc"), "flag_has_param"],
+    [...new Array(9).fill("flag_owned_by_atc"), "flag_has_param"],
   );
+  assert.deepEqual(owned.overridden, []);
   assert.ok(owned.errors.every((e) => e.hint));
   assert.ok(validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["-x"] }).errors.length > 0, "excluded tasks use the task pattern");
 });
@@ -523,6 +527,25 @@ test("parseOpArgv: repeated --flag takes dash-leading values; exclusions map to 
   assert.deepEqual(g.errors, []);
   assert.deepEqual(g.params.excludeTasks, ["lint"]);
   assert.deepEqual(g.params.flags, ["--scan"]);
+
+  // A dash-leading value that is itself an atc option is a missing value, not a flag.
+  for (const next of ["--json", "--force", "--session", "--no-brief", "--config", "--flag", "--ram-mb=4"]) {
+    const amb = parseOpArgv(["bazel", "test", "//...", "--flag", next, "x"]);
+    assert.equal(amb.errors[0]?.code, "ambiguous_value", next);
+    assert.match(amb.errors[0].hint, /--flag=/);
+  }
+  assert.deepEqual(parseOpArgv(["bazel", "test", "//...", "--flag=--json"]).params.flags, ["--json"], "the attached form is always taken literally");
+  assert.deepEqual(parseOpArgv(["bazel", "test", "//...", "--flag", "--json_trace_compression"]).params.flags, ["--json_trace_compression"]);
+  assert.equal(parseOpArgv(["bazel", "test", "//...", "--flag"]).errors[0].code, "missing_value");
+});
+
+test("flags satisfy the Windows batch-argument contract by construction", () => {
+  for (const f of ["--test_output=errors", "--copt=-O2", "--define=a=b", "--remote_cache=", "-Dorg.gradle.caching=true", "--init-script=C:/ci/init.gradle"]) {
+    assert.ok(WINDOWS_BATCH_ARG_RE.test(f), f);
+  }
+  for (const f of ["--x=%PATH%", "--x=a!b", "--x=a^b", "--x=\"q\"", "--x=a&b"]) {
+    assert.ok(!checkPattern("bazelFlag", f) && !checkPattern("gradleFlag", f), f);
+  }
 });
 
 test("xcode: destination only for test actions on the leased simulator", () => {

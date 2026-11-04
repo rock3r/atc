@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cmdClaim, cmdExec } from "../src/cli.mjs";
+import { cmdBatch, cmdClaim, cmdExec } from "../src/cli.mjs";
 import crypto from "node:crypto";
 import { checkWindowsContract, createQueryCapture, execHelp, planOp, resolveQueryOutputFile, summarizeBriefOutput } from "../src/exec.mjs";
 import { readState } from "../src/state.mjs";
@@ -574,6 +574,18 @@ test("exec: bazel flags and excludeTargets reach Bazel in order, with ATC's cap 
     assert.equal(st.forcedRuns.length, 1);
     assert.equal(st.forcedRuns[0].sessionId, "agent-f");
     assert.match(st.forcedRuns[0].reason, /custom flags \(--test_output=errors --jobs_is_not_this\)/);
+    const amb = await cmdExec(s.stateDir, ["bazel", "test", "//...", "--flag", "--json"], { env: s.env, cwd: s.proj, host: HOST });
+    // Series flags are named by entry in the default forced-run reason.
+    const seriesRes = await cmdBatch(s.stateDir, { session: "agent-f", json: true }, {
+      env: s.env,
+      cwd: s.proj,
+      host: HOST,
+      plan: { version: 1, steps: [{ id: "s", op: "bazel.series", series: [{ command: "build", targets: ["//a"] }, { command: "test", targets: ["//t"], flags: ["--test_output=errors"] }] }] },
+    });
+    assert.equal(seriesRes.exitCode, 0, seriesRes.error);
+    assert.match(readState(s.stateDir).forcedRuns.at(-1).reason, /custom flags \(series\[1\]: --test_output=errors\)/);
+    assert.equal(amb.exitCode, 7, "--flag --json is refused instead of passing --json to Bazel");
+    assert.equal(amb.errors[0].code, "ambiguous_value");
 
     // Exclusions alone are typed, not a forced run.
     const excl = await cmdExec(s.stateDir, ["bazel", "build", "//...", "--exclude-target", "//slow/...", "--json"], { env: s.env, cwd: s.proj, host: HOST });

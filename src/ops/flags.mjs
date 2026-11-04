@@ -11,6 +11,7 @@ const BAZEL_OWNED = new Map([
   ["local_resources", "ATC owns host resource caps; concurrent builds rely on them."],
   ["local_ram_resources", "ATC owns host resource caps; RAM is admitted by ATC before the build starts."],
   ["local_cpu_resources", "ATC owns host resource caps; concurrent builds rely on them."],
+  ["ram_utilization_factor", "ATC owns host resource caps; RAM is admitted by ATC before the build starts."],
 ]);
 
 // Redirect only where a second spelling would behave differently (configs are placed before
@@ -29,6 +30,7 @@ const GRADLE_OWNED = new Map([
   ["--continuous", "Continuous mode never finishes, so it would hold the build slot forever."],
   ["-Dorg.gradle.jvmargs", "Daemon JVM args decide daemon reuse and ATC's heap accounting; set them in gradle.properties."],
   ["--project-dir", "ATC resolves the project root to pick the workspace lock; use the workspace param."],
+  ["--settings-file", "The settings file decides the build root, which ATC resolves to pick the workspace lock; use the workspace param."],
   ["--gradle-user-home", "The Gradle user home is shared state ATC accounts for; it cannot change per build."],
   ["-Dgradle.user.home", "The Gradle user home is shared state ATC accounts for; it cannot change per build."],
 ]);

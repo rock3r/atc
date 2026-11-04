@@ -388,7 +388,10 @@ function defaultForcedReason(overridden, params) {
   const parts = [];
   if (overridden.some((o) => o.check === "custom_executable")) parts.push(`custom executable (${params.executable})`);
   const flagSites = overridden.filter((o) => o.check === "custom_flags");
-  if (flagSites.length > 0) parts.push(`custom flags (${flagSites.map((o) => o.value).join("; ")})`);
+  if (flagSites.length > 0) {
+    const describe = (o) => (/\/series\/\d+\/flags$/.test(o.path) ? `${o.path.replace(/^.*\/series\//, "series[").replace(/\/flags$/, "]")}: ${o.value}` : o.value);
+    parts.push(`custom flags (${flagSites.map(describe).join("; ")})`);
+  }
   return parts.join(", ") || "forced run";
 }
 

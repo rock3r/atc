@@ -394,6 +394,35 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
     ["test", "--config=ci", "--test_output=errors", "--jobs=4", "--", "//...", "-//slow/..."],
   );
 
+  // bazel.series end to end: planned argv per entry, then ATC's cap after configs and caller flags.
+  const seriesWs = fs.mkdtempSync(path.join(os.tmpdir(), "atc-series-caps-"));
+  try {
+    fs.writeFileSync(path.join(seriesWs, "MODULE.bazel"), "");
+    const plan = planOp(
+      "bazel.series",
+      {
+        series: [
+          { command: "clean", flags: ["--async"] },
+          { command: "build", targets: ["//app"], configs: ["ci"], flags: ["--keep_going"] },
+          { command: "test", targets: ["//..."], excludeTargets: ["//slow/..."], flags: ["--test_output=errors"] },
+        ],
+      },
+      { cwd: seriesWs, env: { PATH: "" } },
+    );
+    assert.deepEqual(plan.errors, []);
+    assert.deepEqual(
+      plan.makeInvocations(null).map((i) => prepareOpChildInvocation(i, { baseEnv: {}, buildLease: caps, tool: "bazel" }).args),
+      [
+        ["clean", "--async"],
+        ["build", "--config=ci", "--keep_going", "//app", "--jobs=4"],
+        ["test", "--test_output=errors", "--jobs=4", "--", "//...", "-//slow/..."],
+      ],
+    );
+    assert.deepEqual(plan.overridden.map((o) => o.path), ["/series/0/flags", "/series/1/flags", "/series/2/flags"]);
+  } finally {
+    fs.rmSync(seriesWs, { recursive: true, force: true });
+  }
+
   const android = prepareOpChildInvocation(
     { cmd: "/repo/gradlew", args: ["connectedCheck"] },
     { baseEnv: {}, lease: { leaseId: "lease_1", platform: "android", kind: "emulator", serial: "emulator-5554" } },
