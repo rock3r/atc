@@ -109,7 +109,7 @@ atc exec gradle tasks build --exclude-task lint --flag --scan --flag -Dorg.gradl
 atc exec bazel test //... --exclude-target //slow/... --flag --test_output=errors --flag=--flaky_test_attempts=2
 ```
 
-`excludeTasks` / `excludeTargets` are typed. Each `flags` entry is one token (`--name`, `--name=value`, or for Gradle `-Dkey=value`). ATC does not track which flags exist in which tool version; Bazel or Gradle rejects unknown ones. ATC refuses only flags it owns: resource caps (`--jobs`, `--local_*resources`, `--ram_utilization_factor`, `--max-workers`), daemon lifecycle, `--continuous`, the project dir, settings file and Gradle user home, and `-Dorg.gradle.jvmargs`. `--config` and `--exclude-task` are refused with a pointer to `configs` and `excludeTasks`. Passing `flags` counts as a forced run, exactly like `executable`.
+`excludeTasks` / `excludeTargets` are typed. Each `flags` entry is one token (`--name`, `--name=value`, or for Gradle `-Dkey=value`). ATC does not track which flags exist in which tool version; Bazel or Gradle rejects unknown ones. ATC refuses only flags it owns: resource caps (`--jobs`, `--local_*resources`, `--ram_utilization_factor`, `--max-workers`), daemon lifecycle, `--continuous`, the project dir, settings and build file, included builds, and Gradle user home, and `-Dorg.gradle.jvmargs`. `--config` and `--exclude-task` are refused with a pointer to `configs` and `excludeTasks`. Passing `flags` counts as a forced run, exactly like `executable`.
 
 Prefer the attached form `--flag=--name=value`: a bare `--flag` followed by an `atc` option (`--flag --json`) is refused as ambiguous. Flag values use `[A-Za-z0-9_.:/@+=,-]`, so write paths with forward slashes, also on Windows.
 

@@ -31,6 +31,8 @@ const GRADLE_OWNED = new Map([
   ["-Dorg.gradle.jvmargs", "Daemon JVM args decide daemon reuse and ATC's heap accounting; set them in gradle.properties."],
   ["--project-dir", "ATC resolves the project root to pick the workspace lock; use the workspace param."],
   ["--settings-file", "The settings file decides the build root, which ATC resolves to pick the workspace lock; use the workspace param."],
+  ["--build-file", "The build file decides the build root, which ATC resolves to pick the workspace lock; use the workspace param."],
+  ["--include-build", "An included build is another workspace that ATC has not locked; declare it in settings.gradle(.kts) or build it separately."],
   ["--gradle-user-home", "The Gradle user home is shared state ATC accounts for; it cannot change per build."],
   ["-Dgradle.user.home", "The Gradle user home is shared state ATC accounts for; it cannot change per build."],
 ]);

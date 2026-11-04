@@ -508,11 +508,11 @@ test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting
 
   const owned = validateOpParams("gradle.tasks", {
     tasks: ["build"],
-    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--gradle-user-home=/y", "--system-prop=org.gradle.jvmargs=-Xmx64g", "--system-prop=org.gradle.workers.max=64", "--system-prop=gradle.user.home=/z", "--exclude-task=lint"],
+    flags: ["--max-workers=64", "-Dorg.gradle.workers.max=64", "--no-daemon", "--stop", "--continuous", "-Dorg.gradle.jvmargs=-Xmx64g", "--project-dir=/x", "--settings-file=other/settings.gradle.kts", "--build-file=/other/build.gradle", "--include-build=../lib", "--gradle-user-home=/y", "--system-prop=org.gradle.jvmargs=-Xmx64g", "--system-prop=org.gradle.workers.max=64", "--system-prop=gradle.user.home=/z", "--exclude-task=lint"],
   });
   assert.deepEqual(
     owned.errors.map((e) => e.code),
-    [...new Array(12).fill("flag_owned_by_atc"), "flag_has_param"],
+    [...new Array(14).fill("flag_owned_by_atc"), "flag_has_param"],
   );
   assert.deepEqual(validateOpParams("gradle.tasks", { tasks: ["build"], flags: ["--system-prop=org.gradle.caching=true"] }).errors, [], "other system properties stay allowed");
   assert.deepEqual(owned.overridden, []);
