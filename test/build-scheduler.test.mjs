@@ -274,6 +274,19 @@ test("typed build ops derive device coupling, platform and workspace keys from t
     assert.equal(computeColdBuildRamDemandMb(ramHint.buildReqs, 3072), 6144);
     assert.equal(computeColdBuildRamDemandMb(pure.buildReqs, 3072), 3072);
 
+    // Caller Gradle flags may select a different daemon (--priority, -Dorg.gradle.java.home, ...):
+    // no warm-daemon credit, admitted as cold. Bazel command flags never select another server.
+    assert.notEqual(pure.buildReqs.disablesDaemon, true);
+    const withFlags = planOp("gradle.tasks", { tasks: ["build"], flags: ["--priority=low"] }, { cwd: wsDir });
+    assert.deepEqual(withFlags.errors, []);
+    assert.equal(withFlags.buildReqs.disablesDaemon, true);
+    assert.deepEqual(
+      probeWarmBuildDaemons(withFlags.buildReqs, { runner: () => ({ stdout: `4242 java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.14\n` }) }),
+      { warm: false, daemonPids: [] },
+    );
+    const bazelFlags = planOp("bazel.build", { targets: ["//..."], flags: ["--keep_going"] }, { cwd: wsDir, env: { PATH: "" } });
+    assert.notEqual(bazelFlags.buildReqs.disablesDaemon, true);
+
     for (const [opName, params] of [
       ["bazel.build", { targets: ["//app:main"] }],
       ["bazel.clean", { expunge: true }],
