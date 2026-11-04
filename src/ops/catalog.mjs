@@ -402,18 +402,25 @@ export const OPS = Object.freeze({
       return checkToolFlags("gradle", params.flags, "/flags");
     },
     notices(params) {
+      const notices = [];
       const tasks = params.tasks || [];
       const device = tasks.filter((t) => isGradleDeviceTaskName(String(t).split(":").pop()));
       if (device.length > 0 && device.length < tasks.length) {
-        return [
-          {
-            assumption: `Tasks ${device.join(", ")} need a device; the others are pure build tasks.`,
-            consequence: "The device is held for the whole invocation, including compilation.",
-            fix: "Split into an assemble step and a device step (batch dependsOn) so the device is only claimed when needed.",
-          },
-        ];
+        notices.push({
+          assumption: `Tasks ${device.join(", ")} need a device; the others are pure build tasks.`,
+          consequence: "The device is held for the whole invocation, including compilation.",
+          fix: "Split into an assemble step and a device step (batch dependsOn) so the device is only claimed when needed.",
+        });
       }
-      return [];
+      if ((params.flags || []).length > 0) {
+        // Mirrors src/ops/requirements.mjs: caller Gradle flags disable warm-daemon credit.
+        notices.push({
+          assumption: "Custom Gradle flags may need a different daemon (e.g. --priority, -Dorg.gradle.java.home), and ATC cannot tell whether an idle daemon is compatible.",
+          consequence: "This build gets no warm-daemon credit: it reserves full build RAM and may wait longer for admission.",
+          fix: "Use typed params where they exist (offline, info, stacktrace, rerunTasks, continueAfterFailure, properties, excludeTasks), or set stable options in gradle.properties, so no flags are needed.",
+        });
+      }
+      return notices;
     },
   },
 

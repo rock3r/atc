@@ -620,6 +620,7 @@ test("exec: gradle excludeTasks and flags reach the wrapper after the tasks, wit
     );
     assert.equal(res.exitCode, 0, res.error);
     assert.match(res.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ build --exclude-task lint --scan -Dorg\.gradle\.caching=true\n/);
+    assert.ok(res.notices.some((n) => /full build RAM/.test(n.consequence)), "the cold-admission assumption is reported to the agent");
     assert.ok(res.forcedRunId);
     const owned = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--flag", "--no-daemon", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(owned.exitCode, 7);

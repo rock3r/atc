@@ -136,6 +136,13 @@ test("gradle.tasks: device coupling and split notice", () => {
   assert.equal(notices.length, 1);
   assert.match(notices[0].fix, /Split/);
   assert.deepEqual(op.notices({ tasks: ["connectedDebugAndroidTest"] }), []);
+  // Caller flags make the build cold for admission; the agent is told why and how to avoid it.
+  const flagNotices = op.notices({ tasks: ["build"], flags: ["--priority=low"] });
+  assert.equal(flagNotices.length, 1);
+  assert.match(flagNotices[0].consequence, /full build RAM/);
+  assert.ok(flagNotices[0].assumption && flagNotices[0].fix);
+  assert.equal(op.notices({ tasks: ["assembleDebug", "connectedDebugAndroidTest"], flags: ["--scan"] }).length, 2);
+  assert.deepEqual(op.notices({ tasks: ["build"], excludeTasks: ["lint"] }), [], "typed params alone are not a notice");
 });
 
 test("bazel: prefers bazelw, then bazelisk, then bazel", () => {
