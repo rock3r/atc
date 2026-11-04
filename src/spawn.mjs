@@ -439,7 +439,10 @@ const BAZEL_RESOURCE_SUBCOMMANDS = new Set(["build", "test", "run", "coverage"])
 // build starts; Bazel's RAM flag changed incompatibly across majors (--local_ram_resources was
 // removed in Bazel 9; --local_resources=memory= does not exist in Bazel 7), so it is not injected.
 function renderBuildCaps(tool, args, jobsLimit) {
-  if (tool === "gradle") return [...args, `-Dorg.gradle.workers.max=${jobsLimit}`];
+  // Gradle: prepend. A command-line -D applies wherever it appears, every flag that could override
+  // it is ATC-owned (src/ops/flags.mjs), and caller flags come last (task options such as --tests
+  // must follow their task), so a value-taking caller flag without "=value" cannot consume the cap.
+  if (tool === "gradle") return [`-Dorg.gradle.workers.max=${jobsLimit}`, ...args];
   if (tool === "bazel") {
     const subIdx = findBazelSubcommandIndex(args);
     if (subIdx < 0 || !BAZEL_RESOURCE_SUBCOMMANDS.has(args[subIdx].toLowerCase())) return args;

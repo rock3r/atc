@@ -43,7 +43,7 @@ function setup() {
   const proj = path.join(root, "proj");
   fs.mkdirSync(proj);
   const log = path.join(root, "calls.log");
-  script(path.join(proj, "gradlew"), `echo "gradlew $* ENV_FOO=$FOO" >> ${log}; [ "$1" = "fail" ] && exit 5; exit 0`);
+  script(path.join(proj, "gradlew"), `echo "gradlew $* ENV_FOO=$FOO" >> ${log}; [ "$2" = "fail" ] && exit 5; exit 0`);
   script(path.join(bin, "adb"), `echo "adb $*" >> ${log}; exit 0`);
   const env = { ...process.env, PATH: `${bin}:/usr/bin:/bin` };
   return {
@@ -104,7 +104,7 @@ test("batch: assemble → install → launch with claim reuse, per-step env, rel
     assert.equal(res.exitCode, 0, JSON.stringify(res, null, 2));
     assert.deepEqual(res.steps.map((x) => x.status), ["ok", "ok", "ok"]);
     const calls = s.calls();
-    assert.match(calls[0], /^gradlew :app:assembleDebug -Dorg\.gradle\.workers\.max=\d+ ENV_FOO=bar$/);
+    assert.match(calls[0], /^gradlew -Dorg\.gradle\.workers\.max=\d+ :app:assembleDebug ENV_FOO=bar$/);
     assert.match(calls[1], /^adb -s emulator-5554 install .*app\.apk$/);
     assert.equal(calls[2], "adb -s emulator-5554 shell am start -n 'com.ex.app/.Main'");
     const st = readState(s.stateDir);
@@ -229,7 +229,7 @@ test("batch: a claim is released once its last consumer is skipped", { skip: !po
     const stateFile = path.join(s.stateDir, "state.json");
     script(
       path.join(s.proj, "gradlew"),
-      `[ "$1" = "fail" ] && exit 5; if grep -q '"avd:Pixel_8_API_35"' ${stateFile}; then echo held > ${leaseCountDuringStep}; else echo free > ${leaseCountDuringStep}; fi; exit 0`,
+      `[ "$2" = "fail" ] && exit 5; if grep -q '"avd:Pixel_8_API_35"' ${stateFile}; then echo held > ${leaseCountDuringStep}; else echo free > ${leaseCountDuringStep}; fi; exit 0`,
     );
     const res = await s.run({
       version: 1,
@@ -450,7 +450,7 @@ test("batch: custom executable on gradle/bazel steps validates and records force
     assert.equal(ran.exitCode, 0, JSON.stringify(ran));
     assert.ok(ran.steps[0].forcedRunId);
     assert.deepEqual(ran.steps[0].overridden, [{ path: "/executable", check: "custom_executable", value: "./gradlew-custom" }]);
-    assert.ok(s.calls().some((l) => l.startsWith("custom-gradle assembleDebug")));
+    assert.ok(s.calls().some((l) => /^custom-gradle -Dorg\.gradle\.workers\.max=\d+ assembleDebug/.test(l)));
 
     // A later failing batch step in the same workspace surfaces attribution in the step result
     script(path.join(s.proj, "gradlew"), "exit 2");

@@ -60,10 +60,10 @@ test("exec: gradle.tasks runs the wrapper with literal argv and resource caps", 
     const res = await cmdExec(s.stateDir, ["gradle", "tasks", ":app:assembleDebug", "--offline", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(res.exitCode, 0, res.error);
     assert.equal(res.steps.length, 1);
-    assert.equal(res.steps[0].args[0], ":app:assembleDebug");
-    assert.equal(res.steps[0].args[1], "--offline");
-    assert.match(res.steps[0].args[2], /^-Dorg\.gradle\.workers\.max=\d+$/);
-    assert.match(res.stdout, /ARGS::app:assembleDebug --offline -Dorg/);
+    assert.match(res.steps[0].args[0], /^-Dorg\.gradle\.workers\.max=\d+$/);
+    assert.equal(res.steps[0].args[1], ":app:assembleDebug");
+    assert.equal(res.steps[0].args[2], "--offline");
+    assert.match(res.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ :app:assembleDebug --offline\n/);
     const st = readState(s.stateDir);
     assert.deepEqual(Object.keys(st.buildLeases || {}), [], "build lease released");
   } finally {
@@ -619,7 +619,7 @@ test("exec: gradle excludeTasks and flags reach the wrapper before ATC's worker 
       { env: s.env, cwd: s.proj, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    assert.match(res.stdout, /ARGS:--scan -Dorg\.gradle\.caching=true build --exclude-task lint -Dorg\.gradle\.workers\.max=\d+\n/);
+    assert.match(res.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ build --exclude-task lint --scan -Dorg\.gradle\.caching=true\n/);
     assert.ok(res.forcedRunId);
     const owned = await cmdExec(s.stateDir, ["gradle", "tasks", "build", "--flag", "--no-daemon", "--json"], { env: s.env, cwd: s.proj, host: HOST });
     assert.equal(owned.exitCode, 7);
@@ -640,7 +640,7 @@ test("exec: custom gradle --executable runs in project root and records responsi
       { env: s.env, cwd: s.proj, host: HOST },
     );
     assert.equal(res.exitCode, 0, res.error);
-    assert.match(res.stdout, new RegExp(`CWD:${fs.realpathSync(s.proj).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ARGS::app:test -Dorg\\.gradle\\.workers\\.max=`));
+    assert.match(res.stdout, new RegExp(`CWD:${fs.realpathSync(s.proj).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ARGS:-Dorg\\.gradle\\.workers\\.max=\\d+ :app:test`));
     assert.ok(res.forcedRunId);
     assert.deepEqual(res.overridden, [{ path: "/executable", check: "custom_executable", value: custom }]);
 

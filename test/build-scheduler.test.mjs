@@ -323,11 +323,16 @@ test("prepareOpChildInvocation appends per-build caps, injects lease env and san
     },
   );
   assert.deepEqual(inv.args, [
+    "-Dorg.gradle.workers.max=4",
     "assembleDebug",
     "-Pfilter=a|b;c&&d",
     "-Pnote=-Dorg.gradle.workers.max=99",
-    "-Dorg.gradle.workers.max=4",
   ]);
+  // Caller flags come last; a value-taking flag without "=value" has no ATC token after it to consume.
+  assert.deepEqual(
+    prepareOpChildInvocation({ cmd: "/repo/gradlew", args: ["test", "--tests=example.Test", "--system-prop"] }, { baseEnv: {}, buildLease: { jobsLimit: 4 }, tool: "gradle" }).args,
+    ["-Dorg.gradle.workers.max=4", "test", "--tests=example.Test", "--system-prop"],
+  );
   assert.equal(inv.env.ATC_BUILD_OP_ID, "op_fresh");
   assert.equal(inv.env.ATC_BUILD_OP_NONCE, "nonce_fresh");
   assert.equal(inv.env.ATC_BUILD_ID, "build_123");
@@ -1885,7 +1890,7 @@ test("exec gradle tasks coordinates pure builds via a build lease and writes str
       inventory: hostInventory(),
     });
     assert.equal(execRes.exitCode, 0, execRes.error);
-    assert.match(execRes.stdout, /ARGS:assembleDebug -Dorg\.gradle\.workers\.max=\d+/);
+    assert.match(execRes.stdout, /ARGS:-Dorg\.gradle\.workers\.max=\d+ assembleDebug/);
     assert.match(execRes.stdout, /OP:\S+/, "child receives its build op identity");
 
     const afterState = readState(s.stateDir);
@@ -2025,7 +2030,7 @@ test("exec serializes concurrent builds on the same workspace key", { skip: !pos
   const s = setupProject();
   try {
     const log = path.join(s.root, "order.log");
-    script(path.join(s.proj, "gradlew"), `echo "start $1" >> ${log}; sleep 1; echo "end $1" >> ${log}`);
+    script(path.join(s.proj, "gradlew"), `echo "start $2" >> ${log}; sleep 1; echo "end $2" >> ${log}`);
     // Each waiter runs in its own process, as real agents do (the in-process queue wait is synchronous).
     const cliUrl = new URL("../src/cli.mjs", import.meta.url).href;
     const run = (task, session) =>
@@ -2242,7 +2247,7 @@ test("batch runs typed build steps in dependency order and rejects invalid plans
   const s = setupProject();
   try {
     const orderLog = path.join(s.root, "dag-order.txt");
-    script(path.join(s.proj, "gradlew"), `echo "$1" >> ${orderLog}`);
+    script(path.join(s.proj, "gradlew"), `echo "$2" >> ${orderLog}`);
     const run = (plan, flags = {}) =>
       cmdBatch(s.stateDir, { session: "sess-batch", json: true, ...flags }, { env: s.env, cwd: s.proj, plan, inventory: hostInventory() });
 

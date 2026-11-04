@@ -39,7 +39,7 @@ test("mcp: atc_gradle runs under the MCP session identity and captures output", 
     const reply = await call(s.stateDir, "atc_gradle", { operation: "tasks", params: { tasks: ["assembleDebug"] } }, { sessionId: "agent-42", cwd: s.proj, env: { ...process.env }, host: HOST });
     const res = JSON.parse(reply.result.content[0].text);
     assert.equal(reply.result.isError, false, res.error);
-    assert.match(res.stdout, /^SESSION=agent-42 ARGS=assembleDebug -Dorg\.gradle\.workers\.max=\d+/);
+    assert.match(res.stdout, /^SESSION=agent-42 ARGS=-Dorg\.gradle\.workers\.max=\d+ assembleDebug/);
   } finally {
     s.cleanup();
   }

@@ -384,10 +384,7 @@ export const OPS = Object.freeze({
     deviceCoupled: (p) => Array.isArray(p.tasks) && p.tasks.some((t) => isGradleDeviceTaskName(String(t).split(":").pop())),
     invocations(params, ctx) {
       const { cmd, cwd } = resolveGradleExecutable(params, ctx);
-      // Caller flags go first, before the tasks: a value-taking flag passed without "=value"
-      // (e.g. a bare --system-prop) can then only consume a caller task, never an ATC token such
-      // as the worker cap appended at the end (src/spawn.mjs).
-      const args = [...(params.flags || []), ...params.tasks];
+      const args = [...params.tasks];
       if (params.offline) args.push("--offline");
       if (params.info) args.push("--info");
       if (params.stacktrace) args.push("--stacktrace");
@@ -395,6 +392,10 @@ export const OPS = Object.freeze({
       if (params.continueAfterFailure) args.push("--continue");
       for (const [k, v] of Object.entries(params.properties || {})) args.push(`-P${k}=${v}`);
       for (const t of params.excludeTasks || []) args.push("--exclude-task", t);
+      // Caller flags go last, after the tasks, so task options such as --tests work. ATC's worker
+      // cap is prepended (src/spawn.mjs), so a value-taking flag passed without "=value" has
+      // nothing of ATC's to consume.
+      args.push(...(params.flags || []));
       return [{ cmd, args, cwd }];
     },
     check(params) {

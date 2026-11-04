@@ -498,8 +498,12 @@ test("gradle flags and excludeTasks: argv, owned flags and forced-run accounting
     { tasks: ["build"], excludeTasks: ["lint", ":app:test"], flags: ["--scan", "-Dorg.gradle.caching=true"], properties: { a: "b" } },
     { cwd: root, platform: "darwin" },
   );
-  // Caller flags first, so a bare value-taking flag can only consume a caller task (never ATC's cap).
-  assert.deepEqual(inv, { cmd: wrapper, args: ["--scan", "-Dorg.gradle.caching=true", "build", "-Pa=b", "--exclude-task", "lint", "--exclude-task", ":app:test"], cwd: root });
+  // Caller flags last, after the tasks, so task options such as --tests follow their task.
+  assert.deepEqual(inv, { cmd: wrapper, args: ["build", "-Pa=b", "--exclude-task", "lint", "--exclude-task", ":app:test", "--scan", "-Dorg.gradle.caching=true"], cwd: root });
+  assert.deepEqual(
+    OPS["gradle.tasks"].invocations({ tasks: ["test"], flags: ["--tests=example.Test"] }, { cwd: root, platform: "darwin" })[0].args,
+    ["test", "--tests=example.Test"],
+  );
 
   const ok = validateOpParams("gradle.tasks", { tasks: ["build"], excludeTasks: ["lint"], flags: ["--scan"] });
   assert.deepEqual(ok.errors, []);
